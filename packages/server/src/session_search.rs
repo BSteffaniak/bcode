@@ -436,9 +436,8 @@ async fn complete_backfill_inner(
                 if cancellation.is_cancelled() {
                     break;
                 }
-                let response = state
-                    .session_search_work
-                    .run_maintenance(backfill_provider_with_cancellation(
+                let response = Box::pin(state.session_search_work.run_maintenance(
+                    backfill_provider_with_cancellation(
                         state,
                         BackfillSessionSearchRequest {
                             provider_id: provider_id.clone(),
@@ -449,8 +448,9 @@ async fn complete_backfill_inner(
                             deadline_ms: request.slice_deadline_ms,
                         },
                         Some(cancellation),
-                    ))
-                    .await;
+                    ),
+                ))
+                .await;
                 if cancellation.is_cancelled() {
                     break;
                 }
@@ -3187,7 +3187,7 @@ pub(crate) mod tests {
                                 output,
                                 output_capacity,
                                 output_len,
-                                bcode_plugin_sdk::ServiceEventEmitter::new(
+                                &bcode_plugin_sdk::ServiceEventEmitter::new(
                                     event_callback,
                                     event_user_data,
                                 ),
@@ -3264,7 +3264,10 @@ pub(crate) mod tests {
                         output,
                         output_capacity,
                         output_len,
-                        bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
+                        &bcode_plugin_sdk::ServiceEventEmitter::new(
+                            event_callback,
+                            event_user_data,
+                        ),
                     );
                 }
                 let request = context
@@ -3295,7 +3298,10 @@ pub(crate) mod tests {
                         output,
                         output_capacity,
                         output_len,
-                        bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
+                        &bcode_plugin_sdk::ServiceEventEmitter::new(
+                            event_callback,
+                            event_user_data,
+                        ),
                     );
                 }
                 assert!(request.records.iter().all(|record| {
@@ -3466,7 +3472,7 @@ pub(crate) mod tests {
             output,
             output_capacity,
             output_len,
-            bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
+            &bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
         )
     }
 
@@ -3524,46 +3530,6 @@ pub(crate) mod tests {
     pub fn reset_slow_apply_state() {
         SLOW_APPLY_STARTED.store(false, Ordering::SeqCst);
         SLOW_APPLY_CANCELLED.store(false, Ordering::SeqCst);
-    }
-
-    pub fn state_with_static_provider_vtables(
-        providers: &[(PluginManifest, StaticPluginVtable)],
-        configs: BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
-    ) -> crate::ServerState {
-        let static_plugins = providers
-            .iter()
-            .map(|(manifest, vtable)| {
-                bcode_plugin::StaticBundledPlugin::new(
-                    Box::leak(
-                        toml::to_string(manifest)
-                            .expect("static provider manifest serializes")
-                            .into_boxed_str(),
-                    ),
-                    *vtable,
-                )
-            })
-            .collect::<Vec<_>>();
-        let selection = bcode_plugin::PluginSelection {
-            mode: bcode_plugin::PluginSelectionMode::Explicit,
-            enabled: providers
-                .iter()
-                .map(|(manifest, _)| manifest.id.clone())
-                .collect(),
-            disabled: BTreeSet::new(),
-        };
-        let plugins = PluginHost::load_defaults_with_static_bundled_and_config(
-            &selection,
-            &static_plugins,
-            configs,
-        )
-        .expect("load real static providers")
-        .into();
-        crate::tests::test_server_state_with_plugins(
-            bcode_session::SessionManager::persistent_lazy(
-                tempfile::tempdir().expect("session root").keep(),
-            ),
-            plugins,
-        )
     }
 
     pub fn state_with_providers(

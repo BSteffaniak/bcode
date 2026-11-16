@@ -11,22 +11,24 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_client = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
-bcode_plugin_sdk = { workspace = true, features = ["tui"] }
+bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
-bcode_tui_components = { workspace = true, features = ["tool-card"] }
+bcode_tui_components = { workspace = true, optional = true, features = [
+    "tool-card",
+] }
 bcode_worktree = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bmux_keyboard = { workspace = true }
-bmux_text_edit = { workspace = true }
-bmux_tui = { workspace = true }
-bmux_tui_components = { workspace = true, features = [
+bmux_text_edit = { workspace = true, optional = true }
+bmux_tui = { workspace = true, optional = true }
+bmux_tui_components = { workspace = true, optional = true, features = [
     "key-hint-bar",
     "selectable-list",
     "text-input-box",
@@ -41,4 +43,12 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+# Compatibility alias; frontend capability is independent of packaging.
+static-bundled = ["tui"]
+tui = [
+    "bcode_plugin_sdk/tui",
+    "dep:bcode_tui_components",
+    "dep:bmux_text_edit",
+    "dep:bmux_tui",
+    "dep:bmux_tui_components",
+]

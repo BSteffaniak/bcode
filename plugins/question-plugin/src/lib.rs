@@ -14,7 +14,7 @@ mod question_native;
 mod question_outcome;
 #[cfg(feature = "presentation")]
 pub use question_outcome::portable_visual_registrations;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod question_outcome_tui;
 #[cfg(feature = "presentation")]
 mod question_tui;
@@ -23,11 +23,14 @@ pub use question_domain::{
     answered_outcome, dismissed_outcome, format_question_outcome_output, parse_question_request,
     unanswered_outcome,
 };
+// Portable interaction controllers do not require terminal packaging; only the
+// native TUI registry is frontend-capability gated.
+#[cfg(feature = "tui")]
+pub use question_native::question_tui_registry;
 #[cfg(feature = "native")]
-pub use question_native::{QuestionPlugin, static_plugin};
-#[cfg(feature = "static-bundled")]
 pub use question_native::{
-    question_interaction_adapter, question_interaction_registry, question_tui_registry,
+    QuestionPlugin, plugin_definition, plugin_definition_with_host, product_registrations,
+    question_interaction_adapter, question_interaction_registry, static_plugin,
 };
 pub use question_types::*;
 #[cfg(feature = "native")]

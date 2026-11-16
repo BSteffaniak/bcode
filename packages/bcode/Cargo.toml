@@ -102,6 +102,8 @@ bcode_server               = { workspace = true }
 bcode_shell_plugin         = { workspace = true, features = ["static-bundled"] }
 bcode_workflow_store       = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
+bmux_plugin_runtime        = { workspace = true }
+bmux_plugin_sdk            = { workspace = true }
 hex                        = { workspace = true }
 sshenv_vault               = { workspace = true }
 tempfile                   = { workspace = true }

@@ -353,6 +353,11 @@ pub enum AuthPoolPickerRootOutcome {
 
 #[derive(Debug)]
 pub enum WorkflowViewRequest {
+    /// Move actual response ownership through the existing read worker.
+    Correlated {
+        request: Box<Self>,
+        responsibility: super::plugin_tui::dynamic::FrontendEffectResponsibility,
+    },
     SelectRun(String),
     UpdateQuery {
         filter: bcode_workflow_view_models::WorkflowCatalogFilter,
@@ -801,7 +806,7 @@ impl ChatLoopState {
         Vec<bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage>>,
         std::collections::BTreeMap<
             bcode_session_models::SessionId,
-            std::collections::VecDeque<TuiEffect>,
+            std::collections::VecDeque<super::effects::ScheduledEffect>,
         >,
     ) {
         // The catalog stream belongs to the modal, not to the chat session. Closing
@@ -820,9 +825,10 @@ impl ChatLoopState {
         let (effects, notes) = chat.pending_effects.drain_runtime();
         let commands = effects
             .into_iter()
-            .map(|(schedule, effect)| {
-                effect.command(
-                    schedule,
+            .map(|entry| {
+                entry.effect.command_with_responsibility(
+                    entry.schedule,
+                    entry.responsibility,
                     self.foreground_client.as_ref(),
                     self.passive_client.as_ref(),
                     self.managed_effect_access(),
@@ -835,11 +841,12 @@ impl ChatLoopState {
 
     pub fn ordered_effect_command(
         &self,
-        effect: TuiEffect,
+        entry: super::effects::ScheduledEffect,
         handle: &bmux_tui_runtime::RuntimeHandle<super::root_program::BcodeRuntimeMessage>,
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
-        effect.command(
-            super::effects::EffectSchedule::StartIfIdle,
+        entry.effect.command_with_responsibility(
+            entry.schedule,
+            entry.responsibility,
             self.foreground_client.as_ref(),
             self.passive_client.as_ref(),
             self.managed_effect_access(),
@@ -1518,7 +1525,7 @@ impl ChatLoopState {
     }
 
     #[cfg(test)]
-    pub fn active_root_plugin_surface_id(&self) -> Option<&'static str> {
+    pub fn active_root_plugin_surface_id(&self) -> Option<&str> {
         self.plugin_surface
             .as_ref()
             .and_then(|surface| surface.surface.as_ref().map(|surface| surface.id()))
@@ -1538,6 +1545,63 @@ impl ChatLoopState {
             .focused_text_field()
             .filter(|field| {
                 field.eligible && !field.content_rect.is_empty() && !field.anchor.is_empty()
+            })
+    }
+
+    /// Move only the exact surface response capability; absent ordinary surfaces remain ordinary.
+    pub fn take_root_completion(
+        &mut self,
+    ) -> Result<
+        Option<super::plugin_tui::dynamic::FrontendEffectResponsibility>,
+        bcode_plugin_sdk::tui::portable::settlement::CompletionResponsibilityError,
+    > {
+        let Some(active) = self
+            .plugin_surface
+            .as_mut()
+            .and_then(|surface| surface.surface.as_mut())
+        else {
+            return Ok(None);
+        };
+        active.take_completion_responsibility().map(|token| {
+            token.map(super::plugin_tui::dynamic::FrontendEffectResponsibility::from_opaque)
+        })
+    }
+
+    /// Move only the actual focused edit's completion, never an ordinary queued action.
+    pub fn take_root_edit_completion(
+        &mut self,
+    ) -> Result<
+        Option<super::plugin_tui::dynamic::FrontendEffectResponsibility>,
+        bcode_plugin_sdk::tui::portable::settlement::CompletionResponsibilityError,
+    > {
+        let Some(active) = self
+            .plugin_surface
+            .as_mut()
+            .and_then(|surface| surface.surface.as_mut())
+        else {
+            return Ok(None);
+        };
+        active
+            .take_focused_edit_completion_responsibility()
+            .map(|token| {
+                token.map(super::plugin_tui::dynamic::FrontendEffectResponsibility::from_opaque)
+            })
+    }
+
+    /// Transfer interactive ownership through its actual boxed surface, never reconstruct IDs.
+    pub fn take_interactive_completion(
+        &mut self,
+    ) -> Result<
+        Option<super::plugin_tui::dynamic::FrontendEffectResponsibility>,
+        bcode_plugin_sdk::tui::portable::settlement::CompletionResponsibilityError,
+    > {
+        let Some(surface) = self.interactive_surface.as_mut() else {
+            return Ok(None);
+        };
+        surface
+            .take_focused_edit_completion_responsibility()
+            .map(|token| {
+                token.map(super::plugin_tui::dynamic::FrontendEffectResponsibility::from_opaque)
             })
     }
 
@@ -1563,6 +1627,33 @@ impl ChatLoopState {
         surface.effects_pending = true;
         surface.invalidation.request();
         Some(result)
+    }
+
+    /// Take an asynchronous root-editor result from the same live semantic owner.
+    pub fn take_root_focused_text_field_edit_result(
+        &mut self,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiFocusedTextFieldEditResult> {
+        let surface = self.plugin_surface.as_mut()?;
+        let result = surface
+            .surface
+            .as_mut()?
+            .take_focused_text_field_edit_result()?;
+        // Preserve terminal effects in the ordinary root effect reconciliation queue.
+        surface.effects_pending = true;
+        surface.invalidation.request();
+        Some(result)
+    }
+
+    /// Take an asynchronous interactive-editor result from the current owner.
+    pub fn take_interactive_focused_text_field_edit_result(
+        &mut self,
+    ) -> Option<(
+        bcode_plugin_sdk::tui::FocusedTextFieldEditResult,
+        super::interactive_surface::InteractiveSurfaceEventOutcome,
+    )> {
+        self.interactive_surface
+            .as_mut()?
+            .take_focused_text_field_edit_result()
     }
 
     pub fn handle_root_plugin_surface_event(
@@ -1803,6 +1894,43 @@ impl ChatLoopState {
         self.plugin_surface
             .as_ref()
             .and_then(|surface| surface.workflow_view_requests.as_ref())
+    }
+
+    /// Reserve a same-record follow-up before the existing workflow-view worker receives it.
+    pub fn request_correlated_workflow_view(
+        &self,
+        parent: &mut super::plugin_tui::dynamic::FrontendEffectResponsibility,
+        request: WorkflowViewRequest,
+    ) -> bool {
+        let Some(requests) = self.root_workflow_view_requests() else {
+            parent.recovery_required();
+            return false;
+        };
+        let Ok(mut token) = parent.follow_up() else {
+            parent.recovery_required();
+            return false;
+        };
+        if token.retained().is_err() {
+            parent.recovery_required();
+            return false;
+        }
+        let requested = WorkflowViewRequest::Correlated {
+            request: Box::new(request),
+            responsibility: token,
+        };
+        let sent = requests.try_send(requested);
+        if let Err(error) = sent {
+            if let WorkflowViewRequest::Correlated {
+                mut responsibility, ..
+            } = error.into_inner()
+                && responsibility.not_dispatched().is_err()
+            {
+                responsibility.recovery_required();
+            }
+            parent.recovery_required();
+            return false;
+        }
+        true
     }
 
     pub fn request_root_workflow_run(&self, run_id: String) {
@@ -3069,7 +3197,7 @@ impl ChatLoopState {
     }
 
     #[cfg(test)]
-    pub fn active_interactive_surface_native_id_for_test(&self) -> Option<&'static str> {
+    pub fn active_interactive_surface_native_id_for_test(&self) -> Option<&str> {
         self.interactive_surface
             .as_ref()
             .map(InteractiveSurfaceState::surface_id_for_test)
@@ -3448,13 +3576,42 @@ fn external_connection_notice(applications: &[String]) -> Option<String> {
     ))
 }
 
+/// Reserve on the original completion before queue admission. Failure leaves the parent
+/// recovery-required; no tokenless dispatch or second correlation ledger is permitted.
+pub fn transfer_frontend_follow_up(
+    chat: &mut ActiveChat,
+    parent: &mut super::plugin_tui::dynamic::FrontendEffectResponsibility,
+    effect: TuiEffect,
+) -> bool {
+    let Ok(token) = parent.follow_up() else {
+        parent.recovery_required();
+        return false;
+    };
+    let transfer = super::plugin_tui::dynamic::FrontendEffectTransfer::new(effect, token);
+    if let Err(returned) = chat
+        .pending_effects
+        .try_push_frontend(super::effects::EffectSchedule::Replace, transfer)
+    {
+        let mut rejected = *returned;
+        if rejected.responsibility.not_dispatched().is_err() {
+            rejected.responsibility.recovery_required();
+        }
+        drop(rejected);
+        parent.recovery_required();
+        return false;
+    }
+    true
+}
+
+/// Apply through the existing owner, transferring correlated follow-up responsibility first.
 #[allow(clippy::too_many_lines)]
-pub fn apply_effect_result(
+pub fn apply_effect_result_with_frontend(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     draft_autosave: &mut DraftAutosave,
     loop_state: &mut ChatLoopState,
     result: TuiEffectResult,
+    mut frontend: Option<&mut super::plugin_tui::dynamic::FrontendEffectResponsibility>,
 ) {
     match result {
         // Owned by the transcript host, which applies it before shell effect handling.
@@ -3542,8 +3699,44 @@ pub fn apply_effect_result(
                     }
                 }
             }
-            session_flow::complete_switch_session(chat, session_id, *result);
-            if chat.attached_session_id() == Some(session_id) {
+            if frontend.is_some() {
+                if chat.opening_session_id() != Some(session_id) {
+                    if let Some(parent) = frontend.as_deref_mut() {
+                        parent.recovery_required();
+                    }
+                    if let Ok((_, task)) = *result {
+                        task.abort();
+                    }
+                    return;
+                }
+                session_flow::complete_switch_session_state(chat, session_id, *result);
+                if chat.attached_session_id() == Some(session_id)
+                    && let Some(parent) = frontend.as_deref_mut()
+                {
+                    let follow_ups = [
+                        TuiEffect::LoadSessionStatus { session_id },
+                        TuiEffect::ListPermissions,
+                        TuiEffect::LoadChildActivity {
+                            session_id,
+                            after: None,
+                            generation: 0,
+                        },
+                        TuiEffect::LoadSessionChildren {
+                            parent_id: session_id,
+                            after: None,
+                            generation: 0,
+                        },
+                    ];
+                    for effect in follow_ups {
+                        if !transfer_frontend_follow_up(chat, parent, effect) {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                session_flow::complete_switch_session(chat, session_id, *result);
+            }
+            if frontend.is_none() && chat.attached_session_id() == Some(session_id) {
                 chat.replace_effect(TuiEffect::LoadChildActivity {
                     session_id,
                     after: None,
@@ -4045,12 +4238,69 @@ pub fn apply_effect_result(
                             chat.app.set_status(status);
                         }
                         bcode_command::CommandEffect::AppendText { text, format } => {
-                            chat.append_durable_presentation_note(plugin_id.clone(), text, format);
+                            if let Some(parent) = frontend.as_deref_mut() {
+                                if !chat.append_frontend_presentation_note(
+                                    plugin_id.clone(),
+                                    text,
+                                    format,
+                                    parent,
+                                ) {
+                                    chat.app.set_status(
+                                        "frontend note admission failed; recovery required"
+                                            .to_owned(),
+                                    );
+                                }
+                            } else {
+                                chat.append_durable_presentation_note(
+                                    plugin_id.clone(),
+                                    text,
+                                    format,
+                                );
+                            }
                         }
                         bcode_command::CommandEffect::ToggleSurface { surface_id } => chat
                             .app
                             .set_status(format!("surface toggle requested: {surface_id}")),
                         bcode_command::CommandEffect::OpenSession { session_id, focus } => {
+                            if let Some(parent) = frontend.as_deref_mut() {
+                                if super::session_flow::managed_navigation_intercepted(
+                                    chat,
+                                    Some(session_id),
+                                ) {
+                                    // Managed navigation applied the request synchronously;
+                                    // no follow-up is reserved on the original completion.
+                                    continue;
+                                }
+                                let request =
+                                    super::session_flow::initial_transcript_window_request(
+                                        bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+                                    );
+                                if transfer_frontend_follow_up(
+                                    chat,
+                                    parent,
+                                    TuiEffect::OpenSession {
+                                        session_id,
+                                        initial_window_request: request,
+                                        event_sender: chat.event_sender.clone(),
+                                        allow_daemon_start: true,
+                                    },
+                                ) {
+                                    super::session_flow::prepare_switch_session(
+                                        chat, session_id, None,
+                                    );
+                                    if focus == bcode_command::SessionOpenFocus::Composer {
+                                        chat.app.set_status(
+                                            "session opening with composer focus".to_owned(),
+                                        );
+                                    }
+                                } else {
+                                    chat.app.set_status(
+                                        "frontend navigation admission failed; recovery required"
+                                            .to_owned(),
+                                    );
+                                }
+                                continue;
+                            }
                             super::session_flow::start_switch_session(
                                 chat,
                                 session_id,
@@ -4068,17 +4318,25 @@ pub fn apply_effect_result(
                             instance_id,
                             options,
                         } => {
-                            chat.replace_effect(TuiEffect::OpenPluginSurface {
-                                plugin_id: plugin_id.clone(),
-                                surface_kind,
-                                instance_id,
-                                options,
-                                working_directory: chat.app.working_directory().map_or_else(
-                                    || settings.launch_working_directory().to_path_buf(),
-                                    std::path::Path::to_path_buf,
-                                ),
-                                session_id: chat.attached_session_id(),
-                            });
+                            {
+                                let effect = TuiEffect::OpenPluginSurface {
+                                    presentation: chat.app.shared_plugin_presentation(),
+                                    plugin_id: plugin_id.clone(),
+                                    surface_kind,
+                                    instance_id,
+                                    options,
+                                    working_directory: chat.app.working_directory().map_or_else(
+                                        || settings.launch_working_directory().to_path_buf(),
+                                        std::path::Path::to_path_buf,
+                                    ),
+                                    session_id: chat.attached_session_id(),
+                                };
+                                if let Some(parent) = frontend.as_deref_mut() {
+                                    transfer_frontend_follow_up(chat, parent, effect);
+                                } else {
+                                    chat.replace_effect(effect);
+                                }
+                            }
                             chat.app.set_status("opening plugin surface…".to_owned());
                         }
                     }
@@ -5014,6 +5272,7 @@ fn apply_root_slash_command_outcome(
         }
         SlashCommandOutcome::OpenRalphHome => {
             chat.replace_effect(TuiEffect::OpenPluginSurface {
+                presentation: chat.app.shared_plugin_presentation(),
                 plugin_id: "bcode.ralph".to_owned(),
                 surface_kind: "ralph-home".to_owned(),
                 instance_id: "ralph-home".to_owned(),
@@ -5694,13 +5953,15 @@ pub fn start_cancel_turn(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState)
         chat.app.set_status("No active session".to_owned());
         return;
     };
-    let effect = TuiEffect::CancelTurn { session_id };
-    if chat.pending_effects.contains_effect(&effect) {
-        chat.app
-            .set_status("turn cancellation already requested".to_owned());
-        return;
+    {
+        let effect = TuiEffect::CancelTurn { session_id };
+        if chat.pending_effects.contains_effect(&effect) {
+            chat.app
+                .set_status("turn cancellation already requested".to_owned());
+            return;
+        }
+        chat.start_effect(effect);
     }
-    chat.start_effect(effect);
     if chat.app.managed_execution_session().is_some() {
         chat.app
             .set_status("Native interruption requested; settlement remains independent".into());
@@ -6140,7 +6401,8 @@ pub fn draw_chat_frame<W: Write>(
     let config = loop_state.markdown_image_config.clone();
     let terminal_area = terminal.area();
     let permission_docked = loop_state.permission_dock.is_some();
-    let draw_result = terminal.draw_damage_with_output_hooks(
+    let presentation = chat.app.shared_plugin_presentation();
+    let draw_result = terminal.draw_damage_with_prepared_output_hooks(
         damage,
         |frame| {
             let modal = loop_state.modal_foreground();
@@ -6197,6 +6459,12 @@ pub fn draw_chat_frame<W: Write>(
             }
             paint_foreground(chat, loop_state, surface_geometry.get(), frame);
         },
+        |prepared| {
+            if let Some(presentation) = &presentation {
+                presentation.configure_retained_prepared(prepared)?;
+            }
+            Ok(())
+        },
         |writer| compositor.borrow_mut().prepare_output(writer),
         |writer, scene, delta| {
             let mut compositor = compositor.borrow_mut();
@@ -6217,6 +6485,9 @@ pub fn draw_chat_frame<W: Write>(
                 .map_err(std::io::Error::other)
         },
     );
+    // Configuration hooks have completed; the application still retains the selected owner
+    // through the root presenter's successful-output acknowledgment.
+    drop(presentation);
     let compositor = compositor.into_inner();
     let draw_stats = match draw_result {
         Ok(stats) => {
@@ -7455,6 +7726,60 @@ mod scheduler_tests {
         chat.event_task.take().unwrap().abort();
     }
 
+    #[test]
+    fn navigation_admission_retains_same_record_before_preparing_session() {
+        let (event_sender, event_receiver) = super::super::history_flow::session_stream_channel();
+        let mut chat = ActiveChat {
+            app: super::super::app::BmuxApp::new_with_history(None, &[], &[]),
+            agents: session_flow::AgentCatalog::default(),
+            attachment: session_flow::ChatSessionAttachment::Draft,
+            event_sender,
+            event_receiver,
+            event_task: None,
+            opening_session_progress: None,
+            pending_effects: super::super::effects::TuiEffectQueue::default(),
+        };
+        let mut parent = super::super::plugin_tui::dynamic::completion_test_responsibility();
+        parent.retained().unwrap();
+        parent.dispatched().unwrap();
+        let id = parent.response_id();
+        let next = bcode_session_models::SessionId::new();
+        let event_sender = chat.event_sender.clone();
+        assert!(transfer_frontend_follow_up(
+            &mut chat,
+            &mut parent,
+            TuiEffect::OpenSession {
+                session_id: next,
+                initial_window_request: session_flow::initial_transcript_window_request(
+                    bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+                ),
+                event_sender,
+                allow_daemon_start: true,
+            }
+        ));
+        session_flow::prepare_switch_session(&mut chat, next, None);
+        assert_eq!(chat.opening_session_id(), Some(next));
+        let (mut effects, notes) = chat.pending_effects.drain_runtime();
+        assert!(notes.is_empty());
+        assert_eq!(
+            effects.len(),
+            1,
+            "preparation must not enqueue a tokenless duplicate"
+        );
+        let entry = effects.pop().unwrap();
+        let token = entry.responsibility.as_ref().unwrap();
+        assert_eq!(token.response_id(), id);
+        assert_ne!(token.ordinal(), parent.ordinal());
+        assert_eq!(
+            token.disposition(),
+            bcode_plugin_sdk::tui::portable::settlement::CompletionDisposition::Retained
+        );
+        assert!(
+            matches!(entry.effect, TuiEffect::OpenSession { session_id, .. } if session_id == next)
+        );
+        drop(entry);
+    }
+
     #[tokio::test]
     async fn a_staged_native_agent_commits_only_when_its_message_is_prepared() {
         use super::super::effects::SubmitMessageResult;
@@ -7571,7 +7896,7 @@ mod scheduler_tests {
             assert!(
                 matches!(
                     resent.as_slice(),
-                    [(_, TuiEffect::SubmitMessage { request })]
+                    [crate::effects::ScheduledEffect { effect: TuiEffect::SubmitMessage { request }, .. }]
                         if request.managed.as_ref() == Some(&retained)
                 ),
                 "attempt {attempt} resends the exact retained request"

@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod ocr_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
@@ -49,6 +49,10 @@ impl Default for OcrPlugin {
 }
 
 impl RustPlugin for OcrPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn deactivate(&mut self) -> Result<(), PluginError> {
         if let Ok(runtime) = &self.runtime {
             runtime
@@ -281,7 +285,7 @@ impl OcrPlugin {
             Err(error) => return invalid_request(&error),
         };
         let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
-            context.events,
+            context.events.clone(),
             &invocation.tool_call_id,
             OCR_PLUGIN_ID,
             OCR_REQUEST_SCHEMA,
@@ -295,7 +299,7 @@ impl OcrPlugin {
             &invocation.arguments,
         ));
         let response = match invocation.name.as_str() {
-            "ocr.extract" => self.invoke_extract(&invocation, context.events),
+            "ocr.extract" => self.invoke_extract(&invocation, context.events.clone()),
             "ocr.status" => invoke_status(&invocation.tool_call_id),
             _ => ToolInvocationResponse {
                 output: format!("unknown OCR tool: {}", invocation.name),
@@ -1045,13 +1049,42 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(serial OcrPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(ocr_tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_host::<OcrPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(OcrPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn ocr_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -1065,9 +1098,6 @@ pub fn ocr_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(OcrPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

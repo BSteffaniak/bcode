@@ -290,7 +290,9 @@ mod tests {
         let [TuiEffect::LoadTranscriptV2History { load }] = effects.as_slice() else {
             panic!("one tail request, got {} effects", effects.len());
         };
-        (host, *load)
+        let load = *load;
+        drop(effects);
+        (host, load)
     }
 
     fn tail_result(load: HistoryLoad, events: Vec<SessionEvent>) -> TuiEffectResult {
@@ -408,10 +410,12 @@ mod tests {
         let [TuiEffect::LoadTranscriptV2History { load: retried }] = effects.as_slice() else {
             panic!("the request is re-issued, got {} effects", effects.len());
         };
+        let retried = *retried;
+        drop(effects);
         assert_eq!(retried.request, load.request);
         // A second failure doubles the delay.
         let failed = TuiEffectResult::TranscriptV2HistoryLoaded {
-            load: *retried,
+            load: retried,
             result: Err(ClientError::Protocol("offline".to_owned())),
         };
         assert!(!host.apply_effect_result(failed, due));
@@ -419,7 +423,7 @@ mod tests {
             host.next_deadline(),
             Some(due + 2 * crate::transcript_v2_host::data::FIRST_RETRY_DELAY)
         );
-        assert!(host.apply_effect_result(tail_result(*retried, conversation(session, 6)), due));
+        assert!(host.apply_effect_result(tail_result(retried, conversation(session, 6)), due));
         assert_eq!(
             host.engine().window().last_sequence,
             Some(7),
@@ -519,11 +523,13 @@ mod tests {
         let [TuiEffect::LoadTranscriptV2History { load }] = effects.as_slice() else {
             panic!("one around request, got {} effects", effects.len());
         };
+        let load = *load;
+        drop(effects);
         let HostRequest::Window(issued) = load.request else {
             panic!("window request");
         };
         let result = TuiEffectResult::TranscriptV2HistoryLoaded {
-            load: *load,
+            load,
             result: Ok(HistoryLoaded::Window(HistoryWindowResult {
                 generation: issued.generation,
                 target: issued.request,

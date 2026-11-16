@@ -4,6 +4,14 @@
 
 //! Single source of truth for statically bundled Bcode plugins.
 
+// The same public implementation definition is used by generated dynamic
+// wrappers. Keep the legacy registry below until all host consumers migrate.
+include!(concat!(env!("OUT_DIR"), "/shared_definitions.rs"));
+
+#[cfg(test)]
+#[path = "../registry_generation.rs"]
+mod registry_generation;
+
 /// Return statically bundled native TUI extension registrations.
 #[must_use]
 #[allow(clippy::missing_const_for_fn, clippy::vec_init_then_push)] // Feature-selected builds push function pointers at runtime.
@@ -277,22 +285,13 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     #[cfg(feature = "static-bundled-eval-plugin")]
     plugins.push(eval_plugin());
     #[cfg(feature = "static-bundled-usage-plugin")]
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/usage-plugin/bcode-plugin.toml"),
-        bcode_usage_plugin::static_plugin(),
-    ));
+    plugins.push(usage_plugin());
     #[cfg(feature = "static-bundled-metrics-plugin")]
     plugins.push(metrics_plugin());
     #[cfg(feature = "static-bundled-recap-plugin")]
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/recap-plugin/bcode-plugin.toml"),
-        bcode_recap_plugin::static_plugin(),
-    ));
+    plugins.push(recap_plugin());
     #[cfg(feature = "static-bundled-vox-plugin")]
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/vox-plugin/bcode-plugin.toml"),
-        bcode_vox_plugin::static_plugin(),
-    ));
+    plugins.push(vox_plugin());
     #[cfg(feature = "static-bundled-ocr-plugin")]
     plugins.push(ocr_plugin());
     #[cfg(feature = "static-bundled-fake-provider-plugin")]
@@ -306,24 +305,18 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     #[cfg(feature = "static-bundled-github-review-publisher-plugin")]
     plugins.push(github_review_publisher_plugin());
     #[cfg(feature = "static-bundled-graphite-plugin")]
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+    plugins.push(bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/graphite-plugin/bcode-plugin.toml"),
-        bcode_graphite_plugin::static_plugin(),
+        bcode_graphite_plugin::plugin_definition,
     ));
     #[cfg(feature = "static-bundled-model-plugin")]
     plugins.push(model_plugin());
     #[cfg(feature = "static-bundled-jev-provider-plugin")]
     plugins.push(jev_provider_plugin());
     #[cfg(feature = "static-bundled-auth-broker-plugin")]
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/auth-broker-plugin/bcode-plugin.toml"),
-        bcode_auth_broker_plugin::static_plugin(),
-    ));
+    plugins.push(auth_broker_plugin());
     #[cfg(feature = "static-bundled-auth-broker-provider-plugin")]
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/auth-broker-provider-plugin/bcode-plugin.toml"),
-        bcode_auth_broker_provider_plugin::static_plugin(),
-    ));
+    plugins.push(auth_broker_provider_plugin());
     #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
     plugins.push(openai_compatible_provider_plugin());
     #[cfg(feature = "static-bundled-opencode-session-import-plugin")]
@@ -340,10 +333,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-session-derivation-plugin")]
     plugins.push(session_derivation_plugin());
-    plugins.push(bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/xray-plugin/bcode-plugin.toml"),
-        bcode_xray_plugin::static_plugin(),
-    ));
+    #[cfg(feature = "static-bundled-xray-plugin")]
+    plugins.push(xray_plugin());
     #[cfg(feature = "static-bundled-session-milestones-plugin")]
     plugins.push(session_milestones_plugin());
     #[cfg(feature = "static-bundled-shell-plugin")]
@@ -364,12 +355,57 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(workflow_plugin());
 }
 
+#[cfg(feature = "static-bundled-recap-plugin")]
+fn recap_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::from_definition(
+        include_str!("../../../plugins/recap-plugin/bcode-plugin.toml"),
+        bcode_recap_plugin::plugin_definition,
+    )
+}
+
+#[cfg(feature = "static-bundled-vox-plugin")]
+fn vox_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/vox-plugin/bcode-plugin.toml"),
+        bcode_vox_plugin::static_plugin(),
+    )
+    .with_definition(bcode_vox_plugin::plugin_definition)
+}
+
+#[cfg(feature = "static-bundled-auth-broker-plugin")]
+fn auth_broker_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/auth-broker-plugin/bcode-plugin.toml"),
+        bcode_auth_broker_plugin::static_plugin(),
+    )
+    .with_definition(bcode_auth_broker_plugin::plugin_definition)
+}
+
+#[cfg(feature = "static-bundled-auth-broker-provider-plugin")]
+fn auth_broker_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/auth-broker-provider-plugin/bcode-plugin.toml"),
+        bcode_auth_broker_provider_plugin::static_plugin(),
+    )
+    .with_definition(bcode_auth_broker_provider_plugin::plugin_definition)
+}
+
+#[cfg(feature = "static-bundled-xray-plugin")]
+fn xray_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/xray-plugin/bcode-plugin.toml"),
+        bcode_xray_plugin::static_plugin(),
+    )
+    .with_definition(bcode_xray_plugin::plugin_definition)
+}
+
 #[cfg(feature = "static-bundled-claude-code-plugin")]
 fn claude_code_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/claude-code-plugin/bcode-plugin.toml"),
         bcode_claude_code_plugin::static_plugin(),
     )
+    .with_definition(bcode_claude_code_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-codex-harness-plugin")]
@@ -378,6 +414,7 @@ fn codex_harness_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/codex-harness-plugin/bcode-plugin.toml"),
         bcode_codex_harness_plugin::static_plugin(),
     )
+    .with_definition(bcode_codex_harness_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-harness-plugin")]
@@ -386,6 +423,16 @@ fn harness_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/harness-plugin/bcode-plugin.toml"),
         bcode_harness_plugin::static_plugin(),
     )
+    .with_definition(bcode_harness_plugin::plugin_definition)
+}
+
+#[cfg(feature = "static-bundled-usage-plugin")]
+fn usage_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/usage-plugin/bcode-plugin.toml"),
+        bcode_usage_plugin::static_plugin(),
+    )
+    .with_definition(bcode_usage_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
@@ -394,13 +441,14 @@ fn bedrock_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/bedrock-provider-plugin/bcode-plugin.toml"),
         bcode_bedrock_provider_plugin::static_plugin(),
     )
+    .with_definition(bcode_bedrock_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-blims-plugin")]
 fn blims_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/blims-plugin/bcode-plugin.toml"),
-        bcode_blims_plugin::static_plugin(),
+        bcode_blims_plugin::plugin_definition,
     )
 }
 
@@ -410,13 +458,14 @@ fn code_review_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
         bcode_code_review_plugin::static_plugin(),
     )
+    .with_definition(bcode_code_review_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-prompt-profile-plugin")]
 fn prompt_profile_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
-        bcode_prompt_profile_plugin::static_plugin(),
+        bcode_prompt_profile_plugin::plugin_definition,
     )
 }
 
@@ -424,8 +473,29 @@ fn prompt_profile_plugin() -> bcode_plugin::StaticBundledPlugin {
 fn default_agents_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-        bcode_default_agents_plugin::static_plugin(),
+        // StaticBundledPlugin still requires the legacy metadata carrier. No
+        // legacy implementation or singleton is created: production dispatch
+        // uses the shared factory below, and old execution hooks fail closed.
+        bcode_plugin_sdk::StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest: |cache| {
+                bcode_plugin_sdk::static_manifest_export(
+                    include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+                    cache,
+                )
+            },
+            activate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
+            register_commands: None,
+            register_auth_providers: None,
+            deactivate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
+            invoke_service_streaming: |_, _, _, _, _, _, _, _, _, _, _, _| {
+                bcode_plugin_sdk::EXIT_UNAVAILABLE
+            },
+            handle_event: |_, _, _| bcode_plugin_sdk::EXIT_UNAVAILABLE,
+            cli_registration: None,
+        },
     )
+    .with_definition(bcode_default_agents_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-document-plugin")]
@@ -434,6 +504,7 @@ fn document_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/document-plugin/bcode-plugin.toml"),
         bcode_document_plugin::static_plugin(),
     )
+    .with_definition(bcode_document_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-eval-plugin")]
@@ -442,6 +513,7 @@ fn eval_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/eval-plugin/bcode-plugin.toml"),
         bcode_eval_plugin::static_plugin(),
     )
+    .with_definition(bcode_eval_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-metrics-plugin")]
@@ -450,6 +522,7 @@ fn metrics_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/metrics-plugin/bcode-plugin.toml"),
         bcode_metrics_plugin::static_plugin(),
     )
+    .with_definition(bcode_metrics_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-ocr-plugin")]
@@ -458,6 +531,7 @@ fn ocr_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/ocr-plugin/bcode-plugin.toml"),
         bcode_ocr_plugin::static_plugin(),
     )
+    .with_definition(bcode_ocr_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-fake-provider-plugin")]
@@ -466,6 +540,7 @@ fn fake_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
         bcode_fake_provider_plugin::static_plugin(),
     )
+    .with_definition(bcode_fake_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-file-references-plugin")]
@@ -474,6 +549,7 @@ fn file_references_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/file-references-plugin/bcode-plugin.toml"),
         bcode_file_references_plugin::static_plugin(),
     )
+    .with_definition(bcode_file_references_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-filesystem-plugin")]
@@ -482,6 +558,7 @@ fn filesystem_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
         bcode_filesystem_plugin::static_plugin(),
     )
+    .with_definition(bcode_filesystem_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-git-plugin")]
@@ -490,13 +567,14 @@ fn git_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
         bcode_git_plugin::static_plugin(),
     )
+    .with_definition(bcode_git_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-github-review-publisher-plugin")]
 fn github_review_publisher_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/github-review-publisher-plugin/bcode-plugin.toml"),
-        bcode_github_review_publisher_plugin::static_plugin(),
+        bcode_github_review_publisher_plugin::plugin_definition,
     )
 }
 
@@ -506,6 +584,7 @@ fn model_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/model-plugin/bcode-plugin.toml"),
         bcode_model_plugin::static_plugin(),
     )
+    .with_definition(bcode_model_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-jev-provider-plugin")]
@@ -514,6 +593,7 @@ fn jev_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
         bcode_jev_provider_plugin::static_plugin(),
     )
+    .with_definition(bcode_jev_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
@@ -522,29 +602,30 @@ fn openai_compatible_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
         bcode_openai_compatible_provider_plugin::static_plugin(),
     )
+    .with_definition(bcode_openai_compatible_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-opencode-session-import-plugin")]
 fn opencode_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml"),
-        bcode_opencode_session_import_plugin::static_plugin(),
+        bcode_opencode_session_import_plugin::plugin_definition,
     )
 }
 
 #[cfg(feature = "static-bundled-pi-session-import-plugin")]
 fn pi_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
-        bcode_pi_session_import_plugin::static_plugin(),
+        bcode_pi_session_import_plugin::plugin_definition,
     )
 }
 
 #[cfg(feature = "static-bundled-sdk-session-import-plugin")]
 fn sdk_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
-        bcode_sdk_session_import_plugin::static_plugin(),
+        bcode_sdk_session_import_plugin::plugin_definition,
     )
 }
 
@@ -554,6 +635,7 @@ fn question_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
         bcode_question_plugin::static_plugin(),
     )
+    .with_definition(bcode_question_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-loop-plugin")]
@@ -563,6 +645,7 @@ pub fn static_loop_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/loop-plugin/bcode-plugin.toml"),
         bcode_loop_plugin::static_plugin(),
     )
+    .with_definition(bcode_loop_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-read-plugin")]
@@ -571,6 +654,7 @@ fn read_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/read-plugin/bcode-plugin.toml"),
         bcode_read_plugin::static_plugin(),
     )
+    .with_definition(bcode_read_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-session-derivation-plugin")]
@@ -579,13 +663,14 @@ fn session_derivation_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/session-derivation-plugin/bcode-plugin.toml"),
         bcode_session_derivation_plugin::static_plugin(),
     )
+    .with_definition(bcode_session_derivation_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-session-milestones-plugin")]
 fn session_milestones_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/session-milestones-plugin/bcode-plugin.toml"),
-        bcode_session_milestones_plugin::static_plugin(),
+        bcode_session_milestones_plugin::plugin_definition,
     )
 }
 
@@ -595,21 +680,22 @@ fn shell_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
         bcode_shell_plugin::static_plugin(),
     )
+    .with_definition(bcode_shell_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-compressed-session-search-plugin")]
 fn compressed_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"),
-        bcode_compressed_session_search_plugin::static_plugin(),
+        bcode_compressed_session_search_plugin::plugin_definition,
     )
 }
 
 #[cfg(feature = "static-bundled-tantivy-session-search-plugin")]
 fn tantivy_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"),
-        bcode_tantivy_session_search_plugin::static_plugin(),
+        bcode_tantivy_session_search_plugin::plugin_definition,
     )
 }
 
@@ -619,6 +705,7 @@ fn skills_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/skills-plugin/bcode-plugin.toml"),
         bcode_skills_plugin::static_plugin(),
     )
+    .with_definition(bcode_skills_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-vim-edit-plugin")]
@@ -627,6 +714,7 @@ fn vim_edit_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
         bcode_vim_edit_plugin::static_plugin(),
     )
+    .with_definition(bcode_vim_edit_plugin::plugin_definition)
     .with_default_activation(bcode_plugin::PluginDefaultActivation::Disabled)
 }
 
@@ -636,6 +724,7 @@ fn web_search_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
         bcode_web_search_plugin::static_plugin(),
     )
+    .with_definition(bcode_web_search_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-worktree-plugin")]
@@ -644,6 +733,7 @@ fn worktree_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/worktree-plugin/bcode-plugin.toml"),
         bcode_worktree_plugin::static_plugin(),
     )
+    .with_definition(bcode_worktree_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-workflow-plugin")]
@@ -652,6 +742,7 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
         bcode_workflow_plugin::static_plugin(),
     )
+    .with_definition(bcode_workflow_plugin::plugin_definition)
     .with_package_root(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../plugins/workflow-plugin"
@@ -659,7 +750,115 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
 }
 
 #[cfg(test)]
+mod test_host;
+
+#[cfg(test)]
 mod tests {
+    #[cfg(feature = "static-bundled-recap-plugin")]
+    #[test]
+    fn recap_definition_only_selection_preserves_registration_and_disableability() {
+        let bundles = super::static_bundled_plugins();
+        let selection = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::Explicit,
+            enabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
+            disabled: std::collections::BTreeSet::default(),
+        };
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&bundles, &selection).unwrap();
+        assert_eq!(selected.len(), 1);
+        let (manifest, registration) = &selected[0];
+        assert_eq!(manifest.id, "bcode.recap");
+        assert!(registration.vtable.is_none());
+        assert_eq!(
+            registration.default_activation(),
+            bcode_plugin::PluginDefaultActivation::Enabled
+        );
+        // The legacy-only API must not invent a carrier or silently drop this
+        // selected definition. Production callers retain the complete registration.
+        assert!(bcode_plugin::filter_selected_static_plugins(&bundles, &selection).is_err());
+        let disabled = bcode_plugin::PluginSelection {
+            disabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
+            ..selection
+        };
+        assert!(
+            bcode_plugin::filter_selected_static_registrations(&bundles, &disabled)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "static-bundled-default-agents-plugin")]
+    #[test]
+    fn default_agents_legacy_carrier_is_metadata_only() {
+        let registration = super::default_agents_plugin();
+        let vtable = registration
+            .vtable
+            .expect("default agents explicit legacy carrier");
+        assert!(vtable.instance.is_null());
+        assert_eq!(
+            (vtable.activate)(vtable.instance),
+            bcode_plugin_sdk::EXIT_UNAVAILABLE
+        );
+        let definition = bcode_default_agents_plugin::plugin_definition();
+        assert_eq!(definition.metadata.plugin_id, "bcode.default-agents");
+        let embedded: toml::Value =
+            toml::from_str(definition.metadata.manifest_toml.as_deref().unwrap()).unwrap();
+        let mut registered: toml::Value = toml::from_str(registration.manifest_toml).unwrap();
+        // Shared declarations add generic dispatch facts without changing any
+        // product-owned fields, including the complete default-agent policy.
+        let service = registered["services"][0].as_table_mut().unwrap();
+        service.insert(
+            "capability".into(),
+            toml::Value::String("bcode.product".into()),
+        );
+        service.insert("kind".into(), toml::Value::String("command".into()));
+        assert_eq!(embedded, registered);
+        let selected = bcode_plugin::filter_selected_static_registrations(
+            &[registration],
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: std::collections::BTreeSet::from(["bcode.default-agents".into()]),
+                disabled: std::collections::BTreeSet::default(),
+            },
+        )
+        .unwrap();
+        let mut host = super::test_host::load_selected(&selected).unwrap();
+        assert_eq!(host.loaded_plugins().len(), 1);
+        assert_eq!(
+            host.loaded_plugins()[0].manifest().id,
+            "bcode.default-agents"
+        );
+        host.deactivate_all().unwrap();
+    }
+    #[test]
+    fn production_registry_and_shared_inventory_have_the_same_logical_ids() {
+        let shared: std::collections::BTreeSet<_> = super::bundled_plugin_definitions()
+            .into_iter()
+            .map(|definition| definition.metadata.plugin_id)
+            .collect();
+        let production: std::collections::BTreeSet<_> = super::static_bundled_plugins()
+            .into_iter()
+            .map(|plugin| {
+                let declaration: toml::Value = toml::from_str(plugin.manifest_toml).unwrap();
+                declaration["id"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(shared, production);
+    }
+
+    #[test]
+    fn shared_bundled_definitions_have_unique_logical_ids_and_declarations() {
+        let definitions = super::bundled_plugin_definitions();
+        let mut ids = std::collections::BTreeSet::new();
+        for definition in definitions {
+            assert!(ids.insert(definition.metadata.plugin_id.clone()));
+            assert_ne!(
+                definition.metadata.roles,
+                [] as [bmux_plugin_sdk::ComponentRole; 0]
+            );
+            assert!(definition.metadata.manifest_toml.is_some());
+        }
+    }
     #[cfg(feature = "static-bundled-recap-plugin")]
     #[test]
     fn recap_selection_loads_commands_and_disabled_selection_removes_them() {
@@ -669,8 +868,9 @@ mod tests {
             enabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
             disabled: std::collections::BTreeSet::new(),
         };
-        let selected = bcode_plugin::filter_selected_static_plugins(&bundles, &selection).unwrap();
-        let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap();
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&bundles, &selection).unwrap();
+        let mut host = super::test_host::load_selected(&selected).unwrap();
         let commands = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
         assert_eq!(commands.len(), 4);
         assert!(
@@ -684,8 +884,9 @@ mod tests {
             disabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
             ..selection
         };
-        let selected = bcode_plugin::filter_selected_static_plugins(&bundles, &disabled).unwrap();
-        let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap();
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&bundles, &disabled).unwrap();
+        let mut host = super::test_host::load_selected(&selected).unwrap();
         assert!(
             host.registered_command_contributions(&bcode_command::CommandSurface::Slash)
                 .is_empty()
@@ -697,7 +898,7 @@ mod tests {
     #[test]
     fn vox_loads_with_command_routing_but_daemon_actions_still_fail_closed() {
         let bundles = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundles,
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
@@ -706,7 +907,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+        let mut host = super::test_host::load_selected(&selected)
             .expect("Vox command declarations must permit plugin activation");
         let commands = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
         assert_eq!(commands.len(), bcode_vox_plugin::commands().len());
@@ -735,18 +936,18 @@ mod tests {
             .expect("test runtime");
         let _entered = runtime.enter();
         let bundles = super::static_bundled_plugins();
-        let all = bcode_plugin::filter_selected_static_plugins(
+        let all = bcode_plugin::filter_selected_static_registrations(
             &bundles,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("bundle manifests");
         let mut baseline =
-            bcode_plugin::PluginHost::load_static_plugins(&all).expect("baseline plugins activate");
+            super::test_host::load_selected(&all).expect("baseline plugins activate");
         let catalogs = tool_catalogs(&baseline);
         baseline.deactivate_all().expect("baseline deactivation");
-        for (manifest, vtable) in &all {
+        for (manifest, registration) in &all {
             let mut isolated =
-                bcode_plugin::PluginHost::load_static_plugins(&[(manifest.clone(), *vtable)])
+                super::test_host::load_selected(&[(manifest.clone(), *registration)])
                     .unwrap_or_else(|error| panic!("{} alone: {error}", manifest.id));
             assert_eq!(isolated.loaded_plugins().len(), 1);
             for (id, catalog) in tool_catalogs(&isolated) {
@@ -759,9 +960,9 @@ mod tests {
                 enabled: std::collections::BTreeSet::new(),
                 disabled: std::collections::BTreeSet::from([manifest.id.clone()]),
             };
-            let selected = bcode_plugin::filter_selected_static_plugins(&bundles, &selection)
+            let selected = bcode_plugin::filter_selected_static_registrations(&bundles, &selection)
                 .expect("disabled selection");
-            let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+            let mut host = super::test_host::load_selected(&selected)
                 .unwrap_or_else(|error| panic!("without {}: {error}", manifest.id));
             let actual = host
                 .loaded_plugins()
@@ -817,7 +1018,7 @@ mod tests {
     #[test]
     fn bundled_tui_extensions_cover_every_manifest_declared_visual_schema() {
         let static_plugins = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &static_plugins,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
@@ -891,26 +1092,30 @@ mod tests {
             enabled: std::collections::BTreeSet::new(),
             disabled: std::collections::BTreeSet::from(["bcode.workflow".to_string()]),
         };
-        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &disabled)
-            .expect("manifest selection");
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&static_plugins, &disabled)
+                .expect("manifest selection");
         assert!(
             selected
                 .iter()
                 .all(|(manifest, _)| manifest.id != "bcode.workflow")
         );
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &disabled,
-            &static_plugins,
-        )
-        .expect("host");
-        assert!(!host.plugin_ids().iter().any(|id| id == "bcode.workflow"));
+        let mut host = super::test_host::load_selected(&selected).expect("host");
         assert!(
-            host.registry().workflow_templates().is_empty(),
+            host.loaded_plugins()
+                .iter()
+                .all(|plugin| plugin.manifest().id != "bcode.workflow")
+        );
+        assert!(
+            host.loaded_plugins()
+                .iter()
+                .all(|plugin| plugin.manifest().workflow_templates.is_empty()),
             "disabled workflow plugin must contribute no templates"
         );
         let commands =
             host.registered_command_contributions(&bcode_command::CommandSurface::Palette);
-        drop(host);
+        host.deactivate_all()
+            .expect("disabled workflow host deactivates");
         assert!(
             commands
                 .iter()
@@ -973,11 +1178,12 @@ mod tests {
             .expect("test runtime");
         let _entered = runtime.enter();
         let static_plugins = super::static_bundled_plugins();
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection::all_enabled(),
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &static_plugins,
+            &bcode_plugin::PluginSelection::all_enabled(),
         )
-        .expect("enabled host");
+        .expect("enabled manifest selection");
+        let mut host = super::test_host::load_selected(&selected).expect("enabled host");
         let slash = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
         assert!(
             slash
@@ -990,24 +1196,25 @@ mod tests {
                 .any(|command| command.slash_name() == Some("clone"))
         );
 
-        drop(host);
+        host.deactivate_all()
+            .expect("enabled derivation host deactivates");
         let selection = bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::All,
             enabled: std::collections::BTreeSet::new(),
             disabled: std::collections::BTreeSet::from(["bcode.session-derivation".to_owned()]),
         };
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &selection,
-            &static_plugins,
-        )
-        .expect("disabled host");
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&static_plugins, &selection)
+                .expect("disabled manifest selection");
+        let mut host = super::test_host::load_selected(&selected).expect("disabled host");
         let slash = host.registered_command_contributions(&bcode_command::CommandSurface::Slash);
         assert!(
             slash
                 .iter()
                 .all(|command| !matches!(command.slash_name(), Some("fork" | "clone")))
         );
-        drop(host);
+        host.deactivate_all()
+            .expect("disabled derivation host deactivates");
     }
 
     #[cfg(feature = "static-bundled-loop-plugin")]
@@ -1019,7 +1226,7 @@ mod tests {
             .expect("test Tokio runtime");
         let _guard = runtime.enter();
         let static_plugins = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &static_plugins,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
@@ -1032,11 +1239,8 @@ mod tests {
             loop_manifest.services,
             [] as [bcode_plugin::PluginService; 0]
         );
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &bcode_plugin::PluginSelection::all_enabled(),
-            &static_plugins,
-        )
-        .expect("enabled static plugin host should load");
+        let mut host = super::test_host::load_selected(&selected)
+            .expect("enabled static plugin host should load");
         assert!(host
             .registered_command_contributions(&bcode_command::CommandSurface::Palette)
             .iter()
@@ -1057,25 +1261,24 @@ mod tests {
                 })
         );
 
-        drop(host);
+        host.deactivate_all()
+            .expect("enabled loop host deactivates");
         let selection = bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::All,
             enabled: std::collections::BTreeSet::new(),
             disabled: std::collections::BTreeSet::from(["bcode.loop".to_owned()]),
         };
-        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &selection)
-            .expect("disabled static plugin selection should parse");
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&static_plugins, &selection)
+                .expect("disabled static plugin selection should parse");
 
         assert!(
             selected
                 .iter()
                 .all(|(manifest, _)| manifest.id != "bcode.loop")
         );
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-            &selection,
-            &static_plugins,
-        )
-        .expect("disabled static plugin host should load");
+        let mut host = super::test_host::load_selected(&selected)
+            .expect("disabled static plugin host should load");
         assert!(host
             .registered_command_contributions(&bcode_command::CommandSurface::Palette)
             .iter()
@@ -1091,17 +1294,23 @@ mod tests {
                 bcode_command::CommandAction::Plugin { plugin_id, .. } if plugin_id == "bcode.loop"
             )));
         assert!(
-            host.service_summaries()
+            host.loaded_plugins()
                 .iter()
+                .flat_map(|plugin| plugin
+                    .manifest()
+                    .services
+                    .iter()
+                    .map(move |service| (&plugin.manifest().id, service)))
                 .all(|(plugin_id, _)| plugin_id != "bcode.loop")
         );
-        drop(host);
+        host.deactivate_all()
+            .expect("disabled loop host deactivates");
     }
 
     #[test]
     fn bundled_plugins_can_all_be_disabled() {
         let plugins = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &plugins,
             &bcode_plugin::PluginSelection::default(),
         )
@@ -1288,14 +1497,14 @@ mod tests {
             &default_ids,
         );
         let selected =
-            bcode_plugin::filter_selected_static_plugins(&static_plugins, &default_selection)
+            bcode_plugin::filter_selected_static_registrations(&static_plugins, &default_selection)
                 .expect("default static plugin selection parses");
         assert!(
             selected
                 .iter()
                 .all(|(manifest, _)| manifest.id != "bcode.vim-edit")
         );
-        let default_host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+        let default_host = super::test_host::load_selected(&selected)
             .expect("default-selected static plugins load");
         assert!(
             !default_host
@@ -1338,15 +1547,17 @@ mod tests {
             &explicitly_enabled_config,
             &default_ids,
         );
-        let selected =
-            bcode_plugin::filter_selected_static_plugins(&static_plugins, &explicitly_enabled)
-                .expect("explicit static plugin selection parses");
+        let selected = bcode_plugin::filter_selected_static_registrations(
+            &static_plugins,
+            &explicitly_enabled,
+        )
+        .expect("explicit static plugin selection parses");
         assert!(
             selected
                 .iter()
                 .any(|(manifest, _)| manifest.id == "bcode.vim-edit")
         );
-        let explicitly_enabled_host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+        let explicitly_enabled_host = super::test_host::load_selected(&selected)
             .expect("explicitly selected Vim plugin loads");
         assert!(
             explicitly_enabled_host
@@ -1386,7 +1597,7 @@ mod tests {
         let all_selection =
             bcode_config::plugin_selection_with_default_plugin_ids(&all_config, &default_ids);
         let selected =
-            bcode_plugin::filter_selected_static_plugins(&static_plugins, &all_selection)
+            bcode_plugin::filter_selected_static_registrations(&static_plugins, &all_selection)
                 .expect("all static plugin selection parses");
         assert!(
             selected
@@ -1405,9 +1616,11 @@ mod tests {
         };
         let disabled_selection =
             bcode_config::plugin_selection_with_default_plugin_ids(&disabled_config, &default_ids);
-        let selected =
-            bcode_plugin::filter_selected_static_plugins(&static_plugins, &disabled_selection)
-                .expect("disabled static plugin selection parses");
+        let selected = bcode_plugin::filter_selected_static_registrations(
+            &static_plugins,
+            &disabled_selection,
+        )
+        .expect("disabled static plugin selection parses");
         assert!(
             selected
                 .iter()
@@ -1424,10 +1637,9 @@ mod tests {
         assert!(defaults.iter().any(|id| id == "bcode.file-references"));
         let config = bcode_config::BcodeConfig::default();
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-        let selected = bcode_plugin::filter_selected_static_plugins(&plugins, &selection)
+        let selected = bcode_plugin::filter_selected_static_registrations(&plugins, &selection)
             .expect("selected bundled plugins");
-        let host = bcode_plugin::PluginHost::load_static_plugins(&selected)
-            .expect("default plugin activation");
+        let host = super::test_host::load_selected(&selected).expect("default plugin activation");
         assert!(
             bcode_plugin::plugin_composer_contributions(
                 &host
@@ -1464,10 +1676,9 @@ mod tests {
             .disabled
             .insert("bcode.file-references".into());
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, &defaults);
-        let selected = bcode_plugin::filter_selected_static_plugins(&plugins, &selection)
+        let selected = bcode_plugin::filter_selected_static_registrations(&plugins, &selection)
             .expect("disabled bundled plugins");
-        let host = bcode_plugin::PluginHost::load_static_plugins(&selected)
-            .expect("disabled plugin selection");
+        let host = super::test_host::load_selected(&selected).expect("disabled plugin selection");
         assert!(
             bcode_plugin::plugin_composer_contributions(
                 &host
@@ -1532,12 +1743,13 @@ mod tests {
     #[test]
     fn openai_compatible_bundle_registers_api_key_auth_providers() {
         let static_plugins = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &static_plugins,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("static plugin manifests parse");
-        let mut host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        let mut host =
+            super::test_host::load_selected(&selected).expect("selected shared plugins activate");
         let openai = host.auth_provider("openai").expect("OpenAI auth provider");
         assert_eq!(openai.plugin_id, "bcode.openai-compatible");
         assert_eq!(openai.contribution.methods[0].method_id(), "api_key");
@@ -1585,9 +1797,11 @@ mod tests {
             enabled: std::collections::BTreeSet::new(),
             disabled: std::collections::BTreeSet::from(["bcode.web-search".to_owned()]),
         };
-        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &selection)
-            .expect("static plugin manifests parse");
-        let host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        let selected =
+            bcode_plugin::filter_selected_static_registrations(&static_plugins, &selection)
+                .expect("static plugin manifests parse");
+        let host =
+            super::test_host::load_selected(&selected).expect("selected shared plugins activate");
         assert!(host.auth_provider("exa").is_none());
     }
 
@@ -1595,12 +1809,13 @@ mod tests {
     #[test]
     fn web_search_bundle_registers_exa_auth_provider() {
         let static_plugins = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &static_plugins,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("static plugin manifests parse");
-        let mut host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        let mut host =
+            super::test_host::load_selected(&selected).expect("selected shared plugins activate");
         let provider = host.auth_provider("exa").expect("Exa auth provider");
         assert_eq!(provider.plugin_id, "bcode.web-search");
         assert_eq!(provider.contribution.methods.len(), 1);
@@ -1612,7 +1827,7 @@ mod tests {
     #[test]
     fn filesystem_bundle_provides_tui_file_change_visual_adapter() {
         let static_plugins = super::static_bundled_plugins();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &static_plugins,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
@@ -1624,7 +1839,8 @@ mod tests {
             "filesystem plugin is included in the static bundle"
         );
 
-        let host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        let host =
+            super::test_host::load_selected(&selected).expect("selected shared plugins activate");
         let route = host
             .visual_adapter(
                 "bcode.filesystem.change",
@@ -1650,6 +1866,6 @@ mod tests {
         let rows = registry
             .visual_rows(&route.adapter_id, &route.schema, &payload, &context)
             .expect("filesystem TUI visual adapter renders file change payload");
-        assert!(!rows.is_empty());
+        assert_ne!(rows, Vec::new());
     }
 }

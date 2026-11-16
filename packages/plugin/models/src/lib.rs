@@ -8,6 +8,7 @@
 //! and serde defaults preserve existing decoding; schema versions in config metadata
 //! describe plugin-owned schemas, not host implementation versions.
 
+pub mod activation;
 pub mod composer;
 pub mod harness;
 pub mod interaction_controller;

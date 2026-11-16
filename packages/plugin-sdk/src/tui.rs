@@ -1,7 +1,10 @@
 //! Native Tokio-backed TUI surface host APIs for plugins.
 
 pub mod focused_input;
+/// Invocation-bound typed product TUI host callbacks.
+pub mod host;
 pub mod keymap;
+pub mod portable;
 
 pub use focused_input::{
     FocusedTextFieldAdapter, FocusedTextFieldEdit, FocusedTextFieldEditResult,
@@ -60,7 +63,7 @@ pub type PluginTuiSurfaceFuture =
 pub type PluginTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Errors returned by TUI host capabilities.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginTuiHostError {
     /// This host does not support the requested capability.
     Unsupported(String),
@@ -567,7 +570,7 @@ pub struct PluginWorkflowStartResponse {
 }
 
 /// Request to observe renderer-neutral semantic state for one explicit Bcode session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginSessionViewSubscriptionRequest {
     /// Session to observe.
     pub session_id: SessionId,
@@ -581,7 +584,7 @@ pub struct PluginSessionViewSubscriptionRequest {
 }
 
 /// Semantic session-view updates delivered to plugin-owned TUI surfaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginSessionViewUpdate {
     /// Complete authoritative state. Consumers replace prior state by session id.
     Snapshot(Box<SessionViewSnapshot>),
@@ -618,6 +621,11 @@ pub type PluginUsageCollectFuture = Pin<
 
 /// Host services available to native TUI plugin surfaces.
 pub trait PluginTuiHost: Send + Sync {
+    /// Clone only the actual local product host for selected frontend callbacks.
+    /// This is Rust-local authority; it is never serialized or inferred from plugin metadata.
+    fn retained_product_host(&self) -> Option<Arc<dyn PluginTuiHost>> {
+        None
+    }
     /// Read one revision-pinned scheduling observation page through the application boundary.
     fn workflow_scheduling_page(
         &self,
@@ -1138,7 +1146,7 @@ pub struct PluginTuiSurfaceOutcome {
 }
 
 /// Renderer-neutral update delivered to a plugin-owned surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginTuiSurfaceUpdate {
     /// Report that the catalog is being fetched. Stale content may remain visible.
     WorkflowCatalogLoading { stale: bool },
@@ -1169,7 +1177,7 @@ pub type PluginTuiSurfaceUpdateSender = mpsc::Sender<PluginTuiSurfaceUpdate>;
 /// Receiver owned by one plugin surface.
 pub type PluginTuiSurfaceUpdateReceiver = mpsc::Receiver<PluginTuiSurfaceUpdate>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginTuiAction {
     /// No host action is needed.
     None,
@@ -1219,7 +1227,7 @@ impl PluginTuiAction {
 }
 
 /// Host-owned transcript header hints supplied by a plugin visual adapter.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiTranscriptHeader {
     /// Plugin-selected title for host transcript chrome.
     pub title: Option<String>,
@@ -1228,7 +1236,7 @@ pub struct PluginTuiTranscriptHeader {
 }
 
 /// How a visual adapter's rows should be composed into the host transcript block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginTuiVisualRenderMode {
     /// Rows are rendered inside the host-provided transcript block chrome/header.
     Inline,
@@ -1239,7 +1247,7 @@ pub enum PluginTuiVisualRenderMode {
 }
 
 /// Diff layout preference supplied by the TUI host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginTuiDiffLayout {
     Auto { breakpoint: u16 },
     Unified,
@@ -1247,7 +1255,7 @@ pub enum PluginTuiDiffLayout {
 }
 
 /// Compact terminal syntax color supplied by the TUI host without palette conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiSyntaxColor(u32);
 
 impl PluginTuiSyntaxColor {
@@ -1336,7 +1344,7 @@ impl From<PluginTuiSyntaxColor> for bmux_tui::style::Color {
 }
 
 /// Semantic syntax palette supplied by the TUI host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiSyntaxTheme {
     pub text: PluginTuiSyntaxColor,
     pub comment: PluginTuiSyntaxColor,
@@ -1357,7 +1365,7 @@ pub struct PluginTuiSyntaxTheme {
 }
 
 /// Semantic styles for source-code cards supplied by the TUI host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiSourceTheme {
     pub source: Style,
     pub border: Style,
@@ -1366,7 +1374,7 @@ pub struct PluginTuiSourceTheme {
 }
 
 /// Semantic styles for diff presentation supplied by the TUI host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiDiffTheme {
     pub text: Style,
     pub muted: Style,
@@ -1394,7 +1402,7 @@ pub const PLUGIN_TUI_COMPONENT_THEME_VERSION: u16 = 2;
 ///
 /// This context contains presentation only. It must not affect plugin routing,
 /// authorization, dispatch, or persisted outcomes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiTheme {
     /// Version of the host component-theme contract.
     pub component_theme_version: u16,
@@ -1421,6 +1429,7 @@ pub struct PluginTuiTheme {
     /// Meaningful only when [`Self::component_theme_version`] matches
     /// [`PLUGIN_TUI_COMPONENT_THEME_VERSION`]; read it through
     /// [`Self::component_theme`].
+    #[serde(with = "component_theme_wire")]
     pub component: bmux_tui_components::theme::ComponentTheme,
 }
 
@@ -1470,6 +1479,237 @@ impl PluginTuiTheme {
             Some(self.component)
         } else {
             None
+        }
+    }
+}
+
+/// Portable serde representation of the host [`ComponentTheme`].
+///
+/// `bmux_tui_components` keeps its theme types serde-free, while
+/// [`PluginTuiTheme`] crosses the portable plugin boundary as neutral data.
+/// These mirrors give the component theme an explicit, field-for-field wire
+/// shape without changing the generic component crate.
+mod component_theme_wire {
+    use bmux_tui::chrome::BorderSet;
+    use bmux_tui::gradient::ColorGradient;
+    use bmux_tui::prelude::Style;
+    use bmux_tui::style::Color;
+    use bmux_tui_components::theme::{
+        ComponentChrome, ComponentStateSurfaces, ComponentSurfaces, ComponentTheme,
+    };
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        theme: &ComponentTheme,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        ComponentThemeWire::from(*theme).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ComponentTheme, D::Error> {
+        ComponentThemeWire::deserialize(deserializer).map(ComponentTheme::from)
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ComponentThemeWire {
+        canvas: Style,
+        surfaces: ComponentSurfacesWire,
+        text: Style,
+        accent: Style,
+        title: Style,
+        focused: Style,
+        hover: Style,
+        selected: Style,
+        selected_inactive: Style,
+        disabled: Style,
+        muted: Style,
+        link: Style,
+        info: Style,
+        success: Style,
+        warning: Style,
+        error: Style,
+        state_surfaces: ComponentStateSurfacesWire,
+        border: Style,
+        border_focused: Style,
+        chrome: ComponentChromeWire,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ComponentSurfacesWire {
+        normal: Style,
+        raised: Style,
+        overlay: Style,
+        scrim: Option<Style>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ComponentStateSurfacesWire {
+        info: Style,
+        success: Style,
+        warning: Style,
+        error: Style,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ComponentChromeWire {
+        border_set: Option<BorderSetWire>,
+        focus_gradient: Option<ColorGradientWire>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BorderSetWire {
+        top_left: char,
+        top_right: char,
+        bottom_left: char,
+        bottom_right: char,
+        horizontal: char,
+        vertical: char,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ColorGradientWire {
+        from: RgbWire,
+        to: RgbWire,
+        phase: u16,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RgbWire {
+        r: u8,
+        g: u8,
+        b: u8,
+    }
+
+    impl From<ComponentTheme> for ComponentThemeWire {
+        fn from(theme: ComponentTheme) -> Self {
+            Self {
+                canvas: theme.canvas,
+                surfaces: ComponentSurfacesWire {
+                    normal: theme.surfaces.normal,
+                    raised: theme.surfaces.raised,
+                    overlay: theme.surfaces.overlay,
+                    scrim: theme.surfaces.scrim,
+                },
+                text: theme.text,
+                accent: theme.accent,
+                title: theme.title,
+                focused: theme.focused,
+                hover: theme.hover,
+                selected: theme.selected,
+                selected_inactive: theme.selected_inactive,
+                disabled: theme.disabled,
+                muted: theme.muted,
+                link: theme.link,
+                info: theme.info,
+                success: theme.success,
+                warning: theme.warning,
+                error: theme.error,
+                state_surfaces: ComponentStateSurfacesWire {
+                    info: theme.state_surfaces.info,
+                    success: theme.state_surfaces.success,
+                    warning: theme.state_surfaces.warning,
+                    error: theme.state_surfaces.error,
+                },
+                border: theme.border,
+                border_focused: theme.border_focused,
+                chrome: ComponentChromeWire {
+                    border_set: theme.chrome.border_set.map(|set| BorderSetWire {
+                        top_left: set.top_left,
+                        top_right: set.top_right,
+                        bottom_left: set.bottom_left,
+                        bottom_right: set.bottom_right,
+                        horizontal: set.horizontal,
+                        vertical: set.vertical,
+                    }),
+                    focus_gradient: theme
+                        .chrome
+                        .focus_gradient
+                        .map(|gradient| ColorGradientWire {
+                            from: RgbWire {
+                                r: gradient.from.r,
+                                g: gradient.from.g,
+                                b: gradient.from.b,
+                            },
+                            to: RgbWire {
+                                r: gradient.to.r,
+                                g: gradient.to.g,
+                                b: gradient.to.b,
+                            },
+                            phase: gradient.phase,
+                        }),
+                },
+            }
+        }
+    }
+
+    impl From<ColorGradientWire> for ColorGradient {
+        fn from(wire: ColorGradientWire) -> Self {
+            // Rebuild the opaque `Rgb` channels without depending on
+            // `bmux_color` directly. `Color::rgb` is `Some` for every
+            // `Color::Rgb`, so the default is unreachable.
+            let from = Color::Rgb(wire.from.r, wire.from.g, wire.from.b)
+                .rgb()
+                .unwrap_or_default();
+            let to = Color::Rgb(wire.to.r, wire.to.g, wire.to.b)
+                .rgb()
+                .unwrap_or_default();
+            Self::new(from, to).with_phase(wire.phase)
+        }
+    }
+
+    impl From<ComponentThemeWire> for ComponentTheme {
+        fn from(wire: ComponentThemeWire) -> Self {
+            Self {
+                canvas: wire.canvas,
+                surfaces: ComponentSurfaces {
+                    normal: wire.surfaces.normal,
+                    raised: wire.surfaces.raised,
+                    overlay: wire.surfaces.overlay,
+                    scrim: wire.surfaces.scrim,
+                },
+                text: wire.text,
+                accent: wire.accent,
+                title: wire.title,
+                focused: wire.focused,
+                hover: wire.hover,
+                selected: wire.selected,
+                selected_inactive: wire.selected_inactive,
+                disabled: wire.disabled,
+                muted: wire.muted,
+                link: wire.link,
+                info: wire.info,
+                success: wire.success,
+                warning: wire.warning,
+                error: wire.error,
+                state_surfaces: ComponentStateSurfaces {
+                    info: wire.state_surfaces.info,
+                    success: wire.state_surfaces.success,
+                    warning: wire.state_surfaces.warning,
+                    error: wire.state_surfaces.error,
+                },
+                border: wire.border,
+                border_focused: wire.border_focused,
+                chrome: ComponentChrome {
+                    border_set: wire.chrome.border_set.map(|set| BorderSet {
+                        top_left: set.top_left,
+                        top_right: set.top_right,
+                        bottom_left: set.bottom_left,
+                        bottom_right: set.bottom_right,
+                        horizontal: set.horizontal,
+                        vertical: set.vertical,
+                    }),
+                    focus_gradient: wire.chrome.focus_gradient.map(ColorGradient::from),
+                },
+            }
         }
     }
 }
@@ -1535,6 +1775,24 @@ mod component_theme_tests {
         );
         assert_eq!(theme(1).component_theme(), None);
         assert_eq!(theme(u16::MAX).component_theme(), None);
+    }
+
+    #[test]
+    fn component_theme_round_trips_through_portable_serde() {
+        let mut original = theme(PLUGIN_TUI_COMPONENT_THEME_VERSION);
+        let rgb = |color: bmux_tui::style::Color| color.rgb().expect("explicit rgb color");
+        let gradient = bmux_tui::gradient::ColorGradient::new(
+            rgb(bmux_tui::style::Color::Rgb(0xff, 0x00, 0xaa)),
+            rgb(bmux_tui::style::Color::Rgb(0x00, 0xff, 0xff)),
+        )
+        .with_phase(17);
+        original.component.chrome = bmux_tui_components::theme::ComponentChrome {
+            border_set: Some(bmux_tui::chrome::BorderSet::ROUNDED),
+            focus_gradient: Some(gradient),
+        };
+        let encoded = serde_json::to_string(&original).expect("serialize theme");
+        let decoded: PluginTuiTheme = serde_json::from_str(&encoded).expect("deserialize theme");
+        assert_eq!(decoded, original);
     }
 
     #[test]
@@ -1780,7 +2038,7 @@ impl PluginTuiVisualRenderContext {
 }
 
 /// Opaque bounded artifact bytes delivered asynchronously to a plugin-owned visual adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiArtifactChunk {
     pub tool_call_id: String,
     pub artifact_id: String,
@@ -2191,9 +2449,10 @@ pub struct PluginTuiWorkShape {
 }
 
 /// Explicit terminal consumption, independent of the plugin's resulting effect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiEventResult {
     /// Whether routing stops, and whether terminal presentation needs redraw.
+    #[serde(with = "portable::wire::EventOutcome")]
     pub outcome: EventOutcome,
     /// Plugin-owned effect; `None` does not imply that input was ignored.
     pub action: PluginTuiAction,
@@ -2222,7 +2481,7 @@ impl PluginTuiEventResult {
 }
 
 /// Completion result with semantic mutation separate from terminal routing and effects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginTuiFocusedTextFieldEditResult {
     /// Explicit live editor mutation outcome; never inferred from redraw.
     pub edit_result: FocusedTextFieldEditResult,
@@ -2256,11 +2515,55 @@ pub trait PluginTuiSurface: Send {
         Err("canonical terminal presentation unsupported".to_owned())
     }
 
+    /// Transfer the original correlated completion responsibility after producing an action.
+    /// Ordinary surfaces return absent. Optional settlement-mode consumers must reject absent
+    /// authority before commitment; they must never reconstruct a handle from serialized IDs.
+    /// Forwarders must move this handle without cloning, acknowledging, or dropping it.
+    ///
+    /// # Errors
+    /// Returns recovery-required or capacity when the original owner cannot transfer safely.
+    fn take_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        Ok(None)
+    }
+
+    /// Move only a focused-edit completion; ordinary action polling must not settle pending edits.
+    ///
+    /// # Errors
+    /// Returns recovery-required when the original edit cannot transfer safely.
+    fn take_focused_edit_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        Ok(None)
+    }
+
+    /// Require opt-in ownership before a new-mode consumer accepts effects or commits.
+    /// Ordinary frontend-v2 consumers need not call this method.
+    ///
+    /// # Errors
+    /// Absence fails closed; serialized correlation cannot replace the actual handle.
+    fn require_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Box<dyn portable::settlement::FrontendCompletionResponsibility>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        self.take_completion_responsibility()?
+            .ok_or(portable::settlement::CompletionResponsibilityError::Missing)
+    }
+
     /// Stable surface identifier.
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
 
     /// Human-readable surface title.
-    fn title(&self) -> &'static str;
+    fn title(&self) -> &str;
 
     /// Classify an explicit gesture to retry delivery of a retained close proposal.
     ///
@@ -2343,6 +2646,18 @@ pub trait PluginTuiSurface: Send {
         self.render_with_theme(area, frame, theme);
     }
 
+    /// Logical source text emitted with retained selection fragments. Keys must match the
+    /// caller-local content IDs painted by this surface; cells are never used as source text.
+    fn retained_selection_text(&self) -> BTreeMap<bmux_tui::selection::SelectionContentId, String> {
+        BTreeMap::new()
+    }
+
+    /// Ordered caller-local modal scopes painted by this surface. The receiving compositor
+    /// reconciles its own focus history; producer focus state is never imported as authority.
+    fn retained_modal_scopes(&self) -> Vec<bmux_tui::focus::FocusScopeId> {
+        Vec::new()
+    }
+
     /// Handle routed terminal input.
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction;
 
@@ -2394,6 +2709,14 @@ pub trait PluginTuiSurface: Send {
         PluginTuiFocusedTextFieldEditResult::rejected(
             bcode_plugin_models::composer::ComposerValidationError::Stale,
         )
+    }
+
+    /// Take the terminal result of one previously admitted asynchronous focused edit.
+    /// Returning `Pending` here is invalid; callers wait only on an explicit admission.
+    fn take_focused_text_field_edit_result(
+        &mut self,
+    ) -> Option<PluginTuiFocusedTextFieldEditResult> {
+        None
     }
 
     /// Attach a renderer-neutral update stream to this retained surface.
@@ -2466,6 +2789,32 @@ pub trait TerminalInteractionRenderer<C>: Default + Send + 'static
 where
     C: PluginInteraction,
 {
+    /// Move optional settlement ownership through the typed surface adapter unchanged.
+    ///
+    /// # Errors
+    /// Returns the original renderer's admission/recovery failure. Absence never grants commitment.
+    fn take_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        Ok(None)
+    }
+
+    /// Move the original focused-edit completion separately from ordinary actions.
+    ///
+    /// # Errors
+    /// Returns the original renderer's admission/recovery error.
+    fn take_focused_edit_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        Ok(None)
+    }
+
     /// Native terminal surface kind.
     const SURFACE_KIND: &'static str;
 
@@ -2739,6 +3088,24 @@ where
         self.snapshot = decode(snapshot).map_err(|error| error.to_string())?;
         self.invalidate_measurement();
         Ok(())
+    }
+
+    fn take_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        self.renderer.take_completion_responsibility()
+    }
+
+    fn take_focused_edit_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+        portable::settlement::CompletionResponsibilityError,
+    > {
+        self.renderer.take_focused_edit_completion_responsibility()
     }
 
     fn id(&self) -> &'static str {
@@ -3321,6 +3688,59 @@ mod typed_interaction_surface_tests {
         }
     }
 
+    #[test]
+    fn typed_boxed_surface_preserves_completion_boundary_failure() {
+        #[derive(Default)]
+        struct DeniedRenderer;
+        impl TerminalInteractionRenderer<NoEffectController> for DeniedRenderer {
+            const SURFACE_KIND: &'static str = "test.denied-completion";
+            fn id(&self) -> &'static str {
+                "denied-completion"
+            }
+            fn title(&self) -> &'static str {
+                "Denied completion"
+            }
+            fn preferred_height(&mut self, _: &usize, _: u16) -> u16 {
+                1
+            }
+            fn render(&mut self, _: &usize, _: Rect, _: &mut PaintCx<'_, '_>) {}
+            fn input(
+                &mut self,
+                _: &Event,
+                _: &usize,
+                _: &dyn PluginTuiHost,
+            ) -> TerminalInteractionInput {
+                TerminalInteractionInput::Ignored
+            }
+            fn take_completion_responsibility(
+                &mut self,
+            ) -> Result<
+                Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+                portable::settlement::CompletionResponsibilityError,
+            > {
+                Err(portable::settlement::CompletionResponsibilityError::RecoveryRequired)
+            }
+        }
+        let mut surface: BoxedPluginTuiSurface = Box::new(TypedTerminalInteractionSurface::new(
+            NoEffectController::new(()),
+            DeniedRenderer,
+        ));
+        assert!(matches!(
+            surface.require_completion_responsibility(),
+            Err(portable::settlement::CompletionResponsibilityError::RecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn ordinary_boxed_surface_has_no_optional_completion_authority() {
+        let mut surface: BoxedPluginTuiSurface = Box::new(LegacyCompletionSurface);
+        assert!(surface.take_completion_responsibility().unwrap().is_none());
+        assert!(matches!(
+            surface.require_completion_responsibility(),
+            Err(portable::settlement::CompletionResponsibilityError::Missing)
+        ));
+    }
+
     struct LegacyCompletionSurface;
 
     impl PluginTuiSurface for LegacyCompletionSurface {
@@ -3739,7 +4159,7 @@ pub trait PluginTuiSurfaceFactory: Send + Sync {
     }
 
     /// Stable surface kind identifier.
-    fn surface_kind(&self) -> &'static str;
+    fn surface_kind(&self) -> &str;
 
     /// Open a new surface instance.
     ///
@@ -3799,9 +4219,20 @@ impl StaticPluginTuiExtension {
 
 /// A frontend-local, explicitly user-invoked command contribution.
 ///
-/// Implementations own their domain workflow. The host only invokes actions and
-/// applies final literal text to its currently focused editor. Never route these
-/// callbacks through a remote daemon or model-tool dispatch.
+/// Final literal text plus move-only optional ownership from the original response.
+/// Ordinary frontend-v2 commands carry no responsibility.
+#[derive(Debug)]
+pub struct PluginFrontendTextCompletion {
+    /// Literal editor insertion, not a command to execute.
+    pub text: String,
+    /// Original response handle; consumed only after the editor applies the text.
+    pub responsibility: Option<Box<dyn portable::settlement::FrontendCompletionResponsibility>>,
+}
+
+/// Implementations own their domain workflow.
+///
+/// The host only invokes actions and applies final literal text to its currently
+/// focused editor. Never route these callbacks through a remote daemon or model-tool dispatch.
 pub trait PluginFrontendCommand: Send + Sync {
     /// Invoke one explicit user action without blocking on recognition.
     ///
@@ -3814,6 +4245,18 @@ pub trait PluginFrontendCommand: Send + Sync {
     /// Returns a safe diagnostic if completion cannot be observed.
     fn drain_text(&self) -> Result<Option<String>, String> {
         Ok(None)
+    }
+    /// Move a bounded text completion to its actual editor consumer.
+    ///
+    /// # Errors
+    /// Propagates completion uncertainty without replaying invocation.
+    fn drain_text_completion(&self) -> Result<Option<PluginFrontendTextCompletion>, String> {
+        self.drain_text().map(|text| {
+            text.map(|text| PluginFrontendTextCompletion {
+                text,
+                responsibility: None,
+            })
+        })
     }
     /// Release this frontend's workflow resources on orderly shutdown.
     fn shutdown(&self) {}
@@ -3877,6 +4320,22 @@ impl PluginTuiRegistry {
         }
         Ok(text)
     }
+    /// Move bounded literal completions without dropping their original response ownership.
+    ///
+    /// # Errors
+    /// Returns the command's safe completion error. No invocation is retried.
+    pub fn drain_frontend_text_completions(
+        &self,
+    ) -> Result<Vec<PluginFrontendTextCompletion>, String> {
+        let mut completions = Vec::new();
+        for command in self.frontend_commands.values() {
+            if let Some(completion) = command.drain_text_completion()? {
+                completions.push(completion);
+            }
+        }
+        Ok(completions)
+    }
+
     /// Stop resources owned by this frontend registry.
     pub fn shutdown_frontend_commands(&self) {
         for command in self.frontend_commands.values() {
@@ -4293,6 +4752,8 @@ impl PluginTuiRegistry {
 #[derive(Clone)]
 pub struct TokioPluginTuiHost {
     handle: tokio::runtime::Handle,
+    author_tasks: Option<Arc<portable::AuthorTasks>>,
+    product_host: Option<host::RemoteHost>,
     redraw_sender: mpsc::Sender<()>,
     text_input: Option<Arc<dyn PluginTuiTextInputResolver>>,
 }
@@ -4336,7 +4797,81 @@ pub trait PluginTuiTextInputResolver: Send + Sync {
     fn submits(&self, stroke: KeyStroke) -> bool;
 }
 
+struct RemoteLease {
+    remote: host::RemoteHost,
+    close: host::Request,
+}
+impl Drop for RemoteLease {
+    fn drop(&mut self) {
+        let _ = self.remote.synchronous(&self.close);
+    }
+}
+
 impl TokioPluginTuiHost {
+    fn remote_session_subscription(
+        &self,
+        request: PluginSessionViewSubscriptionRequest,
+    ) -> Result<PluginSessionViewSubscription, PluginTuiHostError> {
+        let remote = self.product_host.clone().ok_or_else(|| {
+            PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+        })?;
+        let (sender, receiver) = mpsc::channel(request.buffer.clamp(1, 32));
+        let host = self.clone();
+        self.spawn(Box::pin(async move {
+            let opened = remote
+                .request(host::Request::SubscribeSession { request })
+                .await;
+            let Ok(host::Response::Subscribed(Ok(id))) = opened else {
+                let _ = sender
+                    .send(PluginSessionViewUpdate::Disconnected {
+                        message: "session subscription failed".to_owned(),
+                    })
+                    .await;
+                return;
+            };
+            let _lease = RemoteLease {
+                remote: remote.clone(),
+                close: host::Request::CloseSession { subscription: id },
+            };
+            loop {
+                if sender.is_closed() {
+                    break;
+                }
+                match remote
+                    .request(host::Request::PollSession { subscription: id })
+                    .await
+                    .map(|response| match response {
+                        host::Response::SessionUpdate(result) => result.map(|value| *value),
+                        _ => Err(PluginTuiHostError::Internal(
+                            "session observation mismatch".to_owned(),
+                        )),
+                    }) {
+                    Ok(Ok(Some(update))) => {
+                        if sender.send(update).await.is_err() {
+                            break;
+                        }
+                        host.request_redraw();
+                    }
+                    Ok(Ok(None)) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    }
+                    _ => {
+                        let _ = sender
+                            .send(PluginSessionViewUpdate::Disconnected {
+                                message: "session subscription unavailable".to_owned(),
+                            })
+                            .await;
+                        break;
+                    }
+                }
+            }
+            let _ = remote
+                .request(host::Request::CloseSession { subscription: id })
+                .await;
+        }));
+        Ok(PluginSessionViewSubscription { receiver })
+    }
+
     /// Create a host handle from the current Tokio runtime.
     ///
     /// # Panics
@@ -4346,9 +4881,23 @@ impl TokioPluginTuiHost {
     pub fn current(redraw_sender: mpsc::Sender<()>) -> Self {
         Self {
             handle: tokio::runtime::Handle::current(),
+            author_tasks: None,
+            product_host: None,
             redraw_sender,
             text_input: None,
         }
+    }
+
+    pub(super) fn set_product_host(
+        &mut self,
+        services: Option<bmux_plugin_sdk::definition::PluginHostServices>,
+    ) {
+        self.product_host = services.map(|services| host::RemoteHost { services });
+    }
+
+    fn with_author_tasks(mut self, tasks: Arc<portable::AuthorTasks>) -> Self {
+        self.author_tasks = Some(tasks);
+        self
     }
 
     /// Attach a host-configured composer-like text input resolver.
@@ -4368,24 +4917,740 @@ impl TokioPluginTuiHost {
 }
 
 impl PluginTuiHost for TokioPluginTuiHost {
+    fn subscribe_session_view(
+        &self,
+        request: PluginSessionViewSubscriptionRequest,
+    ) -> Result<PluginSessionViewSubscription, PluginTuiHostError> {
+        self.remote_session_subscription(request)
+    }
+    fn generate_observable_structured_output(
+        &self,
+        request: PluginStructuredGenerationRequest,
+        control: PluginStructuredGenerationControl,
+    ) -> PluginStructuredGenerationFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            let host::Response::GenerationStarted(result) = remote
+                .request(host::Request::StartGeneration { request })
+                .await?
+            else {
+                return Err(PluginTuiHostError::Internal(
+                    "generation response mismatch".to_owned(),
+                ));
+            };
+            let id = result?;
+            let _lease = RemoteLease {
+                remote: remote.clone(),
+                close: host::Request::CancelGeneration { generation: id },
+            };
+            let mut cancellation_sent = false;
+            loop {
+                if control.is_cancelled() && !cancellation_sent {
+                    let host::Response::CancellationRequested(result) = remote
+                        .request(host::Request::CancelGeneration { generation: id })
+                        .await?
+                    else {
+                        return Err(PluginTuiHostError::Internal(
+                            "cancellation response mismatch".to_owned(),
+                        ));
+                    };
+                    result?;
+                    cancellation_sent = true;
+                }
+                let host::Response::GenerationStatus(status) = remote
+                    .request(host::Request::PollGeneration { generation: id })
+                    .await?
+                else {
+                    return Err(PluginTuiHostError::Internal(
+                        "generation observation mismatch".to_owned(),
+                    ));
+                };
+                let status = *status?;
+                if let Some(session) = status.session_id {
+                    control.set_session_id(session);
+                }
+                if let Some(result) = status.result {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            }
+        })
+    }
+    fn workflow_scheduling_page(
+        &self,
+        request: bcode_workflow::WorkflowSchedulingPageRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bcode_workflow::WorkflowSchedulingPage<
+                            bcode_workflow_view_models::WorkflowSchedulingView,
+                        >,
+                        PluginTuiHostError,
+                    >,
+                > + Send,
+        >,
+    > {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowSchedulingPage { request })
+                .await?
+            {
+                host::Response::WorkflowSchedulingPage(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn validate_judgement_setup(
+        &self,
+        selection: bcode_model::judgement::SetupSelection,
+    ) -> PluginJudgementValidationFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::ValidateJudgementSetup { selection })
+                .await?
+            {
+                host::Response::ValidateJudgementSetup(result) => result,
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn judgement_setup(&self) -> PluginJudgementSetupFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote.request(host::Request::JudgementSetup {}).await? {
+                host::Response::JudgementSetup(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn usage_report(&self, query: bcode_usage_models::UsageQuery) -> PluginUsageReportFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote.request(host::Request::UsageReport { query }).await? {
+                host::Response::UsageReport(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn collect_usage(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> PluginUsageCollectFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::CollectUsage { session_id, query })
+                .await?
+            {
+                host::Response::CollectUsage(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn workflow_delegation_preflight(
+        &self,
+        plugin_id: String,
+    ) -> PluginWorkflowDelegationPreflightFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowDelegationPreflight { plugin_id })
+                .await?
+            {
+                host::Response::WorkflowDelegationPreflight(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn start_workflow(&self, request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::StartWorkflow { request })
+                .await?
+            {
+                host::Response::StartWorkflow(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn associated_workflow(&self, lookup: PluginWorkflowLookup) -> PluginWorkflowLookupFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::AssociatedWorkflow { lookup })
+                .await?
+            {
+                host::Response::AssociatedWorkflow(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn inspect_associated_workflow(
+        &self,
+        lookup: PluginWorkflowLookup,
+        limit: usize,
+    ) -> PluginWorkflowInspectionFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::InspectAssociatedWorkflow { lookup, limit })
+                .await?
+            {
+                host::Response::InspectAssociatedWorkflow(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn control_associated_workflow(
+        &self,
+        lookup: PluginWorkflowLookup,
+        action: PluginWorkflowControlAction,
+    ) -> PluginWorkflowControlFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::ControlAssociatedWorkflow { lookup, action })
+                .await?
+            {
+                host::Response::ControlAssociatedWorkflow(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn workflow_authoring_catalog(&self) -> PluginWorkflowAuthoringCatalogFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowAuthoringCatalog {})
+                .await?
+            {
+                host::Response::WorkflowAuthoringCatalog(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn workflow_launch_catalog(
+        &self,
+        request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    ) -> PluginWorkflowLaunchCatalogFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowLaunchCatalog { request })
+                .await?
+            {
+                host::Response::WorkflowLaunchCatalog(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn workflow_launch_detail(
+        &self,
+        request: bcode_workflow::WorkflowLaunchDetailRequest,
+    ) -> PluginWorkflowLaunchDetailFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowLaunchDetail { request })
+                .await?
+            {
+                host::Response::WorkflowLaunchDetail(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn prepare_fresh_session(&self, existing: Option<SessionId>) -> PluginCreateSessionFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::PrepareFreshSession { existing })
+                .await?
+            {
+                host::Response::PrepareFreshSession(result) => result,
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn session_working_document(
+        &self,
+        request: bcode_session_models::SessionWorkingDocumentRequest,
+    ) -> PluginWorkingDocumentFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::SessionWorkingDocument { request })
+                .await?
+            {
+                host::Response::SessionWorkingDocument(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn generate_structured_output(
+        &self,
+        request: PluginStructuredGenerationRequest,
+    ) -> PluginStructuredGenerationFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::GenerateStructuredOutput { request })
+                .await?
+            {
+                host::Response::GenerateStructuredOutput(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn accept_generated_workflow_candidate(
+        &self,
+        candidate: PluginWorkflowGeneratedCandidate,
+    ) -> PluginWorkflowGeneratedCandidateAcceptanceFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::AcceptGeneratedWorkflowCandidate { candidate })
+                .await?
+            {
+                host::Response::AcceptGeneratedWorkflowCandidate(result) => {
+                    result.map(|value| *value)
+                }
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn instantiate_workflow_template(
+        &self,
+        request: PluginWorkflowTemplateInstantiationRequest,
+    ) -> PluginWorkflowTemplateInstantiationFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::InstantiateWorkflowTemplate { request })
+                .await?
+            {
+                host::Response::InstantiateWorkflowTemplate(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn workflow_authoring_draft(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+    ) -> PluginWorkflowAuthoringDraftFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowAuthoringDraft {
+                    workflow_id,
+                    draft_id,
+                })
+                .await?
+            {
+                host::Response::WorkflowAuthoringDraft(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn fork_workflow_authoring_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+        draft_id: String,
+        producer: bcode_workflow::WorkflowProducerProvenance,
+    ) -> PluginWorkflowAuthoringForkFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::ForkWorkflowAuthoringRevision {
+                    workflow_id,
+                    revision,
+                    draft_id,
+                    producer,
+                })
+                .await?
+            {
+                host::Response::ForkWorkflowAuthoringRevision(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn workflow_authoring_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> PluginWorkflowAuthoringRevisionFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::WorkflowAuthoringRevision {
+                    workflow_id,
+                    revision,
+                })
+                .await?
+            {
+                host::Response::WorkflowAuthoringRevision(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn apply_workflow_authoring_edits(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+        batch: bcode_workflow::WorkflowAuthoringEditBatch,
+        producer: bcode_workflow::WorkflowProducerProvenance,
+    ) -> PluginWorkflowAuthoringEditFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::ApplyWorkflowAuthoringEdits {
+                    workflow_id,
+                    draft_id,
+                    batch,
+                    producer,
+                })
+                .await?
+            {
+                host::Response::ApplyWorkflowAuthoringEdits(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn validate_workflow_authoring(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+    ) -> PluginWorkflowAuthoringValidationFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::ValidateWorkflowAuthoring { document })
+                .await?
+            {
+                host::Response::ValidateWorkflowAuthoring(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn apply_workflow_source(
+        &self,
+        source_format: bcode_workflow::WorkflowSourceFormat,
+        source: String,
+        draft_id: String,
+    ) -> PluginWorkflowAuthoringApplyFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::ApplyWorkflowSource {
+                    source_format,
+                    source,
+                    draft_id,
+                })
+                .await?
+            {
+                host::Response::ApplyWorkflowSource(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn preview_workflow_authoring(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        configuration: Option<serde_json::Value>,
+    ) -> PluginWorkflowAuthoringPreviewFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::PreviewWorkflowAuthoring {
+                    document,
+                    configuration,
+                })
+                .await?
+            {
+                host::Response::PreviewWorkflowAuthoring(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn publish_workflow_authoring_draft(
+        &self,
+        workflow_id: String,
+        draft_id: String,
+        expected_generation: u64,
+        activate: bool,
+    ) -> PluginWorkflowAuthoringPublishFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::PublishWorkflowAuthoringDraft {
+                    workflow_id,
+                    draft_id,
+                    expected_generation,
+                    activate,
+                })
+                .await?
+            {
+                host::Response::PublishWorkflowAuthoringDraft(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn start_authored_workflow_revision(
+        &self,
+        workflow_id: String,
+        revision: u64,
+        parent_session_id: SessionId,
+        workspace_snapshot: Option<String>,
+        configuration: Option<serde_json::Value>,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::StartAuthoredWorkflowRevision {
+                    workflow_id,
+                    revision,
+                    parent_session_id,
+                    workspace_snapshot,
+                    configuration,
+                })
+                .await?
+            {
+                host::Response::StartAuthoredWorkflowRevision(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn start_workflow_package_export(
+        &self,
+        request: PluginWorkflowPackageExportStartRequest,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::StartWorkflowPackageExport { request })
+                .await?
+            {
+                host::Response::StartWorkflowPackageExport(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
+    fn start_workflow_template(
+        &self,
+        request: PluginWorkflowTemplateStartRequest,
+    ) -> PluginWorkflowAuthoringStartFuture {
+        let remote = self.product_host.clone();
+        Box::pin(async move {
+            let remote = remote.ok_or_else(|| {
+                PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+            })?;
+            match remote
+                .request(host::Request::StartWorkflowTemplate { request })
+                .await?
+            {
+                host::Response::StartWorkflowTemplate(result) => result.map(|value| *value),
+                _ => Err(PluginTuiHostError::InvalidRequest(
+                    "frontend callback response mismatch".to_owned(),
+                )),
+            }
+        })
+    }
     fn spawn(&self, task: PluginTask) {
         let redraw_sender = self.redraw_sender.clone();
-        drop(self.handle.spawn(async move {
+        let task = Box::pin(async move {
             task.await;
             let _ = redraw_sender.try_send(());
-        }));
+        });
+        if let Some(tasks) = &self.author_tasks {
+            tasks.spawn(&self.handle, task);
+        } else {
+            drop(self.handle.spawn(task));
+        }
     }
 
     fn spawn_blocking(&self, task: Box<dyn FnOnce() + Send + 'static>) {
         let redraw_sender = self.redraw_sender.clone();
-        drop(self.handle.spawn_blocking(move || {
-            task();
-            let _ = redraw_sender.try_send(());
-        }));
+        if let Some(tasks) = &self.author_tasks {
+            tasks.spawn_blocking(
+                &self.handle,
+                Box::new(move || {
+                    task();
+                    let _ = redraw_sender.try_send(());
+                }),
+            );
+        } else {
+            drop(self.handle.spawn_blocking(move || {
+                task();
+                let _ = redraw_sender.try_send(());
+            }));
+        }
     }
 
     fn request_redraw(&self) {
         let _ = self.redraw_sender.try_send(());
+        if let Some(remote) = &self.product_host {
+            let _ = remote.synchronous(&host::Request::Redraw {});
+        }
+    }
+
+    fn copy_text(&self, text: String) -> Result<(), PluginTuiHostError> {
+        let remote = self.product_host.as_ref().ok_or_else(|| {
+            PluginTuiHostError::Unsupported("frontend host port unavailable".to_owned())
+        })?;
+        match remote.synchronous(&host::Request::CopyText { text })? {
+            host::Response::CopyText(result) => result,
+            _ => Err(PluginTuiHostError::Internal(
+                "clipboard response mismatch".to_owned(),
+            )),
+        }
     }
 
     fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {

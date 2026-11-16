@@ -3333,7 +3333,7 @@ mod controller_consumer_tests {
         );
         let state = crate::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from(["bcode.question".to_owned()]),

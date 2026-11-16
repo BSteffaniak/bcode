@@ -1,6 +1,6 @@
 //! Typed daemon search preparation. No client-local discovery or content IO.
 
-use bcode_filesystem_plugin::path_search::{
+use bcode_filesystem_models::path_search::{
     SearchPathKind, SearchPathsRequest, SearchPathsResponse, SearchPathsScope, SearchPathsState,
 };
 use bcode_plugin_sdk::composer::{ComposerSearchRequest, ComposerSnapshot};
@@ -167,34 +167,124 @@ fn discover(
     request: &ComposerSearchRequest,
     prepared: &SearchPathsRequest,
 ) -> Result<SearchPathsResponse, &'static str> {
-    let payload = serde_json::to_value(prepared).map_err(|_| "encode_failed")?;
-    let response = context
-        .bridge
-        .request(&ServiceBridgeRequest::InvokeService(
-            ToolInvocationServiceRequest {
-                // Empty identity inherits the contextual bridge's bound invocation.
-                invocation_id: String::new(),
-                request_id: format!("{}:paths", request.request_id),
-                route_id: None,
-                interface_id: "bcode.filesystem/v1".to_owned(),
-                operation: bcode_filesystem_plugin::path_search::OP_SEARCH_PATHS.to_owned(),
-                payload,
-            },
-        ))
-        .map_err(|_| "search_unavailable")?;
-    if context.cancellation.is_cancelled() {
-        return Err("cancelled");
-    }
-    let resolution = match response {
-        ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { payload }) => {
-            payload
-        }
-        ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled) => {
-            return Err("cancelled");
-        }
-        _ => return Err("search_unavailable"),
+    use crate::path_search_transport::filesystem_paths::{SearchPathsInput, client};
+    let mut request_value = serde_json::to_value(prepared).map_err(|_| "encode_failed")?;
+    let object = request_value.as_object_mut().ok_or("encode_failed")?;
+    let query = object.remove("query").ok_or("encode_failed")?;
+    object.insert("search_query".into(), query);
+    let input: SearchPathsInput =
+        serde_json::from_value(request_value).map_err(|_| "encode_failed")?;
+    let mut bridge = PathSearchBridge {
+        context,
+        request_id: format!("{}:paths", request.request_id),
+        failure: PathSearchFailure::Unavailable,
     };
-    serde_json::from_value::<SearchPathsResponse>(resolution).map_err(|_| "invalid_response")
+    let response = futures::executor::block_on(client::search_paths(&mut bridge, input))
+        .map_err(|_| bridge.failure.code())?;
+    serde_json::from_value(serde_json::to_value(response).map_err(|_| "invalid_response")?)
+        .map_err(|_| "invalid_response")
+}
+
+// Only the generated path endpoint is accepted here. Authority and cancellation
+// remain in the invocation-bound bridge, never in the generated request record.
+#[derive(Clone, Copy)]
+enum PathSearchFailure {
+    Unavailable,
+    Cancelled,
+}
+
+impl PathSearchFailure {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "search_unavailable",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+struct PathSearchBridge<'a> {
+    context: &'a NativeServiceContext,
+    request_id: String,
+    // Generated transport errors erase the nested resolution. Keep only typed
+    // cancellation evidence, never infer it from diagnostics or a late flag.
+    failure: PathSearchFailure,
+}
+
+impl bmux_plugin_sdk::TypedDispatchClient for PathSearchBridge<'_> {
+    fn invoke_service_raw(
+        &mut self,
+        _capability: &str,
+        _kind: bmux_ipc::InvokeServiceKind,
+        interface: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>> + Send
+    {
+        self.failure = PathSearchFailure::Unavailable;
+        let result = (|| {
+            use crate::path_search_transport::filesystem_paths::{
+                self, SearchPathsOutput, client::SearchPathsRequest,
+            };
+            use bmux_plugin_sdk::TypedDispatchClientError;
+            let failed = || {
+                TypedDispatchClientError::transport(
+                    interface,
+                    operation,
+                    "path discovery unavailable",
+                )
+            };
+            if interface != filesystem_paths::INTERFACE_ID.as_str()
+                || operation != filesystem_paths::OP_SEARCH_PATHS.as_str()
+            {
+                return Err(failed());
+            }
+            if self.context.cancellation.is_cancelled() {
+                self.failure = PathSearchFailure::Cancelled;
+                return Err(failed());
+            }
+            let request: SearchPathsRequest =
+                bmux_plugin_sdk::decode_service_message(&payload).map_err(|_| failed())?;
+            let response = self
+                .context
+                .bridge
+                .request(&ServiceBridgeRequest::InvokeService(
+                    ToolInvocationServiceRequest {
+                        invocation_id: String::new(),
+                        request_id: self.request_id.clone(),
+                        route_id: None,
+                        interface_id: interface.to_owned(),
+                        operation: operation.to_owned(),
+                        payload: serde_json::to_value(request).map_err(|_| failed())?,
+                    },
+                ))
+                .map_err(|_| failed())?;
+            let payload = match response {
+                ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
+                    payload,
+                }) => payload,
+                ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled) => {
+                    self.failure = PathSearchFailure::Cancelled;
+                    return Err(failed());
+                }
+                _ => return Err(failed()),
+            };
+            if self.context.cancellation.is_cancelled() {
+                return Err(failed());
+            }
+            let response: SearchPathsOutput =
+                serde_json::from_value(payload).map_err(|_| failed())?;
+            bmux_plugin_sdk::encode_service_message(&response).map_err(|_| failed())
+        })();
+        std::future::ready(result)
+    }
+}
+
+const fn validate_search_outcome(state: SearchPathsState) -> Result<(), &'static str> {
+    match state {
+        SearchPathsState::Complete | SearchPathsState::Incomplete => Ok(()),
+        SearchPathsState::Cancelled => Err("cancelled"),
+        SearchPathsState::Unavailable => Err("search_unavailable"),
+    }
 }
 
 /// Convert bounded daemon results into validated text-only edits.
@@ -206,12 +296,7 @@ pub fn snapshot(
     mut paths: SearchPathsResponse,
 ) -> Result<ComposerSnapshot, &'static str> {
     request.validate().map_err(|_| "invalid_request")?;
-    if !matches!(
-        paths.state,
-        SearchPathsState::Complete | SearchPathsState::Incomplete
-    ) {
-        return Err("search_unavailable");
-    }
+    validate_search_outcome(paths.state)?;
     if paths.entries.len() > request.max_results {
         return Err("oversized_response");
     }
@@ -384,11 +469,11 @@ mod tests {
         input.action_id = None;
         let path = "src/how-to-my-life.txt";
         let response = SearchPathsResponse {
-            entries: vec![bcode_filesystem_plugin::path_search::SearchPathEntry {
+            entries: vec![bcode_filesystem_models::path_search::SearchPathEntry {
                 path: path.into(),
                 kind: SearchPathKind::File,
                 score: 0,
-                match_ranges: vec![bcode_filesystem_plugin::path_search::SearchPathMatchRange {
+                match_ranges: vec![bcode_filesystem_models::path_search::SearchPathMatchRange {
                     start: 0,
                     end: 1,
                 }],
@@ -445,8 +530,8 @@ mod tests {
             return 1;
         };
         if !call.invocation_id.is_empty()
-            || call.interface_id != "bcode.filesystem/v1"
-            || call.operation != "search_paths"
+            || call.interface_id != "filesystem-paths/v1"
+            || call.operation != "search-paths"
             || call.payload.get("invocation_id").is_some()
             || call.payload.get("workspace_root").is_some()
         {
@@ -455,7 +540,7 @@ mod tests {
         let response = ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
             payload: serde_json::json!({
                 "entries": [{"path": "src/lib.rs", "kind": "file", "score": 0}],
-                "state": "complete", "reason": null, "visited_entries": 1
+                "state": "complete", "reason": null, "visited_entries": 1, "effective_scope": "tracked"
             }),
         });
         let Ok(encoded) = serde_json::to_vec(&response) else {
@@ -550,7 +635,7 @@ mod tests {
 
     #[test]
     fn mixed_unpresentable_names_keep_valid_peers_and_mark_truncation() {
-        use bcode_filesystem_plugin::path_search::SearchPathEntry;
+        use bcode_filesystem_models::path_search::SearchPathEntry;
         for name in [
             "bad\nname".to_owned(),
             "x".repeat(1025),
@@ -595,7 +680,7 @@ mod tests {
 
     #[test]
     fn deterministic_ranked_snapshot_and_rejection() {
-        use bcode_filesystem_plugin::path_search::SearchPathEntry;
+        use bcode_filesystem_models::path_search::SearchPathEntry;
         let request = request("@s");
         let response = SearchPathsResponse {
             entries: vec![

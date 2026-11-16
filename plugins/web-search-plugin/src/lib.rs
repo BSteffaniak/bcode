@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "frontend")]
 mod web_search_tui;
 
 #[path = "providers/exa.rs"]
@@ -105,6 +105,12 @@ impl Default for WebSearchPlugin {
 }
 
 impl RustPlugin for WebSearchPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+        #[cfg(feature = "frontend")]
+        let registrations = registrations.with_frontend(web_search_tui_registry);
+        registrations
+    }
     fn deactivate(&mut self) -> Result<(), PluginError> {
         if let Ok(runtime) = &self.runtime {
             runtime
@@ -253,7 +259,7 @@ impl WebSearchPlugin {
         }
         if let Some(schema) = web_request_schema(&invocation.name) {
             let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
-                context.events,
+                context.events.clone(),
                 &invocation.tool_call_id,
                 WEB_SEARCH_PLUGIN_ID,
                 schema,
@@ -273,7 +279,7 @@ impl WebSearchPlugin {
                 ProviderCredentials::new(context.credentials()),
                 &context.cancellation,
                 &invocation,
-                context.events,
+                context.events.clone(),
                 context.bridge.clone(),
             ),
             "web.fetch" => self.invoke_fetch(
@@ -281,7 +287,7 @@ impl WebSearchPlugin {
                 ProviderCredentials::new(context.credentials()),
                 &context.cancellation,
                 &invocation,
-                context.events,
+                context.events.clone(),
             ),
             "web.status" => {
                 let credentials = ProviderCredentials::new(context.credentials());
@@ -3005,7 +3011,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(WebSearchPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "frontend")]
 #[must_use]
 pub fn web_search_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -3025,11 +3031,23 @@ pub fn web_search_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     registry
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::define_plugin!(serial WebSearchPlugin, include_str!("../bcode-plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_definition_tracks_frontend_capability_without_packaging_feature() {
+        use bcode_plugin_sdk::definition::ComponentRole;
+        let definition = plugin_definition();
+        assert!(definition.metadata.roles.contains(&ComponentRole::Backend));
+        assert_eq!(
+            definition.metadata.roles.contains(&ComponentRole::Frontend),
+            cfg!(feature = "frontend")
+        );
+        let registrations = <WebSearchPlugin as RustPlugin>::component_registrations();
+        assert_eq!(registrations.frontend.is_some(), cfg!(feature = "frontend"));
+    }
 
     #[test]
     fn registered_web_provider_keys_preserve_conventional_order() {

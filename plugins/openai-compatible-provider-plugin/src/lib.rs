@@ -477,7 +477,7 @@ impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
         &self,
         registrar: AuthRegistrar,
     ) -> Result<(), PluginError> {
-        register_auth_providers(registrar)
+        register_auth_providers(&registrar)
     }
 
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -490,7 +490,7 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
         self.deactivate_concurrent()
     }
     fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
-        register_auth_providers(registrar)
+        register_auth_providers(&registrar)
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -498,7 +498,7 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
     }
 }
 
-fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> {
+fn register_auth_providers(registrar: &AuthRegistrar) -> Result<(), PluginError> {
     for contribution in [
         AuthProviderContribution {
             external_sources: Vec::new(),
@@ -11852,7 +11852,7 @@ mod tests {
             .lock()
             .expect("auth registration collector")
             .clear();
-        register_auth_providers(AuthRegistrar::new(
+        register_auth_providers(&AuthRegistrar::new(
             Some(collect_auth_registration),
             std::ptr::null_mut(),
         ))
@@ -17176,8 +17176,7 @@ mod tests {
     }
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(
-    OpenAiCompatibleProviderPlugin,
+bcode_plugin_sdk::define_plugin!(
+    concurrent OpenAiCompatibleProviderPlugin,
     include_str!("../bcode-plugin.toml")
 );

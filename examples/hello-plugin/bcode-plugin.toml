@@ -2,6 +2,11 @@ id      = "example.hello"
 name    = "Hello Example Plugin"
 version = "0.0.1"
 
+[[tui_surfaces]]
+description = "One real surface for selected native and portable frontend parity"
+kind        = "hello-probe"
+title       = "Hello portable probe"
+
 [[services]]
 description  = "Echo service used by smoke tests"
 interface_id = "example-hello/v1"

@@ -435,7 +435,7 @@ pub async fn main() -> ExitCode {
         }
         signal_cancel.cancel();
     });
-    let result = run(arguments, &cancellation).await;
+    let result = Box::pin(run(arguments, &cancellation)).await;
     signal_task.abort();
     match result {
         Ok(()) => ExitCode::SUCCESS,

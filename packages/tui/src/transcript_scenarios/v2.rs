@@ -123,7 +123,7 @@ impl V2Driver {
     /// them, and the result is delivered as the persistence effect's result (A3).
     fn collect_effects(&mut self) {
         let (scheduled, _notes) = self.model.chat.pending_effects.drain_runtime();
-        for (_schedule, effect) in scheduled {
+        for crate::effects::ScheduledEffect { effect, .. } in scheduled {
             if let TuiEffect::LoadTranscriptV2History { load } = effect {
                 self.pending
                     .retain(|(_, pending)| pending.lane() != load.lane());

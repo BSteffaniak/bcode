@@ -26,7 +26,7 @@ mod contracts;
 pub mod presentation;
 #[cfg(feature = "native")]
 pub mod recording;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub mod shell_run_tui;
 #[cfg(feature = "static-bundled")]
 mod shell_summary;

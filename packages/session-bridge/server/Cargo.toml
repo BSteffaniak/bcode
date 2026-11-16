@@ -29,7 +29,7 @@ bcode_fake_provider_plugin  = { workspace = true, features = ["static-bundled"] 
 bcode_ipc                   = { workspace = true }
 bcode_model_catalog         = { workspace = true }
 bcode_plugin                = { workspace = true }
-bcode_sdk_session_import_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_sdk_session_import_plugin = { workspace = true }
 bcode_server                = { workspace = true }
 bcode_session_bridge        = { workspace = true }
 tempfile                    = { workspace = true }

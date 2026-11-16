@@ -11,7 +11,38 @@ mod service;
 pub mod state;
 pub use service::FileReferencesPlugin;
 
-/// Native static service registration used by the central bundle.
+// Native service registration used by the central bundle.
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(serial FileReferencesPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    let registrations = registrations.with_composer(composer_registry);
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(file_references_tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_host::<FileReferencesPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(
@@ -24,7 +55,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 ///
 /// # Panics
 /// Panics only if registering one contributor in a fresh empty registry fails.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn file_references_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -32,8 +63,10 @@ pub fn file_references_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistr
     registry
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(FileReferencesPlugin, include_str!("../bcode-plugin.toml"));
+// Both consumers generate this transport from the contract-only schema owner.
+pub mod path_search_transport {
+    include!(concat!(env!("OUT_DIR"), "/path_search.rs"));
+}
 
 use bcode_plugin_sdk::composer::{
     ComposerActivation, ComposerDocument, ComposerTextRange, PluginComposerContributor,
@@ -74,7 +107,7 @@ impl PluginComposerContributor for FileReferenceContributor {
 ///
 /// # Errors
 /// Returns the registry's conflict or invalid-kind error.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub fn register_tui(
     registry: &mut bcode_plugin_sdk::tui::PluginTuiRegistry,
 ) -> Result<(), bcode_plugin_sdk::composer::PluginComposerRegistryError> {
@@ -98,6 +131,14 @@ pub fn register_tui(
         });
     }
     registry.register_composer_contributor(Box::new(FileReferenceContributor))
+}
+
+fn composer_registry() -> bcode_plugin_sdk::composer::PluginComposerRegistry {
+    let mut registry = bcode_plugin_sdk::composer::PluginComposerRegistry::default();
+    registry
+        .register(Box::new(FileReferenceContributor))
+        .expect("file-reference grammar is valid in a fresh registry");
+    registry
 }
 
 #[cfg(test)]

@@ -11,7 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
+
+# Features that make up each packaged component. The plugin definition is
+# unconditional; the terminal frontend and CLI live behind `tui`.
+[package.metadata.bmux-plugin.components.frontend]
+features = ["tui"]
 
 [dependencies]
 bcode_code_review        = { workspace = true }
@@ -35,4 +40,4 @@ tempfile                    = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["dep:bcode_code_review_ui", "dep:clap"]
+tui              = ["dep:bcode_code_review_ui", "dep:clap"]

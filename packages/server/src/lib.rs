@@ -45,6 +45,7 @@ mod model_check;
 mod model_evidence;
 mod model_ignores;
 mod model_request_target;
+mod shared_plugin_runtime;
 pub use command_application::CommandApplicationHandle;
 mod activity_changes;
 mod activity_watch;
@@ -4250,6 +4251,36 @@ fn daemon_log_path() -> PathBuf {
     )
 }
 
+/// Plugin configuration for every known plugin, bound to this daemon's shared plugin runtime.
+///
+/// Configuration, state roots, and invocation-time secret resolution come from
+/// [`bcode_plugin_config::resolve_plugin_configs`]; this daemon then grants each plugin
+/// explicit activation authority from one shared runtime scope. Activation is never
+/// inferred from ambient host state.
+fn resolve_plugin_configs(
+    config: &bcode_config::BcodeConfig,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig> {
+    let configs = bcode_plugin_config::resolve_plugin_configs(
+        config,
+        static_plugins,
+        &managed_plugin_state_base(),
+    );
+    let shared_runtime = shared_plugin_runtime::Runtime::new();
+    let enabled_plugins = configs.keys().cloned().collect::<Vec<_>>();
+    configs
+        .into_iter()
+        .map(|(plugin_id, plugin_config)| {
+            let activation = shared_runtime.activation(
+                &plugin_id,
+                &plugin_config.config,
+                enabled_plugins.clone(),
+            );
+            (plugin_id, plugin_config.with_shared_activation(activation))
+        })
+        .collect()
+}
+
 /// Where this daemon's plugins keep state.
 fn managed_plugin_state_base() -> PathBuf {
     bcode_config::default_state_dir()
@@ -5049,11 +5080,7 @@ async fn run_with_config(
         bcode_model_catalog::RemoteCatalogOptions::default(),
     )?;
     tracing::debug!(target: "bcode_server::startup", "loading plugins");
-    let plugin_configs = bcode_plugin_config::resolve_plugin_configs(
-        &config,
-        static_plugins,
-        &managed_plugin_state_base(),
-    );
+    let plugin_configs = resolve_plugin_configs(&config, static_plugins);
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
         &plugin_selection,
         static_plugins,
@@ -5186,6 +5213,55 @@ pub async fn run_embedded_with_locations_and_shutdown(
         },
     ))
     .await
+}
+
+/// Load caller-selected static plugins for an embedded host such as
+/// [`run_embedded_with_locations_and_shutdown`].
+///
+/// Each enabled plugin receives explicit activation authority from one shared runtime
+/// scope, exactly as the serving daemon grants it; activation is never inferred from
+/// ambient host state.
+///
+/// # Errors
+/// Returns manifest, selection, activation or load failures.
+pub fn load_embedded_plugins(
+    selection: &bcode_plugin::PluginSelection,
+    plugins: &[bcode_plugin::StaticBundledPlugin],
+) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
+    load_embedded_plugins_with_config(selection, plugins, std::collections::BTreeMap::new())
+}
+
+/// [`load_embedded_plugins`] with caller-resolved plugin configuration. Supplied
+/// activation contexts are preserved; other enabled plugins share one runtime scope.
+///
+/// # Errors
+/// Returns manifest, selection, activation or load failures.
+pub fn load_embedded_plugins_with_config(
+    selection: &bcode_plugin::PluginSelection,
+    plugins: &[bcode_plugin::StaticBundledPlugin],
+    mut configs: std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
+) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
+    let runtime = shared_plugin_runtime::Runtime::new();
+    let ids = bcode_plugin::static_bundled_plugin_ids(plugins)?;
+    let enabled = ids
+        .iter()
+        .filter(|id| selection.is_enabled(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in ids {
+        if selection.is_enabled(&id) {
+            let config = configs.remove(&id).unwrap_or_default();
+            if config.shared_activation.is_some() {
+                configs.insert(id, config);
+            } else {
+                let activation = runtime.activation(&id, &config.config, enabled.clone());
+                configs.insert(id, config.with_shared_activation(activation));
+            }
+        }
+    }
+    bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
+        selection, plugins, configs,
+    )
 }
 
 /// Borrowed workflow application available only while its embedded host is alive.
@@ -48094,6 +48170,47 @@ mod tests {
         ));
     }
 
+    /// Metadata-only carrier for a shared test definition; legacy hooks are never executable.
+    pub fn shared_test_plugin(
+        manifest: &'static str,
+        definition: fn() -> bcode_plugin_sdk::definition::PluginDefinition,
+    ) -> bcode_plugin::StaticBundledPlugin {
+        bcode_plugin::StaticBundledPlugin::new(
+            manifest,
+            bcode_plugin_sdk::StaticPluginVtable {
+                instance: std::ptr::null(),
+                manifest: |_| std::ptr::null(),
+                activate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
+                register_commands: None,
+                register_auth_providers: None,
+                deactivate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
+                invoke_service_streaming: |_, _, _, _, _, _, _, _, _, _, _, _| {
+                    bcode_plugin_sdk::EXIT_UNAVAILABLE
+                },
+                handle_event: |_, _, _| bcode_plugin_sdk::EXIT_UNAVAILABLE,
+                cli_registration: None,
+            },
+        )
+        .with_definition(definition)
+    }
+
+    /// Load fixtures using the serving host's configured shared activation factory.
+    pub fn load_test_plugins(
+        selection: &bcode_plugin::PluginSelection,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
+        load_test_plugins_with_config(selection, plugins, std::collections::BTreeMap::new())
+    }
+
+    /// Preserve supplied plugin configuration and explicit activation contexts.
+    pub fn load_test_plugins_with_config(
+        selection: &bcode_plugin::PluginSelection,
+        plugins: &[bcode_plugin::StaticBundledPlugin],
+        configs: std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
+    ) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
+        super::load_embedded_plugins_with_config(selection, plugins, configs)
+    }
+
     include!("session_operations/submission_tests.rs");
     mod collaboration_execution;
     mod goal_entry;
@@ -48656,20 +48773,14 @@ mod tests {
         let _guard = session_search::tests::lock_search_tests().await;
         let tantivy_root = tempfile::tempdir().expect("tantivy root");
         let compressed_root = tempfile::tempdir().expect("compressed root");
-        let manifests = vec![
-            (
-                toml::from_str(include_str!(
-                    "../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"
-                ))
-                .expect("tantivy manifest"),
-                bcode_tantivy_session_search_plugin::static_plugin(),
+        let providers = [
+            shared_test_plugin(
+                include_str!("../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"),
+                bcode_tantivy_session_search_plugin::plugin_definition,
             ),
-            (
-                toml::from_str(include_str!(
-                    "../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"
-                ))
-                .expect("compressed manifest"),
-                bcode_compressed_session_search_plugin::static_plugin(),
+            shared_test_plugin(
+                include_str!("../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"),
+                bcode_compressed_session_search_plugin::plugin_definition,
             ),
         ];
         let configs = BTreeMap::from([
@@ -48688,8 +48799,23 @@ mod tests {
                 ),
             ),
         ]);
-        let state = Arc::new(session_search::tests::state_with_static_provider_vtables(
-            &manifests, configs,
+        let state = Arc::new(test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent_lazy(
+                tempfile::tempdir().expect("session root").keep(),
+            ),
+            load_test_plugins_with_config(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from([
+                        "bcode.tantivy-session-search".to_owned(),
+                        "bcode.compressed-session-search".to_owned(),
+                    ]),
+                    disabled: BTreeSet::new(),
+                },
+                &providers,
+                configs,
+            )
+            .expect("load real shared search providers"),
         ));
         let workspace = tempfile::tempdir().expect("workspace");
         let session_count = std::env::var("BCODE_SESSION_SEARCH_COMPLETE_BENCH_SESSIONS")
@@ -48809,20 +48935,14 @@ mod tests {
         let compressed_root = tempfile::tempdir().expect("compressed root");
         let tantivy_id = "bcode.tantivy-session-search";
         let compressed_id = "bcode.compressed-session-search";
-        let manifests = vec![
-            (
-                toml::from_str(include_str!(
-                    "../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"
-                ))
-                .expect("tantivy manifest"),
-                bcode_tantivy_session_search_plugin::static_plugin(),
+        let providers = [
+            shared_test_plugin(
+                include_str!("../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"),
+                bcode_tantivy_session_search_plugin::plugin_definition,
             ),
-            (
-                toml::from_str(include_str!(
-                    "../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"
-                ))
-                .expect("compressed manifest"),
-                bcode_compressed_session_search_plugin::static_plugin(),
+            shared_test_plugin(
+                include_str!("../../../plugins/compressed-session-search-plugin/bcode-plugin.toml"),
+                bcode_compressed_session_search_plugin::plugin_definition,
             ),
         ];
         let configs = BTreeMap::from([
@@ -48841,7 +48961,24 @@ mod tests {
                 ),
             ),
         ]);
-        let state = session_search::tests::state_with_static_provider_vtables(&manifests, configs);
+        let state = test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent_lazy(
+                tempfile::tempdir().expect("session root").keep(),
+            ),
+            load_test_plugins_with_config(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::from([
+                        "bcode.tantivy-session-search".to_owned(),
+                        "bcode.compressed-session-search".to_owned(),
+                    ]),
+                    disabled: BTreeSet::new(),
+                },
+                &providers,
+                configs,
+            )
+            .expect("load real shared search providers"),
+        );
         let session = state
             .sessions
             .create_session(
@@ -52003,7 +52140,7 @@ mod tests {
     #[tokio::test]
     async fn template_catalog_traverses_all_batches_before_paging() {
         let workspace = tempfile::tempdir().unwrap();
-        let state = external_templates_test_state(workspace.path(), 35);
+        let state = external_templates_test_state::<35>(workspace.path());
         let mut request: bcode_workflow::WorkflowLaunchCatalogRequest =
             serde_json::from_value(serde_json::json!({
                 "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
@@ -53917,7 +54054,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ADVISORY_FIXTURE_MANIFEST
             ),
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.test-advisory-boundary".into()]),
@@ -54170,15 +54307,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ApplicationDisposition, Feature, ObservationTerminal, TriggerDisposition,
         };
         let mut state = test_server_state(SessionManager::default());
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.skills".to_owned()]),
                 disabled: BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/skills-plugin/bcode-plugin.toml"),
-                bcode_skills_plugin::static_plugin(),
+                bcode_skills_plugin::plugin_definition,
             )],
         )
         .unwrap();
@@ -55122,7 +55259,7 @@ library = "test"
         NON_RETURNING_CANCEL_STARTED.store(false, Ordering::SeqCst);
         NON_RETURNING_CANCEL_RELEASED.store(false, Ordering::SeqCst);
         let plugin = non_returning_cancel_provider_plugin();
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["test.non-returning-provider".to_string()]),
@@ -55223,17 +55360,15 @@ library = "test"
         NON_RETURNING_SEARCH_RELEASED.store(false, Ordering::SeqCst);
         NON_RETURNING_SEARCH_FINISHED.store(false, Ordering::SeqCst);
         let plugin = non_returning_search_provider_plugin();
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::from(["test.non-returning-search-provider".to_string()]),
-                    disabled: BTreeSet::new(),
-                },
-                &[plugin],
-            )
-            .expect("blocking search provider should load"),
-        );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["test.non-returning-search-provider".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("blocking search provider should load"),);
         let (mut state,) = (test_server_state(SessionManager::default()),);
         state.plugins = plugins;
         state.selected_provider_plugin_id = Some("test.non-returning-search-provider".to_string());
@@ -67074,11 +67209,11 @@ library = "test"
     }
 
     fn register_workflow_publication_tool(state: &mut ServerState) {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
-            bcode_workflow_plugin::static_plugin(),
+            bcode_workflow_plugin::plugin_definition,
         );
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from([
@@ -67089,9 +67224,9 @@ library = "test"
             },
             &[
                 plugin,
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                    bcode_fake_provider_plugin::static_plugin(),
+                    bcode_fake_provider_plugin::plugin_definition,
                 ),
             ],
         )
@@ -67331,20 +67466,20 @@ library = "test"
             false,
         )
         .await;
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.workflow".into(), "bcode.default-agents".into()]),
                 disabled: BTreeSet::new(),
             },
             &[
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
-                    bcode_workflow_plugin::static_plugin(),
+                    bcode_workflow_plugin::plugin_definition,
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                    bcode_default_agents_plugin::static_plugin(),
+                    bcode_default_agents_plugin::plugin_definition,
                 ),
             ],
         )
@@ -73540,9 +73675,13 @@ abi_version = 5
 library = "libbcode_shell_plugin.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
+        fn subscribing_shell_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+            shell_definition_declaring(SUBSCRIBING_SHELL_MANIFEST)
+        }
         let state = Arc::new(test_server_state_with_shell_plugin_manifest(
             SessionManager::default(),
             SUBSCRIBING_SHELL_MANIFEST,
+            subscribing_shell_definition,
         ));
         let direct_services = plugin_operations::list_services(state.as_ref());
         let direct_diagnostics = server_operations::model_catalog_diagnostics(state.as_ref()).await;
@@ -76778,29 +76917,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("native search session")
             .id;
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::from([
-                        "bcode.fake-provider".to_owned(),
-                        "bcode.web-search".to_owned(),
-                    ]),
-                    disabled: BTreeSet::new(),
-                },
-                &[
-                    bcode_plugin::StaticBundledPlugin::new(
-                        include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                        bcode_fake_provider_plugin::static_plugin(),
-                    ),
-                    bcode_plugin::StaticBundledPlugin::new(
-                        include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
-                        bcode_web_search_plugin::static_plugin(),
-                    ),
-                ],
-            )
-            .expect("load web-search and fake-provider plugins"),
-        );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from([
+                    "bcode.fake-provider".to_owned(),
+                    "bcode.web-search".to_owned(),
+                ]),
+                disabled: BTreeSet::new(),
+            },
+            &[
+                crate::tests::shared_test_plugin(
+                    include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                    bcode_fake_provider_plugin::plugin_definition,
+                ),
+                crate::tests::shared_test_plugin(
+                    include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
+                    bcode_web_search_plugin::plugin_definition,
+                ),
+            ],
+        )
+        .expect("load web-search and fake-provider plugins"),);
         let state = Arc::new({
             let mut state = test_server_state(sessions);
             state.trace_store = TraceStore::new(workspace.path().join("traces"));
@@ -76918,15 +77055,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
     fn test_server_state_with_fake_provider_and_filesystem(
         sessions: SessionManager,
     ) -> ServerState {
-        let provider = bcode_plugin::StaticBundledPlugin::new(
+        let provider = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-            bcode_fake_provider_plugin::static_plugin(),
+            bcode_fake_provider_plugin::plugin_definition,
         );
-        let filesystem = bcode_plugin::StaticBundledPlugin::new(
+        let filesystem = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
+            bcode_filesystem_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from([
@@ -76944,11 +77081,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     fn test_server_state_with_filesystem_plugin(sessions: SessionManager) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
+            bcode_filesystem_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.filesystem".to_string()]),
@@ -76966,18 +77103,54 @@ event_symbol = "bcode_plugin_handle_event_v1"
         test_server_state_with_shell_plugin_manifest(
             sessions,
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::plugin_definition,
         )
+    }
+
+    /// Shell implementation declared by a fixture manifest.
+    ///
+    /// The shared runtime admits a definition only when its embedded manifest equals the
+    /// selected registration manifest. Fixtures that extend the shell declaration with
+    /// host-side contributions (workflow templates, event subscriptions) are therefore a
+    /// distinct fixture plugin: the same implementation, embedding the fixture manifest.
+    /// The fixture must not change the identity, version, roles, required capabilities or
+    /// service contracts the implementation was built for.
+    ///
+    /// The fixture is built through the same SDK manifest adapter as the shell's own
+    /// `plugin_definition()` (projection of product service declarations plus declaration
+    /// validation, with the shell's real component registrations). Overwriting
+    /// `metadata.manifest_toml` on an already-built definition would embed an unprojected
+    /// declaration that the shared factory rejects.
+    fn shell_definition_declaring(
+        manifest_toml: &str,
+    ) -> bcode_plugin_sdk::definition::PluginDefinition {
+        use bcode_plugin_sdk::RustPlugin as _;
+        use bcode_plugin_sdk::definition::concurrent_plugin_definition_from_manifest;
+        use bcode_shell_plugin::ShellPlugin;
+        let production = bcode_shell_plugin::plugin_definition();
+        let definition = concurrent_plugin_definition_from_manifest::<ShellPlugin>(
+            manifest_toml,
+            ShellPlugin::component_registrations(),
+        )
+        .expect("fixture shell manifest declaration");
+        assert_eq!(definition.metadata.plugin_id, production.metadata.plugin_id);
+        assert_eq!(definition.metadata.version, production.metadata.version);
+        assert_eq!(definition.metadata.roles, production.metadata.roles);
+        assert_eq!(
+            definition.metadata.required_capabilities,
+            production.metadata.required_capabilities
+        );
+        assert_eq!(definition.metadata.contracts, production.metadata.contracts);
+        definition
     }
 
     fn test_server_state_with_shell_plugin_manifest(
         sessions: SessionManager,
         manifest_toml: &'static str,
+        definition: fn() -> bcode_plugin_sdk::definition::PluginDefinition,
     ) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
-            manifest_toml,
-            bcode_shell_plugin::static_plugin(),
-        );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugin = crate::tests::shared_test_plugin(manifest_toml, definition);
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.shell".to_string()]),
@@ -76993,11 +77166,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[cfg(unix)]
     fn test_server_state_with_vim_edit_plugin(sessions: SessionManager) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
-            bcode_vim_edit_plugin::static_plugin(),
+            bcode_vim_edit_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.vim-edit".to_string()]),
@@ -79905,7 +80078,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].invocation_id, "healthy");
         assert_eq!(results[1].invocation_id, "recovered");
-        assert!(results.iter().all(|record| !record.is_error));
+        assert!(
+            results.iter().all(|record| !record.is_error),
+            "both sibling tool calls must succeed: {results:#?}"
+        );
     }
 
     #[tokio::test]
@@ -83469,11 +83645,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
     fn test_server_state_with_question_plugin(sessions: SessionManager) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
+            bcode_question_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.question".to_string()]),
@@ -84580,11 +84756,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
     ) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-            bcode_fake_provider_plugin::static_plugin(),
+            bcode_fake_provider_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.fake-provider".to_string()]),
@@ -84610,15 +84786,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
     ) -> ServerState {
-        let provider = bcode_plugin::StaticBundledPlugin::new(
+        let provider = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-            bcode_fake_provider_plugin::static_plugin(),
+            bcode_fake_provider_plugin::plugin_definition,
         );
-        let agents = bcode_plugin::StaticBundledPlugin::new(
+        let agents = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-            bcode_default_agents_plugin::static_plugin(),
+            bcode_default_agents_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from([
@@ -84735,11 +84911,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::significant_drop_tightening)] // The plugin host remains active through setup discovery.
     async fn judgement_setup_shows_unconfigured_jev_models_without_credentials() {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
-            bcode_jev_provider_plugin::static_plugin(),
+            bcode_jev_provider_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.jev".into()]),
@@ -84816,11 +84992,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 stream.write_all(reply.as_bytes()).expect("reply");
             }
         });
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
-            bcode_jev_provider_plugin::static_plugin(),
+            bcode_jev_provider_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.jev".into()]),
@@ -84934,11 +85110,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             std::env::var_os("BCODE_JEV_API_KEY").is_none(),
             "unset alternate Jev key for this live test"
         );
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
-            bcode_jev_provider_plugin::static_plugin(),
+            bcode_jev_provider_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.jev".into()]),
@@ -84994,11 +85170,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::significant_drop_tightening)] // The server owns the registered provider until shutdown.
     async fn judgement_jev_environment_auth_is_owned_and_does_not_select_chat() {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
-            bcode_jev_provider_plugin::static_plugin(),
+            bcode_jev_provider_plugin::plugin_definition,
         );
-        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let host = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.jev".into()]),
@@ -85267,11 +85443,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     pub fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-            bcode_fake_provider_plugin::static_plugin(),
+            bcode_fake_provider_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.fake-provider".to_string()]),
@@ -86281,17 +86457,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn precancelled_embedded_startup_skips_resource_acquisition() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().to_path_buf());
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::new(),
-                    disabled: BTreeSet::new(),
-                },
-                &[],
-            )
-            .expect("empty plugin runtime"),
-        );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::new(),
+                disabled: BTreeSet::new(),
+            },
+            &[],
+        )
+        .expect("empty plugin runtime"),);
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         shutdown.cancel();
         run_embedded_with_services_and_shutdown(
@@ -86315,23 +86489,45 @@ event_symbol = "bcode_plugin_handle_event_v1"
             DEACTIVATIONS.fetch_add(1, Ordering::SeqCst);
             1
         }
-        let mut vtable = bcode_prompt_profile_plugin::static_plugin();
-        vtable.deactivate = fail_deactivation;
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
-            include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
-            vtable,
-        );
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::from(["bcode.prompt-profile".to_owned()]),
-                    disabled: BTreeSet::new(),
-                },
-                &[plugin],
+        #[derive(Default)]
+        struct CleanupProfile(bcode_prompt_profile_plugin::PromptProfilePlugin);
+        impl bcode_plugin_sdk::RustPlugin for CleanupProfile {
+            fn deactivate(&mut self) -> Result<(), bcode_plugin_sdk::PluginError> {
+                if fail_deactivation(std::ptr::null()) == 0 {
+                    Ok(())
+                } else {
+                    Err(bcode_plugin_sdk::PluginError::failed(
+                        "injected cleanup failure",
+                    ))
+                }
+            }
+            fn invoke_service(
+                &mut self,
+                context: bcode_plugin_sdk::NativeServiceContext,
+            ) -> bcode_plugin_sdk::ServiceResponse {
+                bcode_plugin_sdk::RustPlugin::invoke_service(&mut self.0, context)
+            }
+        }
+        fn definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<CleanupProfile>(
+                include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
+                bcode_plugin_sdk::definition::ProductRegistrations::default(),
             )
-            .expect("load plugin"),
+            .expect("cleanup profile definition")
+        }
+        let plugin = shared_test_plugin(
+            include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
+            definition,
         );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.prompt-profile".to_owned()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load plugin"),);
         let directory = tempfile::tempdir().expect("temporary directory");
         let shutdown = bcode_agent_runtime::CancellationToken::new();
         shutdown.cancel();
@@ -86372,17 +86568,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ),
             )
             .expect("resolve locations");
-            let (plugins,) = (
-                bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                    &bcode_plugin::PluginSelection {
-                        mode: bcode_plugin::PluginSelectionMode::Explicit,
-                        enabled: BTreeSet::new(),
-                        disabled: BTreeSet::new(),
-                    },
-                    &[],
-                )
-                .expect("empty plugins"),
-            );
+            let (plugins,) = (crate::tests::load_test_plugins(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: BTreeSet::new(),
+                    disabled: BTreeSet::new(),
+                },
+                &[],
+            )
+            .expect("empty plugins"),);
             let shutdown = bcode_agent_runtime::CancellationToken::new();
             let socket = directory.path().join(format!("{name}.sock"));
             let client = bcode_client::BcodeClient::for_state_location(
@@ -86460,17 +86654,41 @@ event_symbol = "bcode_plugin_handle_event_v1"
             DEACTIVATIONS.fetch_add(1, Ordering::SeqCst);
             0
         }
-        let mut vtable = bcode_prompt_profile_plugin::static_plugin();
-        vtable.deactivate = deactivate;
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        #[derive(Default)]
+        struct CleanupProfile(bcode_prompt_profile_plugin::PromptProfilePlugin);
+        impl bcode_plugin_sdk::RustPlugin for CleanupProfile {
+            fn deactivate(&mut self) -> Result<(), bcode_plugin_sdk::PluginError> {
+                if deactivate(std::ptr::null()) == 0 {
+                    Ok(())
+                } else {
+                    Err(bcode_plugin_sdk::PluginError::failed(
+                        "injected cleanup failure",
+                    ))
+                }
+            }
+            fn invoke_service(
+                &mut self,
+                context: bcode_plugin_sdk::NativeServiceContext,
+            ) -> bcode_plugin_sdk::ServiceResponse {
+                bcode_plugin_sdk::RustPlugin::invoke_service(&mut self.0, context)
+            }
+        }
+        fn definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<CleanupProfile>(
+                include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
+                bcode_plugin_sdk::definition::ProductRegistrations::default(),
+            )
+            .expect("cleanup profile definition")
+        }
+        let plugin = shared_test_plugin(
             include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
-            vtable,
+            definition,
         );
         let directory = tempfile::tempdir().expect("temporary directory");
         let result = run_embedded_with_services_and_shutdown(
             bcode_ipc::IpcEndpoint::unix_socket(directory.path().to_path_buf()),
             bcode_config::BcodeConfig::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: BTreeSet::from(["bcode.prompt-profile".to_owned()]),
@@ -86501,11 +86719,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     fn test_server_state_with_prompt_profile(sessions: SessionManager) -> ServerState {
-        let profile = bcode_plugin::StaticBundledPlugin::new(
+        let profile = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/prompt-profile-plugin/bcode-plugin.toml"),
-            bcode_prompt_profile_plugin::static_plugin(),
+            bcode_prompt_profile_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.prompt-profile".to_string()]),
@@ -86665,11 +86883,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
     /// that interface, so workflow-start tests need the default agents plugin loaded. The base
     /// fixture deliberately loads no plugins, so this keeps that default intact.
     fn test_server_state_with_default_agents(sessions: SessionManager) -> ServerState {
-        let agents = bcode_plugin::StaticBundledPlugin::new(
+        let agents = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-            bcode_default_agents_plugin::static_plugin(),
+            bcode_default_agents_plugin::plugin_definition,
         );
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.default-agents".to_string()]),
@@ -89911,20 +90129,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut store =
             bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
                 .expect("store");
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::from(["bcode.test-preparing-workflow-block".to_string()]),
-                    disabled: BTreeSet::new(),
-                },
-                &[bcode_plugin::StaticBundledPlugin::new(
-                    preparing_workflow_manifest(),
-                    preparing_workflow_plugin(),
-                )],
-            )
-            .expect("plugins"),
-        );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.test-preparing-workflow-block".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                preparing_workflow_manifest(),
+                preparing_workflow_plugin(),
+            )],
+        )
+        .expect("plugins"),);
         let block = plugins
             .registry()
             .manifests()
@@ -90128,20 +90344,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
-                    disabled: BTreeSet::new(),
-                },
-                &[bcode_plugin::StaticBundledPlugin::new(
-                    manifest_toml,
-                    delayed_workflow_plugin(),
-                )],
-            )
-            .expect("plugins"),
-        );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                manifest_toml,
+                delayed_workflow_plugin(),
+            )],
+        )
+        .expect("plugins"),);
         let (mut state,) = (test_server_state(sessions),);
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(store).into();
@@ -90317,20 +90531,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let (plugins,) = (
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
-                    disabled: BTreeSet::new(),
-                },
-                &[bcode_plugin::StaticBundledPlugin::new(
-                    manifest_toml,
-                    delayed_workflow_plugin(),
-                )],
-            )
-            .expect("plugins"),
-        );
+        let (plugins,) = (crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                manifest_toml,
+                delayed_workflow_plugin(),
+            )],
+        )
+        .expect("plugins"),);
         let (mut state,) = (test_server_state(sessions),);
         state.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
         state.state_root = workflow_root.path().to_path_buf();
@@ -97398,15 +97610,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     fn external_template_test_state(root: &Path) -> Arc<ServerState> {
-        external_templates_test_state(root, 1)
+        external_templates_test_state::<1>(root)
     }
 
-    fn external_templates_test_state(root: &Path, count: usize) -> Arc<ServerState> {
-        use sha2::Digest as _;
+    fn external_template_source_bytes() -> Vec<u8> {
         let mut document = test_workflow_authoring_document();
         document.requirements.plugins.clear();
-        let bytes = serde_json::to_vec(&document).expect("document");
-        std::fs::write(root.join("template.json"), &bytes).expect("template source");
+        serde_json::to_vec(&document).expect("document")
+    }
+
+    /// Declared (unresolved) fixture manifest. The package-root template source is
+    /// resolved by the host loader; the fixture definition embeds this declaration.
+    fn external_templates_shell_manifest(count: usize) -> String {
+        use sha2::Digest as _;
+        let bytes = external_template_source_bytes();
         let mut manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
             "../../../plugins/shell-plugin/bcode-plugin.toml"
         ))
@@ -97435,17 +97652,26 @@ event_symbol = "bcode_plugin_handle_event_v1"
             template.template_id = format!("external-{index:03}");
             manifest.workflow_templates.push(template);
         }
-        let manifest = Box::leak(
-            toml::to_string(&manifest)
-                .expect("manifest")
-                .into_boxed_str(),
-        );
+        toml::to_string(&manifest).expect("manifest")
+    }
+
+    fn external_templates_shell_definition<const COUNT: usize>()
+    -> bcode_plugin_sdk::definition::PluginDefinition {
+        shell_definition_declaring(&external_templates_shell_manifest(COUNT))
+    }
+
+    fn external_templates_test_state<const COUNT: usize>(root: &Path) -> Arc<ServerState> {
+        std::fs::write(root.join("template.json"), external_template_source_bytes())
+            .expect("template source");
+        let manifest = Box::leak(external_templates_shell_manifest(COUNT).into_boxed_str());
         let root = Box::leak(root.to_str().expect("root").to_string().into_boxed_str());
-        let plugin =
-            bcode_plugin::StaticBundledPlugin::new(manifest, bcode_shell_plugin::static_plugin())
-                .with_package_root(root);
+        let plugin = crate::tests::shared_test_plugin(
+            manifest,
+            external_templates_shell_definition::<COUNT>,
+        )
+        .with_package_root(root);
         let mut state = test_server_state(SessionManager::default());
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from([
@@ -97457,13 +97683,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             &[
                 plugin,
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                    bcode_default_agents_plugin::static_plugin(),
+                    bcode_default_agents_plugin::plugin_definition,
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                    bcode_fake_provider_plugin::static_plugin(),
+                    bcode_fake_provider_plugin::plugin_definition,
                 ),
             ],
         )
@@ -97824,9 +98050,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         server.await.expect("server");
     }
 
-    #[tokio::test]
-    async fn populated_template_reads_match_application_over_ipc() {
-        use bcode_workflow::WorkflowAuthoringApplication as _;
+    /// Deterministic fixture manifest; the fixture definition embeds the identical text.
+    fn populated_template_shell_manifest() -> String {
         let document = test_workflow_authoring_document();
         let mut manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
             "../../../plugins/shell-plugin/bcode-plugin.toml"
@@ -97848,15 +98073,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 required_capabilities: Vec::new(),
                 presentation: BTreeMap::from([("category".into(), "integration".into())]),
             });
+        toml::to_string(&manifest).expect("serialize manifest")
+    }
+
+    fn populated_template_shell_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+        shell_definition_declaring(&populated_template_shell_manifest())
+    }
+
+    #[tokio::test]
+    async fn populated_template_reads_match_application_over_ipc() {
+        use bcode_workflow::WorkflowAuthoringApplication as _;
         // Static bundled plugin manifests are process-lifetime inputs, including test fixtures.
-        let manifest = Box::leak(
-            toml::to_string(&manifest)
-                .expect("serialize manifest")
-                .into_boxed_str(),
-        );
+        let manifest = Box::leak(populated_template_shell_manifest().into_boxed_str());
         let state = Arc::new(test_server_state_with_shell_plugin_manifest(
             SessionManager::default(),
             manifest,
+            populated_template_shell_definition,
         ));
         let direct =
             workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new())
@@ -103017,9 +103249,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn cancellation_during_provider_native_work_persists_no_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
-            .create_session(Some("cancel native".to_owned()), test_working_directory())
+            .create_session(
+                Some("cancel native".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session should be created");
         let session_id = summary.id;
@@ -103046,6 +103282,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
             bcode_config::CompactionBackend::ProviderNative;
@@ -103067,22 +103304,34 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 
-        let compaction = compact_session_context_with_limit(
-            &state,
-            session_id,
-            &selection,
-            None,
-            None,
-            &cancel_state,
-            None,
-        );
-        let cancellation = async {
-            while !bcode_fake_provider_plugin::fake_compaction_started() {
-                tokio::task::yield_now().await;
+        let result = {
+            let compaction = compact_session_context_with_limit(
+                &state,
+                session_id,
+                &selection,
+                None,
+                None,
+                &cancel_state,
+                None,
+            );
+            let cancellation = async {
+                while !bcode_fake_provider_plugin::fake_compaction_started() {
+                    tokio::task::yield_now().await;
+                }
+                cancel_state.cancel().await;
+            };
+            tokio::pin!(compaction);
+            tokio::select! {
+                biased;
+                result = &mut compaction => {
+                    match result {
+                        Ok(_) => panic!("compaction completed successfully before the required provider cancellation stage"),
+                        Err(error) => panic!("compaction failed before the required provider cancellation stage: {error}"),
+                    }
+                }
+                () = cancellation => compaction.await,
             }
-            cancel_state.cancel().await;
         };
-        let (result, ()) = tokio::join!(compaction, cancellation);
         assert!(matches!(result, Err(CompactionError::Cancelled)));
 
         let history = state
@@ -103100,9 +103349,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn cancellation_after_native_success_during_summary_persists_no_marker() {
+        let compaction_cwd = tempfile::tempdir().expect("isolated compaction cwd");
         let sessions = SessionManager::default();
         let summary = sessions
-            .create_session(Some("cancel summary".to_owned()), test_working_directory())
+            .create_session(
+                Some("cancel summary".to_owned()),
+                compaction_cwd.path().to_path_buf(),
+            )
             .await
             .expect("session should be created");
         let session_id = summary.id;
@@ -103129,6 +103382,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append assistant turn");
         }
         let mut state = test_server_state_with_fake_provider(sessions);
+        isolate_compaction_request_fixture(&mut state);
         state.startup_config.model.compaction.keep_recent_tokens = 1;
         state.startup_config.model.compaction.backend =
             bcode_config::CompactionBackend::ProviderNative;
@@ -103149,22 +103403,34 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 
-        let compaction = compact_session_context_with_limit(
-            &state,
-            session_id,
-            &selection,
-            None,
-            None,
-            &cancel_state,
-            None,
-        );
-        let cancellation = async {
-            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
-                tokio::task::yield_now().await;
+        let result = {
+            let compaction = compact_session_context_with_limit(
+                &state,
+                session_id,
+                &selection,
+                None,
+                None,
+                &cancel_state,
+                None,
+            );
+            let cancellation = async {
+                while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
+                    tokio::task::yield_now().await;
+                }
+                cancel_state.cancel().await;
+            };
+            tokio::pin!(compaction);
+            tokio::select! {
+                biased;
+                result = &mut compaction => {
+                    match result {
+                        Ok(_) => panic!("compaction completed successfully before the required provider cancellation stage"),
+                        Err(error) => panic!("compaction failed before the required provider cancellation stage: {error}"),
+                    }
+                }
+                () = cancellation => compaction.await,
             }
-            cancel_state.cancel().await;
         };
-        let (result, ()) = tokio::join!(compaction, cancellation);
         assert!(matches!(result, Err(CompactionError::Cancelled)));
         assert!(bcode_fake_provider_plugin::fake_compaction_started());
 
@@ -107559,20 +107825,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
     async fn discovery_preserves_workflow_tools_without_preparing_fake_invocations() {
         let (mut state,) = (test_server_state(SessionManager::default()),);
         register_workflow_publication_tool(&mut state);
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["bcode.workflow".into(), "bcode.question".into()]),
                 disabled: BTreeSet::new(),
             },
             &[
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
-                    bcode_workflow_plugin::static_plugin(),
+                    bcode_workflow_plugin::plugin_definition,
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-                    bcode_question_plugin::static_plugin(),
+                    bcode_question_plugin::plugin_definition,
                 ),
             ],
         )

@@ -331,17 +331,16 @@ fn session_summary(session_id: SessionId) -> SessionSummary {
 }
 
 fn shell_plugin_host() -> bcode_plugin::PluginHost {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+    let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-        bcode_shell_plugin::static_plugin(),
+        bcode_shell_plugin::plugin_definition,
     )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
+    let selected = bcode_plugin::filter_selected_static_registrations(
         &bundled,
         &bcode_plugin::PluginSelection::all_enabled(),
     )
     .expect("static shell plugin manifest should parse");
-    bcode_plugin::PluginHost::load_static_plugins(&selected)
-        .expect("static shell plugin should load")
+    crate::plugin_tui::fixture::load_static(&selected).expect("static shell plugin should load")
 }
 
 fn shell_run_artifact() -> bcode_session_models::ToolArtifact {

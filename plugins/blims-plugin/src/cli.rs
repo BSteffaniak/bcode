@@ -1,4 +1,17 @@
 #![allow(clippy::module_name_repetitions)]
+
+mod portable;
+pub use portable::{descriptor, invoke_portable};
+
+/// Open the office only after a local frontend accepts `blims.office`.
+///
+/// # Errors
+/// Returns a secret-safe failure when local terminal presentation cannot continue.
+pub async fn open_office() -> Result<(), String> {
+    enter_blims_office()
+        .await
+        .map_err(|_| "Blims could not continue; inspect pending work before restarting".to_owned())
+}
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -52,6 +65,7 @@ enum CliError {
     Json(#[from] serde_json::Error),
 }
 
+#[must_use]
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: |_| true,
@@ -59,20 +73,136 @@ pub fn registration() -> StaticCliRegistration {
         invoke,
     }
 }
+use std::fmt::Write as _;
+
+#[derive(Default)]
+struct CliOutput {
+    stdout: String,
+    stderr: String,
+    overflowed: bool,
+}
+
+impl CliOutput {
+    const LIMIT: usize = 1_048_576;
+
+    fn line(&mut self, arguments: std::fmt::Arguments<'_>) {
+        self.append(arguments, false);
+    }
+
+    fn error_line(&mut self, arguments: std::fmt::Arguments<'_>) {
+        self.append(arguments, true);
+    }
+
+    fn append(&mut self, arguments: std::fmt::Arguments<'_>, error: bool) {
+        // The formatter writes incrementally into a bounded invocation-local sink.
+        // No process descriptor, TLS buffer or shared output capture is involved.
+        struct Bounded<'a> {
+            text: &'a mut String,
+            remaining: usize,
+        }
+        impl std::fmt::Write for Bounded<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                if text.len() > self.remaining {
+                    return Err(std::fmt::Error);
+                }
+                self.remaining -= text.len();
+                self.text.push_str(text);
+                Ok(())
+            }
+        }
+        if self.overflowed {
+            return;
+        }
+        let remaining = Self::LIMIT.saturating_sub(self.stdout.len() + self.stderr.len());
+        let text = if error {
+            &mut self.stderr
+        } else {
+            &mut self.stdout
+        };
+        let mut sink = Bounded { text, remaining };
+        self.overflowed = writeln!(sink, "{arguments}").is_err();
+    }
+}
+
+/// Structured handler used identically by native and portable CLI dispatch.
+pub(super) fn invoke_structured(
+    matches: clap::ArgMatches,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<bcode_command::cli::CliOutcome, String>> + Send>,
+> {
+    Box::pin(async move {
+        use bcode_command::cli::{CliHostAction, CliOutcome};
+        let cli = BlimsCli::from_arg_matches(&matches)
+            .map_err(|_| "invalid Blims arguments".to_owned())?;
+        if matches!(cli.command, BlimsCommand::Enter) {
+            return Ok(CliOutcome {
+                host_action: Some(CliHostAction::OpenTuiSurface {
+                    surface_kind: "blims.office".into(),
+                    repo_path: None,
+                    options: BTreeMap::new(),
+                }),
+                ..CliOutcome::default()
+            });
+        }
+        let mut output = CliOutput::default();
+        let result = handle_blims_command(&mut output, cli.command).await;
+        // Session actions cannot be mixed with output. Progress accumulated before
+        // attaching is intentionally not published as terminal output.
+        if let Err(CliError::AttachSession(session_id)) = &result {
+            return Ok(CliOutcome {
+                host_action: Some(CliHostAction::AttachSession {
+                    session_id: *session_id,
+                }),
+                ..CliOutcome::default()
+            });
+        }
+        if output.overflowed {
+            return Err(
+                "Blims output exceeded limit after execution; inspect pending work, do not replay"
+                    .into(),
+            );
+        }
+        if result.is_err() {
+            output.error_line(format_args!(
+                "Blims command failed; inspect pending work before retrying"
+            ));
+        }
+        Ok(CliOutcome {
+            exit_code: u8::from(result.is_err() || !output.stderr.is_empty()),
+            stdout: output.stdout.into_bytes(),
+            stderr: output.stderr.into_bytes(),
+            host_action: None,
+        })
+    })
+}
+
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
-        let cli = BlimsCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
-        let native_ui = matches!(cli.command, BlimsCommand::Enter);
-        match handle_blims_command(cli.command).await {
-            Ok(outcome) => Ok(outcome),
-            Err(CliError::AttachSession(session_id)) => Ok(StaticCliOutcome {
-                host_action: Some(StaticCliHostAction::AttachSession { session_id }),
-            }),
-            Err(_) if native_ui => Err(
-                "Blims could not continue. Check the terminal and service connection; inspect pending work before restarting.".into(),
-            ),
-            Err(error) => Err(error.to_string()),
+        let outcome = invoke_structured(matches).await?;
+        let host_action = match outcome.host_action {
+            Some(bcode_command::cli::CliHostAction::AttachSession { session_id }) => {
+                Some(StaticCliHostAction::AttachSession { session_id })
+            }
+            Some(bcode_command::cli::CliHostAction::OpenTuiSurface { .. }) => {
+                open_office().await?;
+                None
+            }
+            None => None,
+        };
+        if !outcome.stdout.is_empty() {
+            std::io::stdout()
+                .write_all(&outcome.stdout)
+                .map_err(|error| error.to_string())?;
         }
+        if !outcome.stderr.is_empty() {
+            std::io::stderr()
+                .write_all(&outcome.stderr)
+                .map_err(|error| error.to_string())?;
+        }
+        if outcome.exit_code != 0 {
+            return Err("Blims command failed".into());
+        }
+        Ok(StaticCliOutcome { host_action })
     })
 }
 
@@ -783,19 +913,29 @@ impl BlimsCeoDashboardState {
     }
 }
 
-async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome, CliError> {
+async fn handle_blims_command(
+    output: &mut CliOutput,
+    command: BlimsCommand,
+) -> Result<StaticCliOutcome, CliError> {
     match command {
-        BlimsCommand::Status { json } => Box::pin(print_blims_status(json)).await?,
-        BlimsCommand::Create { json } => Box::pin(create_blims_company(json)).await?,
+        BlimsCommand::Status { json } => Box::pin(print_blims_status(output, json)).await?,
+        BlimsCommand::Create { json } => Box::pin(create_blims_company(output, json)).await?,
         BlimsCommand::Pause { json } => {
-            print_company_lifecycle_update("company.pause", "Blims company paused", json).await?;
+            print_company_lifecycle_update(output, "company.pause", "Blims company paused", json)
+                .await?;
         }
         BlimsCommand::Resume { json } => {
-            print_company_lifecycle_update("company.resume", "Blims company resumed", json).await?;
+            print_company_lifecycle_update(output, "company.resume", "Blims company resumed", json)
+                .await?;
         }
         BlimsCommand::Shutdown { json } => {
-            print_company_lifecycle_update("company.shutdown", "Blims company shut down", json)
-                .await?;
+            print_company_lifecycle_update(
+                output,
+                "company.shutdown",
+                "Blims company shut down",
+                json,
+            )
+            .await?;
         }
         BlimsCommand::Inspect { .. }
         | BlimsCommand::Hire { .. }
@@ -803,54 +943,70 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome,
         | BlimsCommand::Fire { .. }
         | BlimsCommand::Permissions { .. }
         | BlimsCommand::SetPermission { .. } => {
-            Box::pin(handle_blims_agent_command(command)).await?;
+            Box::pin(handle_blims_agent_command(output, command)).await?;
         }
         BlimsCommand::Agents { json } => {
             let response = call_blims_service("agent.list", blims_workspace_payload()?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
                 let agents = decode_blims_response::<Vec<BlimsAgentSnapshot>>(response)?;
                 for agent in agents {
-                    println!(
+                    output.line(format_args!(
                         "{}\t{}\t{}\t{}\t{}",
                         agent.id, agent.name, agent.role, agent.room_id, agent.status
-                    );
+                    ));
                 }
             }
         }
         BlimsCommand::World { json } => {
             let response = call_blims_service("world.snapshot", blims_workspace_payload()?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
                 let world = decode_blims_response::<BlimsWorldSnapshot>(response)?;
-                print_blims_world(&world);
+                print_blims_world(output, &world);
             }
         }
-        BlimsCommand::WorldTemplates { json } => print_world_templates(json).await?,
+        BlimsCommand::WorldTemplates { json } => print_world_templates(output, json).await?,
         BlimsCommand::SelectWorld { template_id, json } => {
-            select_world_template(template_id, json).await?;
+            select_world_template(output, template_id, json).await?;
         }
         BlimsCommand::Enter => enter_blims_office().await?,
-        BlimsCommand::Talk { agent_id } => Box::pin(start_blims_agent_talk_cli(agent_id)).await?,
-        BlimsCommand::AiWork { command } => Box::pin(handle_blims_ai_work_command(command)).await?,
-        BlimsCommand::Task { command } => Box::pin(handle_blims_task_command(command)).await?,
+        BlimsCommand::Talk { agent_id } => {
+            Box::pin(start_blims_agent_talk_cli(output, agent_id)).await?;
+        }
+        BlimsCommand::AiWork { command } => {
+            Box::pin(handle_blims_ai_work_command(output, command)).await?;
+        }
+        BlimsCommand::Task { command } => {
+            Box::pin(handle_blims_task_command(output, command)).await?;
+        }
         BlimsCommand::Artifact { command } => {
-            Box::pin(handle_blims_artifact_command(command)).await?;
+            Box::pin(handle_blims_artifact_command(output, command)).await?;
         }
         BlimsCommand::Proposal { command } => {
-            Box::pin(handle_blims_proposal_command(command)).await?;
+            Box::pin(handle_blims_proposal_command(output, command)).await?;
         }
         BlimsCommand::Initiative { command } => {
-            Box::pin(handle_blims_initiative_command(command)).await?;
+            Box::pin(handle_blims_initiative_command(output, command)).await?;
         }
         BlimsCommand::Guidance { command } => {
-            Box::pin(handle_blims_guidance_command(command)).await?;
+            Box::pin(handle_blims_guidance_command(output, command)).await?;
         }
+        command => handle_blims_report_command(output, command).await?,
+    }
+    Ok(StaticCliOutcome::default())
+}
+
+async fn handle_blims_report_command(
+    output: &mut CliOutput,
+    command: BlimsCommand,
+) -> Result<(), CliError> {
+    match command {
         BlimsCommand::Report { json } => {
             let response = call_blims_service("report.morning", blims_workspace_payload()?).await?;
-            print_report_response::<BlimsMorningReport>(response, json)?;
+            print_report_response::<BlimsMorningReport>(output, response, json)?;
         }
         BlimsCommand::DepartmentReport {
             department_id,
@@ -862,7 +1018,7 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome,
             });
             let response =
                 call_blims_service("report.department", serde_json::to_vec(&request)?).await?;
-            print_report_response::<BlimsFocusedReport>(response, json)?;
+            print_report_response::<BlimsFocusedReport>(output, response, json)?;
         }
         BlimsCommand::AgentReport { agent_id, json } => {
             let request = serde_json::json!({
@@ -871,16 +1027,20 @@ async fn handle_blims_command(command: BlimsCommand) -> Result<StaticCliOutcome,
             });
             let response =
                 call_blims_service("report.agent", serde_json::to_vec(&request)?).await?;
-            print_report_response::<BlimsFocusedReport>(response, json)?;
+            print_report_response::<BlimsFocusedReport>(output, response, json)?;
         }
+        _ => return Err(CliError::Blims("unsupported report command".into())),
     }
-    Ok(StaticCliOutcome::default())
+    Ok(())
 }
 
-async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliError> {
+async fn handle_blims_agent_command(
+    output: &mut CliOutput,
+    command: BlimsCommand,
+) -> Result<(), CliError> {
     match command {
         BlimsCommand::Inspect { agent_id, json } => {
-            print_agent_service_result("agent.inspect", &agent_id, json).await?;
+            print_agent_service_result(output, "agent.inspect", &agent_id, json).await?;
         }
         BlimsCommand::Hire {
             agent_id,
@@ -889,16 +1049,16 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
             room_id,
             json,
         } => {
-            hire_blims_agent(agent_id, name, role, room_id, json).await?;
+            hire_blims_agent(output, agent_id, name, role, room_id, json).await?;
         }
         BlimsCommand::Suspend { agent_id, json } => {
-            print_agent_service_result("agent.suspend", &agent_id, json).await?;
+            print_agent_service_result(output, "agent.suspend", &agent_id, json).await?;
         }
         BlimsCommand::Fire { agent_id, json } => {
-            print_agent_service_result("agent.fire", &agent_id, json).await?;
+            print_agent_service_result(output, "agent.fire", &agent_id, json).await?;
         }
         BlimsCommand::Permissions { agent_id, json } => {
-            print_agent_permission(&agent_id, json).await?;
+            print_agent_permission(output, &agent_id, json).await?;
         }
         BlimsCommand::SetPermission {
             agent_id,
@@ -911,6 +1071,7 @@ async fn handle_blims_agent_command(command: BlimsCommand) -> Result<(), CliErro
             json,
         } => {
             set_agent_permission(
+                output,
                 agent_id,
                 bcode_agent_id,
                 command,
@@ -1033,7 +1194,7 @@ fn blims_client() -> BcodeClient {
         .unwrap_or_else(|_| BcodeClient::default_endpoint())
 }
 
-fn native_blims_client(client: BcodeClient) -> BcodeClient {
+const fn native_blims_client(client: BcodeClient) -> BcodeClient {
     client.with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning)
 }
 
@@ -1263,7 +1424,7 @@ impl BlimsServiceRecovery {
         message.clone_into(status);
         match mode {
             BlimsTuiMode::Conversation(conversation) => {
-                message.clone_into(&mut conversation.status)
+                message.clone_into(&mut conversation.status);
             }
             BlimsTuiMode::Dashboard(dashboard) => message.clone_into(&mut dashboard.status),
             BlimsTuiMode::Office => {}
@@ -1941,12 +2102,7 @@ impl BlimsTuiApp {
                     self.jobs.world_tick = None;
                     dirty = true;
                 }
-                Ok(Err(_)) => {
-                    self.recovery.fail(&mut self.mode, &mut self.status, true);
-                    self.jobs.world_tick = None;
-                    dirty = true;
-                }
-                Err(TryRecvError::Disconnected) => {
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
                     self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.world_tick = None;
                     dirty = true;
@@ -1966,12 +2122,7 @@ impl BlimsTuiApp {
                     self.jobs.player_room_sync = None;
                     dirty = true;
                 }
-                Ok(Err(_)) => {
-                    self.recovery.fail(&mut self.mode, &mut self.status, true);
-                    self.jobs.player_room_sync = None;
-                    dirty = true;
-                }
-                Err(TryRecvError::Disconnected) => {
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
                     self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.player_room_sync = None;
                     dirty = true;
@@ -2001,12 +2152,7 @@ impl BlimsTuiApp {
                     self.last_world_tick = Instant::now();
                     dirty = true;
                 }
-                Ok(Err(_)) => {
-                    self.recovery.fail(&mut self.mode, &mut self.status, true);
-                    self.jobs.world_template_select = None;
-                    dirty = true;
-                }
-                Err(TryRecvError::Disconnected) => {
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
                     self.recovery.fail(&mut self.mode, &mut self.status, true);
                     self.jobs.world_template_select = None;
                     dirty = true;
@@ -2032,13 +2178,7 @@ impl BlimsTuiApp {
                     self.jobs.dashboard_load = None;
                     dirty = true;
                 }
-                Ok(Err(_)) => {
-                    self.recovery
-                        .fail(&mut self.mode, &mut self.status, may_mutate);
-                    self.jobs.dashboard_load = None;
-                    dirty = true;
-                }
-                Err(TryRecvError::Disconnected) => {
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
                     self.recovery
                         .fail(&mut self.mode, &mut self.status, may_mutate);
                     self.jobs.dashboard_load = None;
@@ -3915,13 +4055,18 @@ fn room_bg(room: &BlimsRoomSnapshot) -> Color {
     }
 }
 
-async fn start_blims_agent_talk_cli(agent_id: String) -> Result<(), CliError> {
+async fn start_blims_agent_talk_cli(
+    output: &mut CliOutput,
+    agent_id: String,
+) -> Result<(), CliError> {
     let handle = create_blims_agent_conversation(agent_id).await?;
-    println!(
+    output.line(format_args!(
         "AI chat session with {}: {}",
         handle.agent_id, handle.session
-    );
-    println!("Attaching now. Press Ctrl-C to return to the Blims office.");
+    ));
+    output.line(format_args!(
+        "Attaching now. Press Ctrl-C to return to the Blims office."
+    ));
     Err(CliError::AttachSession(handle.session))
 }
 
@@ -3974,7 +4119,7 @@ async fn record_blims_conversation(
     Ok(())
 }
 
-async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
+async fn start_blims_task_work(output: &mut CliOutput, task_id: String) -> Result<(), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "task_id": task_id,
@@ -3992,18 +4137,21 @@ async fn start_blims_task_work(task_id: String) -> Result<(), CliError> {
             bcode_ipc::PromptPlacement::FollowUp,
         )
         .await?;
-    println!(
+    output.line(format_args!(
         "task work session for {} as {}: {}",
         prompt.task_id, prompt.agent_id, session.id
-    );
-    println!("sandbox\t{}", display_from_current_dir(&worktree.path));
+    ));
+    output.line(format_args!(
+        "sandbox\t{}",
+        display_from_current_dir(&worktree.path)
+    ));
     if let Some(branch) = &worktree.branch {
-        println!("branch\t{branch}");
+        output.line(format_args!("branch\t{branch}"));
         let proposal =
             register_blims_work_proposal(&prompt, &worktree, &session.id, branch).await?;
-        println!("proposal\t{}", proposal.id);
+        output.line(format_args!("proposal\t{}", proposal.id));
     }
-    println!("Attaching now. Press Ctrl-C to return.");
+    output.line(format_args!("Attaching now. Press Ctrl-C to return."));
     Err(CliError::AttachSession(session.id))
 }
 
@@ -4045,15 +4193,15 @@ async fn register_blims_work_proposal(
     decode_blims_response::<BlimsWorkProposalSummary>(response)
 }
 
-fn print_blims_world(world: &BlimsWorldSnapshot) {
-    println!(
+fn print_blims_world(output: &mut CliOutput, world: &BlimsWorldSnapshot) {
+    output.line(format_args!(
         "{} [{}] ({}×{})",
         world.theme, world.template_id, world.width, world.height
-    );
-    println!("player: {}", world.player_name);
-    println!("rooms:");
+    ));
+    output.line(format_args!("player: {}", world.player_name));
+    output.line(format_args!("rooms:"));
     for room in &world.rooms {
-        println!(
+        output.line(format_args!(
             "* {} {} ({}) at {},{} [{}] +{} {} - {}",
             room.symbol,
             room.name,
@@ -4064,14 +4212,14 @@ fn print_blims_world(world: &BlimsWorldSnapshot) {
             room.productivity_modifier,
             room.room_kind,
             room.purpose
-        );
+        ));
     }
-    println!("agents:");
+    output.line(format_args!("agents:"));
     for agent in &world.agents {
-        println!(
+        output.line(format_args!(
             "* {} ({}) at {} - {}",
             agent.name, agent.role, agent.room_id, agent.status
-        );
+        ));
     }
 }
 
@@ -4128,6 +4276,7 @@ impl PrintableReport for BlimsFocusedReport {
 }
 
 fn print_report_response<T>(
+    output: &mut CliOutput,
     response: bcode_ipc::PluginServiceResponse,
     json: bool,
 ) -> Result<(), CliError>
@@ -4135,18 +4284,22 @@ where
     T: PrintableReport + for<'de> Deserialize<'de>,
 {
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let report = decode_blims_response::<T>(response)?;
-        println!("{}", report.title());
+        output.line(format_args!("{}", report.title()));
         for bullet in report.bullets() {
-            println!("* {bullet}");
+            output.line(format_args!("* {bullet}"));
         }
     }
     Ok(())
 }
 
-async fn print_agent_permission(agent_id: &str, json: bool) -> Result<(), CliError> {
+async fn print_agent_permission(
+    output: &mut CliOutput,
+    agent_id: &str,
+    json: bool,
+) -> Result<(), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "agent_id": agent_id,
@@ -4154,21 +4307,25 @@ async fn print_agent_permission(agent_id: &str, json: bool) -> Result<(), CliErr
     let response =
         call_blims_service("agent.get_permission", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let permission = decode_blims_response::<BlimsAgentPermission>(response)?;
-        println!("agent: {}", permission.agent_id);
-        println!("bcode agent: {}", permission.bcode_agent_id);
-        println!("command: {}", permission.command);
-        println!("read: {}", permission.read);
-        println!("write: {}", permission.write);
-        println!("edit: {}", permission.edit);
-        println!("external_directory: {}", permission.external_directory);
+        output.line(format_args!("agent: {}", permission.agent_id));
+        output.line(format_args!("bcode agent: {}", permission.bcode_agent_id));
+        output.line(format_args!("command: {}", permission.command));
+        output.line(format_args!("read: {}", permission.read));
+        output.line(format_args!("write: {}", permission.write));
+        output.line(format_args!("edit: {}", permission.edit));
+        output.line(format_args!(
+            "external_directory: {}",
+            permission.external_directory
+        ));
     }
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
 async fn set_agent_permission(
+    output: &mut CliOutput,
     agent_id: String,
     bcode_agent_id: Option<String>,
     command: Option<String>,
@@ -4201,10 +4358,10 @@ async fn set_agent_permission(
     let response =
         call_blims_service("agent.set_permission", serde_json::to_vec(&payload)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let permission = decode_blims_response::<BlimsAgentPermission>(response)?;
-        println!(
+        output.line(format_args!(
             "permission updated: {} -> command {}, read {}, write {}, edit {}, external {}",
             permission.agent_id,
             permission.command,
@@ -4212,7 +4369,7 @@ async fn set_agent_permission(
             permission.write,
             permission.edit,
             permission.external_directory
-        );
+        ));
     }
     Ok(())
 }
@@ -4226,17 +4383,17 @@ async fn load_agent_permission(agent_id: &str) -> Result<BlimsAgentPermission, C
         call_blims_service("agent.get_permission", serde_json::to_vec(&request)?).await?;
     decode_blims_response::<BlimsAgentPermission>(response)
 }
-async fn print_world_templates(json: bool) -> Result<(), CliError> {
+async fn print_world_templates(output: &mut CliOutput, json: bool) -> Result<(), CliError> {
     let response = call_blims_service("world.template_list", blims_workspace_payload()?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let templates = decode_blims_response::<Vec<BlimsWorldTemplateSummary>>(response)?;
         for template in templates {
-            println!(
+            output.line(format_args!(
                 "{}\t{}\t{} rooms\t{}\t{}",
                 template.id, template.name, template.rooms, template.flavor, template.description
-            );
+            ));
         }
     }
     Ok(())
@@ -4279,73 +4436,87 @@ async fn select_world_template_state(
     ))
 }
 
-async fn select_world_template(template_id: String, json: bool) -> Result<(), CliError> {
+async fn select_world_template(
+    output: &mut CliOutput,
+    template_id: String,
+    json: bool,
+) -> Result<(), CliError> {
     let (selection, response) = select_world_template_state(template_id).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
-        println!(
+        output.line(format_args!(
             "selected world: {} ({})",
             selection.world.theme, selection.world.template_id
-        );
-        print_blims_world(&selection.world);
+        ));
+        print_blims_world(output, &selection.world);
     }
     Ok(())
 }
 
-async fn print_blims_status(json: bool) -> Result<(), CliError> {
+async fn print_blims_status(output: &mut CliOutput, json: bool) -> Result<(), CliError> {
     let response = call_blims_service("company.status", blims_workspace_payload()?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
-        println!("Blims: {}", status.state);
-        println!("{}", status.message);
-        println!("daemon connected: {}", status.daemon_connected);
-        println!("lifecycle: {}", status.lifecycle_status);
-        println!(
+        output.line(format_args!("Blims: {}", status.state));
+        output.line(format_args!("{}", status.message));
+        output.line(format_args!(
+            "daemon connected: {}",
+            status.daemon_connected
+        ));
+        output.line(format_args!("lifecycle: {}", status.lifecycle_status));
+        output.line(format_args!(
             "state root: {}",
             display_from_current_dir(&status.state_root)
-        );
-        println!(
+        ));
+        output.line(format_args!(
             "database: {}",
             display_from_current_dir(&status.database_path)
-        );
-        println!("daemon namespace: {}", status.daemon_namespace);
-        println!(
+        ));
+        output.line(format_args!(
+            "daemon namespace: {}",
+            status.daemon_namespace
+        ));
+        output.line(format_args!(
             "daemon metadata: {}",
             display_from_current_dir(&status.daemon_metadata_path)
-        );
-        println!("compatibility: {}", status.compatibility);
+        ));
+        output.line(format_args!("compatibility: {}", status.compatibility));
     }
     Ok(())
 }
 
-async fn create_blims_company(json: bool) -> Result<(), CliError> {
+async fn create_blims_company(output: &mut CliOutput, json: bool) -> Result<(), CliError> {
     let response = call_blims_service("company.create", blims_workspace_payload()?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
-        println!("Blims company created");
-        println!(
+        output.line(format_args!("Blims company created"));
+        output.line(format_args!(
             "state root: {}",
             display_from_current_dir(&status.state_root)
-        );
-        println!(
+        ));
+        output.line(format_args!(
             "database: {}",
             display_from_current_dir(&status.database_path)
-        );
-        println!("daemon namespace: {}", status.daemon_namespace);
-        println!(
+        ));
+        output.line(format_args!(
+            "daemon namespace: {}",
+            status.daemon_namespace
+        ));
+        output.line(format_args!(
             "daemon metadata: {}",
             display_from_current_dir(&status.daemon_metadata_path)
-        );
+        ));
     }
     Ok(())
 }
 
 async fn print_agent_service_result(
+    output: &mut CliOutput,
     operation: &str,
     agent_id: &str,
     json: bool,
@@ -4356,18 +4527,19 @@ async fn print_agent_service_result(
     });
     let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let agent = decode_blims_response::<BlimsAgentSnapshot>(response)?;
-        println!(
+        output.line(format_args!(
             "{} ({}) at {} — {}",
             agent.name, agent.role, agent.room_id, agent.status
-        );
+        ));
     }
     Ok(())
 }
 
 async fn hire_blims_agent(
+    output: &mut CliOutput,
     agent_id: String,
     name: String,
     role: String,
@@ -4383,42 +4555,52 @@ async fn hire_blims_agent(
     });
     let response = call_blims_service("agent.hire", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let agent = decode_blims_response::<BlimsAgentSnapshot>(response)?;
-        println!("agent hired: {} ({})", agent.name, agent.id);
+        output.line(format_args!("agent hired: {} ({})", agent.name, agent.id));
     }
     Ok(())
 }
 
 async fn print_company_lifecycle_update(
+    output: &mut CliOutput,
     operation: &str,
     message: &str,
     json: bool,
 ) -> Result<(), CliError> {
     let response = call_blims_service(operation, blims_workspace_payload()?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let status = decode_blims_response::<BlimsCompanyStatus>(response)?;
-        println!("{message}");
-        println!("lifecycle: {}", status.lifecycle_status);
-        println!(
+        output.line(format_args!("{message}"));
+        output.line(format_args!("lifecycle: {}", status.lifecycle_status));
+        output.line(format_args!(
             "state root: {}",
             display_from_current_dir(&status.state_root)
-        );
+        ));
     }
     Ok(())
 }
 
-async fn handle_blims_ai_work_command(command: BlimsAiWorkCommand) -> Result<(), CliError> {
+async fn handle_blims_ai_work_command(
+    output: &mut CliOutput,
+    command: BlimsAiWorkCommand,
+) -> Result<(), CliError> {
     match command {
-        BlimsAiWorkCommand::List { limit, json } => print_blims_ai_work(limit, json).await,
-        BlimsAiWorkCommand::Start { work_id } => start_blims_prepared_ai_work(work_id).await,
+        BlimsAiWorkCommand::List { limit, json } => print_blims_ai_work(output, limit, json).await,
+        BlimsAiWorkCommand::Start { work_id } => {
+            start_blims_prepared_ai_work(output, work_id).await
+        }
     }
 }
 
-async fn print_blims_ai_work(limit: u64, json: bool) -> Result<(), CliError> {
+async fn print_blims_ai_work(
+    output: &mut CliOutput,
+    limit: u64,
+    json: bool,
+) -> Result<(), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "limit": limit,
@@ -4426,32 +4608,35 @@ async fn print_blims_ai_work(limit: u64, json: bool) -> Result<(), CliError> {
     let response =
         call_blims_service("projection.ai_work.get", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let work = decode_blims_response::<Vec<BlimsPreparedAiWorkItem>>(response)?;
         if work.is_empty() {
-            println!("no prepared AI work yet");
+            output.line(format_args!("no prepared AI work yet"));
         }
         for item in work {
-            println!(
+            output.line(format_args!(
                 "{}\t{}\t{}\t{}\t{}",
                 item.id,
                 item.kind,
                 item.agent_id,
                 item.task_id.unwrap_or_default(),
                 item.operation_id
-            );
+            ));
         }
     }
     Ok(())
 }
 
-async fn start_blims_prepared_ai_work(work_id: String) -> Result<(), CliError> {
+async fn start_blims_prepared_ai_work(
+    output: &mut CliOutput,
+    work_id: String,
+) -> Result<(), CliError> {
     let (work, session) = create_blims_prepared_ai_work_session(&work_id).await?;
-    println!("started AI work session: {}", session.id);
-    println!("work: {}", work.id);
-    println!("kind: {}", work.kind);
-    println!("agent: {}", work.agent_id);
+    output.line(format_args!("started AI work session: {}", session.id));
+    output.line(format_args!("work: {}", work.id));
+    output.line(format_args!("kind: {}", work.kind));
+    output.line(format_args!("agent: {}", work.agent_id));
     Err(CliError::AttachSession(session.id))
 }
 
@@ -4496,16 +4681,19 @@ async fn load_blims_prepared_ai_work(work_id: &str) -> Result<BlimsPreparedAiWor
         .ok_or_else(|| CliError::Blims(format!("unknown prepared AI work: {work_id}")))
 }
 
-async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliError> {
+async fn handle_blims_task_command(
+    output: &mut CliOutput,
+    command: BlimsTaskCommand,
+) -> Result<(), CliError> {
     match command {
         BlimsTaskCommand::List { json } => {
             let response = call_blims_service("task.list", blims_workspace_payload()?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
                 let tasks = decode_blims_response::<Vec<BlimsTaskSummary>>(response)?;
                 for task in tasks {
-                    println!(
+                    output.line(format_args!(
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         task.id,
                         task.initiative_id,
@@ -4515,7 +4703,7 @@ async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliE
                         task.title,
                         task.description,
                         task.rationale
-                    );
+                    ));
                 }
             }
         }
@@ -4527,35 +4715,41 @@ async fn handle_blims_task_command(command: BlimsTaskCommand) -> Result<(), CliE
             let response =
                 call_blims_service("task.inspect", serde_json::to_vec(&request)?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
-                print_task_detail(&decode_blims_response::<BlimsTaskSummary>(response)?);
+                print_task_detail(
+                    output,
+                    &decode_blims_response::<BlimsTaskSummary>(response)?,
+                );
             }
         }
         BlimsTaskCommand::Work { task_id } => {
-            start_blims_task_work(task_id).await?;
+            start_blims_task_work(output, task_id).await?;
         }
     }
     Ok(())
 }
 
-async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<(), CliError> {
+async fn handle_blims_artifact_command(
+    output: &mut CliOutput,
+    command: BlimsArtifactCommand,
+) -> Result<(), CliError> {
     match command {
         BlimsArtifactCommand::List { json } => {
             let response = call_blims_service("artifact.list", blims_workspace_payload()?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
                 let artifacts = decode_blims_response::<Vec<BlimsArtifactSummary>>(response)?;
                 for artifact in artifacts {
-                    println!(
+                    output.line(format_args!(
                         "{}\t{}\t{}\t{}\t{}",
                         artifact.id,
                         artifact.initiative_id,
                         artifact.kind,
                         artifact.status,
                         artifact.title
-                    );
+                    ));
                 }
             }
         }
@@ -4567,13 +4761,16 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
             let response =
                 call_blims_service("artifact.inspect", serde_json::to_vec(&request)?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
-                print_artifact_detail(&decode_blims_response::<BlimsArtifactDetail>(response)?);
+                print_artifact_detail(
+                    output,
+                    &decode_blims_response::<BlimsArtifactDetail>(response)?,
+                );
             }
         }
         BlimsArtifactCommand::Apply { artifact_id, yes } => {
-            apply_blims_patch_artifact(artifact_id, yes).await?;
+            apply_blims_patch_artifact(output, artifact_id, yes).await?;
         }
         BlimsArtifactCommand::Create {
             kind,
@@ -4583,10 +4780,11 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
             file,
             json,
         } => {
-            create_blims_artifact(kind, title, initiative_id, payload, file, json).await?;
+            create_blims_artifact(output, kind, title, initiative_id, payload, file, json).await?;
         }
         BlimsArtifactCommand::Approve { artifact_id, json } => {
             print_artifact_status_update(
+                output,
                 "artifact.approve",
                 "artifact approved",
                 artifact_id,
@@ -4595,39 +4793,56 @@ async fn handle_blims_artifact_command(command: BlimsArtifactCommand) -> Result<
             .await?;
         }
         BlimsArtifactCommand::Reject { artifact_id, json } => {
-            print_artifact_status_update("artifact.reject", "artifact rejected", artifact_id, json)
-                .await?;
+            print_artifact_status_update(
+                output,
+                "artifact.reject",
+                "artifact rejected",
+                artifact_id,
+                json,
+            )
+            .await?;
         }
         BlimsArtifactCommand::Defer { artifact_id, json } => {
-            print_artifact_status_update("artifact.defer", "artifact deferred", artifact_id, json)
-                .await?;
+            print_artifact_status_update(
+                output,
+                "artifact.defer",
+                "artifact deferred",
+                artifact_id,
+                json,
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
-async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<(), CliError> {
+async fn handle_blims_proposal_command(
+    output: &mut CliOutput,
+    command: BlimsProposalCommand,
+) -> Result<(), CliError> {
     match command {
         BlimsProposalCommand::List { json } => {
             let response = call_blims_service("proposal.list", blims_workspace_payload()?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
-                print_proposal_list(&decode_blims_response::<Vec<BlimsWorkProposalSummary>>(
-                    response,
-                )?);
+                print_proposal_list(
+                    output,
+                    &decode_blims_response::<Vec<BlimsWorkProposalSummary>>(response)?,
+                );
             }
         }
         BlimsProposalCommand::Inspect { proposal_id, json } => {
             let proposal = load_blims_proposal("proposal.inspect", proposal_id).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&proposal)?);
+                output.line(format_args!("{}", serde_json::to_string_pretty(&proposal)?));
             } else {
-                print_proposal_detail(&proposal);
+                print_proposal_detail(output, &proposal);
             }
         }
         BlimsProposalCommand::MarkReady { proposal_id, json } => {
             print_proposal_status_update(
+                output,
                 "proposal.mark_ready",
                 "proposal ready for review",
                 proposal_id,
@@ -4637,6 +4852,7 @@ async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<
         }
         BlimsProposalCommand::Approve { proposal_id, json } => {
             print_proposal_status_update(
+                output,
                 "proposal.approve",
                 "proposal approved",
                 proposal_id,
@@ -4645,21 +4861,34 @@ async fn handle_blims_proposal_command(command: BlimsProposalCommand) -> Result<
             .await?;
         }
         BlimsProposalCommand::Reject { proposal_id, json } => {
-            print_proposal_status_update("proposal.reject", "proposal rejected", proposal_id, json)
-                .await?;
+            print_proposal_status_update(
+                output,
+                "proposal.reject",
+                "proposal rejected",
+                proposal_id,
+                json,
+            )
+            .await?;
         }
         BlimsProposalCommand::Defer { proposal_id, json } => {
-            print_proposal_status_update("proposal.defer", "proposal deferred", proposal_id, json)
-                .await?;
+            print_proposal_status_update(
+                output,
+                "proposal.defer",
+                "proposal deferred",
+                proposal_id,
+                json,
+            )
+            .await?;
         }
         BlimsProposalCommand::Patch { proposal_id, json } => {
-            create_blims_proposal_patch(proposal_id, json).await?;
+            create_blims_proposal_patch(output, proposal_id, json).await?;
         }
     }
     Ok(())
 }
 
 async fn create_blims_artifact(
+    output: &mut CliOutput,
     kind: String,
     title: String,
     initiative_id: String,
@@ -4681,16 +4910,20 @@ async fn create_blims_artifact(
     });
     let response = call_blims_service("artifact.create", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
-        println!("artifact created: {} ({})", artifact.title, artifact.id);
-        print_artifact_detail(&artifact);
+        output.line(format_args!(
+            "artifact created: {} ({})",
+            artifact.title, artifact.id
+        ));
+        print_artifact_detail(output, &artifact);
     }
     Ok(())
 }
 
 async fn print_artifact_status_update(
+    output: &mut CliOutput,
     operation: &str,
     message: &str,
     artifact_id: String,
@@ -4702,11 +4935,11 @@ async fn print_artifact_status_update(
     });
     let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
-        println!("{message}: {}", artifact.id);
-        print_artifact_detail(&artifact);
+        output.line(format_args!("{message}: {}", artifact.id));
+        print_artifact_detail(output, &artifact);
     }
     Ok(())
 }
@@ -4756,6 +4989,7 @@ fn status_from_legacy_operation(operation: &str) -> Result<&'static str, CliErro
 }
 
 async fn print_proposal_status_update(
+    output: &mut CliOutput,
     operation: &str,
     message: &str,
     proposal_id: String,
@@ -4763,15 +4997,19 @@ async fn print_proposal_status_update(
 ) -> Result<(), CliError> {
     let proposal = load_blims_proposal(operation, proposal_id).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&proposal)?);
+        output.line(format_args!("{}", serde_json::to_string_pretty(&proposal)?));
     } else {
-        println!("{message}: {}", proposal.id);
-        print_proposal_detail(&proposal);
+        output.line(format_args!("{message}: {}", proposal.id));
+        print_proposal_detail(output, &proposal);
     }
     Ok(())
 }
 
-async fn create_blims_proposal_patch(proposal_id: String, json: bool) -> Result<(), CliError> {
+async fn create_blims_proposal_patch(
+    output: &mut CliOutput,
+    proposal_id: String,
+    json: bool,
+) -> Result<(), CliError> {
     let proposal = load_blims_proposal("proposal.inspect", proposal_id).await?;
     let patch = git_diff_for_proposal(&proposal)?;
     let request = serde_json::json!({
@@ -4782,16 +5020,20 @@ async fn create_blims_proposal_patch(proposal_id: String, json: bool) -> Result<
     let response =
         call_blims_service("proposal.record_patch", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let artifact = decode_blims_response::<BlimsArtifactDetail>(response)?;
-        println!("patch artifact created: {}", artifact.id);
-        println!("initiative: {}", artifact.initiative_id);
+        output.line(format_args!("patch artifact created: {}", artifact.id));
+        output.line(format_args!("initiative: {}", artifact.initiative_id));
     }
     Ok(())
 }
 
-async fn apply_blims_patch_artifact(artifact_id: String, yes: bool) -> Result<(), CliError> {
+async fn apply_blims_patch_artifact(
+    output: &mut CliOutput,
+    artifact_id: String,
+    yes: bool,
+) -> Result<(), CliError> {
     let artifact = load_blims_artifact(artifact_id).await?;
     let patch = patch_from_artifact(&artifact)?;
     if patch.trim().is_empty() {
@@ -4800,12 +5042,12 @@ async fn apply_blims_patch_artifact(artifact_id: String, yes: bool) -> Result<()
             artifact.id
         )));
     }
-    if !yes && !confirm_patch_apply(&artifact)? {
-        println!("apply cancelled");
+    if !yes && !confirm_patch_apply(output, &artifact)? {
+        output.line(format_args!("apply cancelled"));
         return Ok(());
     }
     apply_patch_to_current_worktree(&patch)?;
-    println!("applied patch artifact: {}", artifact.id);
+    output.line(format_args!("applied patch artifact: {}", artifact.id));
     Ok(())
 }
 
@@ -4833,20 +5075,21 @@ fn patch_from_artifact(artifact: &BlimsArtifactDetail) -> Result<String, CliErro
         .ok_or_else(|| CliError::Blims(format!("artifact {} has no patch payload", artifact.id)))
 }
 
-fn confirm_patch_apply(artifact: &BlimsArtifactDetail) -> Result<bool, CliError> {
-    println!(
+fn confirm_patch_apply(
+    output: &mut CliOutput,
+    artifact: &BlimsArtifactDetail,
+) -> Result<bool, CliError> {
+    output.line(format_args!(
         "About to apply patch artifact {} to the current worktree.",
         artifact.id
-    );
-    println!(
+    ));
+    output.line(format_args!(
         "This can modify files under {}.",
         display_from_current_dir(std::env::current_dir()?)
-    );
-    print!("Type `apply` to continue: ");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    Ok(input.trim() == "apply")
+    ));
+    Err(CliError::Blims(
+        "Patch application requires explicit --yes confirmation; no stdin is read by plugin handlers".into(),
+    ))
 }
 
 fn apply_patch_to_current_worktree(patch: &str) -> Result<(), CliError> {
@@ -4899,34 +5142,34 @@ async fn load_blims_proposal(
     decode_blims_response::<BlimsWorkProposalSummary>(response)
 }
 
-fn print_task_detail(task: &BlimsTaskSummary) {
-    println!("{}", task.title);
-    println!("id: {}", task.id);
-    println!("initiative: {}", task.initiative_id);
-    println!("status: {}", task.status);
-    println!("priority: {}", task.priority);
-    println!("assigned agent: {}", task.assigned_agent_id);
-    println!("description: {}", task.description);
-    println!("rationale: {}", task.rationale);
+fn print_task_detail(output: &mut CliOutput, task: &BlimsTaskSummary) {
+    output.line(format_args!("{}", task.title));
+    output.line(format_args!("id: {}", task.id));
+    output.line(format_args!("initiative: {}", task.initiative_id));
+    output.line(format_args!("status: {}", task.status));
+    output.line(format_args!("priority: {}", task.priority));
+    output.line(format_args!("assigned agent: {}", task.assigned_agent_id));
+    output.line(format_args!("description: {}", task.description));
+    output.line(format_args!("rationale: {}", task.rationale));
 }
 
-fn print_artifact_detail(artifact: &BlimsArtifactDetail) {
-    println!("{}", artifact.title);
-    println!("id: {}", artifact.id);
-    println!("initiative: {}", artifact.initiative_id);
-    println!("kind: {}", artifact.kind);
-    println!("status: {}", artifact.status);
-    println!("payload:");
-    println!("{}", artifact.payload_json);
+fn print_artifact_detail(output: &mut CliOutput, artifact: &BlimsArtifactDetail) {
+    output.line(format_args!("{}", artifact.title));
+    output.line(format_args!("id: {}", artifact.id));
+    output.line(format_args!("initiative: {}", artifact.initiative_id));
+    output.line(format_args!("kind: {}", artifact.kind));
+    output.line(format_args!("status: {}", artifact.status));
+    output.line(format_args!("payload:"));
+    output.line(format_args!("{}", artifact.payload_json));
 }
 
-fn print_proposal_list(proposals: &[BlimsWorkProposalSummary]) {
+fn print_proposal_list(output: &mut CliOutput, proposals: &[BlimsWorkProposalSummary]) {
     if proposals.is_empty() {
-        println!("no work proposals yet");
+        output.line(format_args!("no work proposals yet"));
         return;
     }
     for proposal in proposals {
-        println!(
+        output.line(format_args!(
             "{}\t{}\t{}\t{}\t{}\t{}",
             proposal.id,
             proposal.task_id,
@@ -4934,99 +5177,108 @@ fn print_proposal_list(proposals: &[BlimsWorkProposalSummary]) {
             proposal.agent_id,
             proposal.branch,
             proposal.summary
-        );
+        ));
     }
 }
 
-fn print_proposal_detail(proposal: &BlimsWorkProposalSummary) {
-    println!("{}", proposal.id);
-    println!("task: {}", proposal.task_id);
-    println!("initiative: {}", proposal.initiative_id);
-    println!("agent: {}", proposal.agent_id);
-    println!("session: {}", proposal.session_id);
-    println!("worktree: {}", proposal.worktree_path);
-    println!("branch: {}", proposal.branch);
-    println!("status: {}", proposal.status);
-    println!("summary: {}", proposal.summary);
-    println!("validation: {}", proposal.validation_notes);
+fn print_proposal_detail(output: &mut CliOutput, proposal: &BlimsWorkProposalSummary) {
+    output.line(format_args!("{}", proposal.id));
+    output.line(format_args!("task: {}", proposal.task_id));
+    output.line(format_args!("initiative: {}", proposal.initiative_id));
+    output.line(format_args!("agent: {}", proposal.agent_id));
+    output.line(format_args!("session: {}", proposal.session_id));
+    output.line(format_args!("worktree: {}", proposal.worktree_path));
+    output.line(format_args!("branch: {}", proposal.branch));
+    output.line(format_args!("status: {}", proposal.status));
+    output.line(format_args!("summary: {}", proposal.summary));
+    output.line(format_args!("validation: {}", proposal.validation_notes));
 }
 
-fn print_initiative_list(initiatives: &[BlimsInitiativeSummary]) {
+fn print_initiative_list(output: &mut CliOutput, initiatives: &[BlimsInitiativeSummary]) {
     if initiatives.is_empty() {
-        println!("no initiatives yet");
+        output.line(format_args!("no initiatives yet"));
         return;
     }
     for initiative in initiatives {
-        println!(
+        output.line(format_args!(
             "{}\t{}\t{}\t{}\t{}",
             initiative.id,
             initiative.priority,
             initiative.status,
             initiative.title,
             initiative.description
-        );
+        ));
     }
 }
 
-fn print_initiative_detail(initiative: &BlimsInitiativeSummary) {
-    println!("{}", initiative.title);
-    println!("id: {}", initiative.id);
-    println!("status: {}", initiative.status);
-    println!("priority: {}", initiative.priority);
-    println!("description: {}", initiative.description);
+fn print_initiative_detail(output: &mut CliOutput, initiative: &BlimsInitiativeSummary) {
+    output.line(format_args!("{}", initiative.title));
+    output.line(format_args!("id: {}", initiative.id));
+    output.line(format_args!("status: {}", initiative.status));
+    output.line(format_args!("priority: {}", initiative.priority));
+    output.line(format_args!("description: {}", initiative.description));
 }
 
-async fn handle_blims_initiative_command(command: BlimsInitiativeCommand) -> Result<(), CliError> {
+async fn handle_blims_initiative_command(
+    output: &mut CliOutput,
+    command: BlimsInitiativeCommand,
+) -> Result<(), CliError> {
     match command {
         BlimsInitiativeCommand::Create {
             title,
             description,
             priority,
             json,
-        } => create_blims_initiative(title, description, priority, json).await?,
-        BlimsInitiativeCommand::List { json } => list_blims_initiatives(json).await?,
+        } => create_blims_initiative(output, title, description, priority, json).await?,
+        BlimsInitiativeCommand::List { json } => list_blims_initiatives(output, json).await?,
         BlimsInitiativeCommand::Inspect {
             initiative_id,
             json,
-        } => inspect_blims_initiative(&initiative_id, json).await?,
+        } => inspect_blims_initiative(output, &initiative_id, json).await?,
         BlimsInitiativeCommand::SetGuidance {
             initiative_id,
             guidance,
             strength,
             json,
-        } => set_blims_initiative_guidance(initiative_id, guidance, strength, json).await?,
+        } => set_blims_initiative_guidance(output, initiative_id, guidance, strength, json).await?,
         BlimsInitiativeCommand::Pause {
             initiative_id,
             json,
         } => {
-            print_initiative_status_update("initiative.pause", &initiative_id, json).await?;
+            print_initiative_status_update(output, "initiative.pause", &initiative_id, json)
+                .await?;
         }
         BlimsInitiativeCommand::Resume {
             initiative_id,
             json,
         } => {
-            print_initiative_status_update("initiative.resume", &initiative_id, json).await?;
+            print_initiative_status_update(output, "initiative.resume", &initiative_id, json)
+                .await?;
         }
         BlimsInitiativeCommand::PlanPrompt { initiative_id } => {
             let prompt = blims_initiative_plan_prompt(initiative_id).await?;
-            println!("# Initiative {} AI planning prompt", prompt.initiative_id);
-            println!("{}", prompt.prompt);
+            output.line(format_args!(
+                "# Initiative {} AI planning prompt",
+                prompt.initiative_id
+            ));
+            output.line(format_args!("{}", prompt.prompt));
         }
         BlimsInitiativeCommand::Plan { initiative_id } => {
-            start_blims_initiative_plan(initiative_id).await?;
+            start_blims_initiative_plan(output, initiative_id).await?;
         }
         BlimsInitiativeCommand::ImportPlan {
             initiative_id,
             plan,
             file,
         } => {
-            import_blims_initiative_plan(initiative_id, plan, file).await?;
+            import_blims_initiative_plan(output, initiative_id, plan, file).await?;
         }
     }
     Ok(())
 }
 
 async fn create_blims_initiative(
+    output: &mut CliOutput,
     title: String,
     description: Option<String>,
     priority: Option<i64>,
@@ -5040,43 +5292,51 @@ async fn create_blims_initiative(
     };
     let response = call_blims_service("initiative.create", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let initiative = decode_blims_response::<BlimsInitiativeSummary>(response)?;
-        println!(
+        output.line(format_args!(
             "initiative created: {} ({})",
             initiative.title, initiative.id
-        );
+        ));
     }
     Ok(())
 }
 
-async fn list_blims_initiatives(json: bool) -> Result<(), CliError> {
+async fn list_blims_initiatives(output: &mut CliOutput, json: bool) -> Result<(), CliError> {
     let response = call_blims_service("initiative.list", blims_workspace_payload()?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let initiatives = decode_blims_response::<Vec<BlimsInitiativeSummary>>(response)?;
-        print_initiative_list(&initiatives);
+        print_initiative_list(output, &initiatives);
     }
     Ok(())
 }
 
-async fn inspect_blims_initiative(initiative_id: &str, json: bool) -> Result<(), CliError> {
+async fn inspect_blims_initiative(
+    output: &mut CliOutput,
+    initiative_id: &str,
+    json: bool,
+) -> Result<(), CliError> {
     let request = serde_json::json!({
         "working_directory": std::env::current_dir()?,
         "initiative_id": initiative_id,
     });
     let response = call_blims_service("initiative.inspect", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
-        print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(response)?);
+        print_initiative_detail(
+            output,
+            &decode_blims_response::<BlimsInitiativeSummary>(response)?,
+        );
     }
     Ok(())
 }
 
 async fn set_blims_initiative_guidance(
+    output: &mut CliOutput,
     initiative_id: String,
     guidance: String,
     strength: String,
@@ -5091,15 +5351,19 @@ async fn set_blims_initiative_guidance(
     let response =
         call_blims_service("initiative.set_guidance", serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
         let guidance = decode_blims_response::<BlimsGuidanceSummary>(response)?;
-        println!("initiative guidance set: {}", guidance.guidance);
+        output.line(format_args!(
+            "initiative guidance set: {}",
+            guidance.guidance
+        ));
     }
     Ok(())
 }
 
 async fn print_initiative_status_update(
+    output: &mut CliOutput,
     operation: &str,
     initiative_id: &str,
     json: bool,
@@ -5110,9 +5374,12 @@ async fn print_initiative_status_update(
     });
     let response = call_blims_service(operation, serde_json::to_vec(&request)?).await?;
     if json {
-        print_blims_service_response(response);
+        print_blims_service_response(output, response);
     } else {
-        print_initiative_detail(&decode_blims_response::<BlimsInitiativeSummary>(response)?);
+        print_initiative_detail(
+            output,
+            &decode_blims_response::<BlimsInitiativeSummary>(response)?,
+        );
     }
     Ok(())
 }
@@ -5129,7 +5396,10 @@ async fn blims_initiative_plan_prompt(
     decode_blims_response::<BlimsPlanningPrompt>(response)
 }
 
-async fn start_blims_initiative_plan(initiative_id: String) -> Result<(), CliError> {
+async fn start_blims_initiative_plan(
+    output: &mut CliOutput,
+    initiative_id: String,
+) -> Result<(), CliError> {
     let prompt = blims_initiative_plan_prompt(initiative_id).await?;
     let session = BcodeClient::default_endpoint()
         .create_session(Some(format!("Blims plan: {}", prompt.initiative_id)))
@@ -5141,20 +5411,21 @@ async fn start_blims_initiative_plan(initiative_id: String) -> Result<(), CliErr
             bcode_ipc::PromptPlacement::FollowUp,
         )
         .await?;
-    println!("planning session: {}", session.id);
-    println!(
+    output.line(format_args!("planning session: {}", session.id));
+    output.line(format_args!(
         "When the AI returns JSON, import it with: bcode blims initiative import-plan {} '<json>'",
         prompt.initiative_id
-    );
-    println!(
+    ));
+    output.line(format_args!(
         "Or save the JSON and run in-office: import plan {} <file>",
         prompt.initiative_id
-    );
-    println!("Attaching now. Press Ctrl-C to return.");
+    ));
+    output.line(format_args!("Attaching now. Press Ctrl-C to return."));
     Err(CliError::AttachSession(session.id))
 }
 
 async fn import_blims_initiative_plan(
+    output: &mut CliOutput,
     initiative_id: String,
     plan: String,
     file: bool,
@@ -5171,11 +5442,14 @@ async fn import_blims_initiative_plan(
     };
     let response =
         call_blims_service("initiative.import_plan", serde_json::to_vec(&request)?).await?;
-    print_blims_service_response(response);
+    print_blims_service_response(output, response);
     Ok(())
 }
 
-async fn handle_blims_guidance_command(command: BlimsGuidanceCommand) -> Result<(), CliError> {
+async fn handle_blims_guidance_command(
+    output: &mut CliOutput,
+    command: BlimsGuidanceCommand,
+) -> Result<(), CliError> {
     match command {
         BlimsGuidanceCommand::Set {
             guidance,
@@ -5190,26 +5464,26 @@ async fn handle_blims_guidance_command(command: BlimsGuidanceCommand) -> Result<
             let response =
                 call_blims_service("guidance.set", serde_json::to_vec(&request)?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
                 let guidance = decode_blims_response::<BlimsGuidanceSummary>(response)?;
-                println!(
+                output.line(format_args!(
                     "guidance set: {} ({})",
                     guidance.guidance, guidance.strength
-                );
+                ));
             }
         }
         BlimsGuidanceCommand::List { json } => {
             let response = call_blims_service("guidance.list", blims_workspace_payload()?).await?;
             if json {
-                print_blims_service_response(response);
+                print_blims_service_response(output, response);
             } else {
                 let guidance = decode_blims_response::<Vec<BlimsGuidanceSummary>>(response)?;
                 for item in guidance {
-                    println!(
+                    output.line(format_args!(
                         "{}\t{}\t{}\t{}",
                         item.id, item.strength, item.active, item.guidance
-                    );
+                    ));
                 }
             }
         }
@@ -5246,11 +5520,17 @@ fn decode_blims_response<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(&response.payload)?)
 }
 
-fn print_blims_service_response(response: bcode_ipc::PluginServiceResponse) {
+fn print_blims_service_response(
+    output: &mut CliOutput,
+    response: bcode_ipc::PluginServiceResponse,
+) {
     if let Some(error) = response.error {
-        eprintln!("{}: {}", error.code, error.message);
+        output.error_line(format_args!("{}: {}", error.code, error.message));
     } else if !response.payload.is_empty() {
-        println!("{}", String::from_utf8_lossy(&response.payload));
+        output.line(format_args!(
+            "{}",
+            String::from_utf8_lossy(&response.payload)
+        ));
     }
 }
 fn paint_blims_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {

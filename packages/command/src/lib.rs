@@ -11,6 +11,7 @@
 mod bpdl_contract_tests;
 
 pub mod application;
+pub mod cli;
 pub mod completion;
 
 use bcode_model::ReasoningEffort;

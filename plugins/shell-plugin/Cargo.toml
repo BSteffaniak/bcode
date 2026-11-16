@@ -11,13 +11,13 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_agent_profile                 = { workspace = true, optional = true }
 bcode_config                        = { workspace = true, optional = true }
 bcode_plugin_models                 = { workspace = true, optional = true }
-bcode_plugin_sdk                    = { workspace = true, features = ["tui"], optional = true }
+bcode_plugin_sdk                    = { workspace = true, optional = true }
 bcode_shell_command_analysis        = { workspace = true, optional = true }
 bcode_shell_command_analysis_models = { workspace = true, optional = true }
 bcode_tool                          = { workspace = true, optional = true }
@@ -90,16 +90,16 @@ presentation = [
     "dep:shuck-ast",
     "bcode_tui_components/plugin-visual",
 ]
-static-bundled = [
+# Frontend capability for hosts that run the native implementation; it is
+# independent of packaging. `presentation` alone stays renderer-only (browser).
+tui = [
     "native",
     "presentation",
+    "bcode_plugin_sdk/tui",
     "bcode_tui_components/terminal-viewer",
     "bmux_tui_components/terminal-view",
-    "embedded-languages",
-    "dep:bcode_tui_components",
     "dep:bmux_keyboard",
     "dep:bmux_terminal_grid",
-    "dep:bmux_tui",
-    "dep:shuck-parser",
-    "dep:shuck-ast",
 ]
+# Compatibility alias; frontend capability is independent of packaging.
+static-bundled = ["tui"]

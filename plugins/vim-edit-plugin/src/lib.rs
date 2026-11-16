@@ -7,7 +7,7 @@
 //! This plugin exposes model-callable tools that drive the reusable
 //! `bcode_vim_edit` Neovim RPC editing engine.
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod vim_edit_playback_tui;
 
 use bcode_plugin_sdk::path::display;
@@ -30,9 +30,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const VIM_EDIT_PLUGIN_ID: &str = "bcode.vim-edit";
 const VIM_EDIT_REQUEST_PREVIEW_SCHEMA: &str = "bcode.vim-edit.request.preview";
 const VIM_EDIT_REQUEST_APPLY_SCHEMA: &str = "bcode.vim-edit.request.apply";
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 const VIM_EDIT_REQUEST_DRAFT_PREVIEW_SCHEMA: &str = "bcode.vim-edit.request-draft.preview";
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 const VIM_EDIT_REQUEST_DRAFT_APPLY_SCHEMA: &str = "bcode.vim-edit.request-draft.apply";
 const VIM_EDIT_LIVE_SCHEMA: &str = "bcode.vim-edit.live";
 const VIM_EDIT_PLAYBACK_SCHEMA: &str = "bcode.vim-edit.playback";
@@ -46,6 +46,10 @@ const MAX_DIFF_BYTES: usize = 256 * 1024;
 pub struct VimEditPlugin;
 
 impl RustPlugin for VimEditPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
@@ -335,7 +339,7 @@ impl VimProgressContext {
         schema: &str,
     ) -> PrimaryPresentationPublisher {
         PrimaryPresentationPublisher::with_limits_and_cancellation(
-            self.events,
+            self.events.clone(),
             invocation_id,
             VIM_EDIT_PLUGIN_ID,
             schema,
@@ -353,7 +357,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         Err(error) => return invalid_request(&error),
     };
     let progress = VimProgressContext {
-        events: context.events,
+        events: context.events.clone(),
         limits: context.transient_progress_limits,
         cancellation: context.cancellation.clone(),
     };
@@ -1123,13 +1127,42 @@ fn json_tool_response<T: serde::Serialize>(value: &T, is_error: bool) -> ToolInv
     }
 }
 
-#[cfg(feature = "static-bundled")]
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(serial VimEditPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(vim_edit_tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_host::<VimEditPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> StaticPluginVtable {
     static_plugin_vtable!(VimEditPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -1146,9 +1179,6 @@ pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(not(feature = "static-bundled"))]
-export_plugin!(VimEditPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

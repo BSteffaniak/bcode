@@ -146,6 +146,9 @@ fn workflow_run_limits(
 }
 
 impl PluginTuiHost for BcodePluginTuiHost {
+    fn retained_product_host(&self) -> Option<Arc<dyn PluginTuiHost>> {
+        Some(Arc::new(self.clone()))
+    }
     fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
         self.launch
             .keymap
@@ -1103,9 +1106,22 @@ async fn stream_plugin_workflow_views(
                 let Some(requested) = requested else {
                     return;
                 };
+                let (requested, mut responsibility) = match requested {
+                    super::chat_loop::WorkflowViewRequest::Correlated { request, mut responsibility } => {
+                        if responsibility.dispatched().is_err() { responsibility.recovery_required(); continue; }
+                        (*request, Some(responsibility))
+                    },
+                    request => (request, None),
+                };
                 match requested {
+                    super::chat_loop::WorkflowViewRequest::Correlated { mut responsibility, .. } => {
+                        responsibility.recovery_required();
+                        continue;
+                    },
                     super::chat_loop::WorkflowViewRequest::SelectRun(run_id) => {
                         if selected_run_id.as_deref() == Some(run_id.as_str()) {
+                            // Channel delivery is not renderer application; retain until application is acknowledged.
+                if let Some(token) = responsibility.as_mut() { token.recovery_required(); }
                             continue;
                         }
                         selected_run_id = Some(run_id.clone());
@@ -1214,6 +1230,8 @@ async fn stream_plugin_workflow_views(
                         }
                     }
                 }
+                // Channel delivery is not renderer application; retain until application is acknowledged.
+                if let Some(token) = responsibility.as_mut() { token.recovery_required(); }
             }
             event = watcher.next_event() => match event {
                 Ok(bcode_client::WorkflowRunWatchEvent::Changed(event)) => {
@@ -1365,6 +1383,41 @@ pub fn subscribe_workflow_views(
     tokio::spawn(stream_plugin_workflow_views(
         client, sender, requests, redraw,
     ));
+    (receiver, request_sender)
+}
+
+/// Bind a correlated subscription to the actual read task and its verified join.
+/// Dropping the renderer closes its channels, not the retained completion responsibility.
+pub fn subscribe_correlated_workflow_views(
+    client: BcodeClient,
+    redraw: InvalidationSignal,
+    mut responsibility: super::plugin_tui::dynamic::FrontendEffectResponsibility,
+) -> (
+    PluginTuiSurfaceUpdateReceiver,
+    mpsc::Sender<super::chat_loop::WorkflowViewRequest>,
+) {
+    let (sender, receiver) = mpsc::channel(64);
+    let (request_sender, requests) = mpsc::channel(8);
+    if responsibility
+        .retained()
+        .and_then(|()| responsibility.dispatched())
+        .is_err()
+    {
+        responsibility.recovery_required();
+        return (receiver, request_sender);
+    }
+    let task = tokio::spawn(stream_plugin_workflow_views(
+        client,
+        sender,
+        requests,
+        redraw.clone(),
+    ));
+    tokio::spawn(async move {
+        if task.await.is_err() || responsibility.terminal_applied().is_err() {
+            responsibility.recovery_required();
+        }
+        redraw.request();
+    });
     (receiver, request_sender)
 }
 

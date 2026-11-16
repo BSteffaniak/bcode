@@ -7,8 +7,13 @@
 pub mod context_selection;
 pub mod selection;
 
-#[cfg(feature = "static-bundled")]
 mod cli;
+
+/// Return the plugin-owned CLI grammar and invocation adapter for either packaging mode.
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
 
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
@@ -33,6 +38,10 @@ use serde::Serialize;
 pub struct SkillsPlugin;
 
 impl RustPlugin for SkillsPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         for command in skills_palette_command_contributions() {
             registrar
@@ -181,16 +190,60 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     }
 }
 
+#[cfg(test)]
+mod shared_definition_tests {
+    #[test]
+    fn skill_cli_keeps_validation_options_without_static_packaging() {
+        let registration = super::cli_registration();
+        let matches = (registration.command)()
+            .try_get_matches_from(["skill", "check", "--strict", "--json"])
+            .expect("skill check grammar");
+        assert_eq!(matches.subcommand_name(), Some("check"));
+        assert!((registration.requires_daemon)(&matches));
+        assert_eq!(
+            super::plugin_definition().metadata.plugin_id,
+            "bcode.skills"
+        );
+    }
+}
+
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli_registration()),
+        frontend: Some(skills_tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial SkillsPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<SkillsPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let vtable =
+    let mut vtable =
         bcode_plugin_sdk::static_plugin_vtable!(SkillsPlugin, include_str!("../bcode-plugin.toml"));
-    #[cfg(feature = "static-bundled")]
-    let vtable = {
-        let mut vtable = vtable;
-        vtable.cli_registration = Some(cli::registration);
-        vtable
-    };
+    vtable.cli_registration = Some(cli_registration);
     vtable
 }
 
@@ -522,9 +575,6 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     };
     SkillRegistry::discover(&roots, options).ok()
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(SkillsPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

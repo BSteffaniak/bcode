@@ -101,15 +101,42 @@ fn invoke(request: &InvokeCommandRequest) -> InvokeCommandResponse {
     }
 }
 
-/// Static registration for the bundled plugin registry.
-#[cfg(feature = "static-bundled")]
+/// Component capabilities retained by the same shared plugin instance.
+///
+/// X-ray contributes only a command service, so it has no CLI or frontend
+/// registrations beyond the manifest-declared backend contract.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations::default()
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial XrayPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<XrayPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(XrayPlugin, include_str!("../bcode-plugin.toml"))
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(XrayPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

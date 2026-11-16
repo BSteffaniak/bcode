@@ -696,10 +696,21 @@ pub async fn model_status(
     } else {
         state.session_config(session_id).await
     };
-    let selection =
-        super::session_model_selection_with_runtime_context(state, session_id, runtime_context)
-            .await;
-    super::model_status_for_selection(state, selection, Some(session_id), &config).await
+    let selection = Box::pin(super::session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        runtime_context,
+    ))
+    .await;
+    // Provider status resolution builds a large future; box it so this public
+    // operation (and every caller awaiting it) stays small on the stack.
+    Box::pin(super::model_status_for_selection(
+        state,
+        selection,
+        Some(session_id),
+        &config,
+    ))
+    .await
 }
 
 /// Resolve the session's user-visible model inventory under the verified caller context.
@@ -761,7 +772,11 @@ pub async fn default_model_status(
         .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
         .unwrap_or_else(|| state.startup_config.clone());
     let selection = super::default_model_selection_with_runtime_context(state, runtime_context);
-    super::model_status_for_selection(state, selection, None, &config).await
+    // Box the large provider status future so callers do not inline it.
+    Box::pin(super::model_status_for_selection(
+        state, selection, None, &config,
+    ))
+    .await
 }
 
 /// Public failure while listing models for a client.
@@ -1759,12 +1774,14 @@ pub async fn activate_skill(
     let Some(summary) = registry.summary(&skill_id).cloned() else {
         return Err(ActivateSkillError::Unknown(skill_id));
     };
-    super::apply_skill_model_policy(state, session_id, &skill_id)
-        .await
-        .map_err(|error| ActivateSkillError::ModelPolicy {
-            code: error.code,
-            message: error.message,
-        })?;
+    Box::pin(super::apply_skill_model_policy(
+        state, session_id, &skill_id,
+    ))
+    .await
+    .map_err(|error| ActivateSkillError::ModelPolicy {
+        code: error.code,
+        message: error.message,
+    })?;
     state
         .active_skills
         .lock()

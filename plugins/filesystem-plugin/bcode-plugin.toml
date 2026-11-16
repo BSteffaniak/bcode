@@ -9,6 +9,13 @@ invocation_operations = ["search_paths"]
 name                  = "Filesystem"
 
 [[services]]
+class                 = "service"
+description           = "Generated bounded path discovery contract"
+interface_id          = "filesystem-paths/v1"
+invocation_operations = ["search-paths"]
+name                  = "Path Discovery"
+
+[[services]]
 class        = "tool_execution"
 description  = "Model-callable filesystem tools"
 interface_id = "bcode.tool/v1"

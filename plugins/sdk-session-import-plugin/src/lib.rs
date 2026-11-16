@@ -37,6 +37,10 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 pub struct SdkSessionImportPlugin;
 
 impl RustPlugin for SdkSessionImportPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != SESSION_IMPORT_INTERFACE_ID {
             return ServiceResponse::error(
@@ -325,15 +329,18 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
         .unwrap_or_else(|error| ServiceResponse::error("serialization_failed", error.to_string()))
 }
 
-#[cfg(not(feature = "static-bundled"))]
-export_plugin!(SdkSessionImportPlugin, MANIFEST);
-
-/// Static plugin vtable for builds that bundle this plugin.
-#[cfg(feature = "static-bundled")]
+/// Component capabilities retained by the same shared plugin instance. Import is a
+/// backend service only; the plugin contributes no frontend or CLI registrations.
 #[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(SdkSessionImportPlugin, MANIFEST)
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations::default()
 }
+
+// One declaration serves bundled and native packaging; implementations export no ABI symbols.
+bcode_plugin_sdk::define_plugin!(
+    serial SdkSessionImportPlugin, MANIFEST,
+    registrations = product_registrations(),
+);
 
 #[cfg(test)]
 mod tests {

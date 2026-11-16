@@ -25,7 +25,7 @@ pub const TERMINAL_PTY_STREAM_CONTENT_TYPE: &str =
 /// Authoritative shell recording artifact reference key.
 pub const SHELL_RECORDING_REF_KEY: &str = "shell_recording";
 /// Authoritative shell recording media type, without a format-version parameter.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub const SHELL_RECORDING_MEDIA_TYPE: &str = "application/x-bcode-shell-recording";
 /// Current authoritative shell recording content type.
 pub const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";

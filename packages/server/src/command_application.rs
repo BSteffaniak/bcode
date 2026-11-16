@@ -266,7 +266,7 @@ library = "libtest_blocked_command.dylib"
         tokio::task::JoinHandle<()>,
     ) {
         use std::sync::Arc;
-        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from([
@@ -283,9 +283,9 @@ library = "libtest_blocked_command.dylib"
                         BLOCKED_COMMAND_MANIFEST
                     ),
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                    bcode_default_agents_plugin::static_plugin(),
+                    bcode_default_agents_plugin::plugin_definition,
                 ),
             ],
         )

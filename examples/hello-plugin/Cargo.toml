@@ -11,14 +11,23 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_plugin_sdk           = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_tool                 = { workspace = true }
+bmux_keyboard              = { workspace = true, optional = true }
+bmux_text_edit             = { workspace = true, optional = true }
+bmux_tui                   = { workspace = true, optional = true }
 serde_json                 = { workspace = true }
 
 [features]
-default          = []
+default = []
 fail-on-warnings = []
+tui = [
+    "bcode_plugin_sdk/tui",
+    "dep:bmux_tui",
+    "dep:bmux_keyboard",
+    "dep:bmux_text_edit",
+]

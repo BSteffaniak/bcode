@@ -15,6 +15,7 @@ mod judgement;
 pub mod prompt_cache;
 mod tool_arguments;
 mod vision;
+mod workers;
 
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
@@ -234,6 +235,9 @@ pub const FAKE_AUTH_METHOD_ID: &str = "fake_token";
 pub const FAKE_PERSIST_REFRESHED_TOKEN_SETTING: &str = "fake_persist_refreshed_access_token";
 
 impl ConcurrentRustPlugin for FakeProviderPlugin {
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        self.shutdown_workers()
+    }
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         self.invoke_provider_service(&context)
     }
@@ -247,6 +251,9 @@ impl ConcurrentRustPlugin for FakeProviderPlugin {
 }
 
 impl RustPlugin for FakeProviderPlugin {
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        self.shutdown_workers()
+    }
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         self.invoke_provider_service(&context)
     }
@@ -365,6 +372,7 @@ fn fake_persist_error(message: impl Into<String>) -> ProviderError {
 
 #[derive(Debug, Default)]
 struct FakeProviderState {
+    workers: Arc<workers::Workers>,
     next_turn: u64,
     tool_rounds_emitted: u64,
     tool_rounds_by_turn: BTreeMap<String, u64>,
@@ -398,6 +406,7 @@ impl Default for FakeTurnEvents {
 
 #[derive(Debug, Clone, Default)]
 struct FakeTurn {
+    workers: Arc<workers::Workers>,
     events: Arc<Mutex<FakeTurnEvents>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
     positioned_output: Arc<AtomicBool>,
@@ -405,6 +414,23 @@ struct FakeTurn {
 }
 
 impl FakeTurn {
+    fn spawn_worker(&self, work: impl FnOnce(Self) + Send + 'static) {
+        let turn = self.clone();
+        if !self.workers.spawn(move || work(turn)) {
+            self.cancel();
+        }
+    }
+
+    fn delay(&self, duration: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while let Some(remaining) = duration.checked_sub(start.elapsed()) {
+            if self.is_cancelled() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+        !self.is_cancelled()
+    }
     fn push(&self, event: ProviderTurnEvent) {
         let Ok(mut events) = self.events.lock() else {
             return;
@@ -478,6 +504,19 @@ fn configured_structured_output_execution(
 }
 
 impl FakeProviderPlugin {
+    fn shutdown_workers(&self) -> Result<(), PluginError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| PluginError::failed("fake provider state unavailable"))?;
+        state.workers.close();
+        for turn in state.turns.values() {
+            turn.cancel();
+        }
+        let workers = Arc::clone(&state.workers);
+        drop(state);
+        workers.drain()
+    }
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id == bcode_model::judgement::INTERFACE_ID
             || context.request.interface_id == bcode_model::judgement::VERIFICATION_INTERFACE_ID
@@ -687,7 +726,10 @@ impl FakeProviderPlugin {
             .expect("fake provider state lock should not be poisoned");
         state.next_turn += 1;
         let provider_turn_id = format!("fake-turn-{}", state.next_turn);
-        let turn = FakeTurn::default();
+        let turn = FakeTurn {
+            workers: Arc::clone(&state.workers),
+            ..FakeTurn::default()
+        };
         if positioned_output {
             turn.enable_positioned_output();
         }
@@ -802,7 +844,10 @@ impl FakeProviderPlugin {
         let has_tool_result = tool_result.is_some();
         let text = echo_all_response(&request, tool_result.as_deref(), &user_text)
             .unwrap_or_else(|| fake_response_text(&request, tool_result.as_deref(), &user_text));
-        let turn = FakeTurn::default();
+        let turn = FakeTurn {
+            workers: Arc::clone(&state.workers),
+            ..FakeTurn::default()
+        };
         if positioned_output {
             turn.enable_positioned_output();
         }
@@ -984,7 +1029,7 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
     if compaction_control::enabled(request) {
         compaction_control::dispatch(request, turn, text, request_input_tokens);
     } else if let Some(script) = event_script {
-        run_fake_event_script(turn, script);
+        run_fake_event_script(&turn, script);
     } else if forced_stop == Some(StopReason::Error) {
         turn.push(ProviderTurnEvent::Error {
             error: ProviderError {
@@ -1019,20 +1064,20 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
     ) {
     } else if let Some(text) = last_user_text(&request.messages).strip_prefix("stream-reasoning ") {
         dispatch_fake_reasoning_turn(
-            turn,
+            &turn,
             text.to_owned(),
             fake_stream_delta_delay(request),
             request_input_tokens,
         );
     } else if let Some(text) = last_user_text(&request.messages).strip_prefix("stream-text ") {
         dispatch_fake_streaming_text(
-            turn,
+            &turn,
             text.to_owned(),
             fake_stream_delta_delay(request),
             request_input_tokens,
         );
     } else if let Some(tool_call) = tool_call {
-        dispatch_fake_tool_turn(turn, tool_call, fake_tool_delta_delay(request));
+        dispatch_fake_tool_turn(&turn, tool_call, fake_tool_delta_delay(request));
     } else {
         let text = if request
             .provider_context
@@ -1054,7 +1099,7 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
             text
         };
         finish_fake_text_response(
-            turn,
+            &turn,
             text,
             fake_request_delay(request),
             request_input_tokens,
@@ -1268,15 +1313,15 @@ fn script_dispatch_observed(request: &ModelTurnRequest, script: &FakeProviderEve
     })
 }
 
-fn run_fake_event_script(turn: FakeTurn, script: FakeProviderEventScript) {
+fn run_fake_event_script(turn: &FakeTurn, script: FakeProviderEventScript) {
     let controlled = script
         .steps
         .iter()
         .any(|step| step.gate.is_some() || step.delay_ms.is_some_and(|delay| delay > 0));
     if controlled {
-        std::thread::spawn(move || emit_fake_event_script(&turn, script));
+        turn.spawn_worker(move |turn| emit_fake_event_script(&turn, script));
     } else {
-        emit_fake_event_script(&turn, script);
+        emit_fake_event_script(turn, script);
     }
 }
 
@@ -1287,8 +1332,10 @@ fn emit_fake_event_script(turn: &FakeTurn, script: FakeProviderEventScript) {
         {
             return;
         }
-        if let Some(delay_ms) = step.delay_ms.filter(|delay| *delay > 0) {
-            std::thread::sleep(Duration::from_millis(delay_ms));
+        if let Some(delay_ms) = step.delay_ms.filter(|delay| *delay > 0)
+            && !turn.delay(Duration::from_millis(delay_ms))
+        {
+            return;
         }
         if turn.is_cancelled() {
             return;
@@ -1328,7 +1375,7 @@ fn wait_for_fake_event_script_gate(turn: &FakeTurn, gate: &str) -> bool {
 }
 
 fn finish_fake_text_response(
-    turn: FakeTurn,
+    turn: &FakeTurn,
     text: Result<String, ProviderError>,
     delay: Option<Duration>,
     request_input_tokens: u64,
@@ -1344,7 +1391,7 @@ fn finish_fake_text_response(
         }
     };
     if let Some(delay) = delay {
-        std::thread::spawn(move || {
+        turn.spawn_worker(move |turn| {
             FakeTurnWorker {
                 turn,
                 text,
@@ -1354,7 +1401,7 @@ fn finish_fake_text_response(
             .run();
         });
     } else {
-        finish_fake_turn(&turn, text, request_input_tokens);
+        finish_fake_turn(turn, text, request_input_tokens);
     }
 }
 
@@ -1367,7 +1414,9 @@ struct FakeTurnWorker {
 
 impl FakeTurnWorker {
     fn run(self) {
-        std::thread::sleep(self.delay);
+        if !self.turn.delay(self.delay) {
+            return;
+        }
         if !self.turn.is_cancelled() {
             finish_fake_turn(&self.turn, self.text, self.request_input_tokens);
         }
@@ -2532,13 +2581,13 @@ fn fake_tool_argument_split_indices(call: &ToolCall, arguments: &str) -> Vec<usi
 }
 
 fn dispatch_fake_reasoning_turn(
-    turn: FakeTurn,
+    turn: &FakeTurn,
     text: String,
     delta_delay: Option<Duration>,
     request_input_tokens: u64,
 ) {
     let delay = delta_delay.unwrap_or_default();
-    std::thread::spawn(move || {
+    turn.spawn_worker(move |turn| {
         let activity_id = "fake-streaming-reasoning".to_owned();
         turn.push(ProviderTurnEvent::ReasoningActivity {
             event: bcode_session_models::ReasoningActivityEvent::Started {
@@ -2563,8 +2612,7 @@ fn dispatch_fake_reasoning_turn(
                     text: delta.to_owned(),
                 },
             });
-            std::thread::sleep(delay);
-            if turn.is_cancelled() {
+            if !turn.delay(delay) {
                 return;
             }
         }
@@ -2580,41 +2628,39 @@ fn dispatch_fake_reasoning_turn(
 }
 
 fn dispatch_fake_streaming_text(
-    turn: FakeTurn,
+    turn: &FakeTurn,
     text: String,
     delta_delay: Option<Duration>,
     request_input_tokens: u64,
 ) {
     if let Some(delay) = delta_delay {
-        std::thread::spawn(move || {
+        turn.spawn_worker(move |turn| {
             let midpoint = text
                 .char_indices()
                 .map(|(index, _)| index)
                 .find(|index| *index >= text.len() / 2)
                 .unwrap_or(text.len());
-            std::thread::sleep(delay);
-            if turn.is_cancelled() {
+            if !turn.delay(delay) {
                 return;
             }
             turn.push(ProviderTurnEvent::TextDelta {
                 text: text[..midpoint].to_owned(),
             });
-            std::thread::sleep(delay);
-            if turn.is_cancelled() {
+            if !turn.delay(delay) {
                 return;
             }
             finish_fake_turn(&turn, text[midpoint..].to_owned(), request_input_tokens);
         });
     } else {
-        finish_fake_turn(&turn, text, request_input_tokens);
+        finish_fake_turn(turn, text, request_input_tokens);
     }
 }
 
-fn dispatch_fake_tool_turn(turn: FakeTurn, call: ToolCall, delta_delay: Option<Duration>) {
+fn dispatch_fake_tool_turn(turn: &FakeTurn, call: ToolCall, delta_delay: Option<Duration>) {
     if let Some(delay) = delta_delay {
-        std::thread::spawn(move || finish_fake_tool_turn(&turn, call, Some(delay)));
+        turn.spawn_worker(move |turn| finish_fake_tool_turn(&turn, call, Some(delay)));
     } else {
-        finish_fake_tool_turn(&turn, call, None);
+        finish_fake_tool_turn(turn, call, None);
     }
 }
 
@@ -2637,11 +2683,10 @@ fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall, delta_delay: Option<Du
                 call_id: call.id.clone(),
                 delta: delta.to_owned(),
             });
-            if let Some(delay) = delta_delay {
-                std::thread::sleep(delay);
-                if turn.is_cancelled() {
-                    return;
-                }
+            if let Some(delay) = delta_delay
+                && !turn.delay(delay)
+            {
+                return;
             }
         }
     }
@@ -3401,14 +3446,72 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(
-    FakeProviderPlugin,
+bcode_plugin_sdk::define_plugin!(
+    concurrent FakeProviderPlugin,
     include_str!("../bcode-plugin.toml")
 );
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn instance_shutdown_cancels_and_joins_a_delayed_worker() {
+        use super::*;
+        let plugin = FakeProviderPlugin::default();
+        let turn = {
+            let mut state = plugin.state.lock().expect("state");
+            let turn = FakeTurn {
+                workers: Arc::clone(&state.workers),
+                ..FakeTurn::default()
+            };
+            state.turns.insert("owned".into(), turn.clone());
+            turn
+        };
+        let (started, ready) = std::sync::mpsc::channel();
+        turn.spawn_worker(move |turn| {
+            started.send(()).expect("worker started");
+            assert!(!turn.delay(Duration::from_secs(60)));
+        });
+        ready.recv().expect("worker admitted");
+        plugin.deactivate_concurrent().expect("cancel and join");
+        assert!(turn.is_cancelled());
+        let events = turn.drain();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::Cancelled))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::Cancelled
+            })
+        ));
+        plugin.deactivate_concurrent().expect("idempotent cleanup");
+    }
+
+    #[test]
+    fn shutting_down_one_instance_does_not_cancel_another() {
+        use super::*;
+        let first = FakeProviderPlugin::default();
+        let second = FakeProviderPlugin::default();
+        let second_turn = {
+            let mut state = second.state.lock().expect("state");
+            let turn = FakeTurn {
+                workers: Arc::clone(&state.workers),
+                ..FakeTurn::default()
+            };
+            state.turns.insert("second".into(), turn.clone());
+            turn
+        };
+        first.deactivate_concurrent().expect("first cleanup");
+        assert!(!second_turn.is_cancelled());
+        let (sent, received) = std::sync::mpsc::channel();
+        second_turn.spawn_worker(move |_| {
+            sent.send(()).expect("second still active");
+        });
+        received.recv().expect("second instance admits work");
+        second.deactivate_concurrent().expect("second cleanup");
+    }
     #[cfg(feature = "static-bundled")]
     #[tokio::test]
     async fn gate_members_acknowledge_distinct_held_turns_without_deadlines() {
@@ -3773,7 +3876,7 @@ mod tests {
             name: "filesystem.write".to_owned(),
             arguments: serde_json::json!({"path": "src/lib.rs", "contents": "hello"}),
         };
-        dispatch_fake_tool_turn(turn.clone(), call, Some(Duration::from_millis(100)));
+        dispatch_fake_tool_turn(&turn, call, Some(Duration::from_millis(100)));
         let first = drain_script_until(&turn, |events| {
             events
                 .iter()
@@ -3818,7 +3921,7 @@ mod tests {
     fn fake_text_turn_can_pause_between_deltas() {
         let turn = FakeTurn::default();
         dispatch_fake_streaming_text(
-            turn.clone(),
+            &turn,
             "ASSISTANTPREFIXASSISTANTSUFFIX".to_owned(),
             Some(Duration::from_millis(100)),
             4,
@@ -3953,7 +4056,7 @@ mod tests {
     fn fake_reasoning_turn_can_pause_between_ordered_updates() {
         let turn = FakeTurn::default();
         dispatch_fake_reasoning_turn(
-            turn.clone(),
+            &turn,
             "REASONINGFIRSTREASONINGSECOND".to_owned(),
             Some(Duration::from_millis(100)),
             4,
@@ -4519,7 +4622,7 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
                 }),
         );
         let turn = FakeTurn::default();
-        run_fake_event_script(turn.clone(), FakeProviderEventScript { steps });
+        run_fake_event_script(&turn, FakeProviderEventScript { steps });
 
         let before_gate = drain_script_until(&turn, |events| !events.is_empty());
         assert_eq!(

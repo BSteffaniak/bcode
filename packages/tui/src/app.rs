@@ -716,6 +716,14 @@ impl BmuxApp {
         self.plugin_presentation.is_some()
     }
 
+    /// Retain this frontend's selected adapters while asynchronous surface opening is in flight.
+    #[must_use]
+    pub fn shared_plugin_presentation(
+        &self,
+    ) -> Option<Arc<crate::plugin_tui::PluginTuiPresentation>> {
+        self.plugin_presentation.clone()
+    }
+
     /// Return persistent local plugin presentation state.
     #[must_use]
     pub fn plugin_presentation(&self) -> Option<&crate::plugin_tui::PluginTuiPresentation> {

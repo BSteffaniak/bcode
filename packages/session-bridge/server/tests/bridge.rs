@@ -90,16 +90,16 @@ async fn start_daemon() -> Daemon {
     };
     let client = BcodeClient::for_state_location(endpoint.clone(), locations.primary())
         .with_runtime_context(Some(context));
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = bcode_server::load_embedded_plugins(
         &selection,
         &[
             bcode_plugin::StaticBundledPlugin::new(
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
                 bcode_fake_provider_plugin::static_plugin(),
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
-                bcode_sdk_session_import_plugin::static_plugin(),
+                bcode_sdk_session_import_plugin::plugin_definition,
             ),
         ],
     )

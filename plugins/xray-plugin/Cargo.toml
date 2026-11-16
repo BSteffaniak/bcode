@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_command        = { workspace = true }

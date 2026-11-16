@@ -37,13 +37,13 @@ pub fn fixture() -> Fixture {
 pub fn fixture_with_agents(default_agents: bool, config_toml: &str) -> Fixture {
     let workspace = tempfile::tempdir().expect("workspace");
     let sessions = SessionManager::persistent(workspace.path().join("sessions")).expect("sessions");
-    let provider = bcode_plugin::StaticBundledPlugin::new(
+    let provider = crate::tests::shared_test_plugin(
         include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-        bcode_fake_provider_plugin::static_plugin(),
+        bcode_fake_provider_plugin::plugin_definition,
     );
-    let filesystem = bcode_plugin::StaticBundledPlugin::new(
+    let filesystem = crate::tests::shared_test_plugin(
         include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-        bcode_filesystem_plugin::static_plugin(),
+        bcode_filesystem_plugin::plugin_definition,
     );
     let mut state = crate::tests::test_server_state(sessions);
     let overrides: bcode_config::BcodeConfig =
@@ -57,12 +57,12 @@ pub fn fixture_with_agents(default_agents: bool, config_toml: &str) -> Fixture {
     let mut plugins = vec![provider, filesystem];
     if default_agents {
         enabled.insert("bcode.default-agents".to_owned());
-        plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        plugins.push(crate::tests::shared_test_plugin(
             include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-            bcode_default_agents_plugin::static_plugin(),
+            bcode_default_agents_plugin::plugin_definition,
         ));
     }
-    state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    state.plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled,

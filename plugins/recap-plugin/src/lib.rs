@@ -207,14 +207,22 @@ impl RustPlugin for RecapPlugin {
         }
     }
 }
-/// Static registration; loading selection controls activation and command/tool discovery.
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(RecapPlugin, include_str!("../bcode-plugin.toml"))
-}
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(RecapPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::define_plugin!(
+    RecapPlugin,
+    metadata = bcode_plugin_sdk::definition::PluginMetadata {
+        plugin_id: "bcode.recap".into(),
+        version: "0.1.0".into(),
+        roles: vec![bcode_plugin_sdk::definition::ComponentRole::Backend],
+        required_capabilities: Vec::new(),
+        contracts: vec![bcode_plugin_sdk::definition::ContractDescriptor {
+            interface_id: bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE.into(),
+            major: 1,
+            minor: 0,
+        }],
+        manifest_toml: Some(include_str!("../bcode-plugin.toml").into()),
+    },
+    registrations = bcode_plugin_sdk::definition::ProductRegistrations::default(),
+);
 
 #[cfg(test)]
 mod tests {

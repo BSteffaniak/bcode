@@ -14,6 +14,7 @@ version     = { workspace = true }
 bcode_model          = { workspace = true }
 bcode_session_models = { workspace = true }
 bmux_plugin_schema   = { workspace = true }
+clap                 = { workspace = true, features = ["std", "help", "usage", "string"] }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }
 thiserror            = { workspace = true }

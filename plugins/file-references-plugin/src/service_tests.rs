@@ -140,6 +140,75 @@ fn contribution_dispatch_accepts_own_and_legacy_only() {
     }
 }
 
+#[derive(Debug)]
+struct UncertainSearchReply {
+    cancellation: ServiceCancellation,
+}
+
+impl bcode_plugin_sdk::ProductHostBridge for UncertainSearchReply {
+    fn request(
+        &self,
+        _request: &ServiceBridgeRequest,
+    ) -> Result<ServiceBridgeResponse, bcode_plugin_sdk::ServiceBridgeError> {
+        self.cancellation.cancel();
+        Err(bcode_plugin_sdk::ServiceBridgeError::Unavailable)
+    }
+}
+
+#[test]
+fn cancellation_after_nested_dispatch_does_not_claim_no_effects() {
+    let mut context = context();
+    context.bridge = ServiceBridge::from_owned(
+        std::sync::Arc::new(UncertainSearchReply {
+            cancellation: context.cancellation.clone(),
+        }),
+        context.cancellation.clone(),
+    );
+    let snapshot = invoke(context).payload_json::<ComposerSnapshot>().unwrap();
+    assert_eq!(
+        snapshot.state,
+        ComposerSnapshotState::Error {
+            code: "search_unavailable".into(),
+        }
+    );
+    assert_eq!(
+        snapshot.candidates,
+        [] as [bcode_plugin_sdk::composer::ComposerCandidate; 0]
+    );
+}
+
+#[test]
+fn typed_path_cancellation_is_preserved_without_reason_inference() {
+    let request = context()
+        .request
+        .payload_json::<ComposerSearchRequest>()
+        .unwrap();
+    let paths = bcode_filesystem_models::path_search::SearchPathsResponse::terminal(
+        bcode_filesystem_models::path_search::SearchPathsState::Cancelled,
+        "not_used_to_classify_cancellation",
+    );
+    assert_eq!(
+        crate::search::snapshot(&request, paths).unwrap_err(),
+        "cancelled"
+    );
+}
+
+#[test]
+fn unavailable_path_reason_does_not_masquerade_as_typed_cancellation() {
+    let request = context()
+        .request
+        .payload_json::<ComposerSearchRequest>()
+        .unwrap();
+    let paths = bcode_filesystem_models::path_search::SearchPathsResponse::terminal(
+        bcode_filesystem_models::path_search::SearchPathsState::Unavailable,
+        "cancelled",
+    );
+    assert_eq!(
+        crate::search::snapshot(&request, paths).unwrap_err(),
+        "search_unavailable"
+    );
+}
+
 #[test]
 fn cancellation_before_search_and_in_nested_reply_are_truthful() {
     for nested in [false, true] {

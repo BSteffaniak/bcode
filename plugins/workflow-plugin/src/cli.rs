@@ -165,6 +165,26 @@ pub fn registration() -> StaticCliRegistration {
 #[allow(clippy::too_many_lines)]
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
+        use std::io::Write as _;
+        let outcome = invoke_portable(matches).await?;
+        std::io::stdout()
+            .write_all(&outcome.stdout)
+            .map_err(|error| error.to_string())?;
+        Ok(StaticCliOutcome::default())
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn invoke_portable(
+    matches: clap::ArgMatches,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<bcode_command::cli::CliOutcome, String>>
+            + Send
+            + 'static,
+    >,
+> {
+    Box::pin(async move {
         let cli = WorkflowCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
         let command_id = match cli.action.as_str() {
             "status" => "workflow.status".to_string(),
@@ -328,14 +348,21 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             context: None,
         })
         .await?;
+        let mut stdout = Vec::new();
         if let Some(message) = response.message {
-            println!("{message}");
+            stdout.extend_from_slice(message.as_bytes());
+            stdout.push(b'\n');
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.effects).map_err(|error| error.to_string())?
+        stdout.extend_from_slice(
+            serde_json::to_string_pretty(&response.effects)
+                .map_err(|error| error.to_string())?
+                .as_bytes(),
         );
-        Ok(StaticCliOutcome::default())
+        stdout.push(b'\n');
+        Ok(bcode_command::cli::CliOutcome {
+            stdout,
+            ..bcode_command::cli::CliOutcome::default()
+        })
     })
 }
 

@@ -6,6 +6,8 @@ use clap::Command;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompositionError {
+    #[error("selected plugin CLI declaration or invocation failed: {0}")]
+    Extension(String),
     #[error(
         "plugin CLI command `{command}` is contributed by both `{first_plugin}` and `{second_plugin}`"
     )]
@@ -22,6 +24,7 @@ pub struct Contribution {
     requires_daemon: fn(&clap::ArgMatches) -> bool,
     invoke: fn(clap::ArgMatches) -> StaticCliFuture,
     command: Command,
+    extension: Option<crate::plugin_cli_extension::SelectedCliExtension>,
 }
 
 pub fn registrations(
@@ -40,6 +43,7 @@ pub fn registrations(
             requires_daemon: registration.requires_daemon,
             invoke: registration.invoke,
             command,
+            extension: None,
         });
     }
     contributions.sort_by(|left, right| {
@@ -52,6 +56,19 @@ pub fn registrations(
 }
 
 fn validate(contributions: &[Contribution]) -> Result<(), CompositionError> {
+    let mut claimed = std::collections::BTreeMap::new();
+    for entry in contributions {
+        for name in std::iter::once(entry.command.get_name()).chain(entry.command.get_all_aliases())
+        {
+            if let Some(previous) = claimed.insert(name.to_owned(), entry.plugin_id.clone()) {
+                return Err(CompositionError::Conflict {
+                    command: name.to_owned(),
+                    first_plugin: previous,
+                    second_plugin: entry.plugin_id.clone(),
+                });
+            }
+        }
+    }
     for pair in contributions.windows(2) {
         if pair[0].command_name == pair[1].command_name {
             return Err(CompositionError::Conflict {
@@ -90,7 +107,190 @@ pub fn matched<'a>(
         .find(|contribution| contribution.command_name == name)
 }
 
+/// Extract host-global selection options without interpreting plugin argv. Host
+/// globals are reserved by the root parser even after subcommands; `--` ends them.
+pub fn selection_matches(
+    argv: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<clap::ArgMatches, clap::Error> {
+    let argv = argv.into_iter().collect::<Vec<_>>();
+    let mut command = crate::root_command();
+    command.build();
+    let ids = ["context", "profile", "request_timeout_secs", "config_only"];
+    let arguments = command
+        .get_arguments()
+        .filter(|arg| ids.contains(&arg.get_id().as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut selected = vec![std::ffi::OsString::from("bcode")];
+    let mut index = 1;
+    while index < argv.len() {
+        let Some(token) = argv[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if token == "--" {
+            break;
+        }
+        let spelling = token.split_once('=').map_or(token, |(name, _)| name);
+        if !token.starts_with('-') {
+            break;
+        }
+        let host_argument = command.get_arguments().find(|arg| {
+            arg.get_long()
+                .is_some_and(|long| spelling == format!("--{long}"))
+                || arg
+                    .get_short()
+                    .is_some_and(|short| spelling == format!("-{short}"))
+        });
+        if arguments.iter().any(|arg| {
+            arg.get_long()
+                .is_some_and(|long| spelling == format!("--{long}"))
+        }) {
+            selected.push(argv[index].clone());
+            if !token.contains('=') {
+                index += 1;
+                if let Some(value) = argv.get(index) {
+                    selected.push(value.clone());
+                }
+            }
+        } else if host_argument.is_some_and(|arg| arg.get_action().takes_values())
+            && !token.contains('=')
+        {
+            index += 1;
+        }
+        index += 1;
+    }
+    Command::new("bcode")
+        .args(arguments)
+        .try_get_matches_from(selected)
+}
+
+/// Preserve leaf argv while stripping reserved host globals. Reject non-UTF8
+/// extension argv rather than silently replacing bytes before author parsing.
+pub fn extension_arguments(command: &Command) -> Result<Vec<String>, String> {
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    let mut root = crate::root_command_with_build_info(crate::build_info());
+    root.build();
+    let mut index = 1;
+    let mut found = false;
+    let mut arguments = Vec::new();
+    while index < argv.len() {
+        let token = argv[index]
+            .to_str()
+            .ok_or("non-UTF8 plugin CLI arguments are unsupported")?;
+        if found && token == "--" {
+            for value in &argv[index..] {
+                arguments.push(
+                    value
+                        .to_str()
+                        .ok_or("non-UTF8 plugin CLI arguments are unsupported")?
+                        .to_owned(),
+                );
+            }
+            break;
+        }
+        let (spelling, equals) = token
+            .split_once('=')
+            .map_or((token, false), |(name, _)| (name, true));
+        let global = root.get_arguments().find(|arg| {
+            arg.is_global_set()
+                && (arg
+                    .get_long()
+                    .is_some_and(|long| spelling == format!("--{long}"))
+                    || arg
+                        .get_short()
+                        .is_some_and(|short| spelling == format!("-{short}")))
+        });
+        if let Some(global) = global {
+            if found {
+                // Without clap source-scope indices, a token can also be a
+                // hyphen-accepting plugin value. Never strip it and invoke a
+                // different operation; require explicit unambiguous placement.
+                return Err("native CLI host-global options must precede the plugin command (or follow -- as plugin data)".to_owned());
+            }
+            if global.get_action().takes_values() && !equals {
+                index += 1;
+            }
+        } else if !found {
+            if token == command.get_name() || command.get_all_aliases().any(|alias| alias == token)
+            {
+                found = true;
+            } else if token.starts_with('-') {
+                let host = root.get_arguments().find(|arg| {
+                    arg.get_long()
+                        .is_some_and(|long| spelling == format!("--{long}"))
+                });
+                if host.is_some_and(|arg| arg.get_action().takes_values()) && !equals {
+                    index += 1;
+                }
+            } else {
+                return Err("cannot determine plugin CLI argv boundary".to_owned());
+            }
+        } else {
+            arguments.push(token.to_owned());
+        }
+        index += 1;
+    }
+    if !found {
+        return Err("cannot determine plugin CLI command token".to_owned());
+    }
+    Ok(arguments)
+}
+
+pub async fn add_extensions(
+    contributions: &mut Vec<Contribution>,
+    extensions: &[crate::plugin_cli_extension::SelectedCliExtension],
+) -> Result<(), CompositionError> {
+    for extension in extensions {
+        let descriptor = match extension.describe().await {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => continue,
+            Err(_) => {
+                // Optional plugin damage must not prevent unrelated host commands.
+                // Its known legacy command stays unavailable; never fall back.
+                tracing::warn!(plugin_id = %extension.plugin_id, "selected plugin CLI descriptor unavailable");
+                continue;
+            }
+        };
+        descriptor.validate().map_err(|_| {
+            CompositionError::Extension("invalid portable CLI descriptor".to_owned())
+        })?;
+        let command = descriptor.command();
+        if contributions
+            .iter()
+            .any(|entry| entry.plugin_id == extension.plugin_id)
+        {
+            return Err(CompositionError::Extension(
+                "duplicate selected plugin packaging".to_owned(),
+            ));
+        }
+        contributions.push(Contribution {
+            plugin_id: extension.plugin_id.clone(),
+            command_name: descriptor.name,
+            requires_daemon: |_| false,
+            invoke: |_| {
+                Box::pin(async { Err("native CLI requires extension dispatch".to_owned()) })
+            },
+            command,
+            extension: Some(extension.clone()),
+        });
+    }
+    contributions.sort_by(|a, b| a.command_name.cmp(&b.command_name));
+    validate(contributions)
+}
+
 impl Contribution {
+    pub const fn extension(&self) -> Option<&crate::plugin_cli_extension::SelectedCliExtension> {
+        self.extension.as_ref()
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+    pub const fn command(&self) -> &Command {
+        &self.command
+    }
+
     /// Classify the plugin command before dispatch without owning plugin policy.
     pub fn requires_daemon(&self, matches: &clap::ArgMatches) -> bool {
         (self.requires_daemon)(matches)
@@ -116,7 +316,42 @@ mod tests {
             requires_daemon: |_| false,
             invoke: unused_invoke,
             command,
+            extension: None,
         }
+    }
+
+    #[test]
+    fn startup_selection_preserves_exclusive_config_profile_and_context() {
+        let matches = selection_matches(
+            [
+                "bcode",
+                "--config-only",
+                "/tmp/selected.toml",
+                "--context",
+                "work",
+                "--profile=sol",
+                "example",
+                "inspect",
+                "--",
+                "--profile=plugin-data",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        assert_eq!(
+            matches.get_one::<String>("profile").map(String::as_str),
+            Some("sol")
+        );
+        assert_eq!(
+            matches.get_one::<String>("context").map(String::as_str),
+            Some("work")
+        );
+        assert_eq!(
+            matches
+                .get_one::<std::path::PathBuf>("config_only")
+                .map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/tmp/selected.toml"))
+        );
     }
 
     #[test]

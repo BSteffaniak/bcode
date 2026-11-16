@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_model          = { workspace = true }
@@ -26,4 +26,3 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []

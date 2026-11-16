@@ -229,6 +229,41 @@ pub async fn prepare_presentation(
     Ok(tokio::task::spawn_blocking(move || load_presentation(&plugins)).await?)
 }
 
+/// Prepare explicitly selected frontend artifacts on the blocking startup worker.
+/// The supplied selection is authoritative; failure never retries bundled frontend discovery.
+///
+/// # Errors
+/// Returns worker failure; configuration and frontend failures are reported by the root screen.
+pub async fn prepare_selected_presentation(
+    startup: super::plugin_tui::SelectedFrontendStartup,
+) -> Result<PreparedPresentation, TuiError> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let config = bcode_config::load_config();
+        let streaming_override = bcode_config::load_tui_streaming_presentation_override();
+        let structure_rules = bcode_config::load_tui_presentation_rules();
+        let appearance = SavedAppearance::load();
+        let visual = config
+            .as_ref()
+            .map(|config| config.tui.visual_adapters.clone())
+            .unwrap_or_default();
+        let presentation =
+            super::plugin_tui::PluginTuiPresentation::with_selected_frontend_deployments(
+                startup.runtime,
+                visual,
+                startup.deployments,
+                startup.portable.as_deref(),
+            );
+        PreparedPresentation {
+            config,
+            streaming_override,
+            presentation,
+            structure_rules,
+            appearance,
+        }
+    })
+    .await?)
+}
+
 fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> PreparedPresentation {
     let config = bcode_config::load_config();
     let streaming_override = bcode_config::load_tui_streaming_presentation_override();

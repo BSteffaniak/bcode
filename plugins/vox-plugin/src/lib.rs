@@ -5,9 +5,9 @@
 
 pub mod frontend;
 pub mod service;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub mod tui;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub use tui::tui_registry;
 
 use bcode_command::{
@@ -59,6 +59,10 @@ pub fn commands() -> Vec<CommandContribution> {
 pub struct VoxPlugin;
 
 impl RustPlugin for VoxPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         for command in commands() {
             registrar
@@ -73,12 +77,38 @@ impl RustPlugin for VoxPlugin {
     }
 }
 
-/// Static bundled plugin entry point.
-#[cfg(feature = "static-bundled")]
+// Static bundled plugin entry point.
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(serial VoxPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_host::<VoxPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(VoxPlugin, include_str!("../bcode-plugin.toml"))
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(VoxPlugin, include_str!("../bcode-plugin.toml"));

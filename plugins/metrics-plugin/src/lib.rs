@@ -1,7 +1,12 @@
 //! Metrics dashboard plugin for Bcode.
 
-#[cfg(feature = "static-bundled")]
 mod cli;
+
+/// Return the plugin-owned CLI grammar and invocation adapter for either packaging mode.
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
 
 pub mod metrics_dashboard;
 pub mod tui;
@@ -24,6 +29,10 @@ const DEFAULT_METRICS_ROOT: &str = ".local/state/bcode/metrics/events.jsonl";
 pub struct MetricsPlugin;
 
 impl RustPlugin for MetricsPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         registrar
             .register(&open_dashboard_command())
@@ -128,16 +137,62 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(test)]
+mod shared_definition_tests {
+    #[test]
+    fn cli_registration_is_available_without_static_packaging() {
+        let registration = super::cli_registration();
+        let matches = (registration.command)()
+            .try_get_matches_from(["metrics", "--json"])
+            .expect("metrics grammar");
+        assert!((registration.requires_daemon)(&matches));
+        assert!(matches.get_flag("json"));
+        assert_eq!(
+            super::plugin_definition().metadata.plugin_id,
+            "bcode.metrics"
+        );
+    }
+}
+
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli_registration()),
+        portable_cli: Some(cli::invoke_portable),
+        frontend: Some(tui::tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial MetricsPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<MetricsPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
         MetricsPlugin,
         include_str!("../bcode-plugin.toml")
     );
-    vtable.cli_registration = Some(cli::registration);
+    vtable.cli_registration = Some(cli_registration);
     vtable
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(MetricsPlugin, include_str!("../bcode-plugin.toml"));

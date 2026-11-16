@@ -1781,7 +1781,26 @@ pub struct ProactiveCompactionEvaluation {
     pub previous_compacted_through_sequence: Option<u64>,
 }
 
+// The budget path resolves provider model status and request projections, whose combined
+// future exceeds clippy's large-future threshold; box it once here so every caller stays small.
 pub async fn request_exceeds_compaction_capacity(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    request: &ModelTurnRequest,
+    projected_input_tokens: u64,
+) -> Option<(u64, CompactionCapacity)> {
+    Box::pin(request_exceeds_compaction_capacity_inner(
+        state,
+        session_id,
+        selection,
+        request,
+        projected_input_tokens,
+    ))
+    .await
+}
+
+async fn request_exceeds_compaction_capacity_inner(
     state: &ServerState,
     session_id: SessionId,
     selection: &SessionModelSelection,
@@ -2127,7 +2146,30 @@ async fn compaction_trace_declares_only_its_scalar_projection() {
     drop(state);
 }
 
+// The budget path resolves provider model status and request projections, whose combined
+// future exceeds clippy's large-future threshold; box it once here so every caller stays small.
 pub async fn validate_summary_publication(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    boundary: u64,
+    summary: &str,
+    minimum_reclaim_tokens: u64,
+    cancel: &TurnCancelState,
+) -> Result<(), CompactionError> {
+    Box::pin(validate_summary_publication_inner(
+        state,
+        session_id,
+        selection,
+        boundary,
+        summary,
+        minimum_reclaim_tokens,
+        cancel,
+    ))
+    .await
+}
+
+async fn validate_summary_publication_inner(
     state: &ServerState,
     session_id: SessionId,
     selection: &SessionModelSelection,
@@ -2159,7 +2201,23 @@ pub async fn validate_summary_publication(
     policy.validate_candidate(summary, "", &request)
 }
 
+// The budget path resolves provider model status and request projections, whose combined
+// future exceeds clippy's large-future threshold; box it once here so every caller stays small.
 pub async fn validate_provider_summary_publication(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    boundary: u64,
+    snapshot: &bcode_session_models::ProviderContextSnapshot,
+    cancel: &TurnCancelState,
+) -> Result<(), CompactionError> {
+    Box::pin(validate_provider_summary_publication_inner(
+        state, session_id, selection, boundary, snapshot, cancel,
+    ))
+    .await
+}
+
+async fn validate_provider_summary_publication_inner(
     state: &ServerState,
     session_id: SessionId,
     selection: &SessionModelSelection,
@@ -2209,7 +2267,8 @@ const fn synthesis_limits(policy: &budget::ResolvedSummaryPolicy) -> synthesis::
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// The budget path resolves provider model status and request projections, whose combined
+// future exceeds clippy's large-future threshold; box it once here so every caller stays small.
 async fn resolve_summary_budget(
     state: &ServerState,
     session_id: SessionId,
@@ -3059,8 +3118,31 @@ async fn finish_synthesis(
     Ok(summary)
 }
 
-#[allow(clippy::too_many_lines)] // Frozen legacy packing and new capacity planning share target resolution.
+// The budget path resolves provider model status and request projections, whose combined
+// future exceeds clippy's large-future threshold; box it once here so every caller stays small.
 async fn synthesis_chunks(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    transcript: &CompactionTranscript,
+    cancel_state: &TurnCancelState,
+    policy: Option<&budget::ResolvedSummaryPolicy>,
+    seed: Option<&checkpoint::UpgradeSeed>,
+) -> Result<(Vec<String>, String), CompactionError> {
+    Box::pin(synthesis_chunks_inner(
+        state,
+        session_id,
+        selection,
+        transcript,
+        cancel_state,
+        policy,
+        seed,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_lines)] // Frozen legacy packing and new capacity planning share target resolution.
+async fn synthesis_chunks_inner(
     state: &ServerState,
     session_id: SessionId,
     selection: &SessionModelSelection,

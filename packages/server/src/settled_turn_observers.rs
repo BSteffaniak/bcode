@@ -381,7 +381,7 @@ mod tests {
             .await
             .unwrap();
         let mut state = crate::tests::test_server_state(sessions);
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["test.a-failing".into(), "test.observer".into()]),
@@ -499,7 +499,7 @@ mod tests {
     async fn registry_observer_is_tool_free_and_receives_cancellation() {
         let guard = OBSERVER_TEST_LOCK.lock().await;
         let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from(["test.observer".into()]),

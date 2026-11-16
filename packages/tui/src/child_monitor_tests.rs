@@ -255,6 +255,7 @@ fn child_activity_refresh_advances_cursor_and_terminal_window_restarts() {
         request,
         super::super::effects::TuiEffect::LoadChildActivity { after: None, .. }
     ));
+    drop(request);
     drop(app);
 }
 
@@ -281,6 +282,7 @@ fn newer_monitor_request_rejects_stale_even_in_same_session() {
     else {
         unreachable!()
     };
+    drop(request);
     assert!(!app.accepts_child_result(true, root, first));
     assert!(app.accepts_child_result(true, root, second));
     drop(app);

@@ -523,7 +523,7 @@ impl ConcurrentRustPlugin for ClaudeCodePlugin {
         &self,
         registrar: AuthRegistrar,
     ) -> Result<(), PluginError> {
-        PluginState::register_auth_providers(registrar)
+        PluginState::register_auth_providers(&registrar)
     }
 
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -618,7 +618,7 @@ fn observe_wait(context: &NativeServiceContext) -> Option<(HarnessRequest, std::
 }
 
 impl PluginState {
-    fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> {
+    fn register_auth_providers(registrar: &AuthRegistrar) -> Result<(), PluginError> {
         use bcode_provider_auth_models::{
             AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution,
             AuthProviderContribution, AuthSecretField,
@@ -2030,5 +2030,5 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(ClaudeCodePlugin, include_str!("../bcode-plugin.toml"));
+// One declaration serves bundled and native packaging; implementations export no ABI symbols.
+bcode_plugin_sdk::define_plugin!(concurrent ClaudeCodePlugin, include_str!("../bcode-plugin.toml"));

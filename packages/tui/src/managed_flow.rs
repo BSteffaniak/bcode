@@ -623,7 +623,7 @@ mod tests {
             .drain_runtime()
             .0
             .into_iter()
-            .map(|(_, effect)| effect)
+            .map(|crate::effects::ScheduledEffect { effect, .. }| effect)
             .collect()
     }
 

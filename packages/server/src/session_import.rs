@@ -1451,9 +1451,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn configured_disabled_pi_is_excluded_with_real_provider_loaded() {
-        let pi = bcode_plugin::StaticBundledPlugin::new(
+        let pi = crate::tests::shared_test_plugin(
             include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
-            bcode_pi_session_import_plugin::static_plugin(),
+            bcode_pi_session_import_plugin::plugin_definition,
         );
         let mut state = fixture_import_state(
             &[pi],
@@ -1676,7 +1676,7 @@ mod tests {
     ) -> crate::ServerState {
         crate::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled,
@@ -2469,15 +2469,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = crate::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::persistent(root.path().join("sessions")).unwrap(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from(["bcode.sdk-session-import".into()]),
                     disabled: std::collections::BTreeSet::new(),
                 },
-                &[bcode_plugin::StaticBundledPlugin::new(
+                &[bcode_plugin::StaticBundledPlugin::from_definition(
                     include_str!("../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
-                    bcode_sdk_session_import_plugin::static_plugin(),
+                    bcode_sdk_session_import_plugin::plugin_definition,
                 )],
             )
             .unwrap(),
@@ -2570,15 +2570,15 @@ mod tests {
     fn sdk_import_state(root: &std::path::Path) -> crate::ServerState {
         crate::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::persistent(root.join("sessions")).unwrap(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from(["bcode.sdk-session-import".into()]),
                     disabled: std::collections::BTreeSet::new(),
                 },
-                &[bcode_plugin::StaticBundledPlugin::new(
+                &[bcode_plugin::StaticBundledPlugin::from_definition(
                     include_str!("../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
-                    bcode_sdk_session_import_plugin::static_plugin(),
+                    bcode_sdk_session_import_plugin::plugin_definition,
                 )],
             )
             .unwrap(),

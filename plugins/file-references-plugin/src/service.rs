@@ -15,6 +15,10 @@ mod tests;
 pub struct FileReferencesPlugin;
 
 impl RustPlugin for FileReferencesPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != COMPOSER_INTERFACE_ID
             || context.request.operation != OP_COMPOSER_SEARCH

@@ -13,14 +13,47 @@ use bmux_tui_components::text_input::TextInputState;
 pub enum FocusedTextFieldEditResult {
     /// The live editor changed in one history-preserving transaction.
     Applied,
+    /// Admitted once; the owner will report the terminal mutation result separately.
+    Pending,
+    /// Admission occurred, but commitment cannot be verified. Do not replay the edit.
+    Unknown,
     /// A validated text-identical request left all editor state untouched.
     Noop,
     /// The editor was not changed.
     Rejected(ComposerValidationError),
 }
 
+impl serde::Serialize for FocusedTextFieldEditResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Applied => "applied",
+            Self::Pending => "pending",
+            Self::Unknown => "unknown",
+            Self::Noop => "noop",
+            Self::Rejected(ComposerValidationError::InvalidPayload) => "invalid_payload",
+            Self::Rejected(ComposerValidationError::Stale) => "stale",
+            Self::Rejected(ComposerValidationError::RevisionExhausted) => "revision_exhausted",
+        })
+    }
+}
+impl<'de> serde::Deserialize<'de> for FocusedTextFieldEditResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        match value.as_str() {
+            "pending" => Ok(Self::Pending),
+            "unknown" => Ok(Self::Unknown),
+            "applied" => Ok(Self::Applied),
+            "noop" => Ok(Self::Noop),
+            "invalid_payload" => Ok(Self::Rejected(ComposerValidationError::InvalidPayload)),
+            "stale" => Ok(Self::Rejected(ComposerValidationError::Stale)),
+            "revision_exhausted" => Ok(Self::Rejected(ComposerValidationError::RevisionExhausted)),
+            _ => Err(serde::de::Error::custom("unknown focused edit result")),
+        }
+    }
+}
+
 /// Identity of one field lifetime. Never reuse it after the owning editor is replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FocusedTextFieldIdentity {
     /// Stable identity of the surface or editor owner.
     pub owner_id: String,
@@ -35,7 +68,7 @@ pub struct FocusedTextFieldIdentity {
 /// Owners must validate the document before exposing it, omit secret fields entirely,
 /// and advance generation whenever focus, editor state or eligibility changes. Geometry
 /// comes from the retained measured presentation, never independent text measurement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FocusedTextFieldSnapshot {
     /// Field and owner lifetime being addressed.
     pub identity: FocusedTextFieldIdentity,
@@ -55,7 +88,7 @@ pub struct FocusedTextFieldSnapshot {
 ///
 /// The owner re-reads its live editor, validates this request, then performs a single
 /// history-preserving replacement. This value never contains a mutable editor reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FocusedTextFieldEdit {
     /// Exact field state used to obtain the candidate.
     pub expected: FocusedTextFieldSnapshot,

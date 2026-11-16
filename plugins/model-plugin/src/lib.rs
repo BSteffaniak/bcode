@@ -110,6 +110,10 @@ fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
 pub struct ModelPlugin;
 
 impl RustPlugin for ModelPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         for command in model_palette_command_contributions() {
             registrar
@@ -226,6 +230,37 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     }
 }
 
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(model_tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial ModelPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<ModelPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(ModelPlugin, include_str!("../bcode-plugin.toml"))
@@ -577,9 +612,6 @@ fn model_select_lines() -> Vec<String> {
     lines
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(ModelPlugin, include_str!("../bcode-plugin.toml"));
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,17 +764,64 @@ mod tests {
         );
     }
 
+    extern "C" fn inspection_bridge(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request: ServiceBridgeRequest =
+            serde_json::from_slice(request).expect("bridge request");
+        let ServiceBridgeRequest::InvokeService(request) = request else {
+            panic!("expected nested service request");
+        };
+        assert_eq!(request.invocation_id, "test-dispatch");
+        assert_eq!(request.interface_id, AUTH_HOST_INTERFACE_ID);
+        assert_eq!(request.operation, OP_INSPECT_SECURITY);
+        let inspection: AuthSecurityInspectionRequest =
+            serde_json::from_value(request.payload).expect("inspection request");
+        assert_eq!(inspection.provider_id, "openai");
+        assert_eq!(inspection.profile, "openai");
+        assert_eq!(
+            inspection.schema_version,
+            AUTH_SECURITY_INSPECTION_SCHEMA_VERSION
+        );
+        let (response, calls) = unsafe {
+            &*user_data.cast::<(AuthSecurityInspectionResponse, std::cell::Cell<usize>)>()
+        };
+        calls.set(calls.get() + 1);
+        let encoded = serde_json::to_vec(&ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded {
+                payload: serde_json::to_value(response).expect("response"),
+            },
+        ))
+        .expect("bridge response");
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
+        }
+        0
+    }
+
     #[test]
-    #[allow(clippy::items_after_statements)]
     fn provider_auth_security_block_routes_semantic_host_inspection() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
         let block = manifest
             .services
             .iter()
-            .flat_map(|service| &service.workflow_blocks)
-            .find(|block| block.block_id == "provider_auth.security.inspect")
-            .expect("provider auth security workflow block");
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .and_then(|service| {
+                service
+                    .workflow_blocks
+                    .iter()
+                    .find(|block| block.block_id == "provider_auth.security.inspect")
+            })
+            .expect("provider-auth security workflow block is declared");
         assert_eq!(block.block_id, "provider_auth.security.inspect");
         assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::ReadOnly);
         assert_eq!(
@@ -761,41 +840,7 @@ mod tests {
             policy_satisfied: false,
             diagnostics: Vec::new(),
         };
-        extern "C" fn inspection_bridge(
-            request_ptr: *const u8,
-            request_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-            user_data: *mut std::ffi::c_void,
-        ) -> i32 {
-            let request = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
-            let request: ServiceBridgeRequest =
-                serde_json::from_slice(request).expect("bridge request");
-            let ServiceBridgeRequest::InvokeService(request) = request else {
-                panic!("expected nested service request");
-            };
-            assert_eq!(request.invocation_id, "test-dispatch");
-            assert_eq!(request.interface_id, AUTH_HOST_INTERFACE_ID);
-            assert_eq!(request.operation, OP_INSPECT_SECURITY);
-            let inspection: AuthSecurityInspectionRequest =
-                serde_json::from_value(request.payload).expect("inspection request");
-            assert_eq!(inspection.provider_id, "openai");
-            assert_eq!(inspection.profile, "openai");
-            let response = unsafe { &*user_data.cast::<AuthSecurityInspectionResponse>() };
-            let encoded = serde_json::to_vec(&ServiceBridgeResponse::Service(
-                bcode_tool::ToolInvocationServiceResolution::Responded {
-                    payload: serde_json::to_value(response).expect("response"),
-                },
-            ))
-            .expect("bridge response");
-            assert!(encoded.len() <= output_capacity);
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-                *output_len = encoded.len();
-            }
-            0
-        }
+        let captured = (expected.clone(), std::cell::Cell::new(0usize));
         let context = NativeServiceContext {
             diagnostics: None,
             plugin_id: "bcode.model".to_owned(),
@@ -819,7 +864,7 @@ mod tests {
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             bridge: ServiceBridge::new(
                 Some(inspection_bridge),
-                (&raw const expected).cast_mut().cast::<std::ffi::c_void>(),
+                (&raw const captured).cast_mut().cast::<std::ffi::c_void>(),
                 bcode_plugin_sdk::ServiceCancellation::default(),
             ),
             transient_progress_limits: TransientProgressLimits::default(),
@@ -829,6 +874,7 @@ mod tests {
         let status: AuthSecurityInspectionResponse =
             serde_json::from_slice(&response.payload).expect("status");
         assert_eq!(status, expected);
+        assert_eq!(captured.1.get(), 1, "exactly one semantic host inspection");
     }
 
     #[test]

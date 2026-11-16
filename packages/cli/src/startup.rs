@@ -15,13 +15,15 @@ const fn interactive_startup(terminal: bool, ci: bool, opted_out: bool) -> bool 
 }
 
 pub async fn advanced(no_discovery: bool) -> Result<(), CliError> {
-    let mut shell = bcode_tui::TerminalShell::enter()?;
-    let result = advanced_in_shell(&mut shell, no_discovery).await;
-    if let Err(error) = result {
-        let message = launch_recovery_message(Some(&error));
-        let _ = shell.show_error_without_retry(&message).await?;
+    {
+        let mut shell = bcode_tui::TerminalShell::enter()?;
+        let result = advanced_in_shell(&mut shell, no_discovery).await;
+        if let Err(error) = result {
+            let message = launch_recovery_message(Some(&error));
+            let _ = shell.show_error_without_retry(&message).await?;
+        }
+        shell.finish()?;
     }
-    shell.finish()?;
     Ok(())
 }
 
@@ -56,60 +58,65 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
         // A saved execution route must not inspect an unrelated provider account.
         Err("Execution preference is handled separately")
     };
-    let mut shell = bcode_tui::TerminalShell::enter()?;
-    let backend = if should_route_backends(&config, readiness.is_ok()) {
-        Box::pin(route_backend_selection(&host, &mut shell, no_discovery)).await
-    } else {
-        Ok(false)
-    };
-    host.deactivate_all()?;
-    match backend {
-        Ok(true) => {
-            shell.finish()?;
-            return Ok(true);
-        }
-        Ok(false) => {}
-        Err(error) => {
-            shell.finish()?;
-            return Err(error);
-        }
-    }
-    let remembered = bcode_config::startup::load();
-    let mut host = load_cli_plugin_host()?;
-    register_enabled(&host)?;
-    let readiness = local_readiness(&config, &host);
-    let explicit_selection = has_explicit_selection(&config);
-    let route = startup_route(readiness.is_ok(), explicit_selection, remembered.is_ok());
-    if route == StartupRoute::Continue {
+    // `finish` consumes the shell; scoping it keeps terminal ownership
+    // limited to the journey, matching `advanced`.
+    let result;
+    {
+        let mut shell = bcode_tui::TerminalShell::enter()?;
+        let backend = if should_route_backends(&config, readiness.is_ok()) {
+            Box::pin(route_backend_selection(&host, &mut shell, no_discovery)).await
+        } else {
+            Ok(false)
+        };
         host.deactivate_all()?;
+        match backend {
+            Ok(true) => {
+                shell.finish()?;
+                return Ok(true);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                shell.finish()?;
+                return Err(error);
+            }
+        }
+        let remembered = bcode_config::startup::load();
+        let mut host = load_cli_plugin_host()?;
+        register_enabled(&host)?;
+        let readiness = local_readiness(&config, &host);
+        let explicit_selection = has_explicit_selection(&config);
+        let route = startup_route(readiness.is_ok(), explicit_selection, remembered.is_ok());
+        if route == StartupRoute::Continue {
+            host.deactivate_all()?;
+            shell.finish()?;
+            return Ok(false);
+        }
+        let discovery_enabled = config
+            .onboarding
+            .credential_discovery_enabled(no_discovery, &bcode_config::ProcessConfigEnvironment);
+        let candidates = collect_candidates(&host, discovery_enabled);
+        let choices = if route
+            == (StartupRoute::Recover {
+                allow_choices: true,
+            }) {
+            candidate_selections(&host, &config, &candidates)
+        } else {
+            Vec::new()
+        };
+        host.deactivate_all()?;
+        let input = quick_input(remembered.is_ok(), readiness, &candidates, &choices);
+        result = run_startup_journey(
+            &mut shell,
+            input,
+            remembered.is_ok(),
+            route,
+            &choices,
+            explicit_selection,
+            no_discovery,
+        )
+        .await;
         shell.finish()?;
-        return Ok(false);
     }
-    let discovery_enabled = config
-        .onboarding
-        .credential_discovery_enabled(no_discovery, &bcode_config::ProcessConfigEnvironment);
-    let candidates = collect_candidates(&host, discovery_enabled);
-    let choices = if route
-        == (StartupRoute::Recover {
-            allow_choices: true,
-        }) {
-        candidate_selections(&host, &config, &candidates)
-    } else {
-        Vec::new()
-    };
-    host.deactivate_all()?;
-    let input = quick_input(remembered.is_ok(), readiness, &candidates, &choices);
-    let result = run_startup_journey(
-        &mut shell,
-        input,
-        remembered.is_ok(),
-        route,
-        &choices,
-        explicit_selection,
-        no_discovery,
-    )
-    .await;
-    shell.finish()?;
     result?;
     Ok(true)
 }

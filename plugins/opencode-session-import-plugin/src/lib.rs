@@ -747,11 +747,19 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
 #[cfg(test)]
 mod tests;
 
-#[cfg(not(feature = "static-bundled"))]
-export_plugin!(OpenCodeSessionImportPlugin, MANIFEST);
-
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(OpenCodeSessionImportPlugin, MANIFEST)
-}
+bcode_plugin_sdk::define_plugin!(
+    OpenCodeSessionImportPlugin,
+    metadata = bcode_plugin_sdk::definition::PluginMetadata {
+        plugin_id: "bcode.opencode-session-import".into(),
+        version: "0.0.1".into(),
+        roles: vec![bcode_plugin_sdk::definition::ComponentRole::Backend],
+        required_capabilities: Vec::new(),
+        contracts: vec![bcode_plugin_sdk::definition::ContractDescriptor {
+            interface_id: bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE.into(),
+            major: 1,
+            minor: 0,
+        }],
+        manifest_toml: Some(MANIFEST.into()),
+    },
+    registrations = bcode_plugin_sdk::definition::ProductRegistrations::default(),
+);

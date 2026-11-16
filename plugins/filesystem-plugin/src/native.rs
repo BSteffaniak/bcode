@@ -38,9 +38,16 @@ const FILESYSTEM_REQUEST_SCHEMA: &str = "bcode.filesystem.request";
 pub struct FilesystemPlugin;
 
 impl RustPlugin for FilesystemPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             FILESYSTEM_INTERFACE_ID => invoke_filesystem_service(&context),
+            "filesystem-paths/v1" if context.request.operation == "search-paths" => {
+                path_search::invoke_generated(context)
+            }
             TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
@@ -885,21 +892,21 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             arguments,
             None,
             &context.cancellation,
-            context.events,
+            context.events.clone(),
             &request.tool_call_id,
         ),
         "filesystem.find" => tool_find(
             arguments,
             None,
             &context.cancellation,
-            context.events,
+            context.events.clone(),
             &request.tool_call_id,
         ),
         "filesystem.grep" => tool_grep(
             arguments,
             None,
             &context.cancellation,
-            context.events,
+            &context.events,
             &request.tool_call_id,
         ),
         "filesystem.stat" => tool_stat(arguments, None, &request.tool_call_id),
@@ -1755,7 +1762,7 @@ fn tool_grep(
     arguments: serde_json::Value,
     cwd: Option<&Path>,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    events: ServiceEventEmitter,
+    events: &ServiceEventEmitter,
     tool_call_id: &str,
 ) -> ToolInvocationResponse {
     let result = serde_json::from_value::<GrepRequest>(arguments)
@@ -1764,7 +1771,7 @@ fn tool_grep(
             request
         })
         .and_then(|request| {
-            let mut progress = ProgressReporter::new(events, tool_call_id.to_string());
+            let mut progress = ProgressReporter::new(events.clone(), tool_call_id.to_string());
             progress.emit(format!("grep: searching for {}", request.pattern));
             grep_files_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
                 .map_err(serde_json::Error::io)
@@ -1814,7 +1821,7 @@ fn grep_context_candidates(
 fn emit_grep_context_candidates(
     response: &GrepResponse,
     tool_call_id: &str,
-    events: ServiceEventEmitter,
+    events: &ServiceEventEmitter,
 ) {
     for candidate in grep_context_candidates(response, tool_call_id) {
         let Ok(payload) = serde_json::to_value(&candidate) else {
@@ -1885,7 +1892,7 @@ mod judgement_context_producer_tests {
             Some(capture),
             std::ptr::from_ref(&captured).cast_mut().cast(),
         );
-        emit_grep_context_candidates(&found, "call-a", events);
+        emit_grep_context_candidates(&found, "call-a", &events);
         let messages = captured.lock().unwrap().clone();
         assert_eq!(messages.len(), 2);
         for (index, message) in messages.iter().enumerate() {
@@ -2961,13 +2968,42 @@ fn filesystem_artifact_result(
     }
 }
 
-#[cfg(feature = "static-bundled")]
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(serial FilesystemPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(filesystem_tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_host::<FilesystemPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(FilesystemPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -2996,9 +3032,6 @@ pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {
@@ -3288,7 +3321,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     fn registered_batch_adapter_is_reachable() {
         let registry = filesystem_tui_registry();
         assert!(
@@ -3301,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     fn registered_multi_edit_draft_projects_incomplete_arguments() {
         let registry = filesystem_tui_registry();
         let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(

@@ -2,14 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Dynamic ABI fixture for the question plugin host tests.
-//!
-//! The production question plugin can be linked statically with terminal UI support, which must not
-//! export dynamic ABI symbols. This fixture wraps the same `QuestionPlugin` implementation as a
-//! standalone dynamic library so host tests can exercise dynamic loading without Cargo feature
-//! unification with static-bundled consumers.
+//! Thin shared-ABI dynamic packaging for the production question definition.
+//! No lifecycle, dispatch, manifest or UI behavior is copied into this target.
 
-bcode_plugin_sdk::export_concurrent_plugin!(
-    bcode_question_plugin::QuestionPlugin,
-    include_str!("../../../plugins/question-plugin/bcode-plugin.toml")
-);
+bmux_plugin_sdk::export_plugin_entrypoint!(bcode_question_plugin::plugin_definition);

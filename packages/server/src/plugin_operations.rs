@@ -737,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_activity_selection_is_optional_and_fail_open() {
         let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from(["bcode.loop".into()]),
@@ -778,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn activity_round_trip_through_bundled_loop_producer() {
         let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
-        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        state.plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from(["bcode.loop".into()]),

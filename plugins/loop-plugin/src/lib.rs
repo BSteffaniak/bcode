@@ -53,6 +53,12 @@ const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
 mod activity;
 mod cli;
+
+/// Return the plugin-owned CLI grammar and invocation adapter for either packaging mode.
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
 mod continuation;
 mod goal;
 mod goal_document_view;
@@ -83,6 +89,10 @@ const MAX_PROMPT_BYTES: usize = 262_144;
 struct LoopPlugin;
 
 impl RustPlugin for LoopPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         for command in commands() {
             registrar
@@ -795,10 +805,42 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
         .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string()))
 }
 
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli_registration()),
+        frontend: Some(tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial LoopPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<LoopPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> StaticPluginVtable {
     let mut vtable = static_plugin_vtable!(LoopPlugin, include_str!("../bcode-plugin.toml"));
-    vtable.cli_registration = Some(cli::registration);
+    vtable.cli_registration = Some(cli_registration);
     vtable
 }
 
@@ -6597,6 +6639,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(LoopPlugin, include_str!("../bcode-plugin.toml"));

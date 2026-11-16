@@ -258,15 +258,15 @@ fn unsupported_or_absent_negotiation_never_acquires_callback() {
     let mut fixture = Fixture::default();
     let data = std::ptr::from_mut(&mut fixture).cast();
     let emitter = ServiceEventEmitter::new(Some(event), data);
-    assert!(capture_context(None, emitter, Some(control), data).is_none());
+    assert!(capture_context(None, emitter.clone(), Some(control), data).is_none());
     let mut context = negotiation();
     context.version = 99;
-    assert!(capture_context(Some(&context), emitter, Some(control), data).is_none());
+    assert!(capture_context(Some(&context), emitter.clone(), Some(control), data).is_none());
     context.version = 1;
     context.mode = NativeDiagnosticMode::Disabled;
-    assert!(capture_context(Some(&context), emitter, Some(control), data).is_none());
+    assert!(capture_context(Some(&context), emitter.clone(), Some(control), data).is_none());
     context.mode = NativeDiagnosticMode::CallbackV1;
-    assert!(capture_context(Some(&context), emitter, None, data).is_none());
+    assert!(capture_context(Some(&context), emitter.clone(), None, data).is_none());
     let unknown: NativeDiagnosticContext = serde_json::from_value(serde_json::json!({
         "version":1, "mode":"future_transport", "correlation":{"session_id":"host"},
         "max_event_bytes":65536

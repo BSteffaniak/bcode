@@ -235,7 +235,7 @@ async fn wait_for_contributions(state: &Arc<ServerState>) {
 }
 
 fn configure_coding_plugins(state: &mut ServerState) {
-    state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    state.plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from([

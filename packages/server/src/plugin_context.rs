@@ -1185,9 +1185,9 @@ library = "libtest_command_context.dylib"
                 COMMAND_MANIFEST,
                 bcode_plugin_sdk::static_plugin_vtable!(CommandPlugin, COMMAND_MANIFEST),
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ]
     }
@@ -1196,7 +1196,7 @@ library = "libtest_command_context.dylib"
         let plugins = command_plugins();
         super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from([
@@ -1434,7 +1434,7 @@ library = "libtest_command_context.dylib"
         let plugins = command_plugins();
         let state = std::sync::Arc::new(super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from([
@@ -1524,18 +1524,18 @@ library = "libtest_command_context.dylib"
         let temp = crate::tests::test_socket_dir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let bundles = [
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/session-derivation-plugin/bcode-plugin.toml"),
-                bcode_session_derivation_plugin::static_plugin(),
+                bcode_session_derivation_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ];
         let state = std::sync::Arc::new(super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::persistent(root.join("sessions")).unwrap(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection::all_enabled(),
                 &bundles,
             )
@@ -1752,14 +1752,14 @@ library = "libtest_composer_dispatch.dylib"
                 DISPATCH_MANIFEST,
                 bcode_plugin_sdk::static_plugin_vtable!(DispatchPlugin, DISPATCH_MANIFEST),
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ];
         let state = Arc::new(super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from([
@@ -1940,7 +1940,7 @@ library = "libtest_wait_second.dylib"
             WAIT_MANIFEST,
             bcode_plugin_sdk::static_plugin_vtable!(WaitPlugin, WAIT_MANIFEST),
         );
-        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let runtime = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from([
@@ -1956,9 +1956,9 @@ library = "libtest_wait_second.dylib"
                     WAIT_LEAF_MANIFEST,
                     bcode_plugin_sdk::static_plugin_vtable!(WaitPlugin, WAIT_LEAF_MANIFEST),
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                    bcode_default_agents_plugin::static_plugin(),
+                    bcode_default_agents_plugin::plugin_definition,
                 ),
             ],
         )
@@ -2179,7 +2179,7 @@ library = "libtest_wait_second.dylib"
         ];
         let state = super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            crate::tests::load_test_plugins(
                 &bcode_plugin::PluginSelection {
                     mode: bcode_plugin::PluginSelectionMode::Explicit,
                     enabled: std::collections::BTreeSet::from([
@@ -2219,16 +2219,16 @@ library = "libtest_wait_second.dylib"
 
     fn bridge_state(root: &Path) -> ServerState {
         let plugins = [
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                bcode_filesystem_plugin::static_plugin(),
+                bcode_filesystem_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ];
-        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let runtime = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from([
@@ -2305,17 +2305,17 @@ library = "libtest_wait_second.dylib"
 
     fn real_composer_state(root: &Path, enabled: bool) -> ServerState {
         let plugins = [
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/file-references-plugin/bcode-plugin.toml"),
-                bcode_file_references_plugin::static_plugin(),
+                bcode_file_references_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                bcode_filesystem_plugin::static_plugin(),
+                bcode_filesystem_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ];
         let mut selected = std::collections::BTreeSet::from([
@@ -2325,23 +2325,22 @@ library = "libtest_wait_second.dylib"
         if enabled {
             selected.insert("bcode.file-references".into());
         }
-        let runtime =
-            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
-                &bcode_plugin::PluginSelection {
-                    mode: bcode_plugin::PluginSelectionMode::Explicit,
-                    enabled: selected,
-                    disabled: std::collections::BTreeSet::new(),
-                },
-                &plugins,
-                BTreeMap::from([(
-                    "bcode.file-references".into(),
-                    bcode_plugin::ResolvedPluginConfig::new(
-                        serde_json::json!({"timeout_ms": 1000}),
-                        serde_json::json!({"timeout_ms": 1000}),
-                    ),
-                )]),
-            )
-            .unwrap();
+        let runtime = crate::tests::load_test_plugins_with_config(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: selected,
+                disabled: std::collections::BTreeSet::new(),
+            },
+            &plugins,
+            BTreeMap::from([(
+                "bcode.file-references".into(),
+                bcode_plugin::ResolvedPluginConfig::new(
+                    serde_json::json!({"timeout_ms": 1000}),
+                    serde_json::json!({"timeout_ms": 1000}),
+                ),
+            )]),
+        )
+        .unwrap();
         super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::persistent(root).unwrap(),
             runtime,

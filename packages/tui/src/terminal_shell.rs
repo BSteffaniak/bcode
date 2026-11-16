@@ -36,6 +36,8 @@ pub struct TerminalShell {
     // No fresh terminal may replace uncertain output authority.
     screen_error: Option<TuiError>,
     handoff_blocked: bool,
+    selected_frontend: Option<Box<crate::plugin_tui::SelectedFrontendStartup>>,
+    explicit_frontend_selected: bool,
 }
 
 // Own the yielded writer across the native future. Cancellation discards that
@@ -96,7 +98,16 @@ impl TerminalShell {
             stop_requested: false,
             screen_error: None,
             handoff_blocked: false,
+            selected_frontend: None,
+            explicit_frontend_selected: false,
         })
+    }
+
+    /// Select compatible executable frontend artifacts for the next chat startup.
+    /// Admission failure never substitutes daemon code or a bundled implementation.
+    pub fn set_selected_frontend(&mut self, startup: crate::plugin_tui::SelectedFrontendStartup) {
+        self.explicit_frontend_selected = true;
+        self.selected_frontend = Some(Box::new(startup));
     }
 
     /// Borrow a fresh screen presenter without leaving the alternate screen.
@@ -223,13 +234,27 @@ impl TerminalShell {
         if self.stop_requested() {
             return Ok(None);
         }
-        let Some(presentation) = self
-            .wait(
-                "Loading chat interface…",
-                crate::runtime::prepare_presentation(plugins),
-            )
-            .await?
-        else {
+        // An explicit selection is one launch's executable authority; a later chat
+        // screen in this shell (for example after switching sessions) must not
+        // silently substitute bundled frontends for it.
+        if self.selected_frontend.is_none() && self.explicit_frontend_selected {
+            return Err(TuiError::PluginService {
+                code: "frontend_selection_consumed".to_owned(),
+                message: "explicit frontend startup must be supplied again; bundled substitution is disabled".to_owned(),
+            });
+        }
+        let preparation = {
+            let selected = self.selected_frontend.take();
+            async move {
+                match selected {
+                    Some(startup) => {
+                        Box::pin(crate::runtime::prepare_selected_presentation(*startup)).await
+                    }
+                    None => crate::runtime::prepare_presentation(plugins).await,
+                }
+            }
+        };
+        let Some(presentation) = self.wait("Loading chat interface…", preparation).await? else {
             return Ok(None);
         };
         if self.stop_requested() {

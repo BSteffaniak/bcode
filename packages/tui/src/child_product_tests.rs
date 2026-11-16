@@ -442,10 +442,10 @@ async fn monitor_slash_outcome_opens_refocuses_and_refreshes_children() {
         assert!(model.chat.app.child_panel_open());
         assert!(model.chat.app.child_panel_focused());
         let (effects, _) = model.chat.pending_effects.drain_runtime();
-        assert!(effects.iter().any(|(_, effect)| matches!(effect,
+        assert!(effects.iter().any(|entry| matches!(&entry.effect,
             crate::effects::TuiEffect::LoadSessionChildren { parent_id, .. } if *parent_id == session_id
         )));
-        assert!(effects.iter().any(|(_, effect)| matches!(effect,
+        assert!(effects.iter().any(|entry| matches!(&entry.effect,
             crate::effects::TuiEffect::LoadChildActivity { session_id: id, .. } if *id == session_id
         )));
         model.chat.app.release_child_panel_focus();

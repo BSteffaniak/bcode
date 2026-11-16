@@ -61,6 +61,10 @@ impl ConcurrentRustPlugin for ShellPlugin {
 }
 
 impl RustPlugin for ShellPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         invoke_shell_service(&context)
     }
@@ -1051,7 +1055,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     }
     let primary_presentation = Arc::new(StdMutex::new(
         PrimaryPresentationPublisher::with_limits_and_cancellation(
-            context.events,
+            context.events.clone(),
             &request.tool_call_id,
             "bcode.shell",
             "bcode.tool.request.shell.run",
@@ -1067,7 +1071,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     let response = match request.name.as_str() {
         "shell.run" => run_shell_tool(
             context,
-            context.events,
+            context.events.clone(),
             &request.tool_call_id,
             arguments,
             descriptor.workspace_root.as_deref(),
@@ -1120,7 +1124,7 @@ fn run_shell_tool(
     }
     let arguments_json = serde_json::to_value(&arguments).unwrap_or_else(|_| json!({}));
     emit_tool_lifecycle(
-        events,
+        &events,
         &ToolInvocationLifecycleEvent {
             invocation_id: tool_call_id.to_owned(),
             sequence: 1,
@@ -1656,7 +1660,7 @@ fn wait_for_terminal_shell_status(
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
     timeout: Duration,
     tool_call_id: &str,
-    events: ServiceEventEmitter,
+    events: &ServiceEventEmitter,
     control: Option<&ShellInvocationActionReader>,
     updates: Option<&TerminalCaptureUpdates>,
 ) -> Result<TerminalShellStatus, String> {
@@ -1834,7 +1838,7 @@ fn run_terminal_shell_command_inner(
     let semantic_presentation = paths.primary_presentation.clone().unwrap_or_else(|| {
         Arc::new(StdMutex::new(
             PrimaryPresentationPublisher::with_limits_and_cancellation(
-                events,
+                events.clone(),
                 tool_call_id,
                 "bcode.shell",
                 "bcode.shell.output",
@@ -1853,7 +1857,7 @@ fn run_terminal_shell_command_inner(
         latest: Arc::clone(&latest_commit),
         observer: shell_capture_observer(
             Some(semantic_presentation),
-            events,
+            events.clone(),
             tool_call_id,
             arguments.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS),
             arguments_json.clone(),
@@ -1864,6 +1868,7 @@ fn run_terminal_shell_command_inner(
     let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
     let (stream_tx, stream_rx) = std::sync::mpsc::channel();
     let cancellation_for_reader = cancellation.clone();
+    let wait_events = events.clone();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
@@ -1933,7 +1938,7 @@ fn run_terminal_shell_command_inner(
         cancellation,
         budget.deadline.saturating_duration_since(Instant::now()),
         tool_call_id,
-        events,
+        &wait_events,
         control.as_ref(),
         Some(&updates),
     ) {
@@ -2768,7 +2773,7 @@ fn shell_capture_observer(
     })
 }
 
-fn emit_tool_lifecycle(events: ServiceEventEmitter, event: &ToolInvocationLifecycleEvent) {
+fn emit_tool_lifecycle(events: &ServiceEventEmitter, event: &ToolInvocationLifecycleEvent) {
     if let Ok(payload) = serde_json::to_vec(event) {
         events.emit(&payload);
     }
@@ -2953,7 +2958,36 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-#[cfg(feature = "static-bundled")]
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(concurrent ShellPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(shell_tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::concurrent_plugin_definition_with_host::<ShellPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_concurrent_plugin_vtable!(
@@ -2962,7 +2996,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -2977,9 +3011,6 @@ pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {
@@ -4354,7 +4385,7 @@ mod tests {
         );
         let presentation = Arc::new(StdMutex::new(
             PrimaryPresentationPublisher::with_limits_and_cancellation(
-                emitter,
+                emitter.clone(),
                 "call-continuity",
                 "bcode.shell",
                 "bcode.tool.request.shell.run",
@@ -6174,7 +6205,7 @@ mod tests {
             &cancellation,
             Duration::from_secs(10),
             "cancel-test",
-            ServiceEventEmitter::default(),
+            &ServiceEventEmitter::default(),
             None,
             None,
         )
@@ -6195,7 +6226,7 @@ mod tests {
             &bcode_plugin_sdk::ServiceCancellation::default(),
             Duration::ZERO,
             "timeout-test",
-            ServiceEventEmitter::default(),
+            &ServiceEventEmitter::default(),
             None,
             None,
         )
@@ -6539,7 +6570,7 @@ mod tests {
         drop(recorded_events);
     }
 
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "tui")]
     #[test]
     fn authoritative_recording_replays_the_same_prelude_filtered_bytes_as_live() {
         let dir = tempfile::tempdir().expect("temp dir");

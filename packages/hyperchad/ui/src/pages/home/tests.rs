@@ -85,6 +85,25 @@ fn container_text(container: &hyperchad_transformer::Container, text: &mut Strin
     }
 }
 
+fn collapsed_container_text(container: &hyperchad_transformer::Container, text: &mut String) {
+    if let hyperchad_transformer::Element::Details { open } = &container.element
+        && *open != Some(true)
+    {
+        for child in &container.children {
+            if matches!(child.element, hyperchad_transformer::Element::Summary) {
+                collapsed_container_text(child, text);
+            }
+        }
+        return;
+    }
+    if let hyperchad_transformer::Element::Text { value } = &container.element {
+        text.push_str(value);
+    }
+    for child in &container.children {
+        collapsed_container_text(child, text);
+    }
+}
+
 fn transcript_fixture_item(
     id: &str,
     streaming: bool,
@@ -749,6 +768,19 @@ fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
     }
     assert!(text.contains("Activity details"));
     assert!(text.contains("Canonical instructions"));
+    {
+        // Collapsed disclosure exposes only summaries until the user opens it.
+        let mut text = String::new();
+        for container in &containers {
+            collapsed_container_text(container, &mut text);
+        }
+        assert!(text.contains("Iteration preview"));
+        assert!(text.contains("Activity details"));
+        assert!(!text.contains("**exact instructions** <script>not markup</script>"));
+        assert!(!text.contains("Exact submitted instructions"));
+        assert!(!text.contains("run-a"));
+        assert!(!text.contains("Structured details truncated for display."));
+    }
     let exact_instructions = "**exact instructions** <script>not markup</script>";
     assert!(text.contains(exact_instructions));
     assert_eq!(
@@ -778,6 +810,7 @@ fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
     for container in &containers {
         assert_no_raw_markup(container);
     }
+    assert!(!format!("{containers:?}").contains("Element::Raw"));
     assert!(!text.contains(&"x".repeat(40_000)));
 
     let activity = message.activity.as_mut().unwrap();

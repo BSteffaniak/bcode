@@ -307,7 +307,12 @@ impl ModelApplication for ServicesApplicationHandle<'_> {
         self.selected_session(session_id)
             .await
             .map_err(|(code, message)| ModelApplicationFailure { code, message })?;
-        Ok(session_operations::model_status(self.state, self.client_id, session_id).await)
+        Ok(Box::pin(session_operations::model_status(
+            self.state,
+            self.client_id,
+            session_id,
+        ))
+        .await)
     }
 
     async fn default_model_status(
@@ -318,7 +323,11 @@ impl ModelApplication for ServicesApplicationHandle<'_> {
                 code: code.into(),
                 message: message.into(),
             })?;
-        Ok(session_operations::default_model_status(self.state, self.client_id).await)
+        Ok(Box::pin(session_operations::default_model_status(
+            self.state,
+            self.client_id,
+        ))
+        .await)
     }
 
     async fn model_catalog_diagnostics(

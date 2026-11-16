@@ -64,6 +64,10 @@ bmux_color = { workspace = true }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
 bmux_keyboard = { workspace = true }
 bmux_mermaid_render = { workspace = true }
+# The terminal frontend hosts BMUX component viewports and surfaces.
+bmux_plugin = { workspace = true, features = ["tui"] }
+bmux_plugin_runtime = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
 bmux_terminal = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["terminal-io"] }

@@ -29,148 +29,88 @@ use bcode_plugin_sdk::workspace_access::{
     WorkspaceResourceRequest,
 };
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
-use serde::{Deserialize, Serialize};
 
 /// Filesystem wire operation, additive to the existing v1 service.
-pub const OP_SEARCH_PATHS: &str = "search_paths";
+pub use bcode_filesystem_models::path_search::OP_SEARCH_PATHS;
 /// Invocation-bound host authorization interface, version 1.
 pub const PATH_SEARCH_AUTHORIZATION_INTERFACE: &str = WORKSPACE_ACCESS_INTERFACE_ID;
 
-/// Path search request. Unknown fields are rejected; roots/grants are never accepted here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SearchPathsRequest {
-    /// Case-insensitive Unicode subsequence matched against workspace-relative paths.
-    pub query: String,
-    /// Git-index tracked paths by default; workspace also includes untracked paths.
-    pub scope: SearchPathsScope,
-    /// Bypass a fresh inventory and coalesce a bounded refresh.
-    pub refresh: bool,
-    /// Workspace-relative directory; empty means workspace root. No `..` or absolute paths.
-    pub directory: String,
-    /// Recurse beneath `directory` when true; false returns its immediate children.
-    pub recursive: bool,
-    /// Include dot-prefixed names, except `.git`, when host policy permits it.
-    pub include_hidden: bool,
-    /// Result bound, clamped to `1..=256`.
-    pub max_results: usize,
-    /// Enumeration bound, clamped to `1..=250_000`, including excluded names.
-    pub max_entries: usize,
-    /// Directory descent bound, clamped to `1..=64`.
-    pub max_depth: usize,
-    /// Cooperative traversal deadline, clamped to `1..=1000` milliseconds.
-    pub timeout_ms: u64,
-    /// Cumulative path-storage/output budget, clamped to `1024..=1_048_576` bytes.
-    pub max_bytes: usize,
-}
-
-impl Default for SearchPathsRequest {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            scope: SearchPathsScope::Tracked,
-            refresh: false,
-            directory: String::new(),
-            recursive: true,
-            include_hidden: false,
-            max_results: 100,
-            max_entries: 250_000,
-            max_depth: 32,
-            timeout_ms: 100,
-            max_bytes: 262_144,
-        }
-    }
-}
-
-/// Truthful traversal outcome; empty complete results differ from unavailable search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchPathsState {
-    /// All permitted entries in the requested scope were examined.
-    Complete,
-    /// A budget, depth boundary, encoding limitation, or inaccessible entry stopped work.
-    Incomplete,
-    /// Invocation cancellation was observed.
-    Cancelled,
-    /// Context/authorization/platform/root was unavailable. No results are returned.
-    Unavailable,
-}
-
-/// Kind of an insertion candidate. Symlinks and special files are never candidates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchPathKind {
-    /// Regular file (contents are not opened).
-    File,
-    /// Directory (consumer may navigate using this relative path).
-    Directory,
-}
-
-/// Requested/effective path inventory scope.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SearchPathsScope {
-    /// Existing Git-index files, including staged additions.
-    #[default]
-    Tracked,
-    /// Tracked and nonignored untracked files; nonrepo confined traversal.
-    Workspace,
-}
-
-/// Half-open byte range in the original UTF-8 relative path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchPathMatchRange {
-    /// Inclusive byte offset.
-    pub start: usize,
-    /// Exclusive byte offset.
-    pub end: usize,
-}
-
-/// Workspace-relative candidate, not a file attachment or a content reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SearchPathEntry {
-    /// Exact UTF-8 workspace-relative path; spaces and Unicode are preserved.
-    pub path: String,
-    /// File versus navigable directory.
-    pub kind: SearchPathKind,
-    /// Lower is better. Equal scores are ordered by exact relative path.
-    pub score: usize,
-    /// Matching original-path byte ranges, empty for an empty query.
-    #[serde(default)]
-    pub match_ranges: Vec<SearchPathMatchRange>,
-}
-
-/// Bounded path-only response; consumers must display non-complete states explicitly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchPathsResponse {
-    /// Candidates in deterministic score/path order within the examined scope.
-    pub entries: Vec<SearchPathEntry>,
-    /// Whether results exhaust the requested authorized scope.
-    pub state: SearchPathsState,
-    /// Stable reason code, never an OS error containing sensitive paths.
-    pub reason: Option<String>,
-    /// Number of directory entries examined, including hidden/ignored entries.
-    pub visited_entries: usize,
-    /// Scope actually searched; nonrepo fallback requires explicit workspace scope.
-    #[serde(default)]
-    pub effective_scope: SearchPathsScope,
-}
-
-impl SearchPathsResponse {
-    fn terminal(state: SearchPathsState, reason: &str) -> Self {
-        Self {
-            entries: Vec::new(),
-            state,
-            reason: Some(reason.into()),
-            visited_entries: 0,
-            effective_scope: SearchPathsScope::Tracked,
-        }
-    }
-}
+pub use bcode_filesystem_models::path_search::{
+    SearchPathEntry, SearchPathKind, SearchPathMatchRange, SearchPathsRequest, SearchPathsResponse,
+    SearchPathsScope, SearchPathsState,
+};
 
 pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     let response = invoke_response(context);
     super::json_response(&response)
+}
+
+pub(crate) fn invoke_generated(context: NativeServiceContext) -> ServiceResponse {
+    use crate::path_search_transport::filesystem_paths::{
+        FilesystemPathsClient, client::SearchPathsRequest,
+    };
+    use futures::FutureExt as _;
+
+    let Ok(request) = context.request.payload_json::<SearchPathsRequest>() else {
+        return ServiceResponse::error("invalid_request", "invalid path-search request");
+    };
+    let provider = FilesystemPathsClient::new(std::sync::Arc::new(PathSearchProvider { context }));
+    // Enumeration is synchronous and returns a ready future. Do not enter a nested
+    // executor when this provider is reached through a generated in-process client.
+    provider
+        .search_paths(request.request)
+        .now_or_never()
+        .map_or_else(
+            || {
+                ServiceResponse::error(
+                    "provider_pending",
+                    "path search did not finish synchronously",
+                )
+            },
+            |response| super::json_response(&response),
+        )
+}
+
+// The generated provider retains the original invocation context, including its
+// authorized bridge and live cancellation, throughout filesystem enumeration.
+struct PathSearchProvider {
+    context: NativeServiceContext,
+}
+
+impl crate::path_search_transport::filesystem_paths::FilesystemPathsService for PathSearchProvider {
+    fn search_paths<'a>(
+        &'a self,
+        request: crate::path_search_transport::filesystem_paths::SearchPathsInput,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = crate::path_search_transport::filesystem_paths::SearchPathsOutput,
+                > + Send
+                + 'a,
+        >,
+    > {
+        use crate::path_search_transport::filesystem_paths::{
+            SearchPathsOutput, SearchPathsScope as WireScope, SearchPathsState as WireState,
+        };
+        let response = (|| {
+            let mut value = serde_json::to_value(request).ok()?;
+            let object = value.as_object_mut()?;
+            let query = object.remove("search_query")?;
+            object.insert("query".into(), query);
+            let mut context = self.context.clone();
+            context.request.payload = serde_json::to_vec(&value).ok()?;
+            let response = invoke_response(&context);
+            serde_json::from_value::<SearchPathsOutput>(serde_json::to_value(response).ok()?).ok()
+        })()
+        .unwrap_or_else(|| SearchPathsOutput {
+            entries: Vec::new(),
+            state: WireState::Unavailable,
+            reason: Some("invalid_request".into()),
+            visited_entries: 0,
+            effective_scope: WireScope::Tracked,
+        });
+        Box::pin(std::future::ready(response))
+    }
 }
 
 fn invoke_response(context: &NativeServiceContext) -> SearchPathsResponse {

@@ -11399,6 +11399,9 @@ const fn session_open_failure_code(
     }
 }
 
+#[cfg(test)]
+mod ipc_test_support;
+
 #[cfg(all(test, unix))]
 mod turn_observation_tests;
 
@@ -11699,28 +11702,6 @@ mod session_progress_tests {
 
 #[cfg(test)]
 mod client_timeout_tests {
-    #[cfg(unix)]
-    pub fn create_private_socket_fixture(directory: &std::path::Path) {
-        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(directory)
-            .unwrap();
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[cfg(unix)]
-    async fn remove_closed_fixture_socket(path: &std::path::Path) {
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(path);
-        assert!(
-            bcode_ipc::LocalIpcStream::connect(&endpoint).await.is_err(),
-            "fixture listener must be closed before owner cleanup"
-        );
-        // Generic transport drop closes descriptors but deliberately preserves
-        // pathnames. This isolated fixture is the sole binder/remover.
-        std::fs::remove_file(path).unwrap();
-    }
-
     #[test]
     fn pending_exchange_selection_preserves_schema_and_rejects_ambiguity() {
         let exchange = bcode_session_models::PendingToolExchangeSummary {
@@ -11808,7 +11789,7 @@ mod client_timeout_tests {
             }
             let directory =
                 std::path::PathBuf::from(format!("/tmp/bci-{}", SessionOpenOperationId::new()));
-            create_private_socket_fixture(&directory);
+            crate::ipc_test_support::create_socket_directory(&directory).expect("socket directory");
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("inspect.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
             let server = tokio::spawn(async move {
@@ -11862,13 +11843,10 @@ mod client_timeout_tests {
         use bcode_command::application::{
             CommandApplication as _, CommandInvocationOutcome, CommandInvocationRequest,
         };
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::Builder::new()
-            .prefix("bccmd-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("command.sock"));
+        let directory = tempfile::tempdir().unwrap();
+        let socket_directory = directory.path().join("ipc");
+        crate::ipc_test_support::create_socket_directory(&socket_directory).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_directory.join("command.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
@@ -11973,7 +11951,7 @@ mod client_timeout_tests {
         for provider in [Some("bcode.fake-provider".to_owned()), None] {
             let directory =
                 std::path::PathBuf::from(format!("/tmp/bcv-{}", SessionOpenOperationId::new()));
-            create_private_socket_fixture(&directory);
+            crate::ipc_test_support::create_socket_directory(&directory).unwrap();
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("validation.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let expected_provider = provider.clone();
@@ -12131,9 +12109,9 @@ mod client_timeout_tests {
     #[cfg(unix)]
     async fn interrupted_page_successor(final_page: bool) {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&dir);
+        crate::ipc_test_support::create_socket_directory(&dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let listener = crate::ipc_test_support::SocketListener::bind(&endpoint).unwrap();
         let (dispatched, interrupted) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut signal = Some(dispatched);
@@ -12223,7 +12201,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        remove_closed_fixture_socket(&dir.join("catalog.sock")).await;
+        assert!(!dir.join("catalog.sock").exists());
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -12231,9 +12209,9 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn interrupted_retained_page_does_not_dispatch_after_cancellation() {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&dir);
+        crate::ipc_test_support::create_socket_directory(&dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let listener = crate::ipc_test_support::SocketListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             {
                 let mut stream = listener.accept().await.unwrap();
@@ -12282,7 +12260,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        remove_closed_fixture_socket(&dir.join("catalog.sock")).await;
+        assert!(!dir.join("catalog.sock").exists());
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -12290,9 +12268,9 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn interrupted_catalog_admission_releases_token_without_discovery() {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&dir);
+        crate::ipc_test_support::create_socket_directory(&dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let listener = crate::ipc_test_support::SocketListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             for admission in [true, false] {
                 let mut stream = listener.accept().await.unwrap();
@@ -12355,7 +12333,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        remove_closed_fixture_socket(&dir.join("catalog.sock")).await;
+        assert!(!dir.join("catalog.sock").exists());
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -12364,7 +12342,7 @@ mod client_timeout_tests {
     async fn custom_endpoint_warm_handshake_uses_one_connection_without_startup() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("warm.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let expected_client_id = bcode_session_models::ClientId::new();
@@ -12406,7 +12384,7 @@ mod client_timeout_tests {
     async fn missing_custom_endpoint_requires_running_without_auto_start() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcm-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let socket_path = socket_dir.join("missing.sock");
         let client = BcodeClient::new(bcode_ipc::IpcEndpoint::unix_socket(socket_path.clone()));
 
@@ -12425,7 +12403,7 @@ mod client_timeout_tests {
     async fn connection_timeout_is_distinct_and_does_not_trigger_auto_start() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("connect-timeout.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let server = tokio::spawn(async move {
@@ -12459,7 +12437,7 @@ mod client_timeout_tests {
     async fn mismatched_artifact_hello_is_rejected_explicitly() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bci-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("artifact.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let server = tokio::spawn(async move {
@@ -12504,7 +12482,7 @@ mod client_timeout_tests {
     async fn accepted_compaction_outlives_request_deadline() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("client.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let server = tokio::spawn(async move {
@@ -12569,7 +12547,7 @@ mod client_timeout_tests {
     async fn unrelated_events_remain_buffered_in_fifo_order_during_requests() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bce-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("client.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let server = tokio::spawn(async move {
@@ -12626,7 +12604,7 @@ mod client_timeout_tests {
     async fn stateless_catalog_requests_preserve_directory_and_sources() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcs-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let expected = std::env::current_dir().unwrap().join("relative-workspace");
@@ -12711,7 +12689,7 @@ mod client_timeout_tests {
         use bcode_session_models::ClientId;
 
         let socket_dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("cancel.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let session_id = SessionId::new();
@@ -12770,7 +12748,7 @@ mod client_timeout_tests {
     async fn catalog_relative_directory_is_resolved_before_transport() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcd-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let expected = std::env::current_dir().unwrap().join("relative-workspace");
@@ -12821,9 +12799,9 @@ mod client_timeout_tests {
     async fn catalog_watcher_delivers_queued_completion_and_closes_on_drop() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let listener = crate::ipc_test_support::SocketListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
             let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
@@ -12913,7 +12891,7 @@ mod client_timeout_tests {
             .await
             .unwrap()
             .unwrap();
-        remove_closed_fixture_socket(&socket_dir.join("catalog.sock")).await;
+        assert!(!socket_dir.join("catalog.sock").exists());
         std::fs::remove_dir(socket_dir).unwrap();
     }
 
@@ -12922,7 +12900,7 @@ mod client_timeout_tests {
     async fn long_poll_transport_timeout_is_distinct_from_operation_failure() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bct-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("timeout.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let server = tokio::spawn(async move {
@@ -12970,7 +12948,7 @@ mod client_timeout_tests {
     async fn artifact_client_rejects_invalid_lengths_before_connecting() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bca-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("bounds.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_millis(50));
@@ -13014,7 +12992,8 @@ mod client_timeout_tests {
             let expected_bytes = bytes.clone();
             let socket_dir =
                 std::path::PathBuf::from(format!("/tmp/bca-{}", SessionOpenOperationId::new()));
-            create_private_socket_fixture(&socket_dir);
+            crate::ipc_test_support::create_socket_directory(&socket_dir)
+                .expect("socket directory");
             let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("range.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
             let server = tokio::spawn(async move {
@@ -13092,9 +13071,9 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn reconnect_rejects_replacement_executable_before_restoring_session() {
         let directory = std::path::PathBuf::from(format!("/tmp/bcp-{}", SessionId::new()));
-        create_private_socket_fixture(&directory);
+        crate::ipc_test_support::create_socket_directory(&directory).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("pin.sock"));
-        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let listener = crate::ipc_test_support::SocketListener::bind(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             for replacement in [false, true] {
                 let mut stream = listener.accept().await.unwrap();
@@ -13127,7 +13106,6 @@ mod client_timeout_tests {
         ));
         drop(connection);
         server.await.unwrap();
-        remove_closed_fixture_socket(&directory.join("pin.sock")).await;
         std::fs::remove_dir(directory).unwrap();
     }
 
@@ -13135,7 +13113,7 @@ mod client_timeout_tests {
     #[tokio::test]
     async fn workflow_watcher_requests_resync_after_quiet_reconnect() {
         let socket_dir = std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("watch.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let daemon = matching_daemon_status();
@@ -13195,7 +13173,7 @@ mod client_timeout_tests {
     async fn preparation_recovers_retained_operation_after_transport_interruption() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcr-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("reconnect.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let session_id = SessionId::new();
@@ -13282,7 +13260,7 @@ mod client_timeout_tests {
     async fn dropping_progress_receiver_stops_client_observation_cleanly() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcd-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("drop.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let session_id = SessionId::new();
@@ -13362,7 +13340,7 @@ mod client_timeout_tests {
     async fn application_request_is_not_replayed_after_response_eof() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcd-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("single-send.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let daemon = matching_daemon_status();
@@ -13555,7 +13533,7 @@ mod client_timeout_tests {
         };
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcl-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("long-poll.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let operation_id = "quiet-backfill".to_owned();
@@ -13673,7 +13651,7 @@ mod client_timeout_tests {
         let (respond, response_allowed) = tokio::sync::oneshot::channel();
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcmw-{}", SessionOpenOperationId::new()));
-        create_private_socket_fixture(&socket_dir);
+        crate::ipc_test_support::create_socket_directory(&socket_dir).expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("migration-wait.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
         let operation_id = "quiet-migration".to_owned();
@@ -14921,7 +14899,9 @@ mod portable_application_adapter_tests {
         let _state_guard = bcode_config::push_process_state_location(&location);
         let scope = bcode_config::runtime_scope_id(location.root(), &config_directory);
         let artifact = bcode_ipc::ArtifactId::parse("external-consumer-test-artifact").unwrap();
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("external.sock"));
+        let socket_directory = directory.path().join("ipc");
+        crate::ipc_test_support::create_socket_directory(&socket_directory).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_directory.join("external.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let mut record = bcode_daemon_lifecycle::DaemonRecord::current_with_digest(
             &endpoint,
@@ -15175,7 +15155,7 @@ mod portable_application_adapter_tests {
             "/tmp/bcc-{}",
             bcode_session_models::SessionId::new()
         ));
-        crate::client_timeout_tests::create_private_socket_fixture(&directory);
+        crate::ipc_test_support::create_socket_directory(&directory).unwrap();
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("consumer.sock"));
         let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
         let daemon = semantic_consumer_fixture_daemon();

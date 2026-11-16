@@ -258,7 +258,7 @@ mod tests {
         let (effects, _) = chat.pending_effects.drain_runtime();
         let request = effects
             .into_iter()
-            .find_map(|(_, effect)| match effect {
+            .find_map(|entry| match entry.effect {
                 TuiEffect::SubmitMessage { request } => Some(request),
                 _ => None,
             })
@@ -334,10 +334,12 @@ mod tests {
             let (effects, _) = chat.pending_effects.drain_runtime();
             effects
                 .into_iter()
-                .find_map(|(_, effect)| match effect {
-                    TuiEffect::SubmitMessage { request } => Some(request),
-                    _ => None,
-                })
+                .find_map(
+                    |crate::effects::ScheduledEffect { effect, .. }| match effect {
+                        TuiEffect::SubmitMessage { request } => Some(request),
+                        _ => None,
+                    },
+                )
                 .unwrap()
         };
 
@@ -426,7 +428,7 @@ mod tests {
             let (effects, _) = chat.pending_effects.drain_runtime();
             let request = effects
                 .into_iter()
-                .find_map(|(_, effect)| match effect {
+                .find_map(|entry| match entry.effect {
                     TuiEffect::SubmitMessage { request } => Some(request),
                     _ => None,
                 })

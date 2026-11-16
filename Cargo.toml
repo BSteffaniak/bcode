@@ -15,6 +15,7 @@ members = [
     "plugins/recap-plugin",
     "plugins/vox-plugin",
     "plugins/filesystem-plugin",
+    "plugins/filesystem-plugin/models",
     "plugins/file-references-plugin",
     "plugins/git-plugin",
     "plugins/code-review-plugin",
@@ -275,6 +276,7 @@ bcode_eval_models                       = { version = "0.0.1-alpha.0", default-f
 bcode_eval_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/eval-plugin" }
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
 bcode_file_references_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/file-references-plugin" }
+bcode_filesystem_models                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin/models" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }
 bcode_forge                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/forge" }
 bcode_forge_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/forge/models" }
@@ -397,6 +399,7 @@ bmux_keyboard = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_markdown = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_mermaid_render = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin = { default-features = false, version = "0.0.1-alpha.4" }
+bmux_plugin_runtime = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_schema = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_sdk = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_pty = { default-features = false, version = "0.0.1-alpha.4" }
@@ -670,34 +673,34 @@ opt-level = "z"
 inherits  = "dev"
 opt-level = 0
 
-# Keep framework contracts and their dependency closure on upstream master.
-# Cargo.lock pins the verified revision without requiring a sibling checkout.
+# Worktree integration: keep the complete BMUX dependency closure on one local
+# source. These development patches deliberately do not select an installed BMUX.
 [patch.crates-io]
-bmux_attach_image_protocol         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_codec                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_color                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_config_composition            = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_fonts                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_image                         = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_ipc                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_keyboard                      = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_markdown                      = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_mermaid_render                = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_perf_telemetry                = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_plugin                        = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_plugin_runtime                = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_plugin_schema                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_plugin_sdk                    = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_pty                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_syntax_render                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_terminal                      = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_terminal_grid                 = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_terminal_protocol             = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_text_edit                     = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_tui                           = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_tui_components                = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_tui_runtime                   = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
-bmux_web_renderer                  = { git = "https://github.com/BSteffaniak/bmux", branch = "master" }
+bmux_attach_image_protocol         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/attach-image-protocol" }
+bmux_codec                         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/codec" }
+bmux_color                         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/color" }
+bmux_config_composition            = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/config-composition" }
+bmux_fonts                         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/fonts" }
+bmux_image                         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/image" }
+bmux_ipc                           = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/ipc" }
+bmux_keyboard                      = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/keyboard" }
+bmux_markdown                      = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/markdown" }
+bmux_mermaid_render                = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/mermaid-render" }
+bmux_perf_telemetry                = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/perf-telemetry" }
+bmux_plugin                        = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin" }
+bmux_plugin_runtime                = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin-runtime" }
+bmux_plugin_schema                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin-schema" }
+bmux_plugin_sdk                    = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin-sdk" }
+bmux_pty                           = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/pty" }
+bmux_syntax_render                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/syntax-render" }
+bmux_terminal                      = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/terminal" }
+bmux_terminal_grid                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/terminal-grid" }
+bmux_terminal_protocol             = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/terminal_protocol" }
+bmux_text_edit                     = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/text-edit" }
+bmux_tui                           = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/tui" }
+bmux_tui_components                = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/tui-components" }
+bmux_tui_runtime                   = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/tui-runtime" }
+bmux_web_renderer                  = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/web-renderer" }
 hyperchad                          = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_actions                  = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_app                      = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
@@ -753,3 +756,32 @@ switchy_web_server                 = { git = "https://github.com/MoosicBox/Moosi
 switchy_web_server_core            = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 switchy_web_server_cors            = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 switchy_web_server_simulator       = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
+
+# Dependencies already selected from BMUX Git must converge on the same local
+# implementation as crates.io consumers during this cross-worktree migration.
+[patch."https://github.com/BSteffaniak/bmux"]
+bmux_attach_image_protocol = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/attach-image-protocol" }
+bmux_codec                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/codec" }
+bmux_color                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/color" }
+bmux_config_composition    = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/config-composition" }
+bmux_fonts                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/fonts" }
+bmux_image                 = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/image" }
+bmux_ipc                   = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/ipc" }
+bmux_keyboard              = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/keyboard" }
+bmux_markdown              = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/markdown" }
+bmux_mermaid_render        = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/mermaid-render" }
+bmux_perf_telemetry        = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/perf-telemetry" }
+bmux_plugin                = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin" }
+bmux_plugin_runtime        = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin-runtime" }
+bmux_plugin_schema         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin-schema" }
+bmux_plugin_sdk            = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/plugin-sdk" }
+bmux_pty                   = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/pty" }
+bmux_syntax_render         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/syntax-render" }
+bmux_terminal              = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/terminal" }
+bmux_terminal_grid         = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/terminal-grid" }
+bmux_terminal_protocol     = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/terminal_protocol" }
+bmux_text_edit             = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/text-edit" }
+bmux_tui                   = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/tui" }
+bmux_tui_components        = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/tui-components" }
+bmux_tui_runtime           = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/tui-runtime" }
+bmux_web_renderer          = { path = "/Volumes/ehdd/GitHub/wt-bmux/shared-plugin-architecture/packages/web-renderer" }

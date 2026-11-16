@@ -1357,7 +1357,7 @@ fn authentic_loop_server(
         .selected_provider_context
         .settings
         .insert("fake_structured_output_json".into(), "loop_until:1".into());
-    configured.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    configured.plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: std::collections::BTreeSet::from([
@@ -1369,13 +1369,13 @@ fn authentic_loop_server(
         },
         &[
             bcode_bundled_plugins::static_loop_plugin(),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                bcode_fake_provider_plugin::static_plugin(),
+                bcode_fake_provider_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ],
     )
@@ -1385,7 +1385,7 @@ fn authentic_loop_server(
 }
 
 fn configure_delegation_fixture(state: &mut ServerState) {
-    state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    state.plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: std::collections::BTreeSet::from([
@@ -1396,17 +1396,17 @@ fn configure_delegation_fixture(state: &mut ServerState) {
             disabled: std::collections::BTreeSet::new(),
         },
         &[
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/workflow-plugin/bcode-plugin.toml"),
-                bcode_workflow_plugin::static_plugin(),
+                bcode_workflow_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                bcode_fake_provider_plugin::static_plugin(),
+                bcode_fake_provider_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ],
     )

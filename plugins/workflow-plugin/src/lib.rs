@@ -5,8 +5,13 @@
 //! Workflow product integration plugin for Bcode.
 
 mod authoring_tui;
-#[cfg(feature = "static-bundled")]
 mod cli;
+
+/// Return the plugin-owned CLI grammar and invocation adapter for either packaging mode.
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
 mod keybindings;
 mod observation_policy;
 mod prose;
@@ -32,6 +37,10 @@ const QUERY_LIMIT: usize = 100;
 pub struct WorkflowPlugin;
 
 impl RustPlugin for WorkflowPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         for command in command_contributions() {
             registrar
@@ -1499,19 +1508,76 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
         .unwrap_or_else(|error| ServiceResponse::error("encode_failed", error.to_string()))
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(test)]
+mod shared_definition_tests {
+    #[test]
+    fn workflow_cli_keeps_revision_and_cursor_inputs() {
+        let registration = super::cli_registration();
+        let matches = (registration.command)()
+            .try_get_matches_from([
+                "workflow-ui",
+                "graph",
+                "--id",
+                "run-1",
+                "--expected-revision",
+                "3",
+                "--after-node-id",
+                "node-1",
+                "--limit",
+                "10",
+            ])
+            .expect("workflow graph grammar");
+        assert_eq!(
+            super::plugin_definition().metadata.plugin_id,
+            "bcode.workflow"
+        );
+        assert!((registration.requires_daemon)(&matches));
+        assert_eq!(matches.get_one::<u64>("expected_revision"), Some(&3));
+    }
+}
+
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli_registration()),
+        portable_cli: Some(cli::invoke_portable),
+        frontend: Some(tui::tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial WorkflowPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<WorkflowPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
         WorkflowPlugin,
         include_str!("../bcode-plugin.toml")
     );
-    vtable.cli_registration = Some(cli::registration);
+    vtable.cli_registration = Some(cli_registration);
     vtable
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(WorkflowPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

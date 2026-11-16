@@ -535,7 +535,7 @@ fn state(arm: QualityArm, feature: Feature) -> ServerState {
             bcode_session_derivation_plugin::static_plugin(),
         ),
     ];
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from([

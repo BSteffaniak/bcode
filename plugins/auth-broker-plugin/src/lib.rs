@@ -53,5 +53,5 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(AuthBrokerPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(AuthBrokerPlugin, include_str!("../bcode-plugin.toml"));
+// One declaration serves bundled and native packaging; implementations export no ABI symbols.
+bcode_plugin_sdk::define_plugin!(serial AuthBrokerPlugin, include_str!("../bcode-plugin.toml"));

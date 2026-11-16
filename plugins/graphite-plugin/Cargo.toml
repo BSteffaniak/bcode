@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_code_review_graphite = { workspace = true }
@@ -25,4 +25,3 @@ serde_json = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []

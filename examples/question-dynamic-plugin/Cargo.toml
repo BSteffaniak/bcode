@@ -14,8 +14,8 @@ version     = { workspace = true }
 crate-type = ["cdylib"]
 
 [dependencies]
-bcode_plugin_sdk      = { workspace = true }
 bcode_question_plugin = { workspace = true, features = ["native"] }
+bmux_plugin_sdk       = { workspace = true }
 
 [features]
 default          = []

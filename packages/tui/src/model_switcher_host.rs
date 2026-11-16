@@ -450,7 +450,7 @@ mod tests {
             .drain_runtime()
             .0
             .into_iter()
-            .map(|(_, effect)| effect)
+            .map(|crate::effects::ScheduledEffect { effect, .. }| effect)
             .collect();
         drop(chat);
         assert!(state.execution_picker.is_none());
@@ -493,7 +493,7 @@ mod tests {
             .drain_runtime()
             .0
             .into_iter()
-            .map(|(_, effect)| effect)
+            .map(|crate::effects::ScheduledEffect { effect, .. }| effect)
             .collect();
         assert!(matches!(
             effects.as_slice(),
@@ -512,7 +512,7 @@ mod tests {
             .drain_runtime()
             .0
             .into_iter()
-            .map(|(_, effect)| effect)
+            .map(|crate::effects::ScheduledEffect { effect, .. }| effect)
             .collect();
         assert!(matches!(
             effects.as_slice(),

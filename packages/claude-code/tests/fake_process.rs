@@ -475,8 +475,10 @@ async fn create_and_resume_mismatches_fail_on_first_native_init() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn missing_native_identity_cannot_be_replaced_by_requested_uuid() {
-    let mut fake = Fake::new("identity_missing");
-    fake.options.limits.request_timeout = Duration::from_millis(100);
+    // Keep the shared 2s bound: the same limit also governs the version probe,
+    // `auth status` and the initialize round trip, which must not be raced
+    // against process-spawn latency. Only the identity wait is expected to expire.
+    let fake = Fake::new("identity_missing");
     let session = ClaudeSession::spawn_new(fake.options, "550e8400-e29b-41d4-a716-446655440000")
         .await
         .expect("create process");

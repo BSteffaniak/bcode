@@ -995,8 +995,5 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(
-    CodexHarnessPlugin,
-    include_str!("../bcode-plugin.toml")
-);
+// One declaration serves bundled and native packaging; implementations export no ABI symbols.
+bcode_plugin_sdk::define_plugin!(concurrent CodexHarnessPlugin, include_str!("../bcode-plugin.toml"));

@@ -645,12 +645,12 @@ mod tests {
                 PROVIDER_MANIFEST,
                 bcode_plugin_sdk::static_plugin_vtable!(FixtureProvider, PROVIDER_MANIFEST),
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/session-milestones-plugin/bcode-plugin.toml"),
-                bcode_session_milestones_plugin::static_plugin(),
+                bcode_session_milestones_plugin::plugin_definition,
             ),
         ];
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: BTreeSet::from([

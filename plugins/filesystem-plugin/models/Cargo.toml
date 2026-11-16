@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable filesystem service contracts for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "filesystem", "contracts"]
+license     = { workspace = true }
+name        = "bcode_filesystem_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

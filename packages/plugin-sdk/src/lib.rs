@@ -9,6 +9,7 @@ pub mod application;
 pub mod artifact_resources;
 pub mod auxiliary_generation;
 pub mod composer;
+pub mod definition;
 pub mod generation;
 pub mod harness;
 pub mod interaction;
@@ -208,6 +209,7 @@ pub struct ServiceCancellation {
     state: Arc<ServiceCancellationState>,
     wait_callback: Option<ServiceCancellationWaitCallback>,
     wait_user_data: usize,
+    shared: Option<bmux_plugin_sdk::ServiceCancellation>,
 }
 
 #[derive(Debug)]
@@ -235,6 +237,7 @@ impl ServiceCancellation {
             }),
             wait_callback: None,
             wait_user_data: 0,
+            shared: None,
         }
     }
 
@@ -251,8 +254,20 @@ impl ServiceCancellation {
         }
     }
 
+    /// Retain the shared runtime's live cancellation authority.
+    #[must_use]
+    pub fn from_shared(shared: bmux_plugin_sdk::ServiceCancellation) -> Self {
+        Self {
+            shared: Some(shared),
+            ..Self::default()
+        }
+    }
+
     /// Request cancellation and wake threads blocked on this state.
     pub fn cancel(&self) {
+        if let Some(shared) = &self.shared {
+            shared.cancel();
+        }
         // Serialize the predicate update with the waiter's check-and-sleep transition.
         // Otherwise notification can be lost after its check but before it starts waiting.
         let guard = self
@@ -268,7 +283,10 @@ impl ServiceCancellation {
     /// Return whether host cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.state.cancelled.load(Ordering::SeqCst)
+        self.shared
+            .as_ref()
+            .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
+            || self.state.cancelled.load(Ordering::SeqCst)
             || self
                 .wait_callback
                 .is_some_and(|callback| callback(0, self.wait_user_data as *mut c_void))
@@ -305,10 +323,17 @@ impl ServiceCancellation {
             let (next_guard, wait) = self
                 .state
                 .wakeup
-                .wait_timeout(guard, remaining)
+                .wait_timeout(
+                    guard,
+                    if self.shared.is_some() {
+                        remaining.min(Duration::from_millis(10))
+                    } else {
+                        remaining
+                    },
+                )
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = next_guard;
-            if wait.timed_out() && !self.is_cancelled() {
+            if wait.timed_out() && Instant::now() >= deadline && !self.is_cancelled() {
                 drop(guard);
                 return false;
             }
@@ -329,14 +354,22 @@ impl ServiceCancellation {
 /// fn require_sync<T: Sync>() {}
 /// require_sync::<bcode_plugin_sdk::CommandRegistrar>();
 /// ```
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CommandRegistrar {
+    collected: Option<Arc<Mutex<Vec<bcode_command::CommandContribution>>>>,
     callback: Option<CommandRegistrationCallback>,
     user_data: usize,
     not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl CommandRegistrar {
+    pub(crate) fn collect(into: Arc<Mutex<Vec<bcode_command::CommandContribution>>>) -> Self {
+        Self {
+            collected: Some(into),
+            ..Self::default()
+        }
+    }
+
     /// Create a registrar from raw ABI callback parts.
     #[must_use]
     pub fn new(callback: Option<CommandRegistrationCallback>, user_data: *mut c_void) -> Self {
@@ -344,13 +377,14 @@ impl CommandRegistrar {
             callback,
             user_data: user_data as usize,
             not_send_or_sync: PhantomData,
+            collected: None,
         }
     }
 
     /// Return whether command registration is available.
     #[must_use]
-    pub const fn is_available(self) -> bool {
-        self.callback.is_some()
+    pub fn is_available(&self) -> bool {
+        self.callback.is_some() || self.collected.is_some()
     }
 
     /// Register a command contribution with the host.
@@ -359,9 +393,16 @@ impl CommandRegistrar {
     ///
     /// Returns an error if the contribution cannot be serialized.
     pub fn register(
-        self,
+        &self,
         contribution: &bcode_command::CommandContribution,
     ) -> Result<(), serde_json::Error> {
+        if let Some(collected) = &self.collected {
+            collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(contribution.clone());
+            return Ok(());
+        }
         let payload = serde_json::to_vec(contribution)?;
         if let Some(callback) = self.callback {
             callback(
@@ -387,14 +428,24 @@ impl CommandRegistrar {
 /// fn require_sync<T: Sync>() {}
 /// require_sync::<bcode_plugin_sdk::AuthRegistrar>();
 /// ```
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthRegistrar {
+    collected: Option<Arc<Mutex<Vec<bcode_provider_auth_models::AuthProviderContribution>>>>,
     callback: Option<AuthRegistrationCallback>,
     user_data: usize,
     not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl AuthRegistrar {
+    pub(crate) fn collect(
+        into: Arc<Mutex<Vec<bcode_provider_auth_models::AuthProviderContribution>>>,
+    ) -> Self {
+        Self {
+            collected: Some(into),
+            ..Self::default()
+        }
+    }
+
     /// Create a registrar from raw ABI callback parts.
     #[must_use]
     pub fn new(callback: Option<AuthRegistrationCallback>, user_data: *mut c_void) -> Self {
@@ -402,13 +453,14 @@ impl AuthRegistrar {
             callback,
             user_data: user_data as usize,
             not_send_or_sync: PhantomData,
+            collected: None,
         }
     }
 
     /// Return whether authentication-provider registration is available.
     #[must_use]
-    pub const fn is_available(self) -> bool {
-        self.callback.is_some()
+    pub fn is_available(&self) -> bool {
+        self.callback.is_some() || self.collected.is_some()
     }
 
     /// Register an authentication provider contribution with the host.
@@ -417,9 +469,16 @@ impl AuthRegistrar {
     ///
     /// Returns an error if the contribution cannot be serialized.
     pub fn register(
-        self,
+        &self,
         contribution: &bcode_provider_auth_models::AuthProviderContribution,
     ) -> Result<(), serde_json::Error> {
+        if let Some(collected) = &self.collected {
+            collected
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(contribution.clone());
+            return Ok(());
+        }
         let payload = serde_json::to_vec(contribution)?;
         if let Some(callback) = self.callback {
             callback(
@@ -433,10 +492,14 @@ impl AuthRegistrar {
 }
 
 /// Cloneable event emitter scoped to one service invocation.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ServiceEventEmitter {
     callback: Option<ServiceEventCallback>,
     user_data: usize,
+    shared: Option<(
+        bmux_plugin_sdk::PluginInvocationId,
+        bmux_plugin_sdk::ServiceEventSinkHandle,
+    )>,
 }
 
 impl ServiceEventEmitter {
@@ -446,13 +509,26 @@ impl ServiceEventEmitter {
         Self {
             callback,
             user_data: user_data as usize,
+            shared: None,
+        }
+    }
+
+    /// Retain an invocation-scoped event sink without pointer-backed identity.
+    #[must_use]
+    pub fn from_shared(
+        invocation: bmux_plugin_sdk::PluginInvocationId,
+        sink: bmux_plugin_sdk::ServiceEventSinkHandle,
+    ) -> Self {
+        Self {
+            shared: Some((invocation, sink)),
+            ..Self::default()
         }
     }
 
     /// Return whether this invocation supports incremental events.
     #[must_use]
-    pub const fn is_available(self) -> bool {
-        self.callback.is_some()
+    pub fn is_available(&self) -> bool {
+        self.callback.is_some() || self.shared.is_some()
     }
 
     /// Emit an incremental service event payload.
@@ -460,14 +536,36 @@ impl ServiceEventEmitter {
     /// This is the low-level escape hatch for advanced service event schemas. Tool execution
     /// progress should normally use [`TransientProgressPublisher`], which fixes transient
     /// persistence and progress placement while enforcing host limits.
-    pub fn emit(self, payload: &[u8]) {
-        if let Some(callback) = self.callback {
-            callback(
-                payload.as_ptr(),
-                payload.len(),
-                self.user_data as *mut c_void,
-            );
+    pub fn emit(&self, payload: &[u8]) {
+        // Compatibility entrypoint cannot expose sink rejection. New callers
+        // and publishers use try_emit so rejected commits do not advance state.
+        let _ = self.try_emit(payload);
+    }
+
+    /// Emit once, surfacing rejection by the shared invocation sink.
+    ///
+    /// # Errors
+    /// Returns an error when unavailable or when the shared host rejects the event.
+    pub fn try_emit(&self, payload: &[u8]) -> Result<(), String> {
+        if let Some((invocation_id, sink)) = &self.shared {
+            return sink
+                .emit_event(bmux_plugin_sdk::ServiceEvent {
+                    invocation_id: invocation_id.clone(),
+                    payload: payload.to_vec(),
+                })
+                .map_err(|_| "invocation event was rejected".to_owned());
         }
+        self.callback.map_or_else(
+            || Err("invocation event sink is unavailable".to_owned()),
+            |callback| {
+                callback(
+                    payload.as_ptr(),
+                    payload.len(),
+                    self.user_data as *mut c_void,
+                );
+                Ok(())
+            },
+        )
     }
 }
 
@@ -500,6 +598,8 @@ impl Default for TransientProgressLimits {
 /// Failure returned while publishing an invocation-owned presentation update.
 #[derive(Debug)]
 pub enum PresentationUpdateError {
+    /// The host rejected the event; no presentation revision was committed.
+    EventRejected(String),
     /// The host did not provide an incremental event callback.
     Unavailable,
     /// The invocation was cancelled before publication.
@@ -515,6 +615,7 @@ pub enum PresentationUpdateError {
 impl std::fmt::Display for PresentationUpdateError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EventRejected(message) => formatter.write_str(message),
             Self::Unavailable => formatter.write_str("presentation updates are unavailable"),
             Self::Cancelled => formatter.write_str("presentation update was cancelled"),
             Self::RevisionExhausted => formatter.write_str("presentation revision exhausted"),
@@ -533,7 +634,8 @@ impl std::error::Error for PresentationUpdateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Encode(error) => Some(error),
-            Self::Unavailable
+            Self::EventRejected(_)
+            | Self::Unavailable
             | Self::Cancelled
             | Self::RevisionExhausted
             | Self::TooLarge { .. } => None,
@@ -812,7 +914,9 @@ impl PrimaryPresentationPublisher {
                 maximum: self.limits.max_encoded_bytes,
             });
         }
-        self.events.emit(&encoded);
+        self.events
+            .try_emit(&encoded)
+            .map_err(PresentationUpdateError::EventRejected)?;
         self.schema = schema;
         self.schema_version = schema_version;
         self.revision = revision;
@@ -824,6 +928,8 @@ impl PrimaryPresentationPublisher {
 /// Failure returned while publishing transient plugin progress.
 #[derive(Debug)]
 pub enum TransientProgressError {
+    /// The host rejected the event; no progress sequence was committed.
+    EventRejected(String),
     /// The host did not provide an incremental event callback.
     Unavailable,
     /// The invocation was cancelled before publication.
@@ -841,6 +947,7 @@ pub enum TransientProgressError {
 impl std::fmt::Display for TransientProgressError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EventRejected(message) => formatter.write_str(message),
             Self::Unavailable => formatter.write_str("transient progress events are unavailable"),
             Self::Cancelled => formatter.write_str("transient progress invocation was cancelled"),
             Self::Finished => formatter.write_str("transient progress scope is already finished"),
@@ -860,7 +967,8 @@ impl std::error::Error for TransientProgressError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Encode(error) => Some(error),
-            Self::Unavailable
+            Self::EventRejected(_)
+            | Self::Unavailable
             | Self::Cancelled
             | Self::Finished
             | Self::SequenceExhausted
@@ -1170,7 +1278,9 @@ impl TransientProgressPublisher {
                 maximum: self.limits.max_encoded_bytes,
             });
         }
-        self.events.emit(&encoded);
+        self.events
+            .try_emit(&encoded)
+            .map_err(TransientProgressError::EventRejected)?;
         self.sequence = sequence;
         self.last_emitted_at = Some(Instant::now());
         Ok(sequence)
@@ -1409,9 +1519,26 @@ impl AsyncServiceBridge {
     }
 }
 
+/// Host-owned product operation port.
+///
+/// Implementations preserve the same policy,
+/// authorization, workspace grants and operation correlation as the dynamic path.
+/// No raw pointer or Rust layout is transported over the ABI.
+pub trait ProductHostBridge: std::fmt::Debug + Send + Sync {
+    /// Execute one invocation-scoped operation.
+    ///
+    /// # Errors
+    /// Returns policy, cancellation, host availability or protocol failures.
+    fn request(
+        &self,
+        request: &ServiceBridgeRequest,
+    ) -> Result<ServiceBridgeResponse, ServiceBridgeError>;
+}
+
 /// Cloneable bounded request/reply bridge scoped to one native service invocation.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceBridge {
+    owned: Option<Arc<dyn ProductHostBridge>>,
     callback: Option<ServiceBridgeCallback>,
     user_data: usize,
     cancellation: ServiceCancellation,
@@ -1426,16 +1553,30 @@ impl ServiceBridge {
         cancellation: ServiceCancellation,
     ) -> Self {
         Self {
+            owned: None,
             callback,
             user_data: user_data as usize,
             cancellation,
         }
     }
 
+    /// Create a retained Rust-native bridge. This capability is not serialized.
+    #[must_use]
+    pub fn from_owned(
+        bridge: Arc<dyn ProductHostBridge>,
+        cancellation: ServiceCancellation,
+    ) -> Self {
+        Self {
+            owned: Some(bridge),
+            cancellation,
+            ..Self::default()
+        }
+    }
+
     /// Return whether this invocation provides a request/reply bridge.
     #[must_use]
-    pub const fn is_available(&self) -> bool {
-        self.callback.is_some()
+    pub fn is_available(&self) -> bool {
+        self.callback.is_some() || self.owned.is_some()
     }
 
     /// Execute one bounded request/reply bridge operation.
@@ -1454,6 +1595,29 @@ impl ServiceBridge {
     ) -> Result<ServiceBridgeResponse, ServiceBridgeError> {
         if self.cancellation.is_cancelled() {
             return Err(ServiceBridgeError::Cancelled);
+        }
+        if let Some(owned) = &self.owned {
+            let request_bytes = bounded_bridge_size(request, SERVICE_BRIDGE_MAX_REQUEST_BYTES)?;
+            if request_bytes > SERVICE_BRIDGE_MAX_REQUEST_BYTES {
+                return Err(ServiceBridgeError::RequestTooLarge {
+                    actual: request_bytes,
+                    maximum: SERVICE_BRIDGE_MAX_REQUEST_BYTES,
+                });
+            }
+            // Exactly one call, even if the result exceeds the response bound.
+            let response = owned.request(request);
+            if self.cancellation.is_cancelled() {
+                return Err(ServiceBridgeError::Cancelled);
+            }
+            let response = response?;
+            let required = bounded_bridge_size(&response, SERVICE_BRIDGE_MAX_RESPONSE_BYTES)?;
+            if required > SERVICE_BRIDGE_MAX_RESPONSE_BYTES {
+                return Err(ServiceBridgeError::ResponseTooLarge {
+                    required,
+                    maximum: SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
+                });
+            }
+            return validate_bridge_response_kind(request, response);
         }
         let callback = self.callback.ok_or(ServiceBridgeError::Unavailable)?;
         let encoded = serde_json::to_vec(request)
@@ -1980,7 +2144,7 @@ impl NativeServiceContext {
         retention: bcode_tool::ToolPresentationRetention,
     ) -> PrimaryPresentationPublisher {
         PrimaryPresentationPublisher::with_limits_and_cancellation(
-            self.events,
+            self.events.clone(),
             invocation_id,
             self.plugin_id.clone(),
             schema,
@@ -2001,7 +2165,7 @@ impl NativeServiceContext {
         schema_version: u32,
     ) -> TransientProgressPublisher {
         TransientProgressPublisher::with_limits_and_cancellation(
-            self.events,
+            self.events.clone(),
             invocation_id,
             contribution_id,
             self.plugin_id.clone(),
@@ -2200,6 +2364,13 @@ pub struct ServiceError {
 
 /// Trait implemented by native Rust plugins.
 pub trait RustPlugin: Default + Send + 'static {
+    /// Declare actual component-local factories for both packaging modes.
+    /// This hook is inert: do not activate, access credentials or mutate host state.
+    /// Manifest-form `define_plugin!` uses it unless registrations are supplied.
+    #[must_use]
+    fn component_registrations() -> definition::ProductRegistrations {
+        definition::ProductRegistrations::default()
+    }
     /// Called when the host activates the plugin.
     ///
     /// # Errors
@@ -2354,6 +2525,28 @@ pub trait ConcurrentRustPlugin: RustPlugin + Sync {
         Ok(())
     }
 
+    /// Register host command contributions using shared plugin state.
+    ///
+    /// # Errors
+    /// Returns registration failures. Override when the concurrent plugin owns commands.
+    fn register_commands_concurrent(
+        &self,
+        _registrar: CommandRegistrar,
+    ) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    /// Handle a host event with shared plugin state.
+    ///
+    /// # Errors
+    /// Returns an error when unsupported or event processing fails. Implementations
+    /// subscribing to host events must override this with the concurrent adapter.
+    fn handle_event_concurrent(&self, _context: NativeEventContext) -> Result<(), PluginError> {
+        Err(PluginError::failed(
+            "concurrent event handler is not implemented",
+        ))
+    }
+
     /// Invoke a plugin-provided service operation with shared plugin state.
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         ServiceResponse::error(
@@ -2381,7 +2574,7 @@ pub fn write_service_response(
     output_ptr: *mut u8,
     output_capacity: usize,
     output_len: *mut usize,
-    events: ServiceEventEmitter,
+    events: &ServiceEventEmitter,
 ) -> i32 {
     let Ok(encoded) = serde_json::to_vec(response) else {
         return SERVICE_STATUS_ENCODE_FAILED;
@@ -2431,6 +2624,7 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
     context.events = events;
+    let events = context.events.clone();
     context.cancellation =
         ServiceCancellation::from_wait_callback(cancellation_callback, cancellation_user_data);
     context.bridge = ServiceBridge::new(
@@ -2438,11 +2632,15 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         bridge_user_data,
         context.cancellation.clone(),
     );
+    // Hosts register distinct event and bridge callback handles so nested bridge work can
+    // never serialize service events. The negotiated diagnostic channel is keyed by the
+    // event handle; control frames use the bridge callback function with that same key and
+    // are intercepted by the host before any ordinary bridge state is touched.
     let capture = diagnostics::capture_context(
         context.diagnostics.as_ref(),
-        events,
+        events.clone(),
         bridge_callback,
-        bridge_user_data,
+        events.user_data as *mut c_void,
     );
     let invoke = || {
         instance
@@ -2454,7 +2652,7 @@ pub fn invoke_service_with_emitter_export<P: RustPlugin>(
         Ok(response) => response,
         Err(status) => return status,
     };
-    write_service_response(&response, output_ptr, output_capacity, output_len, events)
+    write_service_response(&response, output_ptr, output_capacity, output_len, &events)
 }
 
 #[doc(hidden)]
@@ -2506,6 +2704,7 @@ pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
         return SERVICE_STATUS_DECODE_FAILED;
     };
     context.events = events;
+    let events = context.events.clone();
     context.cancellation =
         ServiceCancellation::from_wait_callback(cancellation_callback, cancellation_user_data);
     context.bridge = ServiceBridge::new(
@@ -2513,15 +2712,19 @@ pub fn invoke_concurrent_service_with_emitter_export<P: ConcurrentRustPlugin>(
         bridge_user_data,
         context.cancellation.clone(),
     );
+    // Hosts register distinct event and bridge callback handles so nested bridge work can
+    // never serialize service events. The negotiated diagnostic channel is keyed by the
+    // event handle; control frames use the bridge callback function with that same key and
+    // are intercepted by the host before any ordinary bridge state is touched.
     let capture = diagnostics::capture_context(
         context.diagnostics.as_ref(),
-        events,
+        events.clone(),
         bridge_callback,
-        bridge_user_data,
+        events.user_data as *mut c_void,
     );
     let invoke = || instance.invoke_service_concurrent(context);
     let response = diagnostics::scope(capture, invoke);
-    write_service_response(&response, output_ptr, output_capacity, output_len, events)
+    write_service_response(&response, output_ptr, output_capacity, output_len, &events)
 }
 
 #[doc(hidden)]
@@ -2558,7 +2761,7 @@ pub fn invoke_concurrent_service_streaming_export<P: ConcurrentRustPlugin>(
 
 const SERVICE_RESPONSE_CHUNK_DATA_SIZE: usize = 256 * 1024;
 
-fn emit_service_response_chunks(events: ServiceEventEmitter, encoded: &[u8]) {
+fn emit_service_response_chunks(events: &ServiceEventEmitter, encoded: &[u8]) {
     for chunk in encoded.chunks(SERVICE_RESPONSE_CHUNK_DATA_SIZE) {
         let mut payload = Vec::with_capacity(SERVICE_RESPONSE_CHUNK_PREFIX.len() + chunk.len());
         payload.extend_from_slice(SERVICE_RESPONSE_CHUNK_PREFIX);
@@ -2625,7 +2828,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 /// Host action requested after a statically linked plugin CLI handler completes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StaticCliHostAction {
     /// Launch the host TUI and open a plugin-owned surface.
     OpenTuiSurface {
@@ -2644,7 +2847,7 @@ pub enum StaticCliHostAction {
 }
 
 /// Result of a statically linked plugin CLI invocation.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaticCliOutcome {
     /// Optional action for the CLI host to perform.
     pub host_action: Option<StaticCliHostAction>,
@@ -3102,6 +3305,15 @@ macro_rules! static_concurrent_plugin_vtable {
 
 /// Common imports for plugin authors.
 pub mod prelude {
+    /// Return registered shared-runtime migration adapters.
+    pub use crate::definition::{
+        BcodePluginService, PluginDefinition, PluginMetadata, ProductComponentExtension,
+        ProductInvocationContext, ProductInvocationHost, ProductRegistrations,
+        SharedInvocationHost, SharedProductHostBridge, concurrent_plugin_definition,
+        concurrent_plugin_definition_with_host, concurrent_plugin_definition_with_registrations,
+        rust_plugin_definition, rust_plugin_definition_with_host,
+        rust_plugin_definition_with_registrations,
+    };
     #[cfg(feature = "tui")]
     pub use crate::tui::{
         PluginSessionViewSubscription, PluginSessionViewSubscriptionRequest,
@@ -3131,6 +3343,7 @@ pub mod prelude {
         prepare_tool_from_definitions, prepare_tool_service_response,
         static_concurrent_plugin_vtable, static_plugin_vtable,
     };
+    pub use crate::{ProductHostBridge, define_plugin};
 }
 
 #[cfg(test)]
@@ -3301,7 +3514,7 @@ mod tests {
             std::ptr::from_ref(&events).cast_mut().cast(),
         );
         let mut oversized = PrimaryPresentationPublisher::with_limits_and_cancellation(
-            emitter,
+            emitter.clone(),
             "call-1",
             "example.plugin",
             "example.presentation",
@@ -3552,7 +3765,7 @@ mod tests {
             std::ptr::from_ref(&events).cast_mut().cast(),
         );
         let mut bounded = TransientProgressPublisher::with_limits(
-            emitter,
+            emitter.clone(),
             "call-1",
             "preview",
             "example.plugin",
@@ -3571,7 +3784,7 @@ mod tests {
         assert!(events.lock().expect("event collector").is_empty());
 
         let mut cadence = TransientProgressPublisher::with_limits(
-            emitter,
+            emitter.clone(),
             "call-1",
             "preview",
             "example.plugin",

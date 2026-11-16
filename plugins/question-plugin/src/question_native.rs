@@ -1,5 +1,4 @@
 //! Native service and registration adapters.
-#[cfg(feature = "static-bundled")]
 use super::{QUESTION_INLINE_SURFACE, QUESTION_INTERACTION_KIND};
 use bcode_plugin_sdk::{
     ConcurrentRustPlugin, NativeServiceContext, RustPlugin, ServiceBridgeRequest,
@@ -17,14 +16,13 @@ use serde_json::{Value, json};
 pub struct QuestionPlugin;
 
 use super::question_controller;
-#[cfg(feature = "static-bundled")]
 use super::question_interaction;
 use super::{
     NormalizedQuestionRequest, QUESTION_EXCHANGE_SCHEMA, QuestionResolutionPayload,
     QuestionToolOutcome, TOOL_NAME, answered_outcome, dismissed_outcome, parse_question_request,
     unanswered_outcome,
 };
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 use super::{question_outcome_tui, question_tui};
 
 impl ConcurrentRustPlugin for QuestionPlugin {
@@ -34,6 +32,10 @@ impl ConcurrentRustPlugin for QuestionPlugin {
 }
 
 impl RustPlugin for QuestionPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         invoke_question_service(&context)
     }
@@ -254,6 +256,98 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
+#[cfg(test)]
+mod shared_definition_tests {
+    use super::*;
+
+    #[test]
+    fn portable_controller_registration_does_not_require_terminal_packaging() {
+        let registry = question_interaction_registry();
+        assert!(registry.supports(QUESTION_INTERACTION_KIND));
+        let adapter = question_interaction_adapter("web");
+        assert!(adapter.supports(QUESTION_EXCHANGE_SCHEMA, 1));
+        assert!(!adapter.supports(QUESTION_EXCHANGE_SCHEMA, 2));
+        assert_eq!(adapter.tui_surface_kind, None);
+        assert_eq!(adapter.platform_id, "web");
+    }
+
+    #[test]
+    fn shared_factory_creates_distinct_question_instances_and_frontend() {
+        let definition = plugin_definition();
+        let context: bcode_plugin_sdk::definition::PluginCreateContext =
+            serde_json::from_value(serde_json::json!({
+                "runtime_scope": "00000000-0000-0000-0000-000000000001",
+                "instance": "00000000-0000-0000-0000-000000000002",
+                "role": "backend",
+            }))
+            .expect("host scope");
+        let first = definition.create(context.clone()).expect("first instance");
+        let mut second_context = context.clone();
+        second_context.instance =
+            serde_json::from_value(serde_json::json!("00000000-0000-0000-0000-000000000003"))
+                .expect("second host instance identity");
+        let second = definition.create(second_context).expect("second instance");
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        let mut frontend = context;
+        frontend.role = bcode_plugin_sdk::definition::ComponentRole::Frontend;
+        assert!(definition.create(frontend).is_ok());
+    }
+
+    #[test]
+    fn definition_discovery_keeps_question_identity_and_contract() {
+        let metadata = plugin_definition().metadata;
+        assert_eq!(metadata.plugin_id, "bcode.question");
+        assert_eq!(metadata.version, "0.0.1");
+        assert_eq!(
+            metadata.roles,
+            vec![
+                bcode_plugin_sdk::definition::ComponentRole::Backend,
+                bcode_plugin_sdk::definition::ComponentRole::Frontend,
+            ]
+        );
+        assert!(
+            metadata
+                .contracts
+                .iter()
+                .any(|contract| contract.interface_id
+                    == bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE)
+        );
+    }
+}
+
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        interactions: Some(question_interaction_registry),
+        #[cfg(feature = "tui")]
+        frontend: Some(question_tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    concurrent QuestionPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<QuestionPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_concurrent_plugin_vtable!(
@@ -262,7 +356,6 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     )
 }
 
-#[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn question_interaction_adapter(
     platform_id: &str,
@@ -279,7 +372,6 @@ pub fn question_interaction_adapter(
     }
 }
 
-#[cfg(feature = "static-bundled")]
 #[must_use]
 pub fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginInteractionRegistry {
     let mut registry = bcode_plugin_sdk::interaction::PluginInteractionRegistry::default();
@@ -287,7 +379,7 @@ pub fn question_interaction_registry() -> bcode_plugin_sdk::interaction::PluginI
     registry
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -302,9 +394,6 @@ pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(all(feature = "dynamic-export", not(feature = "static-bundled")))]
-bcode_plugin_sdk::export_concurrent_plugin!(QuestionPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

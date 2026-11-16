@@ -5,8 +5,7 @@
 
 mod diagnostics;
 
-#[cfg(feature = "static-bundled")]
-mod cli;
+pub mod cli;
 pub mod setup;
 
 use bcode_model::{self as model, host_operation as wire};
@@ -401,6 +400,26 @@ fn failed(code: Failure) -> ServiceResponse {
     )
 }
 impl AuthBrokerProviderPlugin {
+    fn shutdown(&self) -> Result<(), PluginError> {
+        let state = self.state.lock().map_err(|_| {
+            PluginError::failed("broker state unavailable; retain instance for cleanup")
+        })?;
+        // Lease expiry is not evidence that an uncertain remote start had no effects.
+        if !state.turns.is_empty() || !state.starts.is_empty() {
+            return Err(PluginError::failed(
+                "broker outcomes remain unverified; retain instance and resolve remote turns before cleanup",
+            ));
+        }
+        drop(state);
+        if let Ok(runtime) = &self.runtime {
+            runtime.shutdown(Duration::from_secs(5)).map_err(|_| {
+                PluginError::failed(
+                    "broker runtime is still draining; retain instance and retry cleanup",
+                )
+            })?;
+        }
+        Ok(())
+    }
     fn invoke(&self, context: &NativeServiceContext) -> ServiceResponse {
         let result = self.handle(context);
         diagnostics::operation(&context.request.operation, &result);
@@ -583,11 +602,22 @@ impl AuthBrokerProviderPlugin {
 }
 
 impl RustPlugin for AuthBrokerProviderPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        bcode_plugin_sdk::definition::ProductRegistrations::default()
+            .with_cli(cli::registration())
+            .with_portable_cli(cli::invoke_structured)
+    }
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        self.shutdown()
+    }
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         self.invoke(&context)
     }
 }
 impl ConcurrentRustPlugin for AuthBrokerProviderPlugin {
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        self.shutdown()
+    }
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         self.invoke(&context)
     }
@@ -609,9 +639,8 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     vtable.cli_registration = Some(static_cli_registration);
     vtable
 }
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(
-    AuthBrokerProviderPlugin,
+bcode_plugin_sdk::define_plugin!(
+    concurrent AuthBrokerProviderPlugin,
     include_str!("../bcode-plugin.toml")
 );
 
@@ -650,6 +679,129 @@ mod tests {
             "invalid_private_directory"
         );
     }
+    #[test]
+    fn shared_definition_declares_frontend_cli_and_structured_handler() {
+        use bcode_plugin_sdk::definition::ComponentRole;
+        let definition = plugin_definition();
+        assert!(definition.metadata.roles.contains(&ComponentRole::Frontend));
+        assert!(definition.metadata.roles.contains(&ComponentRole::Backend));
+        let registrations = <AuthBrokerProviderPlugin as RustPlugin>::component_registrations();
+        assert!(registrations.cli.is_some());
+        assert!(registrations.portable_cli.is_some());
+        let registration = registrations.cli.expect("frontend CLI registration");
+        let descriptor = bcode_command::cli::CliDescriptor::extract((registration.command)())
+            .expect("portable registered grammar");
+        assert_eq!(descriptor.name, "auth-broker");
+        assert!(
+            descriptor
+                .subcommands
+                .iter()
+                .any(|command| command.name == "prepare")
+        );
+        let encoded = serde_json::to_vec(&descriptor).expect("encode portable grammar");
+        let descriptor: bcode_command::cli::CliDescriptor =
+            serde_json::from_slice(&encoded).expect("decode portable grammar");
+        let arguments = [
+            "auth-broker",
+            "prepare",
+            "--directory",
+            "/tmp/bcode-broker-grammar-only",
+            "--broker-url",
+            "https://broker.example.test",
+            "--audience",
+            "ci",
+            "--timeout-secs",
+            "120",
+        ];
+        let local = (registration.command)()
+            .try_get_matches_from(arguments)
+            .expect("author parser accepts public CLI path");
+        let portable = descriptor
+            .command()
+            .try_get_matches_from(arguments)
+            .expect("portable parser accepts the same public CLI path");
+        for matches in [&local, &portable] {
+            let prepare = matches.subcommand_matches("prepare").expect("prepare leaf");
+            assert_eq!(
+                prepare.get_one::<String>("broker_url").map(String::as_str),
+                Some("https://broker.example.test")
+            );
+            assert!(!(registration.requires_daemon)(matches));
+        }
+        assert!(
+            descriptor
+                .command()
+                .try_get_matches_from(["auth-broker", "prepare"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn shutdown_retains_uncertain_remote_outcomes() {
+        let plugin = AuthBrokerProviderPlugin::default();
+        plugin
+            .state
+            .lock()
+            .expect("state")
+            .starts
+            .insert("ambiguous-start".into(), now() + 60);
+        assert!(plugin.deactivate_concurrent().is_err());
+        assert!(
+            plugin
+                .state
+                .lock()
+                .expect("retained state")
+                .starts
+                .contains_key("ambiguous-start")
+        );
+        plugin.state.lock().expect("state").starts.clear();
+        plugin
+            .deactivate_concurrent()
+            .expect("cleanup after explicit reconciliation");
+    }
+
+    #[test]
+    fn expired_lease_does_not_prove_an_uncertain_start_had_no_effects() {
+        let plugin = AuthBrokerProviderPlugin::default();
+        plugin
+            .state
+            .lock()
+            .expect("state")
+            .starts
+            .insert("expired-uncertain-start".into(), 0);
+        assert!(plugin.deactivate_concurrent().is_err());
+        assert!(
+            plugin
+                .state
+                .lock()
+                .expect("retained state")
+                .starts
+                .contains_key("expired-uncertain-start")
+        );
+        plugin.state.lock().expect("state").starts.clear();
+        plugin
+            .deactivate_concurrent()
+            .expect("explicitly reconciled cleanup");
+    }
+
+    #[test]
+    fn independent_instances_do_not_share_remote_turn_reservations() {
+        let first = AuthBrokerProviderPlugin::default();
+        let second = AuthBrokerProviderPlugin::default();
+        first
+            .state
+            .lock()
+            .expect("first state")
+            .starts
+            .insert("ambiguous-start".into(), now() + 60);
+        second
+            .deactivate_concurrent()
+            .expect("unrelated instance can close");
+        assert!(first.deactivate_concurrent().is_err());
+        first.state.lock().expect("first state").starts.clear();
+        first.deactivate_concurrent().expect("cleanup first");
+    }
+
     fn context(url: &str) -> model::ProviderRequestContext {
         model::ProviderRequestContext {
             settings: BTreeMap::from([("broker_url".into(), url.into())]),

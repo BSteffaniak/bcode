@@ -170,6 +170,52 @@ impl ActiveChat {
         }
     }
 
+    /// Retain a correlated ordered note before publishing its durable write.
+    /// Returns false without dispatch when the actual ordered queue rejects admission.
+    pub(super) fn append_frontend_presentation_note(
+        &mut self,
+        source_id: String,
+        text: String,
+        format: bcode_command::CommandTextFormat,
+        parent: &mut super::plugin_tui::dynamic::FrontendEffectResponsibility,
+    ) -> bool {
+        let Some(session_id) = self.attached_session_id() else {
+            self.append_durable_presentation_note(source_id, text, format);
+            return true;
+        };
+        let Ok(token) = parent.follow_up() else {
+            parent.recovery_required();
+            return false;
+        };
+        let transfer = super::plugin_tui::dynamic::FrontendEffectTransfer::new(
+            super::effects::TuiEffect::AppendPresentationNote {
+                session_id,
+                source_id,
+                note_id: format!(
+                    "{:020}-{}",
+                    PRESENTATION_NOTE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                    uuid::Uuid::new_v4()
+                ),
+                text,
+                format,
+            },
+            token,
+        );
+        if let Err(returned) = self
+            .pending_effects
+            .try_push_frontend(super::effects::EffectSchedule::StartIfIdle, transfer)
+        {
+            let mut rejected = *returned;
+            if rejected.responsibility.not_dispatched().is_err() {
+                rejected.responsibility.recovery_required();
+            }
+            drop(rejected);
+            parent.recovery_required();
+            return false;
+        }
+        true
+    }
+
     pub fn push_presentation_markdown(&mut self, source_id: impl Into<String>, text: String) {
         self.append_durable_presentation_note(
             source_id,
@@ -342,6 +388,23 @@ fn start_switch_session_at_sequence(
     if managed_navigation_intercepted(chat, Some(next_session_id)) {
         return;
     }
+    prepare_switch_session(chat, next_session_id, anchor_sequence);
+    chat.replace_effect(super::effects::TuiEffect::OpenSession {
+        session_id: next_session_id,
+        initial_window_request,
+        event_sender: chat.event_sender.clone(),
+        allow_daemon_start: true,
+    });
+}
+
+/// Prepare the existing session view after the caller has reserved its actual `OpenSession` effect.
+/// This does not dispatch, enqueue, or create a second completion owner. Callers check
+/// managed navigation interception before reserving that effect.
+pub fn prepare_switch_session(
+    chat: &mut ActiveChat,
+    next_session_id: SessionId,
+    anchor_sequence: Option<u64>,
+) {
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }
@@ -368,16 +431,24 @@ fn start_switch_session_at_sequence(
         chat.app.replace_composer_with(&draft_text);
     }
     chat.app.set_status("Opening session…".to_owned());
-    chat.replace_effect(super::effects::TuiEffect::OpenSession {
-        session_id: next_session_id,
-        initial_window_request,
-        event_sender: chat.event_sender.clone(),
-        allow_daemon_start: true,
-    });
 }
 
 /// Apply a completed asynchronous session-open result.
 pub fn complete_switch_session(
+    chat: &mut ActiveChat,
+    session_id: SessionId,
+    result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
+) {
+    let matching = chat.opening_session_id() == Some(session_id);
+    complete_switch_session_state(chat, session_id, result);
+    if matching && chat.attached_session_id() == Some(session_id) {
+        chat.replace_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
+        chat.start_effect(super::effects::TuiEffect::ListPermissions);
+    }
+}
+
+/// Apply the actual open result without scheduling tokenless descendant effects.
+pub fn complete_switch_session_state(
     chat: &mut ActiveChat,
     session_id: SessionId,
     result: Result<(AttachedSessionHistory, JoinHandle<()>), TuiError>,
@@ -430,8 +501,6 @@ pub fn complete_switch_session(
                     ));
                 }
             }
-            chat.replace_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
-            chat.start_effect(super::effects::TuiEffect::ListPermissions);
         }
         Err(error) => {
             // A failed open must not leave the view holding an identity it cannot serve. Returning
@@ -491,7 +560,7 @@ pub fn auth_security_status(config: &bcode_config::BcodeConfig) -> Option<String
 /// A managed root owns exactly one canonical session and has no model application access.
 /// Navigation elsewhere ends the managed root and lets the outer journey open the target
 /// through its own route (managed reattach or ordinary chat). Returns whether it intercepted.
-fn managed_navigation_intercepted(chat: &mut ActiveChat, target: Option<SessionId>) -> bool {
+pub fn managed_navigation_intercepted(chat: &mut ActiveChat, target: Option<SessionId>) -> bool {
     let Some(owner) = chat.app.managed_execution_session() else {
         return false;
     };

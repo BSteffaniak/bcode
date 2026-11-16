@@ -36,13 +36,15 @@ fn long_session(mode: ScrollbarMode, at: Instant) -> TranscriptV2Host {
     let [TuiEffect::LoadTranscriptV2History { load }] = effects.as_slice() else {
         panic!("one tail request, got {} effects", effects.len());
     };
+    let load = *load;
+    drop(effects);
     let HostRequest::Window(issued) = load.request else {
         panic!("window request");
     };
     let all = conversation(session, TURNS);
     let resident = all[all.len() - usize::try_from(RESIDENT_TURNS * 3).expect("small")..].to_vec();
     let result = TuiEffectResult::TranscriptV2HistoryLoaded {
-        load: *load,
+        load,
         result: Ok(HistoryLoaded::Window(HistoryWindowResult {
             generation: issued.generation,
             target: issued.request,

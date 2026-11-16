@@ -63,7 +63,7 @@ async fn generate_inner(
     if cancellation.is_cancelled() {
         return Err("auxiliary generation cancelled".into());
     }
-    let (provider, target) = resolve_target(state, &input).await?;
+    let (provider, target) = Box::pin(resolve_target(state, &input)).await?;
     let request = prepare_request(&input, &target);
     if local_request_estimate(&request).tokens > input.max_input_tokens {
         return Err("auxiliary request exceeds input allowance".into());

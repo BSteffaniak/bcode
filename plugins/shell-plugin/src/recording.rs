@@ -409,15 +409,19 @@ impl AsyncShellRecordingWriter {
         let mut writer = ShellRecordingWriter::create(path, columns, rows)?;
         let _ = writer.publish_commit(observer.as_ref(), false)?;
         let (sender, receiver) = mpsc::sync_channel(ASYNC_RECORDING_QUEUE_CAPACITY);
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = Arc::clone(&failed);
         let worker = thread::Builder::new()
             .name("bcode-shell-recording".to_owned())
-            .spawn(move || run_async_recording_writer(writer, &receiver, observer.as_ref()))?;
+            .spawn(move || {
+                run_async_recording_writer(writer, &receiver, observer.as_ref(), &worker_failed);
+            })?;
         Ok(Self {
             budget: None,
             sender,
             worker: Some(worker),
             sequence: Arc::new(Mutex::new(Instant::now())),
-            failed: Arc::new(AtomicBool::new(false)),
+            failed,
         })
     }
 
@@ -633,20 +637,12 @@ impl AsyncShellRecordingWriter {
 impl Drop for AsyncShellRecordingWriter {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            if self.failed.load(Ordering::SeqCst)
-                || self
-                    .budget
-                    .as_ref()
-                    .is_some_and(super::ShellExecutionBudget::stopped)
-            {
-                // Failed capture must not wait on an observer or filesystem during teardown.
-                // Disconnect the queue; the worker owns partial-file cleanup.
-                let _ = self.sender.try_send(AsyncRecordingCommand::Shutdown);
-                drop(worker);
-            } else {
-                let _ = self.sender.send(AsyncRecordingCommand::Shutdown);
-                let _ = worker.join();
-            }
+            // A native plugin cannot unload while its writer or observer is still running.
+            // Queue shutdown even after failure/cancellation, then retain ownership until
+            // the worker has released callbacks and partial-file cleanup is complete.
+            self.failed.store(true, Ordering::SeqCst);
+            let _ = self.sender.send(AsyncRecordingCommand::Shutdown);
+            let _ = worker.join();
         }
     }
 }
@@ -713,10 +709,12 @@ fn run_async_recording_writer(
     mut writer: ShellRecordingWriter,
     receiver: &mpsc::Receiver<AsyncRecordingCommand>,
     observer: Option<&ShellRecordingCommitObserver>,
+    failed: &AtomicBool,
 ) {
     let mut failure = None;
     let mut publication = RecordingPublicationState::new(writer.encoded_bytes(), Instant::now());
-    loop {
+    // Discard queued work after failure; any current callback must settle first.
+    while !failed.load(Ordering::SeqCst) {
         let command_result = receive_recording_command(
             receiver,
             observer.is_some(),
@@ -1505,13 +1503,22 @@ mod tests {
                 .kind(),
             io::ErrorKind::TimedOut
         );
-        drop(writer);
         assert!(started.elapsed() < Duration::from_millis(200));
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let drop_thread = thread::spawn(move || {
+            drop(writer);
+            let _ = dropped_tx.send(());
+        });
+        assert!(dropped_rx.recv_timeout(Duration::from_millis(25)).is_err());
         assert!(
             !path.exists(),
             "failed capture cannot publish complete replay"
         );
         release_tx.send(()).expect("release observer");
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failed writer joined after callback release");
+        drop_thread.join().expect("drop worker");
     }
 
     #[test]

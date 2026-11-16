@@ -405,7 +405,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn runtime() -> bcode_plugin::PluginRuntimeHost {
-        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from(["bcode.filesystem".to_owned()]),
@@ -644,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn partial_refresh_excludes_failed_provider_and_preserves_pinned_mapping() {
         let cache = ToolCatalogCache::default();
-        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let runtime = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
                 enabled: std::collections::BTreeSet::from([

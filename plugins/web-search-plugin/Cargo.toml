@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_model = { workspace = true }
@@ -32,4 +32,5 @@ tokio = { workspace = true, features = ["macros", "time"] }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bcode_tui_components", "bmux_tui"]
+frontend         = ["bcode_tui_components", "bmux_tui"]
+static-bundled   = ["frontend"]

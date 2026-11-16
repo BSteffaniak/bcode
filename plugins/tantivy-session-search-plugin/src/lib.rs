@@ -388,6 +388,22 @@ impl Default for TantivySessionSearchPlugin {
 impl RustPlugin for TantivySessionSearchPlugin {}
 
 impl ConcurrentRustPlugin for TantivySessionSearchPlugin {
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        let _lifecycle = self
+            .lifecycle
+            .write()
+            .map_err(|_| PluginError::failed("search lifecycle lock unavailable"))?;
+        let mut engine = self
+            .engine
+            .write()
+            .map_err(|_| PluginError::failed("search engine lock unavailable"))?;
+        // The host drains admitted invocations before deactivation. Dropping this
+        // instance's engine releases its writer without purging durable state.
+        *engine = EngineState::Uninitialized;
+        drop(engine);
+        Ok(())
+    }
+
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != SESSION_SEARCH_INTERFACE_ID {
             return ServiceResponse::error(
@@ -1730,19 +1746,21 @@ fn error_response(error: &ProviderError) -> ServiceResponse {
     ServiceResponse::error(error.code, bounded_message(&error.message))
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        TantivySessionSearchPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(
-    TantivySessionSearchPlugin,
-    include_str!("../bcode-plugin.toml")
+bcode_plugin_sdk::define_plugin!(
+    concurrent TantivySessionSearchPlugin,
+    metadata = bcode_plugin_sdk::definition::PluginMetadata {
+        plugin_id: "bcode.tantivy-session-search".into(),
+        version: "0.0.1".into(),
+        roles: vec![bcode_plugin_sdk::definition::ComponentRole::Backend],
+        required_capabilities: Vec::new(),
+        contracts: vec![bcode_plugin_sdk::definition::ContractDescriptor {
+            interface_id: bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE.into(),
+            major: 1,
+            minor: 0,
+        }],
+        manifest_toml: Some(include_str!("../bcode-plugin.toml").into()),
+    },
+    registrations = bcode_plugin_sdk::definition::ProductRegistrations::default(),
 );
 
 #[cfg(test)]
@@ -2319,6 +2337,45 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn deactivation_releases_writer_and_preserves_checkpoint_for_replacement() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        let session_id = SessionId::new();
+        let batch = apply_batch_request(session_id, "activation-batch", 1, "retained needle");
+        {
+            let engine = SearchEngine::open(root.path().to_path_buf(), &config).expect("engine");
+            let marker = apply_to_engine(&engine, &batch);
+            let mut state = engine.state.lock().expect("state");
+            marker.apply_to(&mut state).expect("marker");
+            persist_state(root.path(), &state).expect("persist");
+        }
+        let plugin = TantivySessionSearchPlugin::default();
+        assert_eq!(plugin.status(&config).document_count, 1);
+        let checkpoint_path = root.path().join(CHECKPOINT_FILE);
+        let checkpoint = std::fs::read(&checkpoint_path).expect("checkpoint");
+
+        plugin.deactivate_concurrent().expect("deactivate");
+        assert!(matches!(
+            *plugin.engine.read().expect("engine state"),
+            EngineState::Uninitialized
+        ));
+        assert_eq!(
+            std::fs::read(&checkpoint_path).expect("retained checkpoint"),
+            checkpoint
+        );
+        // A fresh instance can acquire the writer while the old instance still exists.
+        let replacement = TantivySessionSearchPlugin::default();
+        let status = replacement.status(&config);
+        assert_eq!(status.state, SearchProviderState::Ready);
+        assert_eq!(status.document_count, 1);
+        assert_eq!(status.coverage.len(), 1);
+        replacement
+            .deactivate_concurrent()
+            .expect("release replacement");
+        replacement.deactivate_concurrent().expect("repeat release");
     }
 
     #[test]

@@ -6,8 +6,7 @@
 
 pub mod memory;
 
-#[cfg(feature = "static-bundled")]
-mod cli;
+pub mod cli;
 
 use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
@@ -9912,16 +9911,27 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-#[cfg(not(feature = "static-bundled"))]
-export_plugin!(BlimsPlugin, MANIFEST);
-
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(BlimsPlugin, MANIFEST);
-    vtable.cli_registration = Some(cli::registration);
-    vtable
-}
+bcode_plugin_sdk::define_plugin!(
+    BlimsPlugin,
+    metadata = bcode_plugin_sdk::definition::PluginMetadata {
+        plugin_id: "bcode.blims".into(),
+        version: "0.0.1".into(),
+        roles: vec![
+            bcode_plugin_sdk::definition::ComponentRole::Backend,
+            bcode_plugin_sdk::definition::ComponentRole::Frontend,
+        ],
+        required_capabilities: Vec::new(),
+        contracts: vec![bcode_plugin_sdk::definition::ContractDescriptor {
+            interface_id: bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE.into(),
+            major: 1,
+            minor: 0,
+        }],
+        manifest_toml: Some(MANIFEST.into()),
+    },
+    registrations = bcode_plugin_sdk::definition::ProductRegistrations::default()
+        .with_cli(cli::registration())
+        .with_portable_cli(cli::invoke_structured),
+);
 
 #[cfg(test)]
 mod tests {

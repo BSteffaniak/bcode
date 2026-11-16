@@ -4623,6 +4623,23 @@ pub enum PluginDefaultMode {
     All,
 }
 
+/// Explicit startup packaging choice for one logical plugin.
+///
+/// A dynamic selection must resolve exactly this artifact; loaders must not fall
+/// back to the bundled implementation when loading or compatibility checks fail.
+/// Selection does not enable a disabled plugin or grant execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginSourceOverride {
+    /// Select the implementation embedded in this Bcode artifact.
+    Bundled,
+    /// Select a native artifact at an explicit absolute path.
+    Dynamic {
+        /// Absolute artifact path. The loader verifies identity and compatibility.
+        path: PathBuf,
+    },
+}
+
 /// Plugin configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "plugins")]
@@ -4636,6 +4653,15 @@ pub struct PluginConfig {
     /// Plugin ids disabled even if bundled or discovered.
     #[serde(default)]
     pub disabled: BTreeSet<String>,
+    /// Explicit packaging selection by plugin id, independent of enablement.
+    #[config_doc(
+        map_key = "<plugin-id>",
+        values(),
+        value_type = "table",
+        value_description = "Explicit source: kind = bundled, or kind = dynamic with an absolute path."
+    )]
+    #[serde(default)]
+    pub sources: BTreeMap<String, PluginSourceOverride>,
     /// Provider/plugin-specific plugin configuration tables keyed by plugin id.
     #[config_doc(
         map_key = "<plugin-id>.<setting>",
@@ -4652,6 +4678,7 @@ impl Default for PluginConfig {
             default: PluginDefaultMode::Bundled,
             enabled: BTreeSet::new(),
             disabled: BTreeSet::new(),
+            sources: BTreeMap::new(),
             config: BTreeMap::new(),
         }
     }
@@ -4848,7 +4875,28 @@ pub enum ConfigError {
     },
 }
 
+fn validate_plugin_sources(config: &PluginConfig) -> Result<(), ConfigError> {
+    for (plugin_id, source) in &config.sources {
+        if plugin_id.trim().is_empty() {
+            return Err(ConfigError::Composition {
+                message: "plugins.sources requires a nonempty plugin id".to_owned(),
+            });
+        }
+        if let PluginSourceOverride::Dynamic { path } = source
+            && !path.is_absolute()
+        {
+            return Err(ConfigError::Composition {
+                message: format!(
+                    "plugins.sources.{plugin_id}: dynamic source requires an absolute path"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
+    validate_plugin_sources(&config.plugins)?;
     if config.session_storage.maintenance_interval_secs == 0
         || config.session_storage.artifact_timeout_secs == 0
     {
@@ -9192,6 +9240,19 @@ fn write_plugins_toml(output: &mut String, plugins: &PluginConfig) {
     write_string_set(output, "enabled", &plugins.enabled);
     write_string_set(output, "disabled", &plugins.disabled);
     output.push('\n');
+    for (plugin_id, source) in &plugins.sources {
+        writeln!(output, "[plugins.sources.{}]", toml_table_key(plugin_id))
+            .expect("writing to string should not fail");
+        match source {
+            PluginSourceOverride::Bundled => output.push_str("kind = \"bundled\"\n"),
+            PluginSourceOverride::Dynamic { path } => {
+                output.push_str("kind = \"dynamic\"\n");
+                writeln!(output, "path = {}", toml_string(&path.to_string_lossy()))
+                    .expect("writing to string should not fail");
+            }
+        }
+        output.push('\n');
+    }
     for (plugin_id, value) in &plugins.config {
         if let Some(table) = value.as_table() {
             writeln!(output, "[plugins.config.{}]", toml_table_key(plugin_id))
@@ -11892,6 +11953,60 @@ accent_transition_curve = "ease_in_out"
             plugin_selection
                 .enabled
                 .contains(TEST_PI_SESSION_IMPORT_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn plugin_source_overrides_round_trip_without_changing_enablement() {
+        let mut config = BcodeConfig::default();
+        config.plugins.sources.insert(
+            "example.dynamic".to_owned(),
+            super::PluginSourceOverride::Dynamic {
+                path: std::path::PathBuf::from("/plugins/example.dylib"),
+            },
+        );
+        config.plugins.sources.insert(
+            "example.bundled".to_owned(),
+            super::PluginSourceOverride::Bundled,
+        );
+        config.plugins.disabled.insert("example.dynamic".to_owned());
+        super::validate_config(&config).expect("absolute source is valid");
+        let encoded = super::config_to_toml(&config);
+        let decoded: BcodeConfig = toml::from_str(&encoded).expect("round trip config");
+        assert_eq!(decoded.plugins, config.plugins);
+        let selection = bcode_plugin_models::PluginSelection::from(&decoded.plugins);
+        assert!(!selection.is_enabled("example.dynamic"));
+    }
+
+    #[test]
+    fn plugin_source_overrides_reject_relative_and_ambiguous_sources() {
+        let mut config = BcodeConfig::default();
+        config.plugins.sources.insert(
+            "example.dynamic".to_owned(),
+            super::PluginSourceOverride::Dynamic {
+                path: std::path::PathBuf::from("relative/example.dylib"),
+            },
+        );
+        assert!(super::validate_config(&config).is_err());
+        assert!(
+            toml::from_str::<BcodeConfig>(
+                r#"
+[plugins.sources."example.dynamic"]
+kind = "dynamic"
+path = "/plugins/example.dylib"
+fallback = "bundled"
+"#
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<BcodeConfig>(
+                r#"
+[plugins.sources."example.dynamic"]
+kind = "future-loader"
+"#
+            )
+            .is_err()
         );
     }
 

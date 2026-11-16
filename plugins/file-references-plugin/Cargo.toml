@@ -11,16 +11,28 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
-bcode_filesystem_plugin = { workspace = true, features = ["native"] }
+bcode_filesystem_models = { workspace = true }
 bcode_plugin_sdk        = { workspace = true }
 bcode_tool              = { workspace = true }
+bmux_ipc                = { workspace = true }
+bmux_plugin_sdk         = { workspace = true }
+futures                 = { workspace = true, features = ["executor"] }
 serde                   = { workspace = true, features = ["derive", "std"] }
 serde_json              = { workspace = true }
 
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bcode_plugin_sdk/tui"]
+# Compatibility alias; frontend capability is independent of packaging.
+static-bundled = ["tui"]
+tui            = ["bcode_plugin_sdk/tui"]
+
+[build-dependencies]
+bmux_plugin_schema = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `bmux_plugin_schema` compiles the BPDL contract in build.rs, which machete cannot trace.
+ignored = ["bmux_plugin_schema"]

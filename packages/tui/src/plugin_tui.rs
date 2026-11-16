@@ -1,15 +1,40 @@
 //! Native plugin TUI presentation and surface helpers.
 
+pub mod dynamic;
+#[cfg(test)]
+pub(crate) mod fixture;
+mod host;
+pub mod retained;
+
 use bcode_plugin::{PluginHost, PluginLoadError, PluginRuntimeHost, StaticBundledPlugin};
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiArtifactChunk, PluginTuiRegistry, PluginTuiSurfaceOpenRequest,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
+
+/// Borrowed selected registry or retained native compatibility registry.
+/// Selected registries keep their owning component in the presentation, never a global lookup.
+pub enum PresentationRegistry<'a> {
+    /// A registry owned by the actual selected component.
+    Selected(&'a PluginTuiRegistry),
+    /// A native registry retained by this presentation.
+    Native(Arc<PluginTuiRegistry>),
+}
+
+impl std::ops::Deref for PresentationRegistry<'_> {
+    type Target = PluginTuiRegistry;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Selected(registry) => registry,
+            Self::Native(registry) => registry,
+        }
+    }
+}
 
 static NEXT_PRESENTATION_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
@@ -27,6 +52,29 @@ enum PresentationPluginBackend {
 }
 
 impl PresentationPluginBackend {
+    fn has_plugin(&self, plugin_id: &str) -> bool {
+        match self {
+            Self::Synchronous(host) => host.has_plugin(plugin_id),
+            Self::Runtime(runtime) => runtime.registry().manifests().contains_key(plugin_id),
+        }
+    }
+    fn declares_surface(&self, plugin_id: &str, surface_kind: &str) -> bool {
+        match self {
+            Self::Synchronous(host) => host.loaded_plugins().iter().any(|plugin| {
+                plugin.manifest().id == plugin_id
+                    && plugin
+                        .manifest()
+                        .tui_surfaces
+                        .iter()
+                        .any(|surface| surface.kind == surface_kind)
+            }),
+            Self::Runtime(runtime) => runtime
+                .registry()
+                .tui_surface(plugin_id, surface_kind)
+                .is_some(),
+        }
+    }
+
     fn visual_adapters(
         &self,
         schema: &str,
@@ -393,11 +441,14 @@ pub struct PluginVisualDiagnostic {
 ///
 /// Registries are retained because visual adapters may accumulate incremental artifact state that
 /// later render passes consume.
-#[derive(Debug)]
 pub struct PluginTuiPresentation {
     composer_identity: u64,
+    frontend_closed: AtomicBool,
     backend: PresentationPluginBackend,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+    frontend_instances: Mutex<Vec<bcode_plugin::LoadedPlugin>>,
+    retained_frontends: Mutex<Vec<Arc<retained::RetainedFrontend>>>,
+    selected_frontends: BTreeMap<String, bcode_plugin_sdk::definition::SelectedProductFrontend>,
     registry_factories: BTreeMap<String, bcode_plugin_sdk::tui::PluginTuiRegistryFactory>,
     configuration_failures: Mutex<BTreeSet<String>>,
     configuration: Mutex<bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration>,
@@ -409,6 +460,30 @@ pub struct PluginTuiPresentation {
     full_generation: AtomicU64,
     timings: Mutex<Vec<PluginVisualTiming>>,
     dynamic_visuals: Mutex<DynamicVisualCoordinator>,
+}
+
+impl std::fmt::Debug for PluginTuiPresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginTuiPresentation")
+            .field(
+                "selected_frontends",
+                &self.selected_frontends.keys().collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PluginTuiPresentation {
+    fn drop(&mut self) {
+        self.shutdown_frontend_commands();
+        if let Ok(instances) = self.frontend_instances.get_mut() {
+            for instance in instances.iter() {
+                if instance.deactivate().is_err() {
+                    tracing::warn!("selected frontend cleanup requires retry");
+                }
+            }
+        }
+    }
 }
 
 /// One renderer-local visual route ready for native row conversion.
@@ -478,7 +553,316 @@ pub fn visual_presentation(
     bcode_plugin_sdk::tui_visual::TuiVisualPresentation::from_resolved(resolved)
 }
 
+/// Caller-selected executable frontend admission, independent of daemon delivery.
+/// Supplying this value replaces bundled frontend registry discovery for that launch.
+pub struct SelectedFrontendStartup {
+    /// Already admitted application backend catalog used for compatibility checks.
+    pub runtime: PluginRuntimeHost,
+    /// Explicit compatible frontend artifacts with real lifecycle authority.
+    pub deployments: Vec<SelectedFrontendDeployment>,
+    /// Renderer-local adapter for selected dynamic components.
+    pub portable: Option<Arc<dyn bcode_plugin_sdk::definition::PortableFrontendAdapter>>,
+}
+
+/// Explicit executable frontend selection supplied by the application host.
+/// Configuration includes the same selected lifecycle authority used by its owning host.
+pub struct SelectedFrontendDeployment {
+    /// Product declaration used for application-contract negotiation.
+    pub manifest: bcode_plugin::PluginManifest,
+    /// Exact static definition or native artifact; never inferred from daemon code.
+    pub deployment: bcode_plugin::FrontendDeployment,
+    /// Caller-resolved configuration and scoped activation authority.
+    pub config: bcode_plugin::ResolvedPluginConfig,
+}
+
 impl PluginTuiPresentation {
+    /// Activate explicit static/native frontend deployments on the blocking preparation worker.
+    /// Never infers frontend executable selection from a backend logical identity.
+    ///
+    /// # Errors
+    /// Returns missing-runtime, deployment, activation, compatibility or adapter admission errors.
+    pub fn with_selected_frontend_deployments(
+        runtime: PluginRuntimeHost,
+        visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+        deployments: Vec<SelectedFrontendDeployment>,
+        portable: Option<&dyn bcode_plugin_sdk::definition::PortableFrontendAdapter>,
+    ) -> Result<Self, PluginLoadError> {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| PluginLoadError::TuiSurfaceOpen {
+                plugin_id: "<frontend>".to_owned(),
+                message: "frontend resolution requires the blocking presentation worker".to_owned(),
+            })?;
+        let built_in = dynamic::DynamicFrontendAdapter::new(handle.clone());
+        let mut instances = Vec::new();
+        for SelectedFrontendDeployment {
+            manifest,
+            deployment,
+            mut config,
+        } in deployments
+        {
+            Self::bind_selected_host(&built_in, &manifest.id, &mut config)?;
+            match runtime.load_frontend_component(manifest, deployment, config) {
+                Ok(instance) => instances.push(instance),
+                Err(error) => {
+                    for instance in &instances {
+                        let _ = instance.deactivate();
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let adapter = portable.unwrap_or(&built_in);
+        let presentation = handle.block_on(Self::with_selected_frontends(
+            runtime,
+            visual_adapter_config,
+            instances,
+            Some(adapter),
+        ))?;
+        let views = built_in
+            .take_views()
+            .map_err(|_| PluginLoadError::TuiSurfaceOpen {
+                plugin_id: "<frontend>".to_owned(),
+                message: "dynamic frontend views unavailable".to_owned(),
+            })?;
+        for view in views {
+            presentation
+                .retain_frontend(view)
+                .map_err(|_| PluginLoadError::TuiSurfaceOpen {
+                    plugin_id: "<frontend>".to_owned(),
+                    message: "dynamic frontend retention failed".to_owned(),
+                })?;
+        }
+        Ok(presentation)
+    }
+
+    fn bind_selected_host(
+        adapter: &dynamic::DynamicFrontendAdapter,
+        plugin_id: &str,
+        config: &mut bcode_plugin::ResolvedPluginConfig,
+    ) -> Result<(), PluginLoadError> {
+        let binding = Arc::new(Mutex::new(
+            None::<bmux_plugin_sdk::definition::PluginHostServices>,
+        ));
+        adapter
+            .bind_host(plugin_id, binding.clone())
+            .map_err(|message| PluginLoadError::TuiSurfaceOpen {
+                plugin_id: plugin_id.to_owned(),
+                message,
+            })?;
+        let activation =
+            config
+                .shared_activation
+                .as_mut()
+                .ok_or_else(|| PluginLoadError::TuiSurfaceOpen {
+                    plugin_id: plugin_id.to_owned(),
+                    message: "selected frontend requires actual activation host".to_owned(),
+                })?;
+        let original_sync = activation.services.clone();
+        let async_fallback = original_sync.clone();
+        let synchronous = binding.clone();
+        let services = bmux_plugin_sdk::definition::PluginHostServices::new(move |request| {
+            if request.interface != bcode_plugin_sdk::tui::host::CONTRACT {
+                return original_sync.invoke(request);
+            }
+            let services = synchronous
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: "frontend product host not bound".to_owned(),
+                })?;
+            services.invoke(request)
+        })
+        .with_async(move |request| {
+            let services = if request.interface == bcode_plugin_sdk::tui::host::CONTRACT {
+                binding.lock().ok().and_then(|slot| slot.clone())
+            } else {
+                Some(async_fallback.clone())
+            };
+            Box::pin(async move {
+                let services =
+                    services.ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "frontend product host not bound".to_owned(),
+                    })?;
+                services.call_service_async(request).await
+            })
+        });
+        activation.services = services;
+        Ok(())
+    }
+
+    /// Resolve explicitly deployed frontend instances against their actual selected artifacts.
+    /// Both static and native deployments use the same selected extension port. Dynamic sources
+    /// require an installed rich adapter; absence is an error, never bundled replacement.
+    ///
+    /// # Errors
+    /// Rejects duplicate/unloaded owners, backend-role instances, incompatible contracts and
+    /// adapters rejecting configuration. Instances remain retained through presentation teardown.
+    pub async fn with_selected_frontends(
+        runtime: PluginRuntimeHost,
+        visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+        instances: Vec<bcode_plugin::LoadedPlugin>,
+        portable: Option<&dyn bcode_plugin_sdk::definition::PortableFrontendAdapter>,
+    ) -> Result<Self, PluginLoadError> {
+        let mut presentation = Self::from_backend(
+            PresentationPluginBackend::Runtime(runtime),
+            visual_adapter_config,
+            &[],
+        );
+        presentation.frontend_instances = Mutex::new(instances);
+        {
+            let instances = presentation.frontend_instances.get_mut().map_err(|_| {
+                PluginLoadError::TuiSurfaceOpen {
+                    plugin_id: "<frontend>".to_owned(),
+                    message: "frontend instances unavailable".to_owned(),
+                }
+            })?;
+            for instance in instances.iter() {
+                let id = instance.manifest().id.clone();
+                if !presentation.backend.has_plugin(&id)
+                    || presentation.selected_frontends.contains_key(&id)
+                {
+                    return Err(PluginLoadError::TuiSurfaceOpen {
+                        plugin_id: id,
+                        message: "frontend owner unavailable or duplicated".to_owned(),
+                    });
+                }
+                let owner = instance.frontend_extensions()?;
+                let frontend = owner.resolve_frontend(portable).await.map_err(|_| {
+                    PluginLoadError::TuiSurfaceOpen {
+                        plugin_id: id.clone(),
+                        message: "selected frontend contract or rich adapter unavailable"
+                            .to_owned(),
+                    }
+                })?;
+                presentation.selected_frontends.insert(id, frontend);
+            }
+        }
+        for (id, frontend) in &presentation.selected_frontends {
+            frontend
+                .registry()
+                .map_err(|_| PluginLoadError::PluginNotLoaded(id.clone()))?
+                .configure(&bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration::default())
+                .map_err(|_| PluginLoadError::TuiSurfaceOpen {
+                    plugin_id: id.clone(),
+                    message: "frontend configuration rejected".to_owned(),
+                })?;
+        }
+        Ok(presentation)
+    }
+
+    /// Retain an admitted rich frontend alongside the presentation and its display lifecycle.
+    /// Callers must bind this to an actual selected frontend, never a daemon-supplied executable.
+    ///
+    /// # Errors
+    /// Rejects a closed presentation, resource limit or unavailable registry state.
+    pub fn retain_frontend(&self, frontend: Arc<retained::RetainedFrontend>) -> Result<(), String> {
+        let mut frontends = self
+            .retained_frontends
+            .lock()
+            .map_err(|_| "retained frontends unavailable".to_owned())?;
+        if self.frontend_closed.load(Ordering::Acquire)
+            || frontends.len() >= MAX_DYNAMIC_VISUAL_CACHE_ENTRIES
+        {
+            return Err("retained frontend admission closed or full".to_owned());
+        }
+        if !frontends
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &frontend))
+        {
+            frontends.push(frontend);
+        }
+        drop(frontends);
+        Ok(())
+    }
+
+    /// Resolve logical selection source text from the successfully displayed rich frontend.
+    #[must_use]
+    pub fn retained_selection_text(
+        &self,
+        content: &bmux_tui::selection::SelectionContentId,
+    ) -> Option<String> {
+        if self.frontend_closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let frontends = self.retained_frontends.lock().ok()?;
+        frontends
+            .iter()
+            .find_map(|frontend| frontend.selection_text(content))
+    }
+
+    /// Rich resources require replay of complete frame metadata, not a cells-only temporal pass.
+    pub(crate) fn has_retained_frontends(&self) -> bool {
+        self.retained_frontends
+            .lock()
+            .is_ok_and(|frontends| !frontends.is_empty())
+    }
+
+    /// Begin a root terminal output attempt, discarding receipts from an abandoned attempt.
+    pub(crate) fn begin_retained_display(&self) {
+        if let Ok(frontends) = self.retained_frontends.lock() {
+            for frontend in frontends.iter() {
+                frontend.begin_display();
+            }
+        }
+    }
+
+    /// Configure the authoritative BMUX prepared frame before output or focus reconciliation.
+    ///
+    /// # Errors
+    /// Rejects source conflicts, unavailable owners or invalid modal/source declarations.
+    pub(crate) fn configure_retained_prepared(
+        &self,
+        prepared: &mut bmux_tui::presentation::PreparedPresentation,
+    ) -> std::io::Result<()> {
+        let frontends = self
+            .retained_frontends
+            .lock()
+            .map_err(|_| std::io::Error::other("retained frontends unavailable"))?;
+        if frontends.is_empty() {
+            return Ok(());
+        }
+        let mut text = prepared.selection_text().clone();
+        let mut scopes = prepared.modal_scopes().cloned().collect::<Vec<_>>();
+        for frontend in frontends.iter() {
+            frontend
+                .merge_prepared(&mut text, &mut scopes)
+                .map_err(std::io::Error::other)?;
+        }
+        drop(frontends);
+        prepared
+            .set_selection_text(text)
+            .map_err(|_| std::io::Error::other("invalid composed selection sources"))?;
+        if !prepared.set_modal_scopes(&scopes) {
+            return Err(std::io::Error::other("invalid composed modal scopes"));
+        }
+        Ok(())
+    }
+
+    /// Successful output alone authorizes the exact replayed input/selection revisions.
+    pub(crate) fn commit_retained_display(
+        &self,
+        hits: &bmux_tui::hit::HitMap,
+        selection: &bmux_tui::selection::SelectionScene,
+    ) {
+        if let Ok(frontends) = self.retained_frontends.lock() {
+            for frontend in frontends.iter() {
+                if frontend.display_succeeded(hits, selection).is_err() {
+                    frontend.display_failed();
+                }
+            }
+        }
+    }
+
+    /// Failed output suspends every rich frontend until a fresh successful display.
+    pub(crate) fn fail_retained_display(&self) {
+        if let Ok(frontends) = self.retained_frontends.lock() {
+            for frontend in frontends.iter() {
+                frontend.display_failed();
+            }
+        }
+    }
+
     /// Create presentation state around a loaded plugin host.
     #[must_use]
     pub fn new(host: PluginHost) -> Self {
@@ -522,6 +906,120 @@ impl PluginTuiPresentation {
         )
     }
 
+    /// Admit frontend-local adapters selected and negotiated by the application plugin host.
+    ///
+    /// Both native static adapters and dynamic retained adapters enter through this path. The
+    /// caller must supply fresh, instance-scoped registries, not registries shared with another
+    /// frontend. No executable code or Rust rendering object is obtained from the daemon here.
+    ///
+    /// # Errors
+    /// Returns an error if an adapter has no loaded backend or rejects presentation configuration.
+    /// Application-contract compatibility must be negotiated by the host before admission.
+    pub fn with_runtime_config_and_registries(
+        runtime: PluginRuntimeHost,
+        visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
+        registries: BTreeMap<String, Arc<PluginTuiRegistry>>,
+    ) -> Result<Self, PluginLoadError> {
+        let mut presentation = Self::from_backend(
+            PresentationPluginBackend::Runtime(runtime),
+            visual_adapter_config,
+            &[],
+        );
+        let configuration = bcode_plugin_sdk::tui::PluginTuiPresentationConfiguration::default();
+        let admission = registries.iter().try_for_each(|(plugin_id, registry)| {
+            if !presentation.backend.has_plugin(plugin_id) {
+                return Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()));
+            }
+            registry
+                .configure(&configuration)
+                .map_err(|_| PluginLoadError::TuiSurfaceOpen {
+                    plugin_id: plugin_id.clone(),
+                    message: "selected frontend rejected presentation configuration".to_owned(),
+                })
+        });
+        if let Err(error) = admission {
+            for registry in registries.values() {
+                registry.shutdown_frontend_commands();
+            }
+            return Err(error);
+        }
+        presentation.registries = Mutex::new(registries);
+        Ok(presentation)
+    }
+
+    /// Open an independent surface using this frontend's selected, retained adapter.
+    ///
+    /// # Errors
+    /// Rejects unavailable adapters, undeclared surfaces and surface factory failures.
+    pub async fn open_surface(
+        &self,
+        plugin_id: &str,
+        surface_kind: &str,
+        request: PluginTuiSurfaceOpenRequest,
+    ) -> Result<BoxedPluginTuiSurface, PluginLoadError> {
+        if !self.backend.has_plugin(plugin_id) {
+            return Err(PluginLoadError::PluginNotLoaded(plugin_id.to_owned()));
+        }
+        if !self.backend.declares_surface(plugin_id, surface_kind) {
+            return Err(PluginLoadError::TuiSurfaceOpen {
+                plugin_id: plugin_id.to_owned(),
+                message: format!("plugin does not declare TUI surface kind '{surface_kind}'"),
+            });
+        }
+        let registry = self
+            .registry(plugin_id)
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_owned()))?;
+        registry.open(surface_kind, request).await.map_err(|error| {
+            PluginLoadError::TuiSurfaceOpen {
+                plugin_id: plugin_id.to_owned(),
+                message: error.to_string(),
+            }
+        })
+    }
+
+    /// Open a surface by its declared kind without consulting bundled plugin discovery.
+    ///
+    /// # Errors
+    /// Rejects missing or ambiguous owners before invoking any factory.
+    pub async fn open_surface_kind(
+        &self,
+        surface_kind: &str,
+        request: PluginTuiSurfaceOpenRequest,
+    ) -> Result<BoxedPluginTuiSurface, PluginLoadError> {
+        let mut owners = self
+            .frontend_plugin_ids()
+            .into_iter()
+            .filter(|plugin_id| self.backend.declares_surface(plugin_id, surface_kind));
+        let owner = owners
+            .next()
+            .ok_or_else(|| PluginLoadError::TuiSurfaceOpen {
+                plugin_id: "<unavailable>".to_owned(),
+                message: format!("no selected frontend declares TUI surface kind '{surface_kind}'"),
+            })?;
+        if owners.next().is_some() {
+            return Err(PluginLoadError::TuiSurfaceOpen {
+                plugin_id: "<ambiguous>".to_owned(),
+                message: format!(
+                    "multiple selected frontends declare TUI surface kind '{surface_kind}'"
+                ),
+            });
+        }
+        self.open_surface(&owner, surface_kind, request).await
+    }
+
+    fn frontend_plugin_ids(&self) -> BTreeSet<String> {
+        let mut plugins = self
+            .registry_factories
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Ok(registries) = self.registries.lock() {
+            plugins.extend(registries.keys().cloned());
+        }
+        plugins.extend(self.selected_frontends.keys().cloned());
+        plugins
+    }
+
     fn from_backend(
         backend: PresentationPluginBackend,
         visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
@@ -539,8 +1037,12 @@ impl PluginTuiPresentation {
         let dynamic_visuals = Mutex::new(DynamicVisualCoordinator::new(backend.clone()));
         Self {
             composer_identity: NEXT_PRESENTATION_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            frontend_closed: AtomicBool::new(false),
             backend,
             visual_adapter_config,
+            frontend_instances: Mutex::new(Vec::new()),
+            retained_frontends: Mutex::new(Vec::new()),
+            selected_frontends: BTreeMap::new(),
             registry_factories,
             configuration_failures: Mutex::new(BTreeSet::new()),
             configuration: Mutex::new(
@@ -586,6 +1088,11 @@ impl PluginTuiPresentation {
 
     /// Clear native restoration requests when resuming bottom-follow.
     pub fn clear_content_positions(&self) {
+        for selected in self.selected_frontends.values() {
+            if let Ok(registry) = selected.registry() {
+                registry.clear_visual_content_positions();
+            }
+        }
         if let Ok(registries) = self.registries.lock() {
             for registry in registries.values() {
                 registry.clear_visual_content_positions();
@@ -623,14 +1130,10 @@ impl PluginTuiPresentation {
             }
             after = page.next;
         }
-        for plugin in self.registry_factories.keys() {
-            let loaded = match &self.backend {
-                PresentationPluginBackend::Synchronous(host) => host.has_plugin(plugin),
-                PresentationPluginBackend::Runtime(runtime) => {
-                    runtime.registry().manifests().contains_key(plugin)
-                }
-            };
-            if loaded && let Some(contributor) = self.registry(plugin) {
+        for plugin in self.frontend_plugin_ids() {
+            if self.backend.has_plugin(&plugin)
+                && let Some(contributor) = self.registry(&plugin)
+            {
                 registry.register_all(contributor.keymap_actions().iter().cloned())?;
             }
         }
@@ -806,6 +1309,16 @@ impl PluginTuiPresentation {
                 failures.insert(plugin_id.clone());
             }
         }
+        for (plugin_id, selected) in &self.selected_frontends {
+            if selected
+                .registry()
+                .map_err(|_| ())
+                .and_then(|registry| registry.configure(&configuration).map_err(|_| ()))
+                .is_err()
+            {
+                failures.insert(plugin_id.clone());
+            }
+        }
         drop(registries);
         *current = configuration;
         drop(current);
@@ -880,6 +1393,7 @@ impl PluginTuiPresentation {
     ///
     /// # Errors
     /// Returns registry lock failures or safe adapter completion errors.
+    #[cfg(test)]
     pub fn drain_frontend_text(&self) -> Result<Vec<String>, String> {
         let registries = self
             .registries
@@ -898,13 +1412,73 @@ impl PluginTuiPresentation {
             }
         }
         drop(registries);
+        for selected in self.selected_frontends.values() {
+            let registry = selected
+                .registry()
+                .map_err(|_| "selected frontend unavailable".to_owned())?;
+            output.extend(registry.drain_frontend_text()?);
+        }
+        Ok(output)
+    }
+
+    /// Move bounded literal frontend text with its original completion responsibility.
+    ///
+    /// # Errors
+    /// Returns selected-registry access or completion errors without replaying invocation.
+    pub fn drain_frontend_text_completions(
+        &self,
+    ) -> Result<Vec<bcode_plugin_sdk::tui::PluginFrontendTextCompletion>, String> {
+        let registries = self
+            .registries
+            .lock()
+            .map_err(|_| "frontend registry unavailable".to_owned())?;
+        let mut output = Vec::new();
+        for (id, registry) in registries.iter() {
+            let loaded = match &self.backend {
+                PresentationPluginBackend::Synchronous(host) => host.has_plugin(id),
+                PresentationPluginBackend::Runtime(runtime) => {
+                    runtime.registry().manifests().contains_key(id)
+                }
+            };
+            if loaded {
+                output.extend(registry.drain_frontend_text_completions()?);
+            }
+        }
+        drop(registries);
+        for selected in self.selected_frontends.values() {
+            let registry = selected
+                .registry()
+                .map_err(|_| "selected frontend unavailable".to_owned())?;
+            output.extend(registry.drain_frontend_text_completions()?);
+        }
         Ok(output)
     }
 
     /// Release frontend-local plugin resources before terminal shutdown.
     pub fn shutdown_frontend_commands(&self) {
-        if let Ok(registries) = self.registries.lock() {
-            for registry in registries.values() {
+        if self.frontend_closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.fail_retained_display();
+        if let Ok(frontends) = self.retained_frontends.lock() {
+            for frontend in frontends.iter() {
+                frontend.close();
+            }
+        }
+        // Never hold the host registry mutex across plugin cleanup callbacks.
+        {
+            let registries = self
+                .registries
+                .lock()
+                .map(|registries| registries.values().cloned().collect::<Vec<_>>());
+            if let Ok(registries) = registries {
+                for registry in registries {
+                    registry.shutdown_frontend_commands();
+                }
+            }
+        }
+        for selected in self.selected_frontends.values() {
+            if let Ok(registry) = selected.registry() {
                 registry.shutdown_frontend_commands();
             }
         }
@@ -912,20 +1486,29 @@ impl PluginTuiPresentation {
 
     /// Return one retained native TUI registry.
     #[must_use]
-    pub fn registry(&self, plugin_id: &str) -> Option<Arc<PluginTuiRegistry>> {
+    pub fn registry(&self, plugin_id: &str) -> Option<PresentationRegistry<'_>> {
+        if self.frontend_closed.load(Ordering::Acquire) {
+            return None;
+        }
         let configuration = self.configuration.lock().ok()?;
         if self.configuration_failures.lock().ok()?.contains(plugin_id) {
             return None;
         }
+        if let Some(selected) = self.selected_frontends.get(plugin_id) {
+            return selected.registry().ok().map(PresentationRegistry::Selected);
+        }
         let mut registries = self.registries.lock().ok()?;
+        if self.frontend_closed.load(Ordering::Acquire) {
+            return None;
+        }
         if let Some(registry) = registries.get(plugin_id).cloned() {
-            return Some(registry);
+            return Some(PresentationRegistry::Native(registry));
         }
         let registry = Arc::new((self.registry_factories.get(plugin_id)?)());
         registry.configure(&configuration).ok()?;
         registries.insert(plugin_id.to_owned(), Arc::clone(&registry));
         drop(registries);
-        Some(registry)
+        Some(PresentationRegistry::Native(registry))
     }
 
     /// Export user adapter preferences and the backend's actually selected,
@@ -1683,18 +2266,21 @@ pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
 pub fn load_default_host_with_static_bundled(
     selection: &bcode_plugin::PluginSelection,
     static_plugins: &[StaticBundledPlugin],
-    extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
+    _extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginHost, PluginLoadError> {
+    // A discovery/activation/compatibility failure is not permission to select a different
+    // bundled implementation. In particular an explicit dynamic selection must fail visibly,
+    // never be replaced with a similarly named static presentation adapter.
     PluginHost::load_defaults_with_static_bundled(selection, static_plugins)
-        .or_else(|_| load_presentation_fallback(selection, static_plugins, extensions))
 }
 
+#[cfg(test)]
 fn load_presentation_fallback(
     selection: &bcode_plugin::PluginSelection,
     static_plugins: &[StaticBundledPlugin],
     extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginHost, PluginLoadError> {
-    let selected = bcode_plugin::filter_selected_static_plugins(static_plugins, selection)?;
+    let selected = bcode_plugin::filter_selected_static_registrations(static_plugins, selection)?;
     let visual_plugins = selected
         .into_iter()
         .filter(|(manifest, _)| {
@@ -1715,7 +2301,7 @@ fn load_presentation_fallback(
                 })
         })
         .collect::<Vec<_>>();
-    Ok(PluginHost::load_static_plugins_best_effort(&visual_plugins))
+    crate::plugin_tui::fixture::load_static(&visual_plugins)
 }
 
 /// Load persistent presentation state for TUI client-side visual adapters.
@@ -1729,13 +2315,38 @@ pub fn load_default_presentation_with_static_bundled(
     static_plugins: &[StaticBundledPlugin],
     extensions: &[bcode_plugin_sdk::tui::StaticPluginTuiExtension],
 ) -> Result<PluginTuiPresentation, PluginLoadError> {
-    load_default_host_with_static_bundled(selection, static_plugins, extensions).map(|host| {
-        PluginTuiPresentation::with_runtime_config_and_extensions(
-            host.into(),
-            visual_adapter_config,
-            extensions,
-        )
-    })
+    let host = load_default_host_with_static_bundled(selection, static_plugins, extensions)?;
+    // This function runs on the blocking presentation-preparation worker. Resolve the actual
+    // selected component, not a registry with a matching bundled logical ID.
+    let handle =
+        tokio::runtime::Handle::try_current().map_err(|_| PluginLoadError::TuiSurfaceOpen {
+            plugin_id: "<frontend>".to_owned(),
+            message: "frontend resolution requires the presentation preparation runtime".to_owned(),
+        })?;
+    let selected = handle.block_on(async {
+        let mut selected = BTreeMap::new();
+        for plugin in host.loaded_plugins() {
+            let manifest = plugin.manifest();
+            if manifest.tui_surfaces.is_empty() && manifest.visual_adapters.is_empty()
+                && manifest.composer_contributions.is_empty() {
+                continue;
+            }
+            let owner = plugin.product_extensions()?;
+            let frontend = owner.resolve_frontend(None).await.map_err(|_| PluginLoadError::TuiSurfaceOpen {
+                plugin_id: manifest.id.clone(),
+                message: "selected frontend could not be resolved; dynamic sources require a negotiated rich presentation proxy".to_owned(),
+            })?;
+            selected.insert(manifest.id.clone(), frontend);
+        }
+        Ok::<_, PluginLoadError>(selected)
+    })?;
+    let mut presentation = PluginTuiPresentation::with_runtime_config_and_extensions(
+        host.into(),
+        visual_adapter_config,
+        &[],
+    );
+    presentation.selected_frontends = selected;
+    Ok(presentation)
 }
 
 /// Load the default local plugin runtime for TUI client-side services.
@@ -1835,6 +2446,14 @@ pub(crate) async fn open_plugin_tui_surface_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost};
+
+    fn registry_ptr_eq(
+        first: &impl std::ops::Deref<Target = PluginTuiRegistry>,
+        second: &impl std::ops::Deref<Target = PluginTuiRegistry>,
+    ) -> bool {
+        std::ptr::eq(&raw const **first, &raw const **second)
+    }
     use bmux_tui::prelude::Line;
 
     const DYNAMIC_TEST_MANIFEST: &str = r#"
@@ -2111,6 +2730,36 @@ library = "libdynamic_visual_test.dylib"
         )
     }
 
+    fn dynamic_visual_test_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+        let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+        let metadata = bcode_plugin_sdk::definition::metadata_from_manifest(
+            DYNAMIC_TEST_MANIFEST,
+            &registrations,
+        )
+        .expect("fixture metadata");
+        // The fixture implements its services through `ConcurrentRustPlugin`, matching
+        // `static_concurrent_plugin_vtable!`; the exclusive adapter would only see the
+        // unsupported `RustPlugin::invoke_service` default.
+        bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<
+            DynamicVisualTestPlugin,
+        >(metadata, registrations, |_| {
+            Arc::new(bcode_plugin_sdk::definition::SharedInvocationHost)
+        })
+    }
+
+    fn shared_dynamic_visual_test_host() -> PluginHost {
+        PluginHost::load_discovered_with_static_bundled_and_config(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            Vec::new(),
+            &[dynamic_visual_test_plugin().with_definition(dynamic_visual_test_definition)],
+            BTreeMap::from([(
+                "test.dynamic-visual".to_owned(),
+                super::fixture::config("test.dynamic-visual"),
+            )]),
+        )
+        .expect("load selected shared fixture")
+    }
+
     const COMPOSER_FALLBACK_MANIFEST: &str = r#"
 id = "test.composer-fallback"
 name = "Composer fallback fixture"
@@ -2269,9 +2918,9 @@ library = "libcomposer_fixture.dylib"
 
     #[test]
     fn presentation_fallback_retains_compatible_native_adapters() {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
+            bcode_shell_plugin::plugin_definition,
         )];
         let host = load_presentation_fallback(
             &bcode_plugin::PluginSelection::all_enabled(),
@@ -2301,24 +2950,826 @@ library = "libcomposer_fixture.dylib"
         assert!(host.loaded_plugins().is_empty());
     }
 
+    #[test]
+    fn startup_loading_failure_is_not_replaced_with_a_bundled_presentation_host() {
+        let invalid_plugin = StaticBundledPlugin::new(
+            "not a valid plugin manifest",
+            bcode_plugin_sdk::static_plugin_vtable!(DynamicVisualTestPlugin, DYNAMIC_TEST_MANIFEST),
+        );
+        let result = load_default_host_with_static_bundled(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &[invalid_plugin],
+            &[],
+        );
+        assert!(result.is_err());
+    }
+
+    fn selected_fixture_instance() -> bcode_plugin::LoadedPlugin {
+        #[derive(Default)]
+        struct LocalProbe(AtomicU64);
+        impl bcode_plugin_sdk::tui::PluginFrontendCommand for LocalProbe {
+            fn invoke(&self) -> Result<(), String> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn drain_text(&self) -> Result<Option<String>, String> {
+                Ok(Some(self.0.swap(0, Ordering::Relaxed).to_string()))
+            }
+        }
+        struct ProbeFactory;
+        impl bcode_plugin_sdk::tui::PluginTuiSurfaceFactory for ProbeFactory {
+            fn surface_kind(&self) -> &'static str {
+                "probe.surface"
+            }
+            fn open(
+                &self,
+                _: PluginTuiSurfaceOpenRequest,
+            ) -> bcode_plugin_sdk::tui::PluginTuiSurfaceFuture {
+                Box::pin(async { Ok(Box::new(ProbeSurface(None)) as BoxedPluginTuiSurface) })
+            }
+        }
+        struct ProbeSurface(Option<String>);
+        impl bcode_plugin_sdk::tui::PluginTuiSurface for ProbeSurface {
+            fn id(&self) -> &'static str {
+                "probe.surface"
+            }
+            fn title(&self) -> &'static str {
+                "Probe"
+            }
+            fn render(
+                &mut self,
+                _: bmux_tui::geometry::Rect,
+                cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
+            ) {
+                cx.set_cell(0, 0, "界", bmux_tui::style::Style::new());
+                cx.push_hit(bmux_tui::hit::HitRegion::new(
+                    "probe.hit",
+                    bmux_tui::geometry::Rect::new(0, 0, 2, 1),
+                ));
+            }
+            fn handle_event(
+                &mut self,
+                event: &bmux_tui::event::Event,
+                _: &dyn PluginTuiHost,
+            ) -> PluginTuiAction {
+                if let bmux_tui::event::Event::User(command) = event {
+                    self.0 = Some(command.clone());
+                }
+                PluginTuiAction::Redraw
+            }
+            fn drain_effects<'a>(
+                &'a mut self,
+                _: &'a dyn PluginTuiHost,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginTuiAction> + Send + 'a>>
+            {
+                let command = self.0.take();
+                Box::pin(async move {
+                    command.map_or(PluginTuiAction::None, |command| {
+                        PluginTuiAction::RunCommand { command }
+                    })
+                })
+            }
+        }
+        fn registry() -> PluginTuiRegistry {
+            let mut registry = PluginTuiRegistry::default();
+            registry.register_frontend_command("probe", Arc::new(LocalProbe::default()));
+            registry.register_factory(Box::new(ProbeFactory));
+            registry
+        }
+        let registrations =
+            bcode_plugin_sdk::definition::ProductRegistrations::default().with_frontend(registry);
+        let metadata = bcode_plugin_sdk::definition::metadata_from_manifest(
+            DYNAMIC_TEST_MANIFEST,
+            &registrations,
+        )
+        .unwrap();
+        let definition =
+            bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<
+                DynamicVisualTestPlugin,
+            >(metadata, registrations, |_| {
+                Arc::new(bcode_plugin_sdk::definition::SharedInvocationHost)
+            });
+        let instance = bcode_plugin::load_plugin_component_with_config(
+            toml::from_str(DYNAMIC_TEST_MANIFEST).unwrap(),
+            definition,
+            super::fixture::config("test.dynamic-visual"),
+            bcode_plugin_sdk::definition::ComponentRole::Frontend,
+        )
+        .unwrap();
+        instance.activate().unwrap();
+        instance
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_product_host_bridge_preserves_redraw_catalog_and_application_failures() {
+        use bcode_plugin_sdk::tui::{PluginTuiHost, PluginTuiHostError, host};
+        let directory = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("absent.sock"));
+        let redraw = bmux_tui_runtime::InvalidationSignal::new();
+        let actual = crate::plugin_surface_host::root_host(
+            redraw.clone(),
+            bcode_client::BcodeClient::new(endpoint),
+            crate::plugin_surface_host::FreshSessionSettings::default(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let retained = actual
+            .retained_product_host()
+            .expect("actual host retains application context");
+        let instance = tokio::task::spawn_blocking(selected_fixture_instance)
+            .await
+            .unwrap();
+        let scope = instance
+            .frontend_extensions()
+            .unwrap()
+            .activation_scope()
+            .unwrap();
+        let services = super::host::services(retained, scope).unwrap();
+        let requests = [
+            host::Request::Redraw {},
+            host::Request::JudgementSetup {},
+            host::Request::WorkflowAuthoringCatalog {},
+            host::Request::WorkflowDelegationPreflight {
+                plugin_id: "probe.selected".to_owned(),
+            },
+            host::Request::WorkflowAuthoringDraft {
+                workflow_id: "probe".to_owned(),
+                draft_id: "draft".to_owned(),
+            },
+            host::Request::WorkflowAuthoringRevision {
+                workflow_id: "probe".to_owned(),
+                revision: 1,
+            },
+        ];
+        for request in requests {
+            let expected = serde_json::to_value(&request).unwrap()["operation"].clone();
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                services.call_service_async(bmux_plugin_sdk::HostServiceOwnedRequest {
+                    capability: host::CONTRACT.to_owned(),
+                    interface: host::CONTRACT.to_owned(),
+                    operation: "invoke".to_owned(),
+                    kind: bmux_plugin_sdk::ServiceKind::Command,
+                    payload: serde_json::to_vec(&request).unwrap(),
+                }),
+            )
+            .await
+            .expect("bounded application callback")
+            .unwrap();
+            let response: host::Response = serde_json::from_slice(&bytes).unwrap();
+            match response {
+                host::Response::Redrawn => assert!(redraw.take()),
+                host::Response::JudgementSetup(Err(PluginTuiHostError::Internal(_)))
+                | host::Response::WorkflowAuthoringCatalog(Err(PluginTuiHostError::Internal(_)))
+                | host::Response::WorkflowDelegationPreflight(Err(PluginTuiHostError::Internal(
+                    _,
+                )))
+                | host::Response::WorkflowAuthoringDraft(Err(PluginTuiHostError::Internal(_)))
+                | host::Response::WorkflowAuthoringRevision(Err(PluginTuiHostError::Internal(_))) =>
+                    {}
+                other => panic!("actual application callback {expected} returned {other:?}"),
+            }
+        }
+        drop(services);
+        tokio::task::spawn_blocking(move || instance.deactivate().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_host_callbacks_are_typed_bounded_and_closed_with_actual_owner() {
+        use bcode_plugin_sdk::tui::{
+            PluginCreateSessionFuture, PluginTask, PluginTuiHost, PluginTuiHostError, host,
+        };
+        #[derive(Default)]
+        struct Host {
+            copies: Mutex<Vec<String>>,
+            sessions: AtomicU64,
+        }
+        impl PluginTuiHost for Host {
+            fn spawn(&self, _: PluginTask) {
+                panic!("dispatcher must use selected task scope");
+            }
+            fn spawn_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) {
+                panic!("unexpected blocking task");
+            }
+            fn request_redraw(&self) {}
+            fn copy_text(&self, text: String) -> Result<(), PluginTuiHostError> {
+                self.copies.lock().unwrap().push(text);
+                Ok(())
+            }
+            fn prepare_fresh_session(
+                &self,
+                existing: Option<bcode_session_models::SessionId>,
+            ) -> PluginCreateSessionFuture {
+                self.sessions.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    existing.ok_or_else(|| {
+                        PluginTuiHostError::InvalidRequest(
+                            "expected existing fixture session".to_owned(),
+                        )
+                    })
+                })
+            }
+        }
+        let instance = tokio::task::spawn_blocking(selected_fixture_instance)
+            .await
+            .unwrap();
+        let scope = instance
+            .frontend_extensions()
+            .unwrap()
+            .activation_scope()
+            .unwrap();
+        let host = Arc::new(Host::default());
+        let services = super::host::services(host.clone(), scope.clone()).unwrap();
+        let request = |payload| bmux_plugin_sdk::HostServiceOwnedRequest {
+            capability: host::CONTRACT.to_owned(),
+            kind: bmux_plugin_sdk::ServiceKind::Command,
+            interface: host::CONTRACT.to_owned(),
+            operation: "invoke".to_owned(),
+            payload,
+        };
+        let id = bcode_session_models::SessionId::new();
+        let bytes = services
+            .call_service_async(request(
+                serde_json::to_vec(&host::Request::PrepareFreshSession { existing: Some(id) })
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            matches!(serde_json::from_slice::<host::Response>(&bytes).unwrap(), host::Response::PrepareFreshSession(Ok(result)) if result == id)
+        );
+        assert_eq!(host.sessions.load(Ordering::Relaxed), 1);
+        assert!(services.call_service_async(request(br#"{"operation":"prepare_fresh_session","arguments":{"existing":null,"authority":"forged"}}"#.to_vec())).await.is_err());
+        assert_eq!(host.sessions.load(Ordering::Relaxed), 1);
+        let text = serde_json::to_vec(&host::Request::CopyText {
+            text: "界e\u{301}".to_owned(),
+        })
+        .unwrap();
+        services
+            .invoke(bmux_plugin_sdk::HostServiceRequest {
+                capability: host::CONTRACT,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface: host::CONTRACT,
+                operation: "invoke",
+                payload: &text,
+            })
+            .unwrap();
+        assert_eq!(*host.copies.lock().unwrap(), vec!["界e\u{301}".to_owned()]);
+        assert!(
+            services
+                .call_service_async(request(vec![0; host::MAX_BYTES + 1]))
+                .await
+                .is_err()
+        );
+        scope.close().unwrap();
+        assert!(
+            services
+                .call_service_async(request(
+                    serde_json::to_vec(&host::Request::Redraw {}).unwrap()
+                ))
+                .await
+                .is_err()
+        );
+        drop(services);
+        tokio::task::spawn_blocking(move || instance.deactivate().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_registration_obeys_selected_activation_resource_capacity() {
+        use super::retained::RetainedFrontend;
+        use bmux_plugin_runtime::ScopeError;
+        use bmux_tui::presentation::portable::PortablePresentationLimits;
+
+        let instance = tokio::task::spawn_blocking(selected_fixture_instance)
+            .await
+            .unwrap();
+        let owner = instance.frontend_extensions().unwrap();
+        let descriptor = owner.descriptor().await.unwrap();
+        let scope = owner.activation_scope().unwrap();
+        let mut occupied = Vec::new();
+        loop {
+            match scope.register_resource(Arc::new(())) {
+                Ok(resource) => occupied.push(resource),
+                Err(ScopeError::Capacity) => break,
+                Err(error) => panic!("unexpected selected scope error: {error}"),
+            }
+        }
+        assert_ne!(occupied, [] as [bmux_plugin_runtime::PluginResourceId; 0]);
+        assert!(
+            RetainedFrontend::from_active_descriptor(
+                owner.clone(),
+                &descriptor,
+                PortablePresentationLimits::default(),
+            )
+            .is_err()
+        );
+        scope.release_resource(occupied.pop().unwrap()).unwrap();
+        let view = RetainedFrontend::from_active_descriptor(
+            owner,
+            &descriptor,
+            PortablePresentationLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            scope.register_resource(Arc::new(())),
+            Err(ScopeError::Capacity)
+        ));
+        drop(view);
+        // The scoped cleanup task releases registration after its admission ends.
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match scope.register_resource(Arc::new(())) {
+                    Ok(resource) => break resource,
+                    Err(ScopeError::Capacity) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected selected scope error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("retained registration must be released");
+        scope.release_resource(released).unwrap();
+        for resource in occupied {
+            scope.release_resource(resource).unwrap();
+        }
+        tokio::task::spawn_blocking(move || instance.deactivate().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_activation_executes_same_author_registry_through_portable_contract() {
+        use bcode_plugin_sdk::tui::portable::{Request, Response, TUI_FRONTEND_CONTRACT};
+        let instance = tokio::task::spawn_blocking(selected_fixture_instance)
+            .await
+            .unwrap();
+        let owner = instance.frontend_extensions().unwrap();
+        let invoke = |request: Request| {
+            let owner = owner.clone();
+            async move {
+                let bytes = owner
+                    .invoke(TUI_FRONTEND_CONTRACT, serde_json::to_vec(&request).unwrap())
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Response>(&bytes).unwrap()
+            }
+        };
+        let Response::Descriptor(descriptor) = invoke(Request::Describe).await else {
+            panic!("selected author descriptor")
+        };
+        assert_eq!(descriptor.commands, vec!["probe"]);
+        assert!(matches!(
+            invoke(Request::Command {
+                id: "probe".to_owned()
+            })
+            .await,
+            Response::Applied
+        ));
+        assert!(
+            matches!(invoke(Request::DrainText).await, Response::Text(text) if text == vec!["1"])
+        );
+        assert!(
+            matches!(invoke(Request::DrainText).await, Response::Text(text) if text == vec!["0"])
+        );
+        tokio::task::spawn_blocking(move || instance.deactivate().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            owner
+                .invoke(
+                    TUI_FRONTEND_CONTRACT,
+                    serde_json::to_vec(&Request::Describe).unwrap()
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn portable_factory_executes_selected_activation_without_native_registry_shortcut() {
+        use bcode_plugin_sdk::definition::PortableFrontendAdapter;
+        let instance = tokio::task::spawn_blocking(selected_fixture_instance)
+            .await
+            .unwrap();
+        let owner = instance.frontend_extensions().unwrap();
+        let descriptor = owner.descriptor().await.unwrap();
+        let runtime = tokio::runtime::Handle::current();
+        let (registry, views) = tokio::task::spawn_blocking(move || {
+            let adapter = super::dynamic::DynamicFrontendAdapter::new(runtime);
+            let registry = adapter.registry(owner, &descriptor).unwrap();
+            (registry, adapter.take_views().unwrap())
+        })
+        .await
+        .unwrap();
+        let command = registry.frontend_command("probe").unwrap();
+        command.invoke().unwrap();
+        let text = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(text) = command.drain_text().unwrap()
+                    && text == "1"
+                {
+                    break text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(text, "1");
+        let mut surface = registry
+            .open(
+                "probe.surface",
+                PluginTuiSurfaceOpenRequest {
+                    instance_id: "portable-probe".to_owned(),
+                    repo_path: None,
+                    session_id: None,
+                    target: None,
+                    options: serde_json::Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+        let (redraw, _receiver) = tokio::sync::mpsc::channel(1);
+        let host = bcode_plugin_sdk::tui::TokioPluginTuiHost::current(redraw);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 4, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                views[0].begin_display();
+                let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+                let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+                surface.render_with_host(
+                    area,
+                    &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                    None,
+                    &host,
+                );
+                if !frame.hits().regions().is_empty() {
+                    views[0]
+                        .display_succeeded(frame.hits(), frame.selection())
+                        .unwrap();
+                    break;
+                }
+                surface.poll(&host);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        surface.handle_event_result(
+            &bmux_tui::event::Event::User("effect-through-selected-owner".to_owned()),
+            &host,
+        );
+        assert_eq!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::RunCommand {
+                command: "effect-through-selected-owner".to_owned()
+            }
+        );
+        // ProbeSurface::handle_event intentionally returns Redraw while its
+        // drain_effects returns the command separately. Both must be delivered once.
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::Redraw);
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        views[0].display_failed();
+        surface.handle_event_result(
+            &bmux_tui::event::Event::User("must-not-run".to_owned()),
+            &host,
+        );
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        drop(surface);
+        for view in &views {
+            view.close();
+        }
+        registry.shutdown_frontend_commands();
+        tokio::task::spawn_blocking(move || instance.deactivate().unwrap())
+            .await
+            .unwrap();
+        assert!(command.invoke().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_startup_deployment_executes_frontend_factory_on_preparation_worker() {
+        let presentation = tokio::task::spawn_blocking(|| {
+            fn registry() -> PluginTuiRegistry {
+                PluginTuiRegistry::default()
+            }
+            let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default()
+                .with_frontend(registry);
+            let metadata = bcode_plugin_sdk::definition::metadata_from_manifest(
+                DYNAMIC_TEST_MANIFEST,
+                &registrations,
+            )
+            .unwrap();
+            let definition =
+                bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<
+                    DynamicVisualTestPlugin,
+                >(metadata, registrations, |_| {
+                    Arc::new(bcode_plugin_sdk::definition::SharedInvocationHost)
+                });
+            PluginTuiPresentation::with_selected_frontend_deployments(
+                shared_dynamic_visual_test_host().into(),
+                bcode_config::TuiVisualAdapterConfig::default(),
+                vec![SelectedFrontendDeployment {
+                    manifest: toml::from_str(DYNAMIC_TEST_MANIFEST).unwrap(),
+                    deployment: bcode_plugin::FrontendDeployment::Static(definition),
+                    config: super::fixture::config("test.dynamic-visual"),
+                }],
+                None,
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(presentation.registry_factories.is_empty());
+        assert!(presentation.registry("test.dynamic-visual").is_some());
+        assert_eq!(presentation.frontend_instances.lock().unwrap().len(), 1);
+        drop(presentation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_factory_instances_have_independent_registry_and_shutdown() {
+        let first = PluginTuiPresentation::with_selected_frontends(
+            shared_dynamic_visual_test_host().into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            vec![selected_fixture_instance()],
+            None,
+        )
+        .await
+        .unwrap();
+        let second = PluginTuiPresentation::with_selected_frontends(
+            shared_dynamic_visual_test_host().into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            vec![selected_fixture_instance()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!registry_ptr_eq(
+            &first.registry("test.dynamic-visual").unwrap(),
+            &second.registry("test.dynamic-visual").unwrap()
+        ));
+        assert!(
+            first
+                .invoke_frontend_command("test.dynamic-visual", "probe")
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(first.drain_frontend_text().unwrap(), vec!["1"]);
+        assert_eq!(second.drain_frontend_text().unwrap(), vec!["0"]);
+        first.shutdown_frontend_commands();
+        assert!(first.registry("test.dynamic-visual").is_none());
+        assert!(second.registry("test.dynamic-visual").is_some());
+        drop(first);
+        assert!(
+            second.selected_frontends["test.dynamic-visual"]
+                .owner()
+                .ensure_active()
+                .is_ok()
+        );
+        drop(second);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_selected_component_without_rich_adapter_is_not_substituted() {
+        use bcode_plugin_sdk::definition::{
+            PluginFuture, PluginResult, ProductExtensionPort, ProductExtensions,
+        };
+        struct DynamicOwner;
+        impl ProductExtensionPort for DynamicOwner {
+            fn ensure_active(&self) -> PluginResult<()> {
+                Ok(())
+            }
+            fn invoke(
+                &self,
+                contract: String,
+                _: Vec<u8>,
+            ) -> PluginFuture<'_, PluginResult<Vec<u8>>> {
+                Box::pin(async move {
+                    assert_eq!(
+                        contract,
+                        bcode_plugin_sdk::definition::extensions::PRODUCT_EXTENSIONS_CONTRACT
+                    );
+                    Ok(serde_json::to_vec(&bcode_plugin_sdk::definition::ProductExtensionDescriptor {
+                        plugin_id: "test.dynamic-visual".to_owned(),
+                        role: bcode_plugin_sdk::definition::ComponentRole::Frontend,
+                        contracts: vec![bmux_plugin_sdk::RegistrationContract {
+                            kind: bmux_plugin_sdk::RegistrationKind::Extension,
+                            interface: bmux_plugin::component_viewport::portable::PORTABLE_PRESENTATION_CONTRACT_ID.to_owned(),
+                            version: 2, name: "retained".to_owned(),
+                        }],
+                        native_frontend: false,
+                    }).unwrap())
+                })
+            }
+        }
+        let selected = ProductExtensions::new(Arc::new(DynamicOwner), None);
+        assert!(selected.resolve_frontend(None).await.is_err());
+    }
+
+    pub(super) fn completion_test_owner() -> bcode_plugin_sdk::definition::ProductExtensions {
+        fn registry() -> PluginTuiRegistry {
+            PluginTuiRegistry::default()
+        }
+        let registrations =
+            bcode_plugin_sdk::definition::ProductRegistrations::default().with_frontend(registry);
+        let metadata = bcode_plugin_sdk::definition::metadata_from_manifest(
+            DYNAMIC_TEST_MANIFEST,
+            &registrations,
+        )
+        .unwrap();
+        let definition =
+            bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<
+                DynamicVisualTestPlugin,
+            >(metadata, registrations, |_| {
+                Arc::new(bcode_plugin_sdk::definition::SharedInvocationHost)
+            });
+        let instance = bcode_plugin::load_plugin_component_with_config(
+            toml::from_str(DYNAMIC_TEST_MANIFEST).unwrap(),
+            definition,
+            super::fixture::config("test.dynamic-visual"),
+            bcode_plugin_sdk::definition::ComponentRole::Frontend,
+        )
+        .unwrap();
+        instance.activate().unwrap();
+        instance.product_extensions().unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_frontend_consumer_retains_registry_and_rejects_backend_role() {
+        fn registry() -> PluginTuiRegistry {
+            PluginTuiRegistry::default()
+        }
+        let registrations =
+            bcode_plugin_sdk::definition::ProductRegistrations::default().with_frontend(registry);
+        let metadata = bcode_plugin_sdk::definition::metadata_from_manifest(
+            DYNAMIC_TEST_MANIFEST,
+            &registrations,
+        )
+        .unwrap();
+        let definition =
+            bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<
+                DynamicVisualTestPlugin,
+            >(metadata, registrations, |_| {
+                Arc::new(bcode_plugin_sdk::definition::SharedInvocationHost)
+            });
+        let manifest = toml::from_str(DYNAMIC_TEST_MANIFEST).unwrap();
+        let instance = bcode_plugin::load_plugin_component_with_config(
+            manifest,
+            definition,
+            super::fixture::config("test.dynamic-visual"),
+            bcode_plugin_sdk::definition::ComponentRole::Frontend,
+        )
+        .unwrap();
+        instance.activate().unwrap();
+        let backend = shared_dynamic_visual_test_host();
+        let presentation = PluginTuiPresentation::with_selected_frontends(
+            backend.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            vec![instance],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(presentation.registry_factories.is_empty());
+        let first = presentation.registry("test.dynamic-visual").unwrap();
+        let second = presentation.registry("test.dynamic-visual").unwrap();
+        assert!(registry_ptr_eq(&first, &second));
+        drop(second);
+        drop(first);
+        drop(presentation);
+        let host = shared_dynamic_visual_test_host();
+        assert!(host.loaded_plugins()[0].frontend_extensions().is_err());
+        drop(host);
+    }
+
+    #[test]
+    fn selected_frontend_registry_is_retained_without_a_bundled_factory() {
+        let host = shared_dynamic_visual_test_host();
+        let plugin_id = host.loaded_plugins()[0].manifest().id.clone();
+        let registry = Arc::new(PluginTuiRegistry::default());
+        let presentation = PluginTuiPresentation::with_runtime_config_and_registries(
+            host.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            BTreeMap::from([(plugin_id.clone(), Arc::clone(&registry))]),
+        )
+        .unwrap();
+        assert!(presentation.registry_factories.is_empty());
+        assert!(registry_ptr_eq(
+            &registry,
+            &presentation.registry(&plugin_id).unwrap()
+        ));
+        assert!(registry_ptr_eq(
+            &registry,
+            &presentation.registry(&plugin_id).unwrap()
+        ));
+        drop(presentation);
+    }
+
+    #[test]
+    fn selected_frontend_shutdown_is_local_idempotent_and_closes_admission() {
+        struct LocalCommand(Arc<AtomicU64>);
+        impl bcode_plugin_sdk::tui::PluginFrontendCommand for LocalCommand {
+            fn invoke(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn shutdown(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let shutdowns = Arc::new(AtomicU64::new(0));
+        let host = shared_dynamic_visual_test_host();
+        let plugin_id = host.loaded_plugins()[0].manifest().id.clone();
+        let mut registry = PluginTuiRegistry::default();
+        registry.register_frontend_command("local", Arc::new(LocalCommand(Arc::clone(&shutdowns))));
+        let presentation = PluginTuiPresentation::with_runtime_config_and_registries(
+            host.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            BTreeMap::from([(plugin_id.clone(), Arc::new(registry))]),
+        )
+        .unwrap();
+        assert!(
+            presentation
+                .invoke_frontend_command(&plugin_id, "local")
+                .unwrap()
+                .is_ok()
+        );
+        presentation.shutdown_frontend_commands();
+        assert!(presentation.registry(&plugin_id).is_none());
+        assert!(
+            presentation
+                .invoke_frontend_command(&plugin_id, "local")
+                .is_none()
+        );
+        presentation.shutdown_frontend_commands();
+        drop(presentation);
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn selected_frontends_do_not_share_registry_state_or_shutdown() {
+        fn frontend() -> (PluginTuiPresentation, String) {
+            let host = shared_dynamic_visual_test_host();
+            let plugin_id = host.loaded_plugins()[0].manifest().id.clone();
+            let presentation = PluginTuiPresentation::with_runtime_config_and_registries(
+                host.into(),
+                bcode_config::TuiVisualAdapterConfig::default(),
+                BTreeMap::from([(plugin_id.clone(), Arc::new(PluginTuiRegistry::default()))]),
+            )
+            .unwrap();
+            (presentation, plugin_id)
+        }
+        let (first, plugin_id) = frontend();
+        let (second, _) = frontend();
+        assert!(!registry_ptr_eq(
+            &first.registry(&plugin_id).unwrap(),
+            &second.registry(&plugin_id).unwrap(),
+        ));
+        first.shutdown_frontend_commands();
+        assert!(first.registry(&plugin_id).is_none());
+        assert!(second.registry(&plugin_id).is_some());
+    }
+
+    #[test]
+    fn selected_frontend_rejects_an_adapter_without_its_backend() {
+        let host = PluginHost::load_static_plugins(&[]).unwrap();
+        let result = PluginTuiPresentation::with_runtime_config_and_registries(
+            host.into(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            BTreeMap::from([(
+                "missing.frontend".to_owned(),
+                Arc::new(PluginTuiRegistry::default()),
+            )]),
+        );
+        let rejected = matches!(
+            result,
+            Err(PluginLoadError::PluginNotLoaded(ref id)) if id == "missing.frontend"
+        );
+        drop(result);
+        assert!(rejected);
+    }
+
     fn dynamic_test_presentation(
         preferred_adapter: &str,
         disabled_adapters: &[&str],
     ) -> PluginTuiPresentation {
         let bundled = [
             dynamic_visual_test_plugin(),
-            StaticBundledPlugin::new(
+            StaticBundledPlugin::from_definition(
                 include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-                bcode_shell_plugin::static_plugin(),
+                bcode_shell_plugin::plugin_definition,
             ),
         ];
-        let selected = bcode_plugin::filter_selected_static_plugins(
-            &bundled,
+        let selected = bcode_plugin::filter_selected_static_registrations(
+            &[
+                dynamic_visual_test_plugin().with_definition(dynamic_visual_test_definition),
+                bundled[1],
+            ],
             &bcode_plugin::PluginSelection::all_enabled(),
         )
-        .expect("select dynamic visual test plugins");
-        let runtime: PluginRuntimeHost = PluginHost::load_static_plugins(&selected)
-            .expect("load dynamic visual test plugins")
+        .expect("select isolated dynamic visual test plugins");
+        let runtime: PluginRuntimeHost = super::fixture::load_static(&selected)
+            .expect("load isolated dynamic visual test plugins")
             .into();
         PluginTuiPresentation::with_runtime_config_and_extensions(
             runtime,
@@ -2636,59 +4087,668 @@ library = "libcomposer_fixture.dylib"
     }
 
     fn hello_dynamic_library_path() -> std::path::PathBuf {
-        let executable = std::env::current_exe().expect("current test executable path");
-        let directory = executable.parent().expect("test executable parent");
-        let prefix = format!("{}bcode_hello_plugin", std::env::consts::DLL_PREFIX);
-        std::fs::read_dir(directory)
-            .expect("test dependency directory")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
-                    })
+        let artifact = std::env::var_os("BCODE_HELLO_WRAPPER_ARTIFACT").expect(
+            "build/package the Bcode hello thin frontend wrapper with package-plugin.py --component frontend --feature tui; set BCODE_HELLO_WRAPPER_ARTIFACT to its absolute dylib path (not the export-free implementation library)",
+        );
+        let artifact = std::path::PathBuf::from(artifact);
+        assert!(
+            artifact.is_absolute() && artifact.is_file(),
+            "BCODE_HELLO_WRAPPER_ARTIFACT must identify an existing absolute wrapper artifact"
+        );
+        artifact
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_native_frontend_uses_author_codec_and_retained_v2_without_static_fallback() {
+        use bcode_plugin_sdk::tui::portable::{
+            Bindings, Request, Response, TUI_FRONTEND_CONTRACT, Viewport,
+        };
+        let artifact = hello_dynamic_library_path();
+        let instance = tokio::task::spawn_blocking(move || {
+            let manifest = toml::from_str(include_str!(
+                "../../../examples/hello-plugin/bcode-plugin.toml"
+            ))
+            .unwrap();
+            let instance = bcode_plugin::load_native_component_with_config(
+                manifest,
+                &artifact,
+                super::fixture::config("example.hello"),
+                bcode_plugin_sdk::definition::ComponentRole::Frontend,
+            )
+            .unwrap();
+            instance.activate().unwrap();
+            instance
+        })
+        .await
+        .unwrap();
+        let owner = instance.frontend_extensions().unwrap();
+        let descriptor = owner.descriptor().await.unwrap();
+        assert_eq!(
+            descriptor.role,
+            bcode_plugin_sdk::definition::ComponentRole::Frontend
+        );
+        let invoke = |request: Request| {
+            let owner = owner.clone();
+            async move {
+                let bytes = owner
+                    .invoke(TUI_FRONTEND_CONTRACT, serde_json::to_vec(&request).unwrap())
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Response>(&bytes).unwrap()
+            }
+        };
+        let Response::Descriptor(declaration) = invoke(Request::Describe).await else {
+            panic!("native descriptor")
+        };
+        assert!(
+            declaration
+                .surfaces
+                .iter()
+                .any(|kind| kind == "hello-probe")
+        );
+        let Response::Opened { resource, .. } = invoke(Request::Open {
+            kind: "hello-probe".to_owned(),
+            request: PluginTuiSurfaceOpenRequest {
+                instance_id: "native-selected".to_owned(),
+                repo_path: None,
+                session_id: None,
+                target: None,
+                options: serde_json::Value::Null,
+            },
+        })
+        .await
+        else {
+            panic!("native surface")
+        };
+        let Response::Projection(projection) = invoke(Request::Prepare {
+            resource,
+            viewport: Box::new(Viewport {
+                width: 4,
+                height: 1,
+                logical_row_offset: 0,
+                theme: None,
+            }),
+            bindings: Bindings::default(),
+        })
+        .await
+        else {
+            panic!("native retained projection")
+        };
+        assert_eq!(projection.scene.version, 2);
+        assert!(
+            matches!(invoke(Request::Input { resource, expected_revision: projection.revision,
+            event: bmux_tui::event::Event::Tick, bindings: Bindings::default(), focused: false }).await,
+            Response::Event(result) if result.action == PluginTuiAction::Redraw)
+        );
+        assert!(matches!(
+            invoke(Request::Close { resource }).await,
+            Response::Applied
+        ));
+        tokio::task::spawn_blocking(move || instance.deactivate().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            owner
+                .invoke(
+                    TUI_FRONTEND_CONTRACT,
+                    serde_json::to_vec(&Request::Describe).unwrap()
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    fn selected_native_hello_presentation(
+        artifact: std::path::PathBuf,
+    ) -> Result<PluginTuiPresentation, PluginLoadError> {
+        let backend = discovered_hello_presentation();
+        let super::PresentationPluginBackend::Runtime(runtime) = &backend.backend else {
+            panic!("hello backend must use the production runtime");
+        };
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/hello-plugin");
+        let manifest = bcode_plugin::discover_plugins_in_roots(&[root])
+            .expect("discover unchanged hello declaration")
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "example.hello")
+            .expect("hello product declaration")
+            .manifest;
+        PluginTuiPresentation::with_selected_frontend_deployments(
+            runtime.clone(),
+            bcode_config::TuiVisualAdapterConfig::default(),
+            vec![SelectedFrontendDeployment {
+                manifest,
+                deployment: bcode_plugin::FrontendDeployment::Native(artifact),
+                config: super::fixture::config("example.hello"),
+            }],
+            // No caller adapter or static registry: startup must install its dynamic adapter.
+            None,
+        )
+    }
+
+    async fn wait_for_native_hello_projection(
+        presentation: &PluginTuiPresentation,
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+        area: bmux_tui::geometry::Rect,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                presentation.begin_retained_display();
+                let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+                {
+                    let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+                    surface.render_slice_with_host(
+                        3,
+                        0,
+                        area,
+                        &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                        host,
+                    );
+                }
+                if buffer.cells().iter().any(|cell| cell.symbol == "H") {
+                    break;
+                }
+                surface.poll(host);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("native producer must prepare its actual retained scene");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_native_hello_uses_dynamic_adapter_and_display_admission() {
+        let artifact = hello_dynamic_library_path();
+        let presentation = tokio::task::spawn_blocking(move || {
+            selected_native_hello_presentation(artifact).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(presentation.registry_factories.is_empty());
+        assert!(presentation.registries.lock().unwrap().is_empty());
+        assert_eq!(presentation.frontend_instances.lock().unwrap().len(), 1);
+        assert_eq!(presentation.retained_frontends.lock().unwrap().len(), 1);
+        let scope = presentation.frontend_instances.lock().unwrap()[0]
+            .frontend_activation_scope()
+            .expect("retained view must use the actual selected activation");
+        assert!(!scope.is_cancelled().unwrap());
+        let selected = presentation
+            .selected_frontends
+            .get("example.hello")
+            .unwrap();
+        assert_eq!(selected.descriptor().plugin_id, "example.hello");
+        assert_eq!(
+            selected.descriptor().role,
+            bcode_plugin_sdk::definition::ComponentRole::Frontend
+        );
+        let mut surface = presentation
+            .open_surface_kind(
+                "hello-probe",
+                PluginTuiSurfaceOpenRequest {
+                    instance_id: "startup-native-hello".to_owned(),
+                    repo_path: None,
+                    session_id: None,
+                    target: None,
+                    options: serde_json::Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+        let (redraw, _receiver) = tokio::sync::mpsc::channel(1);
+        let host = bcode_plugin_sdk::tui::TokioPluginTuiHost::current(redraw);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 4, 1);
+        wait_for_native_hello_projection(&presentation, surface.as_mut(), &host, area).await;
+        // Painting is not an output acknowledgement, including for a scene without hits.
+        surface.handle_event_result(&bmux_tui::event::Event::Tick, &host);
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        presentation.begin_retained_display();
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        surface.render_with_host(
+            area,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            None,
+            &host,
+        );
+        presentation.commit_retained_display(frame.hits(), frame.selection());
+        surface.handle_event_result(&bmux_tui::event::Event::Tick, &host);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match surface.drain_effects(&host).await {
+                    PluginTuiAction::Redraw => break,
+                    PluginTuiAction::None => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    action => panic!("unexpected hello effect: {action:?}"),
+                }
+            }
+        })
+        .await
+        .expect("committed native input must reach the actual hello producer");
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        presentation.fail_retained_display();
+        surface.handle_event_result(&bmux_tui::event::Event::Tick, &host);
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        // Cancellation of the selected activation must revoke its actual retained resource.
+        // This checks admission/replay only, not completion of asynchronous cleanup settlement.
+        scope.close().unwrap();
+        presentation.begin_retained_display();
+        drop(presentation);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        {
+            let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+            surface.render_with_host(
+                area,
+                &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                None,
+                &host,
+            );
+        }
+        assert!(buffer.cells().iter().all(|cell| cell.symbol != "H"));
+    }
+
+    fn native_hello_key(key: char) -> bmux_tui::event::Event {
+        bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke::simple(
+            bmux_keyboard::KeyCode::Char(key),
+        ))
+    }
+
+    async fn open_native_hello(presentation: &PluginTuiPresentation) -> BoxedPluginTuiSurface {
+        presentation
+            .open_surface_kind(
+                "hello-probe",
+                PluginTuiSurfaceOpenRequest {
+                    instance_id: "rich-native-hello".to_owned(),
+                    repo_path: None,
+                    session_id: None,
+                    target: None,
+                    options: serde_json::Value::Null,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    fn commit_rich_native_hello(
+        presentation: &PluginTuiPresentation,
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        use bmux_tui::{damage::Damage, geometry::Rect, presentation::PresentationState};
+        let area = Rect::new(0, 0, 12, 3);
+        presentation.begin_retained_display();
+        let state = PresentationState::new(area);
+        let mut prepared = state
+            .prepare(Damage::Full, |cx| {
+                surface.render_with_host(area, cx, None, host);
             })
-            .expect("hello plugin dynamic library")
+            .unwrap();
+        drop(state);
+        assert_eq!(surface.preferred_height(area.width), 3);
+        assert_eq!(surface.focused_row_range(area.width), Some(1..2));
+        assert!(prepared.cursor().is_some());
+        assert!(prepared.focus_scope().is_some());
+        assert_eq!(prepared.hits().regions().len(), 1);
+        let fragments = prepared.selection().fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].source_range, 0.."H界e\u{301}".len());
+        let content = fragments[0].content_id.clone();
+        presentation
+            .configure_retained_prepared(&mut prepared)
+            .unwrap();
+        assert_eq!(prepared.modal_scopes().len(), 1);
+        assert_eq!(
+            prepared.selection_text().get(&content).map(String::as_str),
+            Some("H界e\u{301}")
+        );
+        presentation.commit_retained_display(prepared.hits(), prepared.selection());
+        assert_eq!(
+            presentation.retained_selection_text(&content).as_deref(),
+            Some("H界e\u{301}")
+        );
+    }
+
+    async fn next_native_hello_effect(
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) -> serde_json::Value {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match surface.drain_effects(host).await {
+                    PluginTuiAction::Close {
+                        outcome: Some(outcome),
+                    } => break outcome,
+                    PluginTuiAction::None | PluginTuiAction::Redraw => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    action => panic!("unexpected hello effect: {action:?}"),
+                }
+            }
+        })
+        .await
+        .expect("native hello effect must settle without replay or fallback")
+    }
+
+    async fn wait_for_native_hello_edit(
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+    ) -> bcode_plugin_sdk::tui::FocusedTextFieldEditResult {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(result) = surface.take_focused_text_field_edit_result() {
+                    return result.edit_result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("admitted edit must produce one terminal result")
+    }
+
+    async fn refresh_native_hello_editor(
+        presentation: &PluginTuiPresentation,
+        surface: &mut dyn bcode_plugin_sdk::tui::PluginTuiSurface,
+        host: &dyn bcode_plugin_sdk::tui::PluginTuiHost,
+    ) {
+        // A real resize requests a fresh author projection; never inspect an old local snapshot.
+        for width in [13, 12] {
+            wait_for_native_hello_projection(
+                presentation,
+                surface,
+                host,
+                bmux_tui::geometry::Rect::new(0, 0, width, 3),
+            )
+            .await;
+            // Synchronize the worker's queued Prepare without re-dispatching any edit.
+            assert!(matches!(
+                surface.drain_effects(host).await,
+                PluginTuiAction::None | PluginTuiAction::Redraw
+            ));
+            // The direct Effects receipt is ordered after Prepare; collect that retained
+            // completion before replaying or reading the editor's new source revision.
+            let _ = surface.preferred_height(width);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_native_hello_preserves_rich_metadata_effect_and_field_fences() {
+        use bcode_plugin_sdk::composer::{ComposerEdit, ComposerTextRange};
+        use bcode_plugin_sdk::tui::{FocusedTextFieldEdit, FocusedTextFieldEditResult};
+        let artifact = hello_dynamic_library_path();
+        let presentation = tokio::task::spawn_blocking(move || {
+            selected_native_hello_presentation(artifact).unwrap()
+        })
+        .await
+        .unwrap();
+        let mut surface = open_native_hello(&presentation).await;
+        assert_eq!(surface.id(), "hello-probe");
+        assert_eq!(surface.title(), "Hello portable probe");
+        let (redraw, _receiver) = tokio::sync::mpsc::channel(1);
+        let host = bcode_plugin_sdk::tui::TokioPluginTuiHost::current(redraw);
+        let (updates, incoming) = tokio::sync::mpsc::channel(1);
+        surface.attach_updates(incoming);
+        updates
+            .send(bcode_plugin_sdk::tui::PluginTuiSurfaceUpdate::Resyncing)
+            .await
+            .unwrap();
+        let _ = surface.poll(&host);
+        drop(updates);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 12, 3);
+        wait_for_native_hello_projection(&presentation, surface.as_mut(), &host, area).await;
+        assert!(surface.focused_text_field().is_none());
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        let expected = surface
+            .focused_text_field()
+            .expect("displayed actual editor");
+        assert_eq!(expected.identity.field_id, "hello.input");
+        assert_eq!(expected.document.text, "@src");
+        assert!(expected.eligible);
+        let edit = FocusedTextFieldEdit {
+            edit: ComposerEdit {
+                document_id: expected.document.document_id.clone(),
+                revision: expected.document.revision,
+                range: ComposerTextRange { start: 0, end: 4 },
+                expected_text: "@src".to_owned(),
+                replacement: "界".to_owned(),
+                cursor: "界".len(),
+            },
+            expected,
+        };
+        let admitted = surface.apply_focused_text_field_edit_result(&edit, &host);
+        assert_eq!(admitted.edit_result, FocusedTextFieldEditResult::Pending);
+        assert_eq!(
+            wait_for_native_hello_edit(surface.as_mut()).await,
+            FocusedTextFieldEditResult::Applied,
+        );
+        refresh_native_hello_editor(&presentation, surface.as_mut(), &host).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        assert_eq!(surface.focused_text_field().unwrap().document.text, "界");
+        assert_eq!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &host)
+                .edit_result,
+            FocusedTextFieldEditResult::Pending,
+        );
+        assert!(matches!(
+            wait_for_native_hello_edit(surface.as_mut()).await,
+            FocusedTextFieldEditResult::Rejected(_),
+        ));
+        surface.handle_event_result(&native_hello_key('e'), &host);
+        assert_eq!(
+            next_native_hello_effect(surface.as_mut(), &host).await,
+            serde_json::json!({"kind":"hello.effect", "sequence":1})
+        );
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        presentation.fail_retained_display();
+        assert!(surface.focused_text_field().is_none());
+        assert!(matches!(
+            surface
+                .apply_focused_text_field_edit_result(&edit, &host)
+                .edit_result,
+            FocusedTextFieldEditResult::Rejected(_)
+        ));
+        surface.focused_text_field_event(&native_hello_key('e'), &host);
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        drop(presentation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_native_hello_focus_toggle_revokes_field_snapshot() {
+        let artifact = hello_dynamic_library_path();
+        let presentation = tokio::task::spawn_blocking(move || {
+            selected_native_hello_presentation(artifact).unwrap()
+        })
+        .await
+        .unwrap();
+        let mut surface = open_native_hello(&presentation).await;
+        let (redraw, _receiver) = tokio::sync::mpsc::channel(1);
+        let host = bcode_plugin_sdk::tui::TokioPluginTuiHost::current(redraw);
+        let area = bmux_tui::geometry::Rect::new(0, 0, 12, 3);
+        wait_for_native_hello_projection(&presentation, surface.as_mut(), &host, area).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        let original = surface.focused_text_field().unwrap();
+        // Use the actual focused-input path; ignored editor events fall through exactly once.
+        surface.focused_text_field_event(&native_hello_key('f'), &host);
+        let _ = surface.drain_effects(&host).await;
+        refresh_native_hello_editor(&presentation, surface.as_mut(), &host).await;
+        presentation.begin_retained_display();
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        {
+            let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+            surface.render_with_host(
+                area,
+                &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                None,
+                &host,
+            );
+            assert!(frame.cursor().is_none());
+            presentation.commit_retained_display(frame.hits(), frame.selection());
+        }
+        assert!(surface.focused_text_field().is_none());
+        assert_eq!(surface.focused_row_range(area.width), None);
+        surface.handle_event_result(&native_hello_key('f'), &host);
+        let _ = surface.drain_effects(&host).await;
+        refresh_native_hello_editor(&presentation, surface.as_mut(), &host).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        let restored = surface.focused_text_field().unwrap();
+        assert_eq!(restored.identity, original.identity);
+        assert!(restored.generation > original.generation);
+        presentation.fail_retained_display();
+        drop(presentation);
+        assert!(surface.focused_text_field().is_none());
+    }
+
+    #[derive(Clone)]
+    struct NativeHelloCallbackHost {
+        denied: bool,
+        lookups: Arc<AtomicU64>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl bcode_plugin_sdk::tui::PluginTuiHost for NativeHelloCallbackHost {
+        fn retained_product_host(&self) -> Option<Arc<dyn bcode_plugin_sdk::tui::PluginTuiHost>> {
+            Some(Arc::new(self.clone()))
+        }
+        fn spawn(&self, _: bcode_plugin_sdk::tui::PluginTask) {
+            panic!("hello lookup does not spawn host work");
+        }
+        fn spawn_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) {
+            panic!("hello lookup does not spawn blocking work");
+        }
+        fn request_redraw(&self) {}
+        fn associated_workflow(
+            &self,
+            lookup: bcode_plugin_sdk::tui::PluginWorkflowLookup,
+        ) -> bcode_plugin_sdk::tui::PluginWorkflowLookupFuture {
+            assert_eq!(lookup.owner_plugin_id, "example.hello");
+            assert_eq!(lookup.workflow_kind, "hello.probe");
+            assert_eq!(lookup.scope_key, "parity");
+            self.lookups.fetch_add(1, Ordering::AcqRel);
+            let denied = self.denied;
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                if denied {
+                    Err(bcode_plugin_sdk::tui::PluginTuiHostError::PermissionDenied(
+                        "fixture lookup denied".to_owned(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+    }
+
+    async fn exercise_native_hello_callback(denied: bool, status: &str) {
+        let artifact = hello_dynamic_library_path();
+        let presentation = tokio::task::spawn_blocking(move || {
+            selected_native_hello_presentation(artifact).unwrap()
+        })
+        .await
+        .unwrap();
+        let mut surface = open_native_hello(&presentation).await;
+        let host = NativeHelloCallbackHost {
+            denied,
+            lookups: Arc::new(AtomicU64::new(0)),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let area = bmux_tui::geometry::Rect::new(0, 0, 12, 3);
+        wait_for_native_hello_projection(&presentation, surface.as_mut(), &host, area).await;
+        commit_rich_native_hello(&presentation, surface.as_mut(), &host);
+        surface.handle_event_result(&native_hello_key('w'), &host);
+        surface.handle_event_result(&native_hello_key('w'), &host);
+        let (outcome, ()) =
+            tokio::join!(next_native_hello_effect(surface.as_mut(), &host), async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), host.started.notified())
+                    .await
+                    .expect("actual retained callback must be admitted");
+                assert_eq!(host.lookups.load(Ordering::Acquire), 1);
+                tokio::task::yield_now().await;
+                host.release.notify_one();
+            },);
+        // These expectations deliberately require authority to survive Input -> Effects.
+        // Unsupported native retained callbacks must fail acceptance, not skip or use a mock port.
+        assert_eq!(
+            outcome,
+            serde_json::json!({
+                "kind":"hello.callback", "sequence":1, "status":status,
+            })
+        );
+        assert_eq!(host.lookups.load(Ordering::Acquire), 1);
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        presentation.fail_retained_display();
+        surface.handle_event_result(&native_hello_key('w'), &host);
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        assert_eq!(host.lookups.load(Ordering::Acquire), 1);
+        // Until the compositor-to-author receipt handshake is integrated, cleanup must
+        // retain the selected owner rather than silently acknowledge callback outcomes.
+        let instance = presentation
+            .frontend_instances
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap();
+        drop(presentation);
+        assert!(
+            tokio::task::spawn_blocking(move || instance.deactivate().is_err())
+                .await
+                .unwrap(),
+            "unacknowledged callback outcomes must block retirement"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_native_hello_retained_callback_allow_acceptance() {
+        exercise_native_hello_callback(false, "not_found").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_native_hello_retained_callback_denial_acceptance() {
+        exercise_native_hello_callback(true, "permission_denied").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_selected_invalid_native_hello_does_not_fall_back_to_static() {
+        let selected = hello_dynamic_library_path().join("not-a-native-library");
+        let rejected = tokio::task::spawn_blocking(move || {
+            selected_native_hello_presentation(selected).is_err()
+        })
+        .await
+        .unwrap();
+        assert!(
+            rejected,
+            "selected invalid native artifact must fail startup"
+        );
     }
 
     fn discovered_hello_presentation() -> PluginTuiPresentation {
-        let root = tempfile::tempdir().expect("plugin discovery root");
-        let plugin_dir = root.path().join("hello");
-        std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
-        let manifest_path = plugin_dir.join("bcode-plugin.toml");
-        let mut manifest: toml::Value = toml::from_str(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .expect("hello manifest");
-        let library = hello_dynamic_library_path();
-        manifest["runtime"]["library"] = toml::Value::String(
-            library
-                .file_name()
-                .expect("library name")
-                .to_string_lossy()
-                .into_owned(),
+        let artifact = std::env::var_os("BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT")
+            .map(std::path::PathBuf::from)
+            .expect("build the Bcode hello thin backend wrapper with package-plugin.py --component backend --feature tui; set BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT to its absolute artifact path");
+        assert!(
+            artifact.is_absolute() && artifact.is_file(),
+            "BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT must select an existing absolute Bcode backend wrapper"
         );
-        std::fs::write(
-            &manifest_path,
-            toml::to_string(&manifest).expect("manifest TOML"),
-        )
-        .expect("plugin manifest");
-        std::fs::copy(
-            &library,
-            plugin_dir.join(
-                library
-                    .file_name()
-                    .expect("hello plugin dynamic library name"),
-            ),
-        )
-        .expect("plugin library");
-        let registered = bcode_plugin::discover_plugins_in_roots(&[root.path().to_path_buf()])
-            .expect("discover user plugin");
-        let runtime: PluginRuntimeHost = PluginHost::load_registered_plugins(&registered)
-            .expect("load discovered user plugin")
-            .into();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/hello-plugin");
+        let registered = bcode_plugin::discover_plugins_in_roots(&[root])
+            .expect("discover canonical hello product declaration");
+        let plugin = registered
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == "example.hello")
+            .expect("canonical hello declaration must be registered");
+        // Artifact selection is deployment data; the discovered declaration remains exact,
+        // matching the declaration embedded by the shared author packaging path.
+        let runtime: PluginRuntimeHost = PluginHost::load_native_backend_components(vec![(
+            plugin.manifest,
+            artifact,
+            super::fixture::config("example.hello"),
+        )])
+        .expect("admit selected thin backend wrapper without rewriting its declaration")
+        .into();
         PluginTuiPresentation::with_runtime_config_and_extensions(
             runtime,
             bcode_config::TuiVisualAdapterConfig {
@@ -3075,7 +5135,7 @@ library = "libcomposer_fixture.dylib"
             .unwrap();
         let registry = presentation.registry("lazy-test").unwrap();
         assert!(registry.supports_visual_adapter("configured", "test"));
-        assert!(Arc::ptr_eq(
+        assert!(registry_ptr_eq(
             &registry,
             &presentation.registry("lazy-test").unwrap()
         ));
@@ -3128,7 +5188,7 @@ library = "libcomposer_fixture.dylib"
         assert_eq!(presentation.revision(), revision + 1);
         assert!(!presentation.configure(configuration).unwrap());
         assert_eq!(calls.lock().unwrap().len(), 1);
-        assert!(Arc::ptr_eq(
+        assert!(registry_ptr_eq(
             &retained,
             &presentation.registry("test").unwrap()
         ));
@@ -3155,7 +5215,7 @@ library = "libcomposer_fixture.dylib"
                 .configure(PluginTuiPresentationConfiguration::default())
                 .unwrap()
         );
-        assert!(Arc::ptr_eq(
+        assert!(registry_ptr_eq(
             &retained,
             &presentation.registry("test").unwrap()
         ));
@@ -3317,16 +5377,16 @@ library = "libcomposer_fixture.dylib"
     }
 
     fn test_presentation() -> PluginTuiPresentation {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
+            bcode_shell_plugin::plugin_definition,
         )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("select test plugin");
-        let host = PluginHost::load_static_plugins(&selected).expect("load test plugin");
+        let host = super::fixture::load_static(&selected).expect("load test plugin");
         PluginTuiPresentation::new(host)
     }
 
@@ -3387,24 +5447,24 @@ library = "libcomposer_fixture.dylib"
 
     #[test]
     fn git_contribution_schema_routes_through_platform_registry() {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
-            bcode_git_plugin::static_plugin(),
+            bcode_git_plugin::plugin_definition,
         )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("select Git plugin");
         let presentation = PluginTuiPresentation::new(
-            PluginHost::load_static_plugins(&selected).expect("load Git plugin"),
+            super::fixture::load_static(&selected).expect("load Git plugin"),
         );
         let route = presentation
             .visual_route("bcode.git.clone_request", 1, Some("bcode.git"))
             .expect("Git contribution route");
         assert_eq!(route.plugin_id, "bcode.git");
         let registry = presentation.registry("bcode.git").expect("Git registry");
-        drop(presentation);
+        // The borrowed registry must not outlive its selected presentation owner.
         let rows = registry
             .visual_rows(
                 &route.adapter_id,
@@ -3420,6 +5480,8 @@ library = "libcomposer_fixture.dylib"
                 ),
             )
             .expect("Git contribution rows");
+        drop(registry);
+        drop(presentation);
         let rendered = rows
             .iter()
             .flat_map(|line| &line.spans)
@@ -3630,8 +5692,8 @@ library = "libcomposer_fixture.dylib"
         );
 
         let second = presentation.registry("bcode.shell").expect("registry");
-        drop(presentation);
-        assert!(Arc::ptr_eq(&first, &second));
+        // Retained adapter state is accessed only while its presentation owner is alive.
+        assert!(registry_ptr_eq(&first, &second));
         let rows = second
             .visual_rows(
                 "shell-run-terminal-card",
@@ -3644,6 +5706,9 @@ library = "libcomposer_fixture.dylib"
                 ),
             )
             .expect("stateful adapter rows");
+        drop(second);
+        drop(first);
+        drop(presentation);
         assert_eq!(rows[0].spans[0].content, "abc");
     }
 }

@@ -460,7 +460,7 @@ pub fn dispatch(
             Err(error) => Err(fake_structured_output_error(&error)),
         };
         if !turn.is_cancelled() {
-            finish_fake_text_response(turn, response, None, input_tokens);
+            finish_fake_text_response(&turn, response, None, input_tokens);
         }
     });
 }

@@ -16,6 +16,10 @@ use bcode_plugin_sdk::prelude::*;
 pub struct GraphitePlugin;
 
 impl RustPlugin for GraphitePlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         invoke(&context.request)
     }
@@ -36,14 +40,18 @@ pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+/// Component capabilities retained by the same shared plugin instance. Discovery is a
+/// backend service only; the plugin contributes no frontend or CLI registrations.
 #[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(GraphitePlugin, include_str!("../bcode-plugin.toml"))
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations::default()
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(GraphitePlugin, include_str!("../bcode-plugin.toml"));
+// One declaration serves bundled and native packaging; implementations export no ABI symbols.
+bcode_plugin_sdk::define_plugin!(
+    serial GraphitePlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
 
 #[cfg(test)]
 mod tests {

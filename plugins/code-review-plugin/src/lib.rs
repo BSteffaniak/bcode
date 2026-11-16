@@ -10,12 +10,12 @@
 //! keymap and registers the `bcode review` command, which runs the `bcode_code_review_ui` app in
 //! process.
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod cli;
 
 mod service;
 pub mod tools;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 pub mod tui;
 
 pub use bcode_code_review::{CodeReviewConfig, CodeReviewStateLocation};
@@ -76,6 +76,10 @@ pub struct CodeReviewPlugin {
 }
 
 impl RustPlugin for CodeReviewPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         registrar
             .register(&diff_toggle_command())
@@ -161,19 +165,77 @@ fn invoke_command_service(request: &ServiceRequest) -> ServiceResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+/// Return the plugin-owned CLI grammar and invocation adapter for either packaging mode.
+#[cfg(feature = "tui")]
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
+
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli_registration()),
+        frontend: Some(tui::tui_registry),
+        ..registrations
+    };
+    registrations
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial CodeReviewPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<CodeReviewPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+    #[cfg_attr(not(feature = "tui"), allow(unused_mut))]
     let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
         CodeReviewPlugin,
         include_str!("../bcode-plugin.toml")
     );
-    vtable.cli_registration = Some(cli::registration);
+    #[cfg(feature = "tui")]
+    {
+        vtable.cli_registration = Some(cli_registration);
+    }
     vtable
 }
 
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(CodeReviewPlugin, include_str!("../bcode-plugin.toml"));
+#[cfg(all(test, feature = "tui"))]
+mod shared_definition_tests {
+    #[test]
+    fn review_cli_keeps_surface_only_start_without_daemon() {
+        let registration = super::cli_registration();
+        let matches = (registration.command)()
+            .try_get_matches_from(["review", "unstaged"])
+            .expect("review grammar");
+        assert!(!(registration.requires_daemon)(&matches));
+        assert_eq!(
+            super::plugin_definition().metadata.plugin_id,
+            "bcode.code_review"
+        );
+    }
+}
 
 #[cfg(test)]
 mod command_registration_tests {

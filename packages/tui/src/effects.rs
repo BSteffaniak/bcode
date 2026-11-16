@@ -725,7 +725,7 @@ mod managed_model_filter_tests {
     fn managed_host_allow_list_excludes_execution_and_model_effects() {
         use super::TuiEffect;
         let session_id = bcode_session_models::SessionId::new();
-        for host in [
+        let hosts = [
             TuiEffect::LoadCommandPalette,
             TuiEffect::DeleteSession { session_id },
             TuiEffect::RenameSession {
@@ -738,10 +738,10 @@ mod managed_model_filter_tests {
                 query: bcode_session_models::SessionCatalogQuery::default(),
                 cursor: None,
             },
-        ] {
-            assert!(host.is_managed_host_operation());
-        }
-        for denied in [
+        ];
+        assert!(hosts.iter().all(TuiEffect::is_managed_host_operation));
+        drop(hosts);
+        let denied = [
             TuiEffect::CancelTurn { session_id },
             TuiEffect::CompactContext { session_id },
             TuiEffect::ListPermissions,
@@ -758,9 +758,9 @@ mod managed_model_filter_tests {
                 response_id: "id".into(),
                 value: bcode_harness_models::HarnessResponseValue::Approval { approved: true },
             },
-        ] {
-            assert!(!denied.is_managed_host_operation());
-        }
+        ];
+        assert!(!denied.iter().any(TuiEffect::is_managed_host_operation));
+        drop(denied);
         // Local presentation state needs no daemon or host access at all.
         assert!(TuiEffect::ClearThemeSelection.run_local_state().is_ok());
         assert!(TuiEffect::ListPermissions.run_local_state().is_err());
@@ -1045,6 +1045,8 @@ pub enum TuiEffect {
     },
     /// Open a plugin-owned native surface for root-runtime presentation.
     OpenPluginSurface {
+        /// Selected frontend adapters retained for this asynchronous open.
+        presentation: Option<std::sync::Arc<super::plugin_tui::PluginTuiPresentation>>,
         /// Plugin owner.
         plugin_id: String,
         /// Surface kind.
@@ -2362,8 +2364,27 @@ impl TuiEffect {
     }
 }
 
-type OrderedPresentationEffects = BTreeMap<SessionId, VecDeque<TuiEffect>>;
-type ScheduledEffects = Vec<(EffectSchedule, TuiEffect)>;
+type OrderedPresentationEffects = BTreeMap<SessionId, VecDeque<ScheduledEffect>>;
+type ScheduledEffects = Vec<ScheduledEffect>;
+
+/// One scheduled effect and its optional original frontend completion responsibility.
+pub struct ScheduledEffect {
+    pub(super) schedule: EffectSchedule,
+    pub(super) effect: TuiEffect,
+    pub(super) responsibility: Option<crate::plugin_tui::dynamic::FrontendEffectResponsibility>,
+}
+
+impl ScheduledEffect {
+    fn displaced_before_dispatch(&mut self) {
+        if let Some(responsibility) = &mut self.responsibility
+            && (responsibility.displaced().is_err() || responsibility.not_dispatched().is_err())
+        {
+            responsibility.recovery_required();
+        }
+    }
+}
+
+const FRONTEND_QUEUED_EFFECT_CAPACITY: usize = 32;
 
 /// Queue of effects requested before the chat loop runner can start them.
 ///
@@ -2373,7 +2394,7 @@ type ScheduledEffects = Vec<(EffectSchedule, TuiEffect)>;
 /// before the loop has a chance to drain the queue.
 #[derive(Default)]
 pub struct TuiEffectQueue {
-    effects: BTreeMap<EffectKey, (EffectSchedule, TuiEffect)>,
+    effects: BTreeMap<EffectKey, ScheduledEffect>,
 }
 
 impl TuiEffectQueue {
@@ -2396,8 +2417,7 @@ impl TuiEffectQueue {
     pub fn start_ordered(&mut self, effect: TuiEffect) {
         let key = effect.key();
         debug_assert!(matches!(key, EffectKey::AppendPresentationNote(_, _)));
-        self.effects
-            .insert(key, (EffectSchedule::QueueLatest, effect));
+        self.push(effect, EffectSchedule::QueueLatest);
     }
 
     /// Cancel active and pending work matching this effect key.
@@ -2406,7 +2426,46 @@ impl TuiEffectQueue {
     }
 
     fn push(&mut self, effect: TuiEffect, schedule: EffectSchedule) {
-        self.effects.insert(effect.key(), (schedule, effect));
+        let entry = ScheduledEffect {
+            schedule,
+            effect,
+            responsibility: None,
+        };
+        if let Some(mut displaced) = self.effects.insert(entry.effect.key(), entry) {
+            displaced.displaced_before_dispatch();
+        }
+    }
+
+    /// Retain a frontend transfer only after reserving bounded queue capacity.
+    /// Failure returns the unchanged transfer; admission is not terminal application.
+    pub(crate) fn try_push_frontend(
+        &mut self,
+        schedule: EffectSchedule,
+        mut transfer: crate::plugin_tui::dynamic::FrontendEffectTransfer,
+    ) -> Result<(), Box<crate::plugin_tui::dynamic::FrontendEffectTransfer>> {
+        if matches!(schedule, EffectSchedule::Cancel)
+            || self
+                .effects
+                .values()
+                .filter(|entry| entry.responsibility.is_some())
+                .count()
+                >= FRONTEND_QUEUED_EFFECT_CAPACITY
+        {
+            return Err(Box::new(transfer));
+        }
+        if transfer.responsibility.retained().is_err() {
+            return Err(Box::new(transfer));
+        }
+        let (effect, responsibility) = transfer.into_parts();
+        let entry = ScheduledEffect {
+            schedule,
+            effect,
+            responsibility: Some(responsibility),
+        };
+        if let Some(mut displaced) = self.effects.insert(entry.effect.key(), entry) {
+            displaced.displaced_before_dispatch();
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2417,7 +2476,8 @@ impl TuiEffectQueue {
     /// Return whether an open-session effect is queued for the given session.
     #[cfg(test)]
     pub fn has_open_session(&self, session_id: SessionId) -> bool {
-        self.effects.values().any(|(_, effect)| {
+        self.effects.values().any(|entry| {
+            let effect = &entry.effect;
             matches!(
                 effect,
                 TuiEffect::OpenSession {
@@ -2430,7 +2490,7 @@ impl TuiEffectQueue {
 
     #[cfg(test)]
     pub fn queued_agent_id(&self) -> Option<&str> {
-        self.effects.values().find_map(|(_, effect)| match effect {
+        self.effects.values().find_map(|entry| match &entry.effect {
             TuiEffect::SubmitMessage { request } => request.agent_id.as_deref(),
             TuiEffect::SkillAction { request } => request.agent_id.as_deref(),
             _ => None,
@@ -2439,7 +2499,7 @@ impl TuiEffectQueue {
 
     #[cfg(test)]
     pub fn queued_execution_options(&self) -> Option<&bcode_session_models::TurnExecutionOptions> {
-        self.effects.values().find_map(|(_, effect)| match effect {
+        self.effects.values().find_map(|entry| match &entry.effect {
             TuiEffect::SubmitMessage { request } => Some(&request.execution),
             TuiEffect::SkillAction { request } => Some(&request.execution),
             _ => None,
@@ -2453,10 +2513,12 @@ impl TuiEffectQueue {
     ) -> Vec<super::transcript_v2_host::effects::HistoryLoad> {
         self.effects
             .values()
-            .filter_map(|(_, effect)| match effect {
-                TuiEffect::LoadTranscriptV2History { load } => Some(*load),
-                _ => None,
-            })
+            .filter_map(
+                |crate::effects::ScheduledEffect { effect, .. }| match effect {
+                    TuiEffect::LoadTranscriptV2History { load } => Some(*load),
+                    _ => None,
+                },
+            )
             .collect()
     }
 
@@ -2464,7 +2526,7 @@ impl TuiEffectQueue {
     /// Return the projection request queued for one open session.
     #[cfg(test)]
     pub fn open_session_request(&self, session_id: SessionId) -> Option<&ProjectionWindowRequest> {
-        self.effects.values().find_map(|(_, effect)| match effect {
+        self.effects.values().find_map(|entry| match &entry.effect {
             TuiEffect::OpenSession {
                 session_id: queued,
                 initial_window_request,
@@ -2482,12 +2544,12 @@ impl TuiEffectQueue {
     /// Drain non-note effects while retaining ordered presentation notes for serialized release.
     pub(super) fn drain_runtime(&mut self) -> (ScheduledEffects, OrderedPresentationEffects) {
         let mut effects = Vec::new();
-        let mut notes = BTreeMap::<SessionId, VecDeque<TuiEffect>>::new();
-        for (schedule, effect) in std::mem::take(&mut self.effects).into_values() {
-            if let TuiEffect::AppendPresentationNote { session_id, .. } = &effect {
-                notes.entry(*session_id).or_default().push_back(effect);
+        let mut notes = BTreeMap::<SessionId, VecDeque<ScheduledEffect>>::new();
+        for entry in std::mem::take(&mut self.effects).into_values() {
+            if let TuiEffect::AppendPresentationNote { session_id, .. } = &entry.effect {
+                notes.entry(*session_id).or_default().push_back(entry);
             } else {
-                effects.push((schedule, effect));
+                effects.push(entry);
             }
         }
         (effects, notes)
@@ -2520,9 +2582,13 @@ impl TuiEffect {
         bmux_tui_runtime::CommandKey::new(format!("bcode.effect.{key:?}"))
     }
 
-    pub(super) fn command(
+    // Frontend responsibility, client access mode, and managed generation stay explicit
+    // per dispatch so no authority is inferred from ambient state.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn command_with_responsibility(
         self,
         schedule: EffectSchedule,
+        mut responsibility: Option<crate::plugin_tui::dynamic::FrontendEffectResponsibility>,
         foreground_client: Option<&BcodeClient>,
         passive_client: Option<&BcodeClient>,
         managed: ManagedEffectAccess,
@@ -2530,6 +2596,11 @@ impl TuiEffect {
     ) -> bmux_tui_runtime::Command<super::root_program::BcodeRuntimeMessage> {
         let key = self.command_key();
         if matches!(schedule, EffectSchedule::Cancel) {
+            if let Some(token) = &mut responsibility
+                && token.not_dispatched().is_err()
+            {
+                token.recovery_required();
+            }
             return bmux_tui_runtime::Command::cancel(key);
         }
         let client = match self.daemon_intent() {
@@ -2537,6 +2608,12 @@ impl TuiEffect {
             EffectDaemonIntent::Foreground => foreground_client.cloned(),
         };
         let future = async move {
+            if let Some(token) = &mut responsibility
+                && token.dispatched().is_err()
+            {
+                token.recovery_required();
+                return None;
+            }
             let (streaming_sender, mut streaming_receiver) =
                 mpsc::channel(TUI_EFFECT_STREAM_CAPACITY);
             let effect = Box::pin(async move {
@@ -2560,9 +2637,13 @@ impl TuiEffect {
             loop {
                 tokio::select! {
                     result = &mut effect => {
-                        break Some(super::root_program::BcodeRuntimeMessage::EffectCompleted(
-                            Box::new(result),
-                        ));
+                        break Some(match responsibility.take() {
+                            Some(responsibility) => super::root_program::BcodeRuntimeMessage::FrontendEffectCompleted {
+                                result: Box::new(result),
+                                responsibility,
+                            },
+                            None => super::root_program::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                        });
                     }
                     progress = streaming_receiver.recv() => {
                         let Some(progress) = progress else {
@@ -3362,6 +3443,7 @@ impl TuiEffect {
                 result: super::ralph_flow::execute_root_start(&client, request).await,
             },
             Self::OpenPluginSurface {
+                presentation,
                 plugin_id,
                 surface_kind,
                 instance_id,
@@ -3374,32 +3456,27 @@ impl TuiEffect {
                         &client, session_id, options,
                     )
                     .await;
-                    let runtime =
-                        bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
-                            &bcode_plugin::PluginSelection::all_enabled(),
-                            &crate::static_bundled_plugins(),
+                    let presentation = presentation.ok_or_else(|| TuiError::PluginService {
+                        code: "frontend_unavailable".to_owned(),
+                        message: "no selected frontend presentation is available".to_owned(),
+                    })?;
+                    presentation
+                        .open_surface(
+                            &plugin_id,
+                            &surface_kind,
+                            bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+                                instance_id,
+                                repo_path: Some(working_directory),
+                                session_id,
+                                target: None,
+                                options,
+                            },
                         )
+                        .await
                         .map_err(|error| TuiError::PluginService {
-                            code: "plugin_runtime_load_failed".to_owned(),
+                            code: "tui_surface_open_failed".to_owned(),
                             message: error.to_string(),
-                        })?;
-                    crate::plugin_tui::open_plugin_tui_surface(
-                        &runtime,
-                        &plugin_id,
-                        &surface_kind,
-                        bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
-                            instance_id,
-                            repo_path: Some(working_directory),
-                            session_id,
-                            target: None,
-                            options,
-                        },
-                    )
-                    .await
-                    .map_err(|error| TuiError::PluginService {
-                        code: "tui_surface_open_failed".to_owned(),
-                        message: error.to_string(),
-                    })
+                        })
                 }
                 .await;
                 TuiEffectResult::PluginSurfaceOpened { plugin_id, result }
@@ -4446,8 +4523,9 @@ mod projection_paging_tests {
                     let handle = self.handle.as_ref().unwrap().clone();
                     let cancelled = std::sync::Arc::clone(&self.cancelled);
                     Update::none()
-                        .with_command(effect.command(
+                        .with_command(effect.command_with_responsibility(
                             EffectSchedule::Cancel,
+                            None,
                             Some(&client),
                             Some(&client),
                             ManagedEffectAccess::default(),
@@ -4717,6 +4795,8 @@ mod projection_paging_tests {
     #[tokio::test]
     async fn targeted_prepare_dispatches_read_only_identity_then_bounded_status() {
         use bcode_session_models::*;
+        // Hash the test artifact before measuring bounded IPC work.
+        bcode_daemon_lifecycle::current_executable_identity().expect("test executable identity");
         let session_id = SessionId::new();
         let submission_id = SubmissionId("exact-pending".to_owned());
         let confirmation = SubmissionResumeConfirmation {
@@ -4749,22 +4829,24 @@ mod projection_paging_tests {
             confirmation,
             executable_digest,
         ));
-        let effect = TuiEffect::QueueRecovery {
-            session_id,
-            generation: 0,
-            action: Box::new(SessionViewAction::PrepareSubmissionResume {
-                session_id,
-                submission_id: expected.submission_id.clone(),
-                expected_accepted_sequence: 17,
-            }),
+        let result = {
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                TuiEffect::QueueRecovery {
+                    session_id,
+                    generation: 0,
+                    action: Box::new(SessionViewAction::PrepareSubmissionResume {
+                        session_id,
+                        submission_id: expected.submission_id.clone(),
+                        expected_accepted_sequence: 17,
+                    }),
+                }
+                .run(BcodeClient::new(endpoint), sender),
+            )
+            .await
+            .unwrap()
         };
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            effect.run(BcodeClient::new(endpoint), sender),
-        )
-        .await
-        .unwrap();
         responder.await.unwrap();
         let TuiEffectResult::QueueRecovery { result, .. } = result else {
             panic!("expected recovery result");
@@ -4799,12 +4881,14 @@ mod progress_routing_tests {
         queue.replace(picker_effect());
         let (effects, _) = queue.drain_runtime();
         assert_eq!(effects.len(), 1);
-        assert!(matches!(effects[0].0, EffectSchedule::Replace));
+        assert!(matches!(effects[0].schedule, EffectSchedule::Replace));
+        drop(effects);
         queue.replace(picker_effect());
         queue.cancel(picker_effect());
         let (effects, _) = queue.drain_runtime();
+        drop(queue);
         assert_eq!(effects.len(), 1);
-        assert!(matches!(effects[0].0, EffectSchedule::Cancel));
+        assert!(matches!(effects[0].schedule, EffectSchedule::Cancel));
     }
 
     #[test]
@@ -4858,13 +4942,15 @@ mod progress_routing_tests {
         }
 
         let (effects, notes) = queue.drain_runtime();
+        drop(queue);
 
         assert!(effects.is_empty());
+        drop(effects);
         let queued = notes
             .get(&session_id)
             .expect("ordered session queue")
             .iter()
-            .map(TuiEffect::key)
+            .map(|entry| entry.effect.key())
             .collect::<Vec<_>>();
         assert_eq!(
             queued,

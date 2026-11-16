@@ -14,6 +14,8 @@ pub mod interaction_automation;
 /// Supported secret-safe, versioned CLI diagnostic envelope.
 pub use clierror::CliDiagnosticError;
 mod plugin_cli;
+pub mod plugin_cli_extension;
+pub mod portable_plugin_cli;
 pub mod retired_catalogs;
 mod session_migration_adapter;
 mod theme_check;
@@ -216,6 +218,9 @@ pub enum CliError {
     PluginCliComposition(#[from] plugin_cli::CompositionError),
     #[error("plugin CLI command failed: {0}")]
     PluginCli(String),
+    /// A plugin returned a nonzero process-compatible status.
+    #[error("plugin CLI exited with status {0}")]
+    PluginCliExit(u8),
     #[error("theme command failed: {0}")]
     Theme(String),
     #[error("theme filesystem error: {0}")]
@@ -266,10 +271,29 @@ fn workflow_inspection_exit_code(source: &ClientError) -> u8 {
     }
 }
 
+fn client_failure_exit_code(error: &ClientError) -> u8 {
+    let ClientError::Server { code, .. } = error else {
+        return 1;
+    };
+    match code.as_str() {
+        "invalid_exchange_resolution"
+        | "invalid_invocation_input_producer"
+        | "invalid_invocation_input_schema"
+        | "invalid_invocation_input_id"
+        | "invocation_input_too_large" => 2,
+        "authorization_denied" | "workflow_operation_unauthorized" => 3,
+        "cancelled" | "workflow_computation_cancelled" | "worktree_create_cancelled" => 4,
+        _ => 1,
+    }
+}
+
 impl CliError {
     /// Stable process exit status for this CLI failure category.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
+        if let Self::PluginCliExit(code) = self {
+            return *code;
+        }
         match self {
             Self::WorkflowInspection { source } => workflow_inspection_exit_code(source),
             Self::InvalidArguments(_)
@@ -279,54 +303,18 @@ impl CliError {
             | Self::SessionRepairUsage(_)
             | Self::InvalidExchangeResolution
             | Self::Json(_) => 2,
-            Self::Client(ClientError::Server { code, .. })
-            | Self::ChildSessionCreate {
-                source: ClientError::Server { code, .. },
-                ..
-            } if matches!(
-                code.as_str(),
-                "invalid_exchange_resolution"
-                    | "invalid_invocation_input_producer"
-                    | "invalid_invocation_input_schema"
-                    | "invalid_invocation_input_id"
-                    | "invocation_input_too_large"
-            ) =>
-            {
-                2
-            }
-            Self::Client(ClientError::Server { code, .. })
-            | Self::ChildSessionCreate {
-                source: ClientError::Server { code, .. },
-                ..
-            } if matches!(
-                code.as_str(),
-                "authorization_denied" | "workflow_operation_unauthorized"
-            ) =>
-            {
-                3
+            Self::Client(source) | Self::ChildSessionCreate { source, .. } => {
+                client_failure_exit_code(source)
             }
             Self::TurnRejected(bcode_session_models::TurnRejectionReason::ExecutionPolicy) => 3,
             Self::TurnRejected(bcode_session_models::TurnRejectionReason::SessionUnavailable) => 1,
-            Self::Client(ClientError::Server { code, .. })
-            | Self::ChildSessionCreate {
-                source: ClientError::Server { code, .. },
-                ..
-            } if matches!(
-                code.as_str(),
-                "cancelled" | "workflow_computation_cancelled" | "worktree_create_cancelled"
-            ) =>
-            {
-                4
-            }
             Self::TurnCancelledBeforeStart
             | Self::SessionSearchBackfillCancelled
             | Self::AuthFlowCancelled => 4,
             Self::SessionSearchBackfillIncomplete => 1,
             Self::StartupReportUnavailable | Self::CategoryRankingInput(_) => 1,
             Self::Signal(_) => 1,
-            Self::Client(_)
-            | Self::ManagedAuth { .. }
-            | Self::ChildSessionCreate { .. }
+            Self::ManagedAuth { .. }
             | Self::DaemonLifecycle(_)
             | Self::DaemonStart(_)
             | Self::Config(_)
@@ -349,6 +337,7 @@ impl CliError {
             | Self::IncompatibleDaemonStorage(_)
             | Self::PluginCliComposition(_)
             | Self::PluginCli(_)
+            | Self::PluginCliExit(_)
             | Self::Theme(_)
             | Self::ThemeIo(_)
             | Self::SurfaceRepoPath(_)
@@ -481,6 +470,26 @@ pub async fn run_with_static_bundled(
     artifact_build_info: bcode_build_info::BuildInfo,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
+    run_with_selected_cli(artifact_build_info, static_plugins, Vec::new()).await
+}
+
+/// Run with verified caller-local native CLI handles and bundled registrations.
+///
+/// Handles are filtered by resolved config before descriptor calls.
+/// The loader must verify embedded identity and selected source, retain activation
+/// authority, and avoid changing the process config/state context.
+///
+/// # Errors
+/// Returns startup, selection, command, extension or local presentation failure.
+///
+/// # Panics
+/// Panics if process build information has already been initialized.
+#[allow(clippy::future_not_send)] // Interactive screens retain foreground terminal ownership.
+pub async fn run_with_selected_cli(
+    artifact_build_info: bcode_build_info::BuildInfo,
+    static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
+    cli_extensions: Vec<plugin_cli_extension::SelectedCliExtension>,
+) -> Result<(), CliError> {
     let cli_started = Instant::now();
     let process_started = PROCESS_ENTRY.get().copied().unwrap_or(cli_started);
     init_tracing();
@@ -492,24 +501,35 @@ pub async fn run_with_static_bundled(
     bcode_tui::initialize_build_info(artifact_build_info);
     initialize_process_executables()?;
     let bootstrap_ready = Instant::now();
-    let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
-    let static_default_plugin_ids =
-        bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)?;
-    let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
-    let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
-    let _ = STATIC_BUNDLED_DEFAULT_PLUGIN_IDS.set(static_default_plugin_ids);
-    let registrations = plugin_cli::registrations(
-        STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice),
-        STATIC_BUNDLED_PLUGIN_IDS
-            .get()
-            .map_or(&[][..], Vec::as_slice),
-    )?;
-    let mut command =
-        plugin_cli::compose(root_command_with_build_info(build_info()), &registrations);
+    initialize_cli_plugin_registry(static_plugins)?;
+    // Parse only host config-selection globals before composing plugin grammar.
+    // This performs no plugin invocation, state resolution or daemon operation.
+    let selection_matches = plugin_cli::selection_matches(std::env::args_os())
+        .map_err(|_| CliError::InvalidArguments("invalid startup selection options".to_owned()))?;
+    let _config_override = config_override_from_matches(&selection_matches);
+    let cli_config = bcode_config::load_config()?;
+    let all_plugins = STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice);
+    let (registrations, unavailable_commands) =
+        selected_cli_registrations(&cli_config, all_plugins, &cli_extensions).await?;
+    let root = root_command_with_build_info(build_info()).mut_subcommands(|command| {
+        if unavailable_commands.contains(command.get_name()) {
+            command.hide(true)
+        } else {
+            command
+        }
+    });
+    let mut command = plugin_cli::compose(root, &registrations);
     command = command.version(build_info().display_version());
     let matches = command.get_matches();
+    if matches
+        .subcommand_name()
+        .is_some_and(|name| unavailable_commands.contains(name))
+    {
+        return Err(CliError::PluginCli(
+            "plugin CLI command is disabled or unavailable in the selected source".to_owned(),
+        ));
+    }
     let arguments_ready = Instant::now();
-    let _config_override = config_override_from_matches(&matches);
     // Claim the one-shot state location before state resolution, startup reports,
     // plugin preflight, or any daemon operation can populate it.
     if matches.subcommand_name() == Some("run") {
@@ -531,15 +551,57 @@ pub async fn run_with_static_bundled(
         arguments_ready,
         Instant::now(),
     ]);
+    dispatch_selected_cli(&matches, &registrations).await
+}
+
+fn initialize_cli_plugin_registry(
+    static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
+) -> Result<(), CliError> {
+    let ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
+    let defaults = bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)?;
+    let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
+    let _ = STATIC_BUNDLED_PLUGIN_IDS.set(ids);
+    let _ = STATIC_BUNDLED_DEFAULT_PLUGIN_IDS.set(defaults);
+    Ok(())
+}
+
+#[allow(clippy::future_not_send)] // Interactive screens retain foreground terminal ownership.
+async fn dispatch_selected_cli(
+    matches: &clap::ArgMatches,
+    registrations: &[plugin_cli::Contribution],
+) -> Result<(), CliError> {
     let exceptional_execution_mode = matches.get_flag("dangerously_bypass_all_permissions")
         || matches.get_flag("disable_all_tools");
-    if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
+    if let Some(plugin) = plugin_cli::matched(matches, registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
         if exceptional_execution_mode {
             return Err(CliError::InvalidArguments(
                 "execution-mode flags are not supported by plugin CLI commands".to_owned(),
             ));
+        }
+        if let Some(extension) = plugin.extension() {
+            let request = bcode_command::cli::CliArgvRequest {
+                arguments: plugin_cli::extension_arguments(plugin.command())
+                    .map_err(CliError::PluginCli)?,
+            };
+            let classification = extension
+                .classify(&request)
+                .await
+                .map_err(CliError::PluginCli)?;
+            if classification.requires_daemon {
+                ensure_server_running().await?;
+            }
+            let outcome = extension
+                .invoke(&request)
+                .await
+                .map_err(CliError::PluginCli)?;
+            return plugin_cli_extension::present_outcome(
+                plugin.plugin_id(),
+                outcome,
+                extension.max_response_bytes,
+            )
+            .await;
         }
         if plugin.requires_daemon(subcommand_matches) {
             ensure_server_running().await?;
@@ -572,7 +634,7 @@ pub async fn run_with_static_bundled(
         }
         return Ok(());
     }
-    let cli = match Cli::from_arg_matches(&matches) {
+    let cli = match Cli::from_arg_matches(matches) {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
@@ -675,6 +737,7 @@ async fn run_plugin_surface_in_shell(
             ))
             .await?;
     }
+    drop(shell);
     Ok(())
 }
 
@@ -5000,6 +5063,217 @@ fn root_command_with_build_info(build_info: &'static bcode_build_info::BuildInfo
 #[must_use]
 pub fn root_command() -> clap::Command {
     Cli::command()
+}
+
+/// Compose selected plugin grammar for help, documentation and completion.
+///
+/// This does not start a daemon or invoke a command. Native handles must already
+/// be verified and retained by the caller's startup loader. Config is supplied
+/// explicitly so this path never changes process config or state-location guards.
+///
+/// # Errors
+/// Reports declaration conflicts or bounded descriptor transport/decode failures.
+pub async fn selected_root_command(
+    config: &bcode_config::BcodeConfig,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    native: &[plugin_cli_extension::SelectedCliExtension],
+) -> Result<clap::Command, CliError> {
+    let (registrations, unavailable) =
+        selected_cli_registrations(config, static_plugins, native).await?;
+    let root = root_command().mut_subcommands(|command| {
+        if unavailable.contains(command.get_name()) {
+            command.hide(true)
+        } else {
+            command
+        }
+    });
+    Ok(plugin_cli::compose(root, &registrations))
+}
+
+async fn selected_cli_registrations(
+    config: &bcode_config::BcodeConfig,
+    static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    native: &[plugin_cli_extension::SelectedCliExtension],
+) -> Result<
+    (
+        Vec<plugin_cli::Contribution>,
+        std::collections::BTreeSet<String>,
+    ),
+    CliError,
+> {
+    let ids = bcode_plugin::static_bundled_plugin_ids(static_plugins)?;
+    let defaults = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
+    let selection = bcode_config::plugin_selection_with_default_plugin_ids(config, &defaults);
+    let mut registrations = plugin_cli::registrations(static_plugins, &ids)?;
+    let mut unavailable = registrations
+        .iter()
+        .filter(|entry| {
+            !selection.is_enabled(entry.plugin_id())
+                || matches!(
+                    config.plugins.sources.get(entry.plugin_id()),
+                    Some(bcode_config::PluginSourceOverride::Dynamic { .. })
+                )
+        })
+        .map(|entry| entry.command().get_name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    registrations.retain(|entry| {
+        selection.is_enabled(entry.plugin_id())
+            && !matches!(
+                config.plugins.sources.get(entry.plugin_id()),
+                Some(bcode_config::PluginSourceOverride::Dynamic { .. })
+            )
+    });
+    let selected = native.iter().filter(|entry| selection.is_enabled(&entry.plugin_id) && matches!(
+        config.plugins.sources.get(&entry.plugin_id),
+        Some(bcode_config::PluginSourceOverride::Dynamic { path }) if path == &entry.source_path
+    )).cloned().collect::<Vec<_>>();
+    plugin_cli::add_extensions(&mut registrations, &selected).await?;
+    // A selected replacement may reuse a legacy command name. Only names with
+    // no active contribution remain unavailable in both execution and help.
+    for registration in &registrations {
+        unavailable.remove(registration.command().get_name());
+    }
+    Ok((registrations, unavailable))
+}
+
+#[cfg(test)]
+mod selected_cli_dispatch_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct DescriptorTransport(Arc<AtomicUsize>);
+
+    impl plugin_cli_extension::CliExtension for DescriptorTransport {
+        fn call(
+            &self,
+            contract: &'static str,
+            payload: Vec<u8>,
+        ) -> plugin_cli_extension::CliExtensionFuture<'_> {
+            Box::pin(async move {
+                assert_eq!(contract, bcode_command::cli::CLI_DESCRIBE_CONTRACT);
+                assert_eq!(payload, Vec::<u8>::new());
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let command = clap::Command::new("selected-example").subcommand(
+                    clap::Command::new("inspect").arg(clap::Arg::new("value").required(true)),
+                );
+                let descriptor = bcode_command::cli::CliDescriptor::extract(command).unwrap();
+                Ok(serde_json::to_vec(&Some(descriptor)).unwrap())
+            })
+        }
+    }
+
+    fn native_fixture(calls: &Arc<AtomicUsize>) -> plugin_cli_extension::SelectedCliExtension {
+        plugin_cli_extension::SelectedCliExtension {
+            plugin_id: "example.selected".to_owned(),
+            source_path: PathBuf::from("/selected/plugin"),
+            extension: Arc::new(DescriptorTransport(Arc::clone(calls))),
+            max_response_bytes: 64 * 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_selection_precedes_descriptor_calls() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let native = [native_fixture(&calls)];
+        let mut config = bcode_config::BcodeConfig::default();
+        config.plugins.enabled.insert(native[0].plugin_id.clone());
+        for source in [
+            bcode_config::PluginSourceOverride::Bundled,
+            bcode_config::PluginSourceOverride::Dynamic {
+                path: PathBuf::from("/other/plugin"),
+            },
+        ] {
+            config
+                .plugins
+                .sources
+                .insert(native[0].plugin_id.clone(), source);
+            let (registrations, _) = selected_cli_registrations(&config, &[], &native)
+                .await
+                .unwrap();
+            assert!(registrations.is_empty());
+        }
+        config.plugins.sources.insert(
+            native[0].plugin_id.clone(),
+            bcode_config::PluginSourceOverride::Dynamic {
+                path: native[0].source_path.clone(),
+            },
+        );
+        config.plugins.disabled.insert(native[0].plugin_id.clone());
+        let (registrations, _) = selected_cli_registrations(&config, &[], &native)
+            .await
+            .unwrap();
+        assert!(registrations.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn help_and_execution_use_the_same_selected_nested_grammar() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let native = [native_fixture(&calls)];
+        let mut config = bcode_config::BcodeConfig::default();
+        config.plugins.enabled.insert(native[0].plugin_id.clone());
+        config.plugins.sources.insert(
+            native[0].plugin_id.clone(),
+            bcode_config::PluginSourceOverride::Dynamic {
+                path: native[0].source_path.clone(),
+            },
+        );
+        let mut help = selected_root_command(&config, &[], &native).await.unwrap();
+        assert!(
+            help.render_long_help()
+                .to_string()
+                .contains("selected-example")
+        );
+        let (registrations, unavailable) = selected_cli_registrations(&config, &[], &native)
+            .await
+            .unwrap();
+        assert!(unavailable.is_empty());
+        let matches = plugin_cli::compose(root_command(), &registrations)
+            .try_get_matches_from(["bcode", "selected-example", "inspect", "--", "--literal"])
+            .unwrap();
+        let selected = plugin_cli::matched(&matches, &registrations).unwrap();
+        assert_eq!(selected.plugin_id(), native[0].plugin_id);
+        let nested = matches.subcommand().unwrap().1.subcommand().unwrap().1;
+        assert_eq!(
+            nested.get_one::<String>("value").map(String::as_str),
+            Some("--literal")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn client_exit_mapping_is_identical_for_direct_and_child_failures() {
+        for (code, expected) in [
+            ("invalid_exchange_resolution", 2),
+            ("invalid_invocation_input_producer", 2),
+            ("invalid_invocation_input_schema", 2),
+            ("invalid_invocation_input_id", 2),
+            ("invocation_input_too_large", 2),
+            ("authorization_denied", 3),
+            ("workflow_operation_unauthorized", 3),
+            ("cancelled", 4),
+            ("workflow_computation_cancelled", 4),
+            ("worktree_create_cancelled", 4),
+            ("future_server_failure", 1),
+        ] {
+            let source = || ClientError::Server {
+                code: code.to_owned(),
+                message: "failure".to_owned(),
+            };
+            assert_eq!(CliError::Client(source()).exit_code(), expected, "{code}");
+            let child = CliError::ChildSessionCreate {
+                source: source(),
+                child_id: bcode_session_models::SessionId::new(),
+                parent_id: bcode_session_models::SessionId::new(),
+            };
+            assert_eq!(child.exit_code(), expected, "{code}");
+        }
+        assert_eq!(CliError::PluginCliExit(0).exit_code(), 0);
+        assert_eq!(CliError::PluginCliExit(255).exit_code(), 255);
+    }
 }
 
 #[cfg(test)]
@@ -16341,9 +16615,16 @@ async fn ensure_server_running() -> Result<(), CliError> {
     Ok(())
 }
 
-async fn run_server_foreground() -> Result<(), CliError> {
-    bcode_server::run_with_static_bundled(default_endpoint(), &static_bundled_plugins()).await?;
-    Ok(())
+// Erase the embedded server future at the foreground CLI boundary. Otherwise
+// proving Send for the root CLI future recursively exposes Turso's plan graph
+// through the entire server startup chain, exhausting trait solver depth.
+fn run_server_foreground()
+-> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CliError>> + Send>> {
+    Box::pin(async {
+        bcode_server::run_with_static_bundled(default_endpoint(), &static_bundled_plugins())
+            .await?;
+        Ok(())
+    })
 }
 
 async fn start_server_daemon(quiet: bool) -> Result<(), CliError> {
@@ -21875,16 +22156,19 @@ async fn run_selected_tui(
             CliError::InvalidArguments("managed reattachment requires a generation".into())
         })?;
         bcode_tui::initialize_build_info(build_info().clone());
-        let mut shell = bcode_tui::TerminalShell::enter()?;
-        let result = Box::pin(shell.run_managed_reattach(
-            session_id,
-            &instance,
-            generation,
-            &static_bundled_plugins(),
-            launch_options,
-        ))
-        .await;
-        shell.finish()?;
+        let result;
+        {
+            let mut shell = bcode_tui::TerminalShell::enter()?;
+            result = Box::pin(shell.run_managed_reattach(
+                session_id,
+                &instance,
+                generation,
+                &static_bundled_plugins(),
+                launch_options,
+            ))
+            .await;
+            shell.finish()?;
+        }
         result?;
     } else {
         Box::pin(bcode_tui::run_with_static_bundled_and_options(
@@ -22625,15 +22909,6 @@ fn write_unverified_observation(
             "cancellation_acknowledged": cancellation_acknowledged,
         }),
     )
-}
-
-#[cfg(all(test, unix))]
-fn private_ipc_test_directory() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt as _;
-    let directory = tempfile::tempdir().expect("IPC fixture directory");
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("private IPC fixture permissions");
-    directory
 }
 
 #[cfg(all(test, unix))]
@@ -29276,8 +29551,9 @@ mod send_cli_tests {
             (SubmissionPlacement::Steer, false),
             (SubmissionPlacement::Steer, true),
         ] {
-            let directory = super::private_ipc_test_directory();
-            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("s.sock"));
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint =
+                bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc").join("s.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let session_id = bcode_session_models::SessionId::new();
             let receipt = SubmissionReceipt {
@@ -31232,8 +31508,9 @@ mod json_stream_output_tests {
             .into_iter()
             .flat_map(|raw| (0..3).map(move |outcome| (raw, outcome)))
         {
-            let directory = super::private_ipc_test_directory();
-            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("a.sock"));
+            let directory = tempfile::tempdir().unwrap();
+            let endpoint =
+                bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("ipc").join("a.sock"));
             let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
             let session_id = bcode_session_models::SessionId::new();
             let expected = bcode_session_models::SessionArtifactRange {

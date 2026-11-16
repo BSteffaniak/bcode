@@ -4,7 +4,7 @@
 
 pub mod raster;
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod document_tui;
 
 use bcode_model_provider_runtime::ProviderRuntime;
@@ -46,6 +46,10 @@ impl Default for DocumentPlugin {
 }
 
 impl RustPlugin for DocumentPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn deactivate(&mut self) -> Result<(), PluginError> {
         if let Ok(runtime) = &self.runtime {
             runtime
@@ -268,7 +272,7 @@ impl DocumentPlugin {
             return json_response(&tool_error("document tool cancelled".to_string()));
         }
         let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
-            context.events,
+            context.events.clone(),
             &invocation.tool_call_id,
             DOCUMENT_PLUGIN_ID,
             DOCUMENT_REQUEST_SCHEMA,
@@ -282,7 +286,7 @@ impl DocumentPlugin {
             &invocation.arguments,
         ));
         let response = match invocation.name.as_str() {
-            "document.extract" => self.invoke_extract(&invocation, context.events),
+            "document.extract" => self.invoke_extract(&invocation, context.events.clone()),
             "document.status" => invoke_status(&invocation.tool_call_id),
             _ => ToolInvocationResponse {
                 output: format!("unsupported document tool: {}", invocation.name),
@@ -866,13 +870,50 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    #[cfg(feature = "tui")]
+    {
+        bcode_plugin_sdk::definition::ProductRegistrations {
+            frontend: Some(document_tui_registry),
+            ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+        }
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial DocumentPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<DocumentPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(DocumentPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -886,9 +927,6 @@ pub fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(DocumentPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

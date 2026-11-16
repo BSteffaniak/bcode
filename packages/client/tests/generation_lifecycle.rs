@@ -4,6 +4,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+#[path = "../src/ipc_test_support.rs"]
+mod ipc_test_support;
+
 use bcode_client::BcodeClient;
 use bcode_ipc::{Request, Response, ResponsePayload};
 use bcode_plugin_sdk::generation::{
@@ -51,20 +54,10 @@ fn fixture(fail_history: bool) -> Fixture {
     fixture_with_pending(fail_history, |_| false)
 }
 
-fn private_fixture_directory(session_id: SessionId) -> std::path::PathBuf {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let directory = std::path::PathBuf::from(format!("/tmp/bcg-{session_id}"));
-    // Binding never repairs caller-owned permissions.
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .unwrap();
-    directory
-}
-
 fn fixture_with_pending(fail_history: bool, hold: fn(&Request) -> bool) -> Fixture {
     let session_id = SessionId::new();
-    let directory = private_fixture_directory(session_id);
+    let directory = std::path::PathBuf::from(format!("/tmp/bcg-{session_id}"));
+    ipc_test_support::create_socket_directory(&directory).unwrap();
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("test.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
     let (history_tx, history) = tokio::sync::mpsc::unbounded_channel();

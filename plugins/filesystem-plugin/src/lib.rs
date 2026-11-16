@@ -24,6 +24,11 @@ pub mod path_search;
 mod replacement;
 #[cfg(feature = "native")]
 mod write_receipt;
+// Both consumers generate this transport from the contract-only schema owner.
+#[cfg(feature = "native")]
+pub mod path_search_transport {
+    include!(concat!(env!("OUT_DIR"), "/path_search.rs"));
+}
 // Include preserves the native implementation's private root module paths.
 #[cfg(feature = "native")]
 include!("native.rs");

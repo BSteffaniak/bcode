@@ -67,7 +67,7 @@ fn queued_persistence(chat: &mut ActiveChat) -> (Vec<String>, Vec<Option<String>
     let (effects, _) = chat.pending_effects.drain_runtime();
     let mut themes = Vec::new();
     let mut profiles = Vec::new();
-    for (_, effect) in effects {
+    for crate::effects::ScheduledEffect { effect, .. } in effects {
         match effect {
             TuiEffect::PersistThemeSelection { name } => themes.push(name),
             TuiEffect::PersistProfileSelection { name } => profiles.push(name),
@@ -166,7 +166,7 @@ async fn apply_persists_theme_then_profile_in_sequence() {
 
     let mut settings = TuiRuntimeSettings::bootstrap(std::path::PathBuf::from("."), &[]);
     let mut draft = DraftAutosave::new(std::path::PathBuf::from("."), String::new());
-    apply_effect_result(
+    apply_effect_result_with_frontend(
         &mut settings,
         &mut chat,
         &mut draft,
@@ -175,6 +175,7 @@ async fn apply_persists_theme_then_profile_in_sequence() {
             name: Some("bcode-light".to_owned()),
             result: Ok(std::path::PathBuf::from("tui.toml")),
         },
+        None,
     );
     let (themes, profiles) = queued_persistence(&mut chat);
     assert_eq!(themes, Vec::<String>::new());

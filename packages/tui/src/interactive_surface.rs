@@ -1,6 +1,8 @@
 //! Generic inline interactive surface host for tool interactions.
 
-use bcode_plugin::{PluginLoadError, PluginRuntimeHost};
+use bcode_plugin::PluginLoadError;
+#[cfg(test)]
+use bcode_plugin::PluginRuntimeHost;
 #[cfg(test)]
 use bcode_plugin_sdk::tui::PluginTuiHost;
 use bcode_plugin_sdk::tui::{
@@ -425,10 +427,10 @@ impl NativeDurableSurface {
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiSurface for NativeDurableSurface {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         self.renderer.id()
     }
-    fn title(&self) -> &'static str {
+    fn title(&self) -> &str {
         self.renderer.title()
     }
     fn prepare_keymap(&mut self, host: &dyn bcode_plugin_sdk::tui::PluginTuiHost) {
@@ -563,11 +565,13 @@ impl InteractiveSurfaceState {
         assert!(redraw_receiver.try_recv().is_err());
     }
 
-    /// Open an inline surface from the plugin runtime by surface kind.
+    /// Open a fixture surface from the test plugin runtime by surface kind.
+    /// Production opens through the selected presentation instead.
     ///
     /// # Errors
     ///
     /// Returns an error when no plugin declares the surface kind or the factory fails.
+    #[cfg(test)]
     pub async fn open(
         runtime: &PluginRuntimeHost,
         interaction_id: impl Into<String>,
@@ -599,32 +603,53 @@ impl InteractiveSurfaceState {
         })
     }
 
-    /// Open one queued surface request.
+    /// Open one queued interaction through the frontend's selected component adapters.
     ///
     /// # Errors
-    ///
-    /// Returns an error when no plugin declares the surface kind or the factory fails.
-    pub async fn open_request(
-        runtime: &PluginRuntimeHost,
+    /// Returns an error for unavailable or ambiguous adapters and surface factory failures.
+    pub async fn open_request_with_presentation(
+        presentation: &crate::plugin_tui::PluginTuiPresentation,
         request: &InteractiveSurfaceRequest,
         keymap: &BmuxKeyMap,
     ) -> Result<Self, PluginLoadError> {
-        Self::open(
-            runtime,
-            request.interaction_id.clone(),
-            request.surface_kind.clone(),
-            &request.request_json,
-            keymap,
-        )
-        .await
+        let options = serde_json::from_str(&request.request_json).unwrap_or_else(|_| json!({}));
+        let surface = presentation
+            .open_surface_kind(
+                &request.surface_kind,
+                PluginTuiSurfaceOpenRequest {
+                    instance_id: request.interaction_id.clone(),
+                    repo_path: None,
+                    session_id: None,
+                    target: None,
+                    options,
+                },
+            )
+            .await?;
+        let (redraw_sender, _redraw_receiver) = mpsc::channel(1);
+        let host = TokioPluginTuiHost::current(redraw_sender).with_text_input_resolver(Arc::new(
+            InteractiveTextInputResolver {
+                keymap: keymap.clone(),
+            },
+        ));
+        Ok(Self {
+            interaction_id: request.interaction_id.clone(),
+            surface,
+            host,
+            pending_resolution: None,
+            retry_resolution: None,
+            canonical: None,
+            last_width: 0,
+            last_preferred_height: 0,
+        })
     }
 
-    /// Discover canonical evidence before considering the explicitly unsupported legacy route.
+    /// Discover canonical evidence before opening the queued request through the frontend's
+    /// selected presentation adapters.
     ///
     /// # Errors
     /// Rejects missing/corrupt durable evidence or missing renderer adapters without fallback.
-    pub async fn open_canonical_request(
-        runtime: &PluginRuntimeHost,
+    pub async fn open_canonical_request_with_presentation(
+        presentation: &crate::plugin_tui::PluginTuiPresentation,
         request: &InteractiveSurfaceRequest,
         keymap: &BmuxKeyMap,
         client: &bcode_client::BcodeClient,
@@ -639,7 +664,7 @@ impl InteractiveSurfaceState {
             .await
             .map_err(|error| format!("canonical interaction discovery: {error:?}"))?
         else {
-            return Self::open_request(runtime, request, keymap)
+            return Self::open_request_with_presentation(presentation, request, keymap)
                 .await
                 .map_err(|error| error.to_string());
         };
@@ -713,7 +738,7 @@ impl InteractiveSurfaceState {
 
     /// Return a bounded diagnostic identifier for the active native surface.
     #[cfg(test)]
-    pub(crate) fn surface_id_for_test(&self) -> &'static str {
+    pub(crate) fn surface_id_for_test(&self) -> &str {
         self.surface.id()
     }
 
@@ -852,6 +877,21 @@ impl InteractiveSurfaceState {
         self.surface.work_shape()
     }
 
+    /// Take the opaque original completion through the boxed surface without losing ownership.
+    ///
+    /// # Errors
+    /// Propagates the original owner's recovery/admission failure; absence grants no authority.
+    pub fn take_focused_edit_completion_responsibility(
+        &mut self,
+    ) -> Result<
+        Option<
+            Box<dyn bcode_plugin_sdk::tui::portable::settlement::FrontendCompletionResponsibility>,
+        >,
+        bcode_plugin_sdk::tui::portable::settlement::CompletionResponsibilityError,
+    > {
+        self.surface.take_focused_edit_completion_responsibility()
+    }
+
     /// Return only the opted-in field from an unresolved owner.
     pub fn focused_text_field(&self) -> Option<bcode_plugin_sdk::tui::FocusedTextFieldSnapshot> {
         if self.pending_resolution.is_some() || self.retry_resolution.is_some() {
@@ -883,6 +923,20 @@ impl InteractiveSurfaceState {
             result.edit_result,
             self.reconcile_event_result(result.event),
         )
+    }
+
+    /// Collect the terminal acknowledgement of an admitted owner edit, preserving owner effects.
+    pub fn take_focused_text_field_edit_result(
+        &mut self,
+    ) -> Option<(
+        bcode_plugin_sdk::tui::FocusedTextFieldEditResult,
+        InteractiveSurfaceEventOutcome,
+    )> {
+        let result = self.surface.take_focused_text_field_edit_result()?;
+        Some((
+            result.edit_result,
+            self.reconcile_event_result(result.event),
+        ))
     }
 
     pub fn handle_event_outcome(&mut self, event: &Event) -> InteractiveSurfaceEventOutcome {
@@ -991,6 +1045,7 @@ fn bounded_render_destination(destination: Rect, remaining_rows: u16) -> Option<
     (height > 0).then(|| Rect::new(destination.x, destination.y, destination.width, height))
 }
 
+#[cfg(test)]
 async fn open_surface(
     runtime: &PluginRuntimeHost,
     interaction_id: &str,
@@ -1147,11 +1202,11 @@ mod tests {
         questions: serde_json::Value,
         config: &bcode_config::TuiConfig,
     ) -> InteractiveSurfaceState {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
+            bcode_question_plugin::plugin_definition,
         );
-        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let runtime = crate::plugin_tui::fixture::runtime(
             &bcode_plugin::PluginSelection::all_enabled(),
             &[plugin],
         )
@@ -1963,11 +2018,11 @@ mod tests {
 
     #[tokio::test]
     async fn submitted_resolution_is_retained_until_host_confirmation_and_can_retry() {
-        let plugin_runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let plugin_runtime = crate::plugin_tui::fixture::runtime(
             &bcode_plugin::PluginSelection::all_enabled(),
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-                bcode_question_plugin::static_plugin(),
+                bcode_question_plugin::plugin_definition,
             )],
         )
         .expect("question runtime");
@@ -2067,11 +2122,11 @@ mod tests {
 
     #[tokio::test]
     async fn question_exchange_payload_runs_entirely_in_local_tui_surface() {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
+            bcode_question_plugin::plugin_definition,
         );
-        let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        let runtime = crate::plugin_tui::fixture::runtime(
             &bcode_plugin::PluginSelection::all_enabled(),
             &[plugin],
         )

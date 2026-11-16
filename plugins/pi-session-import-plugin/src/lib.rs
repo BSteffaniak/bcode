@@ -656,8 +656,22 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-#[cfg(not(feature = "static-bundled"))]
-export_plugin!(PiSessionImportPlugin, MANIFEST);
+bcode_plugin_sdk::define_plugin!(
+    PiSessionImportPlugin,
+    metadata = bcode_plugin_sdk::definition::PluginMetadata {
+        plugin_id: "bcode.pi-session-import".into(),
+        version: "0.0.1".into(),
+        roles: vec![bcode_plugin_sdk::definition::ComponentRole::Backend],
+        required_capabilities: Vec::new(),
+        contracts: vec![bcode_plugin_sdk::definition::ContractDescriptor {
+            interface_id: bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE.into(),
+            major: 1,
+            minor: 0,
+        }],
+        manifest_toml: Some(MANIFEST.into()),
+    },
+    registrations = bcode_plugin_sdk::definition::ProductRegistrations::default(),
+);
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -749,10 +763,4 @@ mod tests {
                 .any(|warning| warning.code == "malformed_json")
         );
     }
-}
-
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(PiSessionImportPlugin, MANIFEST)
 }

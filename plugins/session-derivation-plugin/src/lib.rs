@@ -38,6 +38,10 @@ const COPY_SESSION_ID_COMMAND_ID: &str = "session-derivation.copy-session-id";
 pub struct SessionDerivationPlugin;
 
 impl RustPlugin for SessionDerivationPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         for command in commands() {
             registrar
@@ -581,7 +585,37 @@ impl bcode_plugin_sdk::tui::PluginTuiSurface for ForkSelectSurface {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(session_derivation_tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial SessionDerivationPlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<SessionDerivationPlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(
@@ -589,12 +623,6 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
         include_str!("../bcode-plugin.toml")
     )
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(
-    SessionDerivationPlugin,
-    include_str!("../bcode-plugin.toml")
-);
 
 #[cfg(test)]
 mod tests {

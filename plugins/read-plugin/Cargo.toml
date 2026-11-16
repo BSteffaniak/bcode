@@ -11,29 +11,42 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_config = { workspace = true, optional = true }
-bcode_markdown_render = { workspace = true }
+bcode_markdown_render = { workspace = true, optional = true }
 bcode_plugin_sdk = { workspace = true }
-bmux_keyboard = { workspace = true }
-bmux_terminal = { workspace = true }
-bmux_tui = { workspace = true, features = ["terminal-io"] }
-bmux_tui_components = { workspace = true, features = [
+bmux_keyboard = { workspace = true, optional = true }
+bmux_terminal = { workspace = true, optional = true }
+bmux_tui = { workspace = true, optional = true, features = ["terminal-io"] }
+bmux_tui_components = { workspace = true, optional = true, features = [
     "key-hint-bar",
     "text-view",
 ] }
-clap = { workspace = true, features = ["derive", "std"] }
+clap = { workspace = true, optional = true, features = ["derive", "std"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
-insta    = { workspace = true }
-tempfile = { workspace = true }
+bcode_markdown_render = { workspace = true }
+insta                 = { workspace = true }
+tempfile              = { workspace = true }
 
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["dep:bcode_config", "bcode_plugin_sdk/tui"]
+# Compatibility alias; frontend capability is independent of packaging.
+static-bundled = ["tui"]
+tui = [
+    "dep:bcode_config",
+    "bcode_plugin_sdk/tui",
+    "dep:bcode_markdown_render",
+    "dep:bmux_keyboard",
+    "dep:bmux_tui",
+    "dep:bmux_tui_components",
+    "dep:clap",
+    "dep:bmux_terminal",
+    "dep:libc",
+]

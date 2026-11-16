@@ -1272,6 +1272,27 @@ fn selected_workflow_database(state: &ServerState) -> switchy_database::rusqlite
     .unwrap()
 }
 
+/// Create an ordinary parent the way session admission does: reserve its configuration view
+/// before canonical creation and commit that exact binding afterward. Selected discovery for a
+/// workflow caller resolves configuration from this binding and never infers one for an unbound
+/// ordinary session. Without a client context, admission pins the loaded daemon baseline.
+async fn create_selected_parent(
+    state: &Arc<ServerState>,
+    root: &std::path::Path,
+) -> bcode_session_models::SessionSummary {
+    let reservation = state
+        .harness_configuration_views
+        .reserve_parent(crate::harness::configuration_views::baseline(state).unwrap())
+        .unwrap();
+    let parent = state
+        .sessions
+        .create_session(None, root.into())
+        .await
+        .unwrap();
+    reservation.commit(parent.id);
+    parent
+}
+
 async fn start_selected_production_graph(
     state: &Arc<ServerState>,
     graph: &bcode_workflow::WorkflowDefinition,
@@ -1297,11 +1318,7 @@ async fn selected_prompt_fresh_production_admission_and_dependencies() {
         if worker == "unconfirmed" {
             control(&state, "selected_unconfirmed").await;
         }
-        let parent = state
-            .sessions
-            .create_session(None, root.path().into())
-            .await
-            .unwrap();
+        let parent = create_selected_parent(&state, root.path()).await;
         let graph = selected_prompt_graph(&state, parent.id, worker).await;
         validate_workflow_definition_for_production(&state, &graph).unwrap();
         let request = start_request(parent.id, json!({"ok":true}), root.path());
@@ -1398,11 +1415,7 @@ async fn selected_prompt_same_and_mixed_harness_dependencies_use_canonical_lifec
         if worker_instance == "unconfirmed" {
             control(&state, "selected_unconfirmed").await;
         }
-        let parent = state
-            .sessions
-            .create_session(None, root.path().into())
-            .await
-            .unwrap();
+        let parent = create_selected_parent(&state, root.path()).await;
         let inherited = crate::session_model_selection(&state, parent.id).await;
         let graph = selected_prompt_graph(&state, parent.id, worker_instance).await;
         let request = start_request(parent.id, json!({"ok":true}), root.path());

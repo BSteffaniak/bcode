@@ -11,15 +11,17 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
+bcode_command                = { workspace = true }
 bcode_confined_fs            = { workspace = true }
 bcode_model                  = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
 bcode_xray                   = { workspace = true }
 bcode_xray_models            = { workspace = true }
+bmux_plugin_sdk              = { workspace = true }
 clap                         = { workspace = true, features = ["derive", "std"] }
 reqwest                      = { workspace = true, features = ["json"] }
 serde                        = { workspace = true, features = ["derive", "std"] }

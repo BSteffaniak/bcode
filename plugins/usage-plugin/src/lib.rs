@@ -3,8 +3,13 @@
 #![allow(clippy::multiple_crate_versions)]
 //! Disableable usage reporting presentation.
 
-#[cfg(feature = "static-bundled")]
 mod cli;
+
+/// Return the plugin-owned CLI grammar and invocation adapter for either packaging mode.
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
 pub mod tui;
 use bcode_command::{
     CommandAction, CommandContribution, CommandEffect, CommandOwner, CommandSurface,
@@ -17,6 +22,10 @@ use std::collections::BTreeSet;
 #[derive(Default)]
 pub struct UsagePlugin;
 impl RustPlugin for UsagePlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        product_registrations()
+    }
+
     fn register_commands(&mut self, registrar: CommandRegistrar) -> Result<(), PluginError> {
         registrar
             .register(&CommandContribution {
@@ -74,13 +83,60 @@ impl RustPlugin for UsagePlugin {
 }
 
 /// Static bundled plugin entry point.
-#[cfg(feature = "static-bundled")]
+#[cfg(test)]
+mod shared_definition_tests {
+    #[test]
+    fn usage_cli_keeps_explicit_collection_conflicts() {
+        let registration = super::cli_registration();
+        let matches = (registration.command)()
+            .try_get_matches_from(["usage", "--summary", "--to-ms", "100"])
+            .expect("usage summary grammar");
+        assert!((registration.requires_daemon)(&matches));
+        assert!(
+            (registration.command)()
+                .try_get_matches_from(["usage", "--summary", "--csv"])
+                .is_err()
+        );
+        assert_eq!(super::plugin_definition().metadata.plugin_id, "bcode.usage");
+    }
+}
+
+/// Component capabilities retained by the same shared plugin instance.
+#[must_use]
+pub fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli_registration()),
+        frontend: Some(tui::tui_registry),
+        ..bcode_plugin_sdk::definition::ProductRegistrations::default()
+    }
+}
+
+bcode_plugin_sdk::define_plugin!(
+    serial UsagePlugin, include_str!("../bcode-plugin.toml"),
+    registrations = product_registrations(),
+);
+/// Bind host-authorized invocation capabilities to the shared definition.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_registrations::<UsagePlugin>(
+        plugin_definition().metadata,
+        product_registrations(),
+        host,
+    )
+}
+
+/// Transitional compatibility adapter; new consumers must use the shared definition.
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     let mut vtable =
         bcode_plugin_sdk::static_plugin_vtable!(UsagePlugin, include_str!("../bcode-plugin.toml"));
-    vtable.cli_registration = Some(cli::registration);
+    vtable.cli_registration = Some(cli_registration);
     vtable
 }
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(UsagePlugin, include_str!("../bcode-plugin.toml"));

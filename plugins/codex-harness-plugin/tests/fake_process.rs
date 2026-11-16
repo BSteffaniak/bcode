@@ -1175,8 +1175,11 @@ fn server_callback_overflow_fails_closed_with_gap_and_never_settles() {
 
 #[test]
 fn blocked_writer_timeout_fences_later_delivery_and_drop_does_not_wait() {
-    let (temp, mut launch) = fixture();
-    launch.timeout = Duration::from_millis(250);
+    // Keep the fixture's shared bound: the same timeout also governs the
+    // `--version` probe and the open RPCs, which must not race interpreter
+    // startup latency. The blocked fake sleeps 60s, so a drop that waited on the
+    // writer would still blow far past the bound asserted below.
+    let (temp, launch) = fixture();
     std::fs::write(temp.path().join("stop-reading"), "").unwrap();
     let mut session = CodexSession::open(&launch, binding(), false).unwrap();
     let mut input = submission("blocked");
@@ -1191,7 +1194,7 @@ fn blocked_writer_timeout_fences_later_delivery_and_drop_does_not_wait() {
         Err(CodexError::Uncertain)
     );
     drop(session);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < launch.timeout + Duration::from_secs(3));
     assert!(
         !calls(&temp)
             .iter()

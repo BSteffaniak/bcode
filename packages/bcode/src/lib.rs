@@ -4517,7 +4517,10 @@ async fn execute_plugin_tool(
         message: "embedded plugin bridge requires a native Tokio runtime; no compatible execution host is configured".to_owned(),
     })?;
     let bridge = bcode_plugin::PluginInvocationBridge::new(move |request, _| {
-        handle.block_on(route_plugin_bridge_request(&invocation_scope, request))
+        drive_plugin_bridge_callback(
+            &handle,
+            route_plugin_bridge_request(&invocation_scope, request),
+        )
     });
     let mut invocation = plugins
         .invoke_service_with_events_and_bridge_scoped(
@@ -4591,6 +4594,62 @@ struct PluginInvocationCancellation(bcode_plugin::PluginInvocationCancelHandle);
 impl bcode_agent_runtime::InvocationCancellation for PluginInvocationCancellation {
     fn request_cancel(&self) {
         self.0.cancel();
+    }
+}
+
+// The bridge is synchronous, but its caller may be polling a native plugin
+// future on a Tokio worker. Never nest Handle::block_on on that thread. Scope
+// the worker so borrowed invocation authority cannot outlive the callback.
+#[cfg(feature = "embedded-plugins")]
+fn drive_plugin_bridge_callback(
+    handle: &tokio::runtime::Handle,
+    work: impl std::future::Future<Output = std::result::Result<ServiceBridgeResponse, String>> + Send,
+) -> std::result::Result<ServiceBridgeResponse, String> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("bcode-plugin-bridge".to_owned())
+            .spawn_scoped(scope, move || handle.block_on(work))
+            .map_err(|_| "plugin bridge callback worker could not start".to_owned())?;
+        worker.join().unwrap_or_else(|_| {
+            Err("plugin bridge callback panicked; effects may be unresolved".to_owned())
+        })
+    })
+}
+
+#[cfg(all(test, feature = "embedded-plugins"))]
+mod plugin_bridge_callback_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn synchronous_bridge_can_drive_work_from_an_async_worker() {
+        let caller = std::thread::current().id();
+        let result = drive_plugin_bridge_callback(&tokio::runtime::Handle::current(), async move {
+            assert_ne!(std::thread::current().id(), caller);
+            tokio::task::yield_now().await;
+            Err("bridge response".to_owned())
+        });
+        assert!(matches!(result, Err(message) if message == "bridge response"));
+    }
+
+    #[tokio::test]
+    async fn bridge_panic_is_not_unwound_through_callback_authority() {
+        let handle = tokio::runtime::Handle::current();
+        let authority = std::sync::Mutex::new(());
+        let result = {
+            let _guard = authority.lock().unwrap();
+            drive_plugin_bridge_callback(&handle, async {
+                panic!("private callback panic detail");
+            })
+        };
+        assert!(matches!(result, Err(message)
+            if message == "plugin bridge callback panicked; effects may be unresolved"));
+        // The invocation callback remains usable after a worker panic.
+        let _guard = authority
+            .lock()
+            .expect("callback authority must not be poisoned");
+        let result =
+            drive_plugin_bridge_callback(&handle, async { Err("later callback".to_owned()) });
+        assert!(matches!(result, Err(message) if message == "later callback"));
     }
 }
 

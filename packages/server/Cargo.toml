@@ -82,6 +82,7 @@ tokio = { workspace = true, features = [
     "macros",
     "net",
     "rt",
+    "rt-multi-thread",
     "signal",
     "sync",
     "time",
@@ -94,6 +95,8 @@ wait-timeout = { workspace = true }
 
 zeroize = { workspace = true }
 
+bmux_plugin_runtime = { workspace = true }
+bmux_plugin_sdk     = { workspace = true }
 [dev-dependencies]
 bcode_bundled_plugins = { workspace = true, features = [
     "static-bundled-default-agents-plugin",
@@ -133,9 +136,7 @@ bcode_prompt_profile_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_sdk_session_import_plugin = { workspace = true, features = [
-    "static-bundled",
-] }
+bcode_sdk_session_import_plugin = { workspace = true }
 bcode_session_derivation_plugin = { workspace = true, features = [
     "static-bundled",
 ] }

@@ -488,7 +488,7 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
     // startup account. An absent selection permits the normal startup fallback.
     server.startup_config.model.provider_plugin_id = Some("bcode.fake-provider".into());
     server.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
-    server.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    server.plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from([
@@ -524,9 +524,9 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
                 bcode_fake_provider_plugin::static_plugin(),
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                bcode_default_agents_plugin::static_plugin(),
+                bcode_default_agents_plugin::plugin_definition,
             ),
         ],
     )
@@ -1200,7 +1200,7 @@ async fn goal_allowance_command_subprocess() {
             .expect("fixture config path")
             .into(),
     ));
-    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+    let plugins = crate::tests::load_test_plugins(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from(["bcode.loop".into()]),

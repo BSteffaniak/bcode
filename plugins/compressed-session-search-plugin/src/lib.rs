@@ -385,6 +385,22 @@ pub struct CompressedSessionSearchPlugin {
 impl RustPlugin for CompressedSessionSearchPlugin {}
 
 impl ConcurrentRustPlugin for CompressedSessionSearchPlugin {
+    fn deactivate_concurrent(&self) -> Result<(), PluginError> {
+        let _lifecycle = self
+            .lifecycle
+            .write()
+            .map_err(|_| PluginError::failed("search lifecycle lock unavailable"))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PluginError::failed("search state lock unavailable"))?;
+        // Release only this instance's derived cache; retained chunks and checkpoints
+        // remain unchanged across activation and packaging changes.
+        *state = None;
+        drop(state);
+        Ok(())
+    }
+
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.interface_id != SESSION_SEARCH_INTERFACE_ID {
             return ServiceResponse::error("unsupported_interface", "unsupported interface");
@@ -1502,19 +1518,21 @@ fn decode_request<T: serde::de::DeserializeOwned>(
     }
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        CompressedSessionSearchPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_concurrent_plugin!(
-    CompressedSessionSearchPlugin,
-    include_str!("../bcode-plugin.toml")
+bcode_plugin_sdk::define_plugin!(
+    concurrent CompressedSessionSearchPlugin,
+    metadata = bcode_plugin_sdk::definition::PluginMetadata {
+        plugin_id: "bcode.compressed-session-search".into(),
+        version: "0.0.1".into(),
+        roles: vec![bcode_plugin_sdk::definition::ComponentRole::Backend],
+        required_capabilities: Vec::new(),
+        contracts: vec![bcode_plugin_sdk::definition::ContractDescriptor {
+            interface_id: bcode_plugin_sdk::definition::PRODUCT_SERVICE_INTERFACE.into(),
+            major: 1,
+            minor: 0,
+        }],
+        manifest_toml: Some(include_str!("../bcode-plugin.toml").into()),
+    },
+    registrations = bcode_plugin_sdk::definition::ProductRegistrations::default(),
 );
 
 #[cfg(test)]
@@ -1742,6 +1760,45 @@ mod tests {
             cursor: None,
             deadline_ms: Some(5_000),
         }
+    }
+
+    #[test]
+    fn deactivation_releases_instance_cache_without_changing_retained_state() {
+        let directory = tempfile::tempdir().expect("storage");
+        let config = config(directory.path());
+        let session = SessionId::new();
+        let plugin = CompressedSessionSearchPlugin::default();
+        let request = batch(session, vec![record(session, 1, "retained needle")]);
+        plugin
+            .with_state(&config, |state| {
+                apply_batch(state, &config, &request, &ServiceCancellation::default())
+            })
+            .expect("apply");
+        let manifest_path = directory.path().join("manifest.json");
+        let retained = fs::read(&manifest_path).expect("manifest");
+
+        plugin.deactivate_concurrent().expect("deactivate");
+        assert!(plugin.state.lock().expect("state").is_none());
+        assert_eq!(
+            fs::read(&manifest_path).expect("retained manifest"),
+            retained
+        );
+
+        let replacement = CompressedSessionSearchPlugin::default();
+        let response = replacement
+            .with_state(&config, |state| {
+                apply_batch(state, &config, &request, &ServiceCancellation::default())
+            })
+            .expect("reopen");
+        assert_eq!(response.outcome, ApplyBatchOutcome::Duplicate);
+        assert_eq!(
+            fs::read(&manifest_path).expect("unchanged manifest"),
+            retained
+        );
+        replacement
+            .deactivate_concurrent()
+            .expect("release replacement");
+        replacement.deactivate_concurrent().expect("repeat release");
     }
 
     #[test]

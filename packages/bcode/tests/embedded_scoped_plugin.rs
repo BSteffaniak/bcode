@@ -109,15 +109,19 @@ async fn embedded_plugin_uses_same_scope_and_capabilities_as_direct_tools() {
     let bundled = [bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
         bcode_hello_plugin::static_plugin(),
-    )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
-        &bundled,
-        &bcode_plugin::PluginSelection::all_enabled(),
     )
-    .expect("hello plugin manifest should parse");
+    .with_definition(bcode_hello_plugin::plugin_definition)];
     let plugins = bcode_plugin::PluginRuntimeHost::from(
-        bcode_plugin::PluginHost::load_static_plugins(&selected)
-            .expect("hello plugin should load statically"),
+        bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            Vec::new(),
+            &bundled,
+            std::collections::BTreeMap::from([(
+                "example.hello".into(),
+                shared_config("example.hello"),
+            )]),
+        )
+        .expect("hello shared definition should activate statically"),
     );
     let capabilities = Arc::new(Capabilities::default());
     let agent = Agent::builder()
@@ -177,20 +181,174 @@ fn shell_definition() -> ToolDefinition {
     }
 }
 
+struct LifecycleDriver(Option<tokio::runtime::Runtime>);
+
+impl bcode_plugin::SharedLifecycleDriver for LifecycleDriver {
+    fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.0
+            .as_ref()
+            .expect("fixture runtime retained")
+            .handle()
+            .clone()
+    }
+
+    fn run(&self, work: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>) {
+        // Keep one serving runtime through activation, invocation and cleanup.
+        // Never nest an executor on the async test thread.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    self.0
+                        .as_ref()
+                        .expect("fixture runtime retained")
+                        .block_on(work);
+                })
+                .join()
+                .expect("fixture lifecycle thread");
+        });
+    }
+}
+
+impl Drop for LifecycleDriver {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            // Tokio runtime teardown may block; the test task is not its owner.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || drop(runtime))
+                    .join()
+                    .expect("fixture runtime teardown");
+            });
+        }
+    }
+}
+
+struct RegistrationOwner;
+
+impl bcode_plugin::SharedRegistrationOwner for RegistrationOwner {
+    fn revoke_and_drain(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), bcode_plugin::PluginLoadError>> + Send + '_,
+        >,
+    > {
+        // These definitions publish contributions through the modeled product
+        // extension; this fixture admits no background registration producers.
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct ActivationDispatch;
+
+fn activation_request(
+    request: &bmux_plugin_sdk::HostServiceRequest<'_>,
+) -> bmux_plugin_sdk::Result<Vec<u8>> {
+    if request.capability == "bcode.product"
+        && request.kind == bmux_plugin_sdk::ServiceKind::Query
+        && request.interface == bcode_plugin_sdk::definition::PRODUCT_HOST_INTERFACE
+        && request.operation == "invocation_context"
+        && request.payload.is_empty()
+    {
+        return serde_json::to_vec(&bcode_plugin_sdk::definition::ProductInvocationSettings {
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+        })
+        .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: error.to_string(),
+        });
+    }
+    Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+        details: "embedded fixture denies unbound activation host request".into(),
+    })
+}
+
+impl bmux_plugin_sdk::HostServiceDispatch for ActivationDispatch {
+    fn invoke(
+        &self,
+        _: &bmux_plugin_runtime::InvocationScope,
+        request: bmux_plugin_sdk::HostServiceRequest<'_>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        activation_request(&request)
+    }
+}
+
+fn shared_config(plugin_id: &str) -> bcode_plugin::ResolvedPluginConfig {
+    let path = std::env::temp_dir().to_string_lossy().into_owned();
+    let concurrency = match plugin_id {
+        "bcode.filesystem" => bmux_plugin_runtime::PluginConcurrencyConfig::Limited {
+            max: std::num::NonZeroUsize::new(4).expect("filesystem concurrency is nonzero"),
+        },
+        _ => bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
+    };
+    bcode_plugin::ResolvedPluginConfig::default().with_shared_activation(
+        bcode_plugin::SharedActivationContext {
+            runtime: bmux_plugin_runtime::PluginRuntimeScopeId::new(),
+            native: bmux_plugin_sdk::NativeLifecycleContext {
+                plugin_id: plugin_id.into(),
+                required_capabilities: Vec::new(),
+                provided_capabilities: Vec::new(),
+                services: Vec::new(),
+                available_capabilities: Vec::new(),
+                enabled_plugins: vec![plugin_id.into()],
+                plugin_search_roots: Vec::new(),
+                registered_plugins: Vec::new(),
+                host: bmux_plugin_sdk::HostMetadata {
+                    product_name: "bcode".into(),
+                    product_version: "embedded-test".into(),
+                    plugin_api_version: bmux_plugin_sdk::CURRENT_PLUGIN_API_VERSION,
+                    plugin_abi_version: bmux_plugin_sdk::CURRENT_PLUGIN_ABI_VERSION,
+                },
+                connection: bmux_plugin_sdk::HostConnectionInfo {
+                    config_dir: path.clone(),
+                    config_dir_candidates: vec![path.clone()],
+                    runtime_dir: path.clone(),
+                    data_dir: path.clone(),
+                    state_dir: path,
+                },
+                settings: None,
+                plugin_settings_map: std::collections::BTreeMap::new(),
+                host_kernel_bridge: None,
+                host_service_port: None,
+                auxiliary_executables: std::collections::BTreeMap::new(),
+                auxiliary_executable_errors: std::collections::BTreeMap::new(),
+            },
+            services: bmux_plugin_sdk::definition::PluginHostServices::new(|request| {
+                activation_request(&request)
+            }),
+            dispatch: Arc::new(ActivationDispatch),
+            concurrency,
+            progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            driver: Arc::new(LifecycleDriver(Some(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("fixture serving runtime"),
+            ))),
+            registrations: Arc::new(RegistrationOwner),
+        },
+    )
+}
+
 #[cfg(unix)]
 fn static_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
     let bundled = [bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
         bcode_shell_plugin::static_plugin(),
-    )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
-        &bundled,
-        &bcode_plugin::PluginSelection::all_enabled(),
     )
-    .expect("shell plugin manifest should parse");
+    .with_definition(bcode_shell_plugin::plugin_definition)];
     bcode_plugin::PluginRuntimeHost::from(
-        bcode_plugin::PluginHost::load_static_plugins(&selected)
-            .expect("shell plugin should load statically"),
+        bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            Vec::new(),
+            &bundled,
+            std::collections::BTreeMap::from([(
+                "bcode.shell".into(),
+                shared_config("bcode.shell"),
+            )]),
+        )
+        .expect("shell shared definition should activate statically"),
     )
 }
 
@@ -200,35 +358,32 @@ fn dynamic_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
 }
 
 fn dynamic_plugin_runtime(domain: &str, plugin_id: &str) -> bcode_plugin::PluginRuntimeHost {
-    let executable = std::env::current_exe().expect("current test executable path");
-    let directory = executable.parent().expect("test executable parent");
-    let target_profile = directory
-        .parent()
-        .expect("test executable profile directory");
-    let exact_library_name = format!(
-        "{}bcode_{domain}_plugin{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let library = target_profile.join(&exact_library_name);
+    let variable = format!("BCODE_{}_WRAPPER_ARTIFACT", domain.to_uppercase());
+    let library = std::path::PathBuf::from(std::env::var_os(&variable).unwrap_or_else(|| {
+        panic!("set {variable} from acceptance-artifacts.json generated by scripts/package-plugin-acceptance.py --build; implementation dylibs are not supported")
+    }));
     assert!(
-        library.is_file(),
-        "build the standalone {domain} plugin with `cargo build -p bcode_{domain}_plugin` before adapter conformance; expected {}",
+        library.is_absolute() && library.is_file(),
+        "{variable} must select an existing absolute thin-wrapper artifact: {}",
         library.display(),
     );
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../../plugins/{domain}-plugin"));
-    let mut registered = bcode_plugin::discover_plugins_in_roots(&[root])
+    let registered = bcode_plugin::discover_plugins_in_roots(&[root])
         .expect("plugin manifest should be discovered");
     let plugin = registered
-        .iter_mut()
+        .into_iter()
         .find(|plugin| plugin.manifest.id == plugin_id)
         .expect("plugin should be registered");
-    let bcode_plugin::PluginRuntime::Native(runtime) = &mut plugin.manifest.runtime;
-    runtime.library = library;
+    // Deployment selection is separate from the exact embedded declaration.
+    // Normal host admission owns activation, contributions and scheduling.
     bcode_plugin::PluginRuntimeHost::from(
-        bcode_plugin::PluginHost::load_registered_plugins(std::slice::from_ref(plugin))
-            .expect("shell plugin should load dynamically"),
+        bcode_plugin::PluginHost::load_native_backend_components(vec![(
+            plugin.manifest,
+            library,
+            shared_config(plugin_id),
+        )])
+        .expect("thin shared wrapper should activate through native backend admission"),
     )
 }
 
@@ -584,7 +739,14 @@ async fn embedded_filesystem_active_cancellation_preserves_committed_outcome() {
         .unwrap()
         .strip_prefix("Tool cancelled; final invocation report: ")
         .unwrap();
-    let outcome: serde_json::Value = serde_json::from_str(report).unwrap();
+    let outcome: serde_json::Value = serde_json::from_str(report).unwrap_or_else(|error| {
+        let prefix: Vec<u8> = report.as_bytes().iter().copied().take(512).collect();
+        panic!(
+            "cancelled invocation must retain the tool JSON report, not transport framing or an error: {error}; report_bytes={}, prefix={prefix:?}, prefix_text={:?}",
+            report.len(),
+            String::from_utf8_lossy(&prefix),
+        );
+    });
     assert_eq!(outcome["files"][0]["status"], "committed");
     assert_eq!(outcome["files"][1]["status"], "cancelled");
     assert_eq!(
@@ -835,8 +997,32 @@ async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
         assert_eq!(request.schema, "bcode.tool.request.shell.run");
         assert_eq!(request.revision, 1);
         // This SDK path supplies workspace context but no artifact root, so shell
-        // publishes its request without recording-artifact revisions.
-        assert_eq!(updates.len(), 1);
+        // publishes its request and then replaces the same primary with producer-owned
+        // semantic output snapshots, never recording-artifact revisions.
+        let semantic = &updates[1..];
+        assert!(
+            !semantic.is_empty(),
+            "shell should publish semantic output after its request: {updates:?}"
+        );
+        assert!(
+            semantic
+                .iter()
+                .all(|update| update.schema == "bcode.shell.output" && update.artifact.is_none())
+        );
+        assert!(
+            updates
+                .windows(2)
+                .all(|pair| pair[0].revision < pair[1].revision)
+        );
+        let latest = semantic.last().expect("latest semantic output");
+        assert_eq!(latest.payload["command"], "printf shell-contribution");
+        assert!(
+            latest.payload["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("shell-contribution")),
+            "latest semantic output should carry command output: {}",
+            latest.payload
+        );
         assert!(updates.iter().all(|update| {
             update.invocation_id == "shell-contribution"
                 && update.producer_id == "bcode.shell"

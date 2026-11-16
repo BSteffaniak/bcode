@@ -1,0 +1,39 @@
+// Path-only discovery; authority stays in the invocation-bound host bridge.
+plugin bcode.filesystem version 1;
+capability PATH_SEARCH = bcode.filesystem.paths;
+
+@capability(PATH_SEARCH)
+@interface-version(1)
+interface filesystem-paths {
+    enum search-paths-scope { tracked, workspace }
+    enum search-paths-state { complete, incomplete, cancelled, unavailable }
+    enum search-path-kind { file, directory }
+    record search-paths-input {
+        search-query: string,
+        scope: search-paths-scope,
+        refresh: bool,
+        directory: string,
+        recursive: bool,
+        include-hidden: bool,
+        max-results: u64,
+        max-entries: u64,
+        max-depth: u64,
+        timeout-ms: u64,
+        max-bytes: u64,
+    }
+    record search-path-match-range { start: u64, end: u64 }
+    record search-path-entry {
+        path: string,
+        kind: search-path-kind,
+        score: u64,
+        match-ranges: list<search-path-match-range>,
+    }
+    record search-paths-output {
+        entries: list<search-path-entry>,
+        state: search-paths-state,
+        reason: string?,
+        visited-entries: u64,
+        effective-scope: search-paths-scope,
+    }
+    query search-paths(request: search-paths-input) -> search-paths-output;
+}

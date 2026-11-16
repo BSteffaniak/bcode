@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 bcode_model_provider_runtime = { workspace = true }
@@ -31,4 +31,6 @@ thiserror = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = ["bcode_tui_components", "bmux_tui"]
+# Kept for existing consumers; packaging does not select frontend behavior.
+static-bundled = ["tui"]
+tui            = ["dep:bcode_tui_components", "dep:bmux_tui"]

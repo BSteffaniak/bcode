@@ -86,13 +86,15 @@ pub fn attached_to(session: SessionId, turns: u64, at: Instant) -> TranscriptV2H
     let [TuiEffect::LoadTranscriptV2History { load }] = effects.as_slice() else {
         panic!("one tail request, got {} effects", effects.len());
     };
+    let load = *load;
+    drop(effects);
     let HostRequest::Window(issued) = load.request else {
         panic!("window request");
     };
     let events = conversation(session, turns);
     let last = events.last().map(|event| event.sequence);
     let result = TuiEffectResult::TranscriptV2HistoryLoaded {
-        load: *load,
+        load,
         result: Ok(HistoryLoaded::Window(HistoryWindowResult {
             generation: issued.generation,
             target: issued.request,
@@ -122,13 +124,15 @@ pub fn attached_with_events(
     let [TuiEffect::LoadTranscriptV2History { load }] = effects.as_slice() else {
         panic!("one tail request, got {} effects", effects.len());
     };
+    let load = *load;
+    drop(effects);
     let HostRequest::Window(issued) = load.request else {
         panic!("window request");
     };
     let first = events.first().map(|event| event.sequence);
     let last = events.last().map(|event| event.sequence);
     let result = TuiEffectResult::TranscriptV2HistoryLoaded {
-        load: *load,
+        load,
         result: Ok(HistoryLoaded::Window(HistoryWindowResult {
             generation: issued.generation,
             target: issued.request,

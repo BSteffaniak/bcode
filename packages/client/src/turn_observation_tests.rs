@@ -5,7 +5,7 @@ use bcode_session_models::{ModelTurnOutcome, SessionEventKind};
 
 async fn watcher() -> (SessionWatcher, LocalIpcStream, std::path::PathBuf) {
     let directory = std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionId::new()));
-    crate::client_timeout_tests::create_private_socket_fixture(&directory);
+    crate::ipc_test_support::create_socket_directory(&directory).expect("socket directory");
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("client.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
     let stream = LocalIpcStream::connect(&endpoint).await.expect("connect");

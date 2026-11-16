@@ -4,6 +4,9 @@
 
 //! Example native Bcode plugin.
 
+#[cfg(feature = "tui")]
+mod frontend;
+
 use bcode_plugin_sdk::prelude::*;
 
 /// Example plugin used by smoke tests.
@@ -53,6 +56,12 @@ fn render_shell_visual(context: &NativeServiceContext) -> Option<ServiceResponse
 }
 
 impl RustPlugin for HelloPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+        #[cfg(feature = "tui")]
+        let registrations = registrations.with_frontend(frontend::registry);
+        registrations
+    }
     fn activate(&mut self) -> Result<(), PluginError> {
         Ok(())
     }
@@ -260,4 +269,4 @@ pub fn static_plugin() -> StaticPluginVtable {
     bcode_plugin_sdk::static_plugin_vtable!(HelloPlugin, include_str!("../bcode-plugin.toml"))
 }
 
-bcode_plugin_sdk::export_plugin!(HelloPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::define_plugin!(serial HelloPlugin, include_str!("../bcode-plugin.toml"));

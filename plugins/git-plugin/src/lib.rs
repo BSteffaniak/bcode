@@ -4,7 +4,7 @@
 
 #[cfg(feature = "git-ui")]
 mod cli;
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 mod git_tui;
 
 use bcode_forge_models::RepositoryRef;
@@ -28,6 +28,10 @@ const GIT_CLONE_RESULT_SCHEMA: &str = "bcode.git.clone_result";
 pub struct GitPlugin;
 
 impl RustPlugin for GitPlugin {
+    fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+        crate::product_registrations()
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
@@ -118,7 +122,7 @@ fn invoke_clone(
         Err(error) => return tool_error(error.to_string()),
     };
     let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
-        context.events,
+        context.events.clone(),
         &invocation.tool_call_id,
         GIT_PLUGIN_ID,
         GIT_CLONE_REQUEST_SCHEMA,
@@ -602,7 +606,42 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+// Identity and service declarations come from the embedded manifest only.
+bcode_plugin_sdk::define_plugin!(serial GitPlugin, include_str!("../bcode-plugin.toml"));
+
+fn product_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations::default();
+    #[cfg(feature = "tui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        frontend: Some(git_tui_registry),
+        ..registrations
+    };
+    // The interactive `bcode git` client is frontend-local CLI, never a model tool.
+    #[cfg(feature = "git-ui")]
+    let registrations = bcode_plugin_sdk::definition::ProductRegistrations {
+        cli: Some(cli::registration()),
+        ..registrations
+    };
+    registrations
+}
+
+/// Bind this implementation to the host's invocation-scoped capability resolver.
+/// The resolver must retain live cancellation, caller provenance and authorized bridges.
+#[must_use]
+pub fn plugin_definition_with_host(
+    host: impl Fn(
+        bcode_plugin_sdk::definition::PluginCreateContext,
+    ) -> std::sync::Arc<dyn bcode_plugin_sdk::definition::ProductInvocationHost>
+    + Send
+    + Sync
+    + 'static,
+) -> bcode_plugin_sdk::definition::PluginDefinition {
+    bcode_plugin_sdk::definition::rust_plugin_definition_with_host::<GitPlugin>(
+        plugin_definition().metadata,
+        host,
+    )
+}
+
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     #[cfg_attr(not(feature = "git-ui"), allow(unused_mut))]
@@ -615,7 +654,7 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
     vtable
 }
 
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "tui")]
 #[must_use]
 pub fn git_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -625,9 +664,6 @@ pub fn git_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     );
     registry
 }
-
-#[cfg(not(feature = "static-bundled"))]
-bcode_plugin_sdk::export_plugin!(GitPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

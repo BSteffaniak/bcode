@@ -377,7 +377,7 @@ impl ModelHostOperations {
         let task_id = id.clone();
         // Reservation is committed before any provider work. Disconnects cannot replay start.
         tokio::spawn(async move {
-            host.run(state, &task_id, turn).await;
+            Box::pin(host.run(state, &task_id, turn)).await;
         });
         responded(&wire::StartResponse { turn_id: id })
     }
@@ -439,7 +439,7 @@ impl ModelHostOperations {
     }
 
     async fn run(&self, state: Arc<ServerState>, id: &str, turn: Arc<Turn>) {
-        let result = self.run_provider(&state, id, &turn).await;
+        let result = Box::pin(self.run_provider(&state, id, &turn)).await;
         let mut inner = turn.inner.lock().await;
         if let Err(code) = result {
             if code == "turn_cancelled" {
@@ -682,7 +682,7 @@ impl ModelHostOperations {
             jsonschema::validator_for(&output.schema).map_err(|_| "invalid_output_schema")?;
         }
         let route = target.provider_plugin_id.ok_or("provider_unavailable")?;
-        validate_tool_capabilities(state, &request, &route).await?;
+        Box::pin(validate_tool_capabilities(state, &request, &route)).await?;
         for tool in &request.tools {
             jsonschema::validator_for(&tool.input_schema).map_err(|_| "invalid_tool_schema")?;
         }

@@ -22,7 +22,8 @@ bcode_tool                       = { workspace = true }
 bcode_workflow                   = { workspace = true }
 bcode_xray                       = { workspace = true }
 bcode_xray_models                = { workspace = true }
-bmux_plugin                      = { workspace = true, optional = true }
+bmux_plugin                      = { workspace = true }
+bmux_plugin_runtime              = { workspace = true }
 bmux_plugin_sdk                  = { workspace = true }
 hex                              = { workspace = true }
 libloading                       = { workspace = true }
@@ -34,15 +35,18 @@ thiserror                        = { workspace = true, features = ["std"] }
 tokio                            = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 toml                             = { workspace = true }
 tracing                          = { workspace = true }
+uuid                             = { workspace = true }
 
 [dev-dependencies]
 bcode_hello_plugin            = { workspace = true }
 bcode_question_dynamic_plugin = { workspace = true }
-bcode_question_plugin         = { workspace = true }
+bcode_question_plugin         = { workspace = true, features = ["native"] }
 tokio                         = { workspace = true, features = ["macros", "rt", "time"] }
 
 [features]
-bmux-host        = ["dep:bmux_plugin"]
+# Compatibility feature: the shared BMUX plugin runtime is a required dependency of
+# the unified plugin architecture, so this no longer gates `bmux_plugin`.
+bmux-host        = []
 default          = []
 fail-on-warnings = []
 
