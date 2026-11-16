@@ -7,7 +7,6 @@
 mod converse_diagnostics;
 mod diagnostics;
 
-#[cfg(feature = "static-bundled")]
 mod cli;
 mod usage;
 #[cfg(test)]
@@ -6342,15 +6341,10 @@ fn json_value_to_document(value: &serde_json::Value) -> Document {
     }
 }
 
-#[cfg(feature = "static-bundled")]
+/// Return the plugin-owned local CLI contribution for bundled hosts.
 #[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        BedrockProviderPlugin,
-        include_str!("../bcode-plugin.toml")
-    );
-    vtable.cli_registration = Some(cli::registration);
-    vtable
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
 }
 
 bcode_plugin_sdk::define_plugin!(
@@ -7478,7 +7472,6 @@ mod tests {
                 turn.push(ProviderTurnEvent::TurnFinished { stop_reason });
             }
             let context = NativeServiceContext {
-                diagnostics: None,
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
                     interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),
@@ -10339,7 +10332,6 @@ mod tests {
             R: serde::de::DeserializeOwned,
         {
             let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
-                diagnostics: None,
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
                     interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),

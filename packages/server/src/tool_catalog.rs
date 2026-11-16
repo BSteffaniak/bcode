@@ -18,8 +18,7 @@ const fn discovery_failure(error: &bcode_plugin::PluginServiceCallError) -> Prep
         | bcode_plugin::PluginServiceCallError::Invoke(
             bcode_plugin::PluginLoadError::ServiceDecode(_)
             | bcode_plugin::PluginLoadError::ServiceEncode(_)
-            | bcode_plugin::PluginLoadError::ToolCatalogValidation { .. }
-            | bcode_plugin::PluginLoadError::ServiceResponseTooLarge { .. },
+            | bcode_plugin::PluginLoadError::ToolCatalogValidation { .. },
         ) => PreparationFailure::Permanent,
         // Unknown service and transport failures are availability failures. Do not
         // guess permanence from plugin-controlled diagnostic text.
@@ -411,9 +410,9 @@ mod tests {
                 enabled: std::collections::BTreeSet::from(["bcode.filesystem".to_owned()]),
                 disabled: std::collections::BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                bcode_filesystem_plugin::static_plugin(),
+                bcode_filesystem_plugin::plugin_definition,
             )],
         )
         .expect("load filesystem runtime")
@@ -654,13 +653,13 @@ mod tests {
                 disabled: std::collections::BTreeSet::new(),
             },
             &[
-                bcode_plugin::StaticBundledPlugin::new(
+                bcode_plugin::StaticBundledPlugin::from_definition(
                     include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                    bcode_filesystem_plugin::static_plugin(),
+                    bcode_filesystem_plugin::plugin_definition,
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                bcode_plugin::StaticBundledPlugin::from_definition(
                     include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-                    bcode_shell_plugin::static_plugin(),
+                    bcode_shell_plugin::plugin_definition,
                 ),
             ],
         )

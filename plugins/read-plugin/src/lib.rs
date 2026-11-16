@@ -40,7 +40,13 @@ impl RustPlugin for ReadPlugin {
     }
 }
 
-// Return the statically linked plugin vtable.
+/// Return the plugin-owned local CLI contribution for bundled hosts.
+#[cfg(feature = "tui")]
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
+
 // Identity and service declarations come from the embedded manifest only.
 bcode_plugin_sdk::define_plugin!(serial ReadPlugin, include_str!("../bcode-plugin.toml"));
 
@@ -70,17 +76,4 @@ pub fn plugin_definition_with_host(
         plugin_definition().metadata,
         host,
     )
-}
-
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let vtable =
-        bcode_plugin_sdk::static_plugin_vtable!(ReadPlugin, include_str!("../bcode-plugin.toml"));
-    #[cfg(feature = "tui")]
-    let vtable = {
-        let mut vtable = vtable;
-        vtable.cli_registration = Some(cli::registration);
-        vtable
-    };
-    vtable
 }

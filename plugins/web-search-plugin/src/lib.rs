@@ -3005,12 +3005,6 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(WebSearchPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[cfg(feature = "frontend")]
 #[must_use]
 pub fn web_search_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
@@ -3162,7 +3156,6 @@ mod tests {
         context: &bcode_plugin_sdk::PluginConfigContext,
     ) -> ProviderCredentials {
         let native_context = NativeServiceContext {
-            diagnostics: None,
             plugin_id: WEB_SEARCH_PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: TOOL_SERVICE_INTERFACE_ID.to_owned(),

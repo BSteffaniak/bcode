@@ -132,12 +132,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-/// Transitional compatibility adapter; new consumers must use the shared definition.
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(XrayPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,7 +193,6 @@ mod tests {
         let request = request();
         let mut plugin = XrayPlugin;
         let response = plugin.invoke_service(NativeServiceContext {
-            diagnostics: None,
             plugin_id: PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: COMMAND_INTERFACE_ID.to_owned(),

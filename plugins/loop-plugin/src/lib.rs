@@ -836,14 +836,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-/// Transitional compatibility adapter; new consumers must use the shared definition.
-#[must_use]
-pub fn static_plugin() -> StaticPluginVtable {
-    let mut vtable = static_plugin_vtable!(LoopPlugin, include_str!("../bcode-plugin.toml"));
-    vtable.cli_registration = Some(cli_registration);
-    vtable
-}
-
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();

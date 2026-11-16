@@ -22,7 +22,6 @@ interface_id = "bcode.settled-turn-observer/v1"
 name         = "Settled conversation milestone policy"
 
 [runtime]
-abi_version  = 5
-event_symbol = "bcode_plugin_handle_event_v1"
-library      = "libbcode_session_milestones_plugin.dylib"
-type         = "native"
+abi_version = 5
+library     = "libbcode_session_milestones_plugin.dylib"
+type        = "native"

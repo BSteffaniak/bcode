@@ -2998,11 +2998,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(FilesystemPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[cfg(feature = "tui")]
 #[must_use]
 pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
@@ -3096,7 +3091,6 @@ mod tests {
     ) {
         let updates = Mutex::new(Vec::<Vec<u8>>::new());
         let mut context = NativeServiceContext {
-            diagnostics: None,
             plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),

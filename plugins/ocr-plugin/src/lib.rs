@@ -1079,11 +1079,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(OcrPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[cfg(feature = "tui")]
 #[must_use]
 pub fn ocr_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {

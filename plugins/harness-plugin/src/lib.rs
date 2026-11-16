@@ -141,11 +141,5 @@ pub(crate) fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
     })
 }
 
-/// Statically bundled registration with the same manifest and service implementation.
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(HarnessPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 // One declaration serves bundled and native packaging; implementations export no ABI symbols.
 bcode_plugin_sdk::define_plugin!(serial HarnessPlugin, include_str!("../bcode-plugin.toml"));

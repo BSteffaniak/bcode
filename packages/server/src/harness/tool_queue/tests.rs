@@ -182,9 +182,17 @@ fn start_queue_state(sessions: bcode_session::SessionManager) -> ServerState {
         sessions,
         bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(StartQueue, MANIFEST),
+                || {
+                    bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<
+                            StartQueue,
+                        >(
+                            MANIFEST,
+                            <StartQueue as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                        )
+                        .expect("fixture definition")
+                },
             )],
         )
         .unwrap(),

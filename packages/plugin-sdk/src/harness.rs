@@ -108,7 +108,6 @@ mod tests {
             },
             config: crate::PluginConfigContext::default(),
             events: crate::ServiceEventEmitter::default(),
-            diagnostics: None,
             cancellation: crate::ServiceCancellation::default(),
             bridge: crate::ServiceBridge::default(),
             transient_progress_limits: crate::TransientProgressLimits::default(),

@@ -6341,17 +6341,17 @@ mod tests {
     fn shell_terminal_model(output: &str) -> super::BcodeRuntimeModel {
         let session_id = bcode_session_models::SessionId::new();
         let mut model = root_test_model_with_history(session_id, &[]);
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
+            bcode_shell_plugin::plugin_definition,
         )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .unwrap();
         model.chat.app.set_plugin_host(std::sync::Arc::new(
-            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
+            crate::plugin_tui::fixture::load_static(&selected).unwrap(),
         ));
         model
             .chat
@@ -6589,17 +6589,17 @@ mod tests {
         use bmux_tui_runtime::{Presenter, Program, RuntimeEvent, TimerId};
         let session_id = bcode_session_models::SessionId::new();
         let mut model = root_test_model_with_history(session_id, &[]);
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
+            bcode_shell_plugin::plugin_definition,
         )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .unwrap();
         model.chat.app.set_plugin_host(std::sync::Arc::new(
-            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
+            crate::plugin_tui::fixture::load_static(&selected).unwrap(),
         ));
         model
             .chat

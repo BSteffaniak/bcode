@@ -460,7 +460,6 @@ mod tests {
         };
         let expected = rank(&request).unwrap();
         let context = NativeServiceContext {
-            diagnostics: None,
             plugin_id: "bcode.session-derivation".into(),
             request: bcode_plugin_sdk::ServiceRequest {
                 interface_id: bcode_session_models::CATEGORIZATION_INTERFACE_ID.into(),
@@ -598,7 +597,6 @@ mod tests {
                 newest_request: "fix backend private-token-marker".into(),
             };
             let context = NativeServiceContext {
-                diagnostics: None,
                 plugin_id: "bcode.session-derivation".into(),
                 request: bcode_plugin_sdk::ServiceRequest {
                     interface_id: "bcode.session-categorization/v1".into(),

@@ -163,10 +163,13 @@ async fn retained_status_fixture(
 async fn constrained_status_only_readiness_crosses_real_ipc_without_login_or_submission() {
     let root = tempfile::tempdir().unwrap();
     let (sessions, session_id) = Box::pin(retained_status_fixture(root.path())).await;
-    let bundle = bcode_plugin::StaticBundledPlugin::new(
-        MANIFEST,
-        bcode_plugin_sdk::static_plugin_vtable!(StatusOnly, MANIFEST),
-    );
+    let bundle = bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<StatusOnly>(
+            MANIFEST,
+            <StatusOnly as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+        )
+        .expect("fixture definition")
+    });
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection::all_enabled(),
         &[bundle],

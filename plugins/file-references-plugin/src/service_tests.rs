@@ -20,7 +20,6 @@ fn context() -> NativeServiceContext {
         action_id: None,
     };
     NativeServiceContext {
-        diagnostics: None,
         plugin_id: "bcode.file-references".into(),
         request: ServiceRequest {
             interface_id: COMPOSER_INTERFACE_ID.into(),

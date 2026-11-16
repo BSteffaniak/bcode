@@ -1270,9 +1270,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn durable_question_services_export_restore_complete_with_scoped_cancellation() {
-        let producer = crate::StaticBundledPlugin::new(
+        let producer = crate::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
+            bcode_question_plugin::plugin_definition,
         );
         let plugins = PluginRuntimeHost::load_defaults_with_static_bundled(
             &crate::PluginSelection {

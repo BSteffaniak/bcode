@@ -309,18 +309,11 @@ mod tests {
 
     #[test]
     fn normal_bundled_startup_selects_shared_definition() {
-        let registrations = [
-            crate::StaticBundledPlugin::new(
-                include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-                bcode_hello_plugin::static_plugin(),
-            )
-            .with_definition(bcode_hello_plugin::plugin_definition),
-            crate::StaticBundledPlugin::from_definition(
-                include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-                bcode_hello_plugin::plugin_definition,
-            ),
-        ];
-        for registration in registrations {
+        let registration = crate::StaticBundledPlugin::from_definition(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            bcode_hello_plugin::plugin_definition,
+        );
+        {
             let host = crate::PluginHost::load_discovered_with_static_bundled_and_config(
                 &crate::PluginSelection::all_enabled(),
                 Vec::new(),
@@ -421,7 +414,6 @@ mod tests {
             include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
             disabled_factory,
         );
-        assert!(registration.vtable.is_none());
         let mut selection = crate::PluginSelection::all_enabled();
         selection.disabled.insert("example.hello".to_string());
         let host = crate::PluginHost::load_discovered_with_static_bundled_and_config(
@@ -433,16 +425,9 @@ mod tests {
         .expect("disabled definition startup");
         assert!(host.loaded_plugins().is_empty());
         assert!(
-            crate::filter_selected_static_plugins(&[registration], &selection)
-                .expect("disabled legacy selection")
+            crate::filter_selected_static_registrations(&[registration], &selection)
+                .expect("disabled selection")
                 .is_empty()
-        );
-        assert!(
-            crate::filter_selected_static_plugins(
-                &[registration],
-                &crate::PluginSelection::all_enabled(),
-            )
-            .is_err()
         );
     }
 
@@ -453,32 +438,24 @@ mod tests {
             definition.metadata.plugin_id = "example.wrong".to_string();
             definition
         }
-        for registration in [
-            crate::StaticBundledPlugin::from_definition(
-                include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-                wrong_identity,
-            ),
-            crate::StaticBundledPlugin::new(
-                include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-                bcode_hello_plugin::static_plugin(),
-            )
-            .with_definition(wrong_identity),
-        ] {
-            let result = crate::PluginHost::load_discovered_with_static_bundled_and_config(
-                &crate::PluginSelection::all_enabled(),
-                Vec::new(),
-                &[registration],
-                std::collections::BTreeMap::from([(
-                    "example.hello".to_string(),
-                    config(bmux_plugin_runtime::PluginRuntimeScopeId::new()),
-                )]),
-            );
-            assert!(
-                matches!(result, Err(crate::PluginLoadError::ManifestIdMismatch {
-                file_id, library_id,
-            }) if file_id == "example.hello" && library_id == "example.wrong")
-            );
-        }
+        let registration = crate::StaticBundledPlugin::from_definition(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            wrong_identity,
+        );
+        let result = crate::PluginHost::load_discovered_with_static_bundled_and_config(
+            &crate::PluginSelection::all_enabled(),
+            Vec::new(),
+            &[registration],
+            std::collections::BTreeMap::from([(
+                "example.hello".to_string(),
+                config(bmux_plugin_runtime::PluginRuntimeScopeId::new()),
+            )]),
+        );
+        assert!(
+            matches!(result, Err(crate::PluginLoadError::ManifestIdMismatch {
+            file_id, library_id,
+        }) if file_id == "example.hello" && library_id == "example.wrong")
+        );
     }
 
     #[test]
@@ -626,7 +603,6 @@ mod tests {
 
     fn context() -> bcode_plugin_sdk::NativeServiceContext {
         bcode_plugin_sdk::NativeServiceContext {
-            diagnostics: None,
             plugin_id: "example.hello".to_string(),
             request: bcode_plugin_sdk::ServiceRequest {
                 interface_id: "example-hello/v1".to_string(),

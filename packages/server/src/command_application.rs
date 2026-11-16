@@ -276,12 +276,15 @@ library = "libtest_blocked_command.dylib"
                 disabled: std::collections::BTreeSet::new(),
             },
             &[
-                bcode_plugin::StaticBundledPlugin::new(
+                bcode_plugin::StaticBundledPlugin::from_definition(
                     BLOCKED_COMMAND_MANIFEST,
-                    bcode_plugin_sdk::static_plugin_vtable!(
-                        BlockedCommand,
-                        BLOCKED_COMMAND_MANIFEST
-                    ),
+                    || {
+ bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<BlockedCommand>(
+ BLOCKED_COMMAND_MANIFEST,
+ <BlockedCommand as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+ },
                 ),
                 crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),

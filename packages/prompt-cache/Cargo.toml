@@ -19,8 +19,10 @@ serde                        = { workspace = true, features = ["derive"] }
 serde_json                   = { workspace = true }
 
 [dev-dependencies]
-bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_plugin_sdk           = { workspace = true }
+bcode_fake_provider_plugin = { workspace = true, features = [
+    "script-controls",
+] }
+bcode_plugin_sdk = { workspace = true }
 
 [features]
 default          = []

@@ -2,8 +2,8 @@
 
 The hello implementation is an export-free rlib exposing
 `plugin_definition() -> bmux_plugin_sdk::PluginDefinition` through Bcode's
-product adapter macro. Its old `static_plugin()` remains solely for legacy
-consumers during migration; it is not the new dynamic packaging path.
+product adapter macro. Bundled hosts register that definition directly; dynamic
+packaging wraps the same definition.
 
 Generate a thin dynamic wrapper from the repository root (Python 3.11+):
 

@@ -15,9 +15,9 @@ fn definition() -> ToolDefinition {
 }
 
 fn plugin_runtime() -> bcode_plugin::PluginRuntimeHost {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+    let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-        bcode_question_plugin::static_plugin(),
+        bcode_question_plugin::plugin_definition,
     )];
     bcode_plugin::PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
         &bcode_plugin::PluginSelection::all_enabled(),

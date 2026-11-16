@@ -19,7 +19,6 @@ categories = ["composer"]
 section    = "file_references"
 
 [runtime]
-abi_version  = 5
-event_symbol = "bcode_plugin_handle_event_v1"
-library      = "libbcode_file_references_plugin.dylib"
-type         = "native"
+abi_version = 5
+library     = "libbcode_file_references_plugin.dylib"
+type        = "native"

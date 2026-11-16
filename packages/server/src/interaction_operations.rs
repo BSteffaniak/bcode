@@ -3327,9 +3327,9 @@ mod controller_consumer_tests {
 
     #[tokio::test]
     async fn semantic_capability_uses_exact_dynamic_discovery_without_granting_raw_resolution() {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
+        let plugin = bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
+            bcode_question_plugin::plugin_definition,
         );
         let state = crate::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),

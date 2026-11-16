@@ -334,9 +334,9 @@ pub async fn resolve(selection: &Selection) -> Result<bcode::Bcode, ConnectionEr
             .settings
             .insert("openai.base_url".into(), normalized_endpoint(endpoint)?);
     }
-    let providers = [bcode_plugin::StaticBundledPlugin::new(
+    let providers = [bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
-        bcode_openai_compatible_provider_plugin::static_plugin(),
+        bcode_openai_compatible_provider_plugin::plugin_definition,
     )];
     bcode::Bcode::configured_embedded_with_options(&options, &providers)
         .await

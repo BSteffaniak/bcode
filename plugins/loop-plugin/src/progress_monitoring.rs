@@ -205,7 +205,6 @@ mod tests {
                 preparation: None,
             };
             let context = NativeServiceContext {
-                diagnostics: None,
                 plugin_id: PLUGIN_ID.into(),
                 request: ServiceRequest {
                     interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),

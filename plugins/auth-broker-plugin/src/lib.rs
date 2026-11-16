@@ -46,12 +46,5 @@ impl RustPlugin for AuthBrokerPlugin {
     }
 }
 
-/// Static bundled entry point.
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(AuthBrokerPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 // One declaration serves bundled and native packaging; implementations export no ABI symbols.
 bcode_plugin_sdk::define_plugin!(serial AuthBrokerPlugin, include_str!("../bcode-plugin.toml"));

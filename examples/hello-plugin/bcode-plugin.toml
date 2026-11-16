@@ -49,7 +49,6 @@ topic = "bcode.session.event"
 type = "exclusive"
 
 [runtime]
-abi_version  = 5
-event_symbol = "bcode_plugin_handle_event_v1"
-library      = "libbcode_hello_plugin.dylib"
-type         = "native"
+abi_version = 5
+library     = "libbcode_hello_plugin.dylib"
+type        = "native"

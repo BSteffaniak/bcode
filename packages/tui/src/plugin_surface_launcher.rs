@@ -270,16 +270,22 @@ library = "libstartup_surface_fixture.dylib"
     }
 
     fn fixture_runtime() -> bcode_plugin::PluginRuntimeHost {
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
             STARTUP_SURFACE_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(FixturePlugin, STARTUP_SURFACE_MANIFEST),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<FixturePlugin>(
+                    STARTUP_SURFACE_MANIFEST,
+                    <FixturePlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            },
         )];
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("select fixture plugin");
-        bcode_plugin::PluginHost::load_static_plugins(&selected)
+        crate::plugin_tui::fixture::load_static(&selected)
             .expect("load fixture plugin")
             .into()
     }

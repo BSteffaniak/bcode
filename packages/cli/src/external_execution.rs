@@ -272,11 +272,29 @@ type = "native"
 abi_version = 5
 library = "unused.dylib"
 "#;
-        let manifest = MANIFEST;
-        bcode_plugin::PluginHost::load_static_plugins(&[(
-            toml::from_str(manifest).unwrap(),
-            bcode_plugin_sdk::static_plugin_vtable!(FakeProvider, MANIFEST),
-        )])
+        let registrations = [bcode_plugin::StaticBundledPlugin::from_definition(
+            MANIFEST,
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<FakeProvider>(
+                    MANIFEST,
+                    <FakeProvider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            },
+        )];
+        let selection = bcode_plugin::PluginSelection::all_enabled();
+        let configs = bcode_server::bind_shared_plugin_activations(
+            &selection,
+            &registrations,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
+            &selection,
+            Vec::new(),
+            &registrations,
+            configs,
+        )
         .unwrap()
     }
 

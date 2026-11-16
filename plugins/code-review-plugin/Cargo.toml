@@ -34,7 +34,7 @@ serde_json               = { workspace = true }
 [dev-dependencies]
 bcode_agent_policy          = { workspace = true }
 bcode_code_review           = { workspace = true, features = ["testing"] }
-bcode_default_agents_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_default_agents_plugin = { workspace = true }
 tempfile                    = { workspace = true }
 
 [features]

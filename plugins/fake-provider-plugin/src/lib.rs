@@ -40,15 +40,15 @@ use std::time::Duration;
 
 static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
 static FAKE_COMPACTION_SUMMARY_STARTED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 static FAKE_COMPACTION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static FAKE_COMPACTION_SUMMARY_SIGNALS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 static FAKE_SCRIPT_WAITERS: LazyLock<Mutex<BTreeMap<String, BTreeSet<usize>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 static FAKE_SCRIPT_PROGRESS: LazyLock<tokio::sync::watch::Sender<()>> =
     LazyLock::new(|| tokio::sync::watch::channel(()).0);
 static FAKE_SCRIPT_GATES: LazyLock<(Mutex<BTreeSet<String>>, Condvar)> =
@@ -89,7 +89,7 @@ pub struct FakeProviderEventScriptStep {
 }
 
 /// Release one process-local fake-provider script gate.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub fn release_fake_event_script_gate(gate: &str) {
     let (gates, ready) = &*FAKE_SCRIPT_GATES;
     if let Ok(mut gates) = gates.lock() {
@@ -99,7 +99,7 @@ pub fn release_fake_event_script_gate(gate: &str) {
 }
 
 /// Whether a script has reached this test-owned gate (not a timing counter).
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 #[must_use]
 pub fn fake_event_script_gate_ready(gate: &str) -> bool {
     FAKE_SCRIPT_WAITERS
@@ -112,7 +112,7 @@ pub fn fake_event_script_gate_ready(gate: &str) -> bool {
 ///
 /// # Panics
 /// Panics if the process-global readiness notification channel closes unexpectedly.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub async fn wait_for_fake_event_script_gate_ready(gate: &str) {
     wait_for_fake_event_script_gate_members(gate, 1).await;
 }
@@ -122,7 +122,7 @@ pub async fn wait_for_fake_event_script_gate_ready(gate: &str) {
 ///
 /// # Panics
 /// Panics if the process-global notification channel closes unexpectedly.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub async fn wait_for_fake_event_script_gate_members(gate: &str, count: usize) {
     let mut progress = FAKE_SCRIPT_PROGRESS.subscribe();
     loop {
@@ -137,7 +137,7 @@ pub async fn wait_for_fake_event_script_gate_members(gate: &str, count: usize) {
 }
 
 /// Forget the readiness handshake for one test-owned gate.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub fn forget_fake_event_script_gate_ready(gate: &str) {
     if let Ok(mut waiters) = FAKE_SCRIPT_WAITERS.lock() {
         waiters.remove(gate);
@@ -145,7 +145,7 @@ pub fn forget_fake_event_script_gate_ready(gate: &str) {
 }
 
 /// Reset every process-local fake-provider script gate.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub fn reset_fake_event_script_gates() {
     let (gates, _) = &*FAKE_SCRIPT_GATES;
     if let Ok(mut gates) = gates.lock() {
@@ -156,13 +156,13 @@ static FAKE_MANAGED_COMPACTION_EMITTED: AtomicBool = AtomicBool::new(false);
 static FAKE_LAST_PARALLEL_TOOL_POLICY: AtomicBool = AtomicBool::new(false);
 
 /// Acquire exclusive access to process-wide fake compaction test signals.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub async fn fake_compaction_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     FAKE_COMPACTION_TEST_LOCK.lock().await
 }
 
 /// Reset the provider-compaction start signal used by static runtime tests.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub fn reset_fake_compaction_started() {
     FAKE_COMPACTION_STARTED.store(false, Ordering::Release);
     FAKE_COMPACTION_SUMMARY_STARTED.store(false, Ordering::Release);
@@ -171,7 +171,7 @@ pub fn reset_fake_compaction_started() {
 }
 
 /// Reset the compaction-summary signal for one test-owned key.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 pub fn reset_fake_compaction_summary_signal(key: &str) {
     FAKE_COMPACTION_SUMMARY_SIGNALS
         .lock()
@@ -180,7 +180,7 @@ pub fn reset_fake_compaction_summary_signal(key: &str) {
 }
 
 /// Return whether a keyed fake compaction-summary model turn has started.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 #[must_use]
 pub fn fake_compaction_summary_signal_started(key: &str) -> bool {
     FAKE_COMPACTION_SUMMARY_SIGNALS
@@ -190,28 +190,28 @@ pub fn fake_compaction_summary_signal_started(key: &str) -> bool {
 }
 
 /// Return the last provider-visible parallel tool-call policy observed by the fake adapter.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 #[must_use]
 pub fn fake_last_parallel_tool_policy() -> bool {
     FAKE_LAST_PARALLEL_TOOL_POLICY.load(Ordering::Acquire)
 }
 
 /// Return whether fake provider-managed compaction was emitted.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 #[must_use]
 pub fn fake_managed_compaction_emitted() -> bool {
     FAKE_MANAGED_COMPACTION_EMITTED.load(Ordering::Acquire)
 }
 
 /// Return whether a fake compaction-summary model turn has started.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 #[must_use]
 pub fn fake_compaction_summary_started() -> bool {
     FAKE_COMPACTION_SUMMARY_STARTED.load(Ordering::Acquire)
 }
 
 /// Return whether a fake provider-native compaction call has started.
-#[cfg(feature = "static-bundled")]
+#[cfg(feature = "script-controls")]
 #[must_use]
 pub fn fake_compaction_started() -> bool {
     FAKE_COMPACTION_STARTED.load(Ordering::Acquire)
@@ -1345,7 +1345,7 @@ fn emit_fake_event_script(turn: &FakeTurn, script: FakeProviderEventScript) {
 }
 
 fn wait_for_fake_event_script_gate(turn: &FakeTurn, gate: &str) -> bool {
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "script-controls")]
     if let Ok(mut waiters) = FAKE_SCRIPT_WAITERS.lock() {
         // Readiness is retained until explicit test cleanup; cap memory in non-test use.
         if waiters.len() < 256 {
@@ -3437,15 +3437,6 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        FakeProviderPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 bcode_plugin_sdk::define_plugin!(
     concurrent FakeProviderPlugin,
     include_str!("../bcode-plugin.toml")
@@ -3512,7 +3503,7 @@ mod tests {
         received.recv().expect("second instance admits work");
         second.deactivate_concurrent().expect("second cleanup");
     }
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "script-controls")]
     #[tokio::test]
     async fn gate_members_acknowledge_distinct_held_turns_without_deadlines() {
         let gate = format!("member-handshake-{:?}", std::thread::current().id());
@@ -4415,7 +4406,7 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
         ));
     }
 
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "script-controls")]
     fn assert_fake_push_completion(response: &ServiceResponse, events: &[ProviderTurnEvent]) {
         assert_eq!(
             events.len(),
@@ -4443,7 +4434,7 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
 
     /// Exercise the complete fake push path, not just script queue production. A released gate
     /// remains released for later admissions, including a second batch sharing the same gate.
-    #[cfg(feature = "static-bundled")]
+    #[cfg(feature = "script-controls")]
     #[test]
     fn fake_push_fanout_retains_gate_release_for_current_and_later_turns() {
         extern "C" fn collect_event(

@@ -3626,16 +3626,16 @@ fn transcript_resident_window_keeps_pending_submission_repeating_committed_text(
 }
 
 fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+    let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-        bcode_filesystem_plugin::static_plugin(),
+        bcode_filesystem_plugin::plugin_definition,
     )];
-    let selected = bcode_plugin::filter_selected_static_plugins(
+    let selected = bcode_plugin::filter_selected_static_registrations(
         &bundled,
         &bcode_plugin::PluginSelection::all_enabled(),
     )
     .expect("static filesystem plugin manifest should parse");
-    bcode_plugin::PluginHost::load_static_plugins(&selected)
+    crate::plugin_tui::fixture::load_static(&selected)
         .expect("static filesystem plugin should load")
 }
 

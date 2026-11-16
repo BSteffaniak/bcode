@@ -706,7 +706,6 @@ mod tests {
             ] {
                 let input = input(scope);
                 let context = NativeServiceContext {
-                    diagnostics: None,
                     plugin_id: super::super::PLUGIN_ID.into(),
                     request: ServiceRequest {
                         interface_id: INTERFACE_ID.into(),

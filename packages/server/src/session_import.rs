@@ -1523,6 +1523,17 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fixture_definition<P: bcode_plugin_sdk::RustPlugin>(
+        manifest: &'static str,
+    ) -> bcode_plugin_sdk::definition::PluginDefinition {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<P>(
+            manifest,
+            P::component_registrations(),
+        )
+        .expect("fixture definition")
+    }
+
+    #[cfg(unix)]
     static IMPORT_FIXTURE_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
@@ -1547,12 +1558,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn invalid_import_requests_do_not_enumerate_providers() {
-        let bundle = bcode_plugin::StaticBundledPlugin::new(
+        let bundle = bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
-            bcode_plugin_sdk::static_plugin_vtable!(
-                CountingImportFixture,
-                include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml")
-            ),
+            || {
+                fixture_definition::<CountingImportFixture>(include_str!(
+                    "../../../plugins/pi-session-import-plugin/bcode-plugin.toml"
+                ))
+            },
         );
         let state = fixture_import_state(
             &[bundle],
@@ -1695,18 +1707,16 @@ mod tests {
             include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml");
         const OPENCODE_MANIFEST: &str =
             include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml");
-        let pi = bcode_plugin::StaticBundledPlugin::new(
-            PI_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(ImportFixture<true, 1>, PI_MANIFEST),
-        );
-        let duplicate = bcode_plugin::StaticBundledPlugin::new(
-            OPENCODE_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(ImportFixture<false, 1>, OPENCODE_MANIFEST),
-        );
-        let error = bcode_plugin::StaticBundledPlugin::new(
-            OPENCODE_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(ImportFixture<false, 2>, OPENCODE_MANIFEST),
-        );
+        let pi = bcode_plugin::StaticBundledPlugin::from_definition(PI_MANIFEST, || {
+            fixture_definition::<ImportFixture<true, 1>>(PI_MANIFEST)
+        });
+        let duplicate =
+            bcode_plugin::StaticBundledPlugin::from_definition(OPENCODE_MANIFEST, || {
+                fixture_definition::<ImportFixture<false, 1>>(OPENCODE_MANIFEST)
+            });
+        let error = bcode_plugin::StaticBundledPlugin::from_definition(OPENCODE_MANIFEST, || {
+            fixture_definition::<ImportFixture<false, 2>>(OPENCODE_MANIFEST)
+        });
         for (provider, expected) in [
             (duplicate, "session_import_ambiguous_source"),
             (error, "session_import_unavailable"),
@@ -1788,19 +1798,21 @@ mod tests {
             ListImportSourcesResponse, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
             SESSION_IMPORT_INTERFACE_ID,
         };
-        let pi = bcode_plugin::StaticBundledPlugin::new(
+        let pi = bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml"),
-            bcode_plugin_sdk::static_plugin_vtable!(
-                ImportFixture<true>,
-                include_str!("../../../plugins/pi-session-import-plugin/bcode-plugin.toml")
-            ),
+            || {
+                fixture_definition::<ImportFixture<true>>(include_str!(
+                    "../../../plugins/pi-session-import-plugin/bcode-plugin.toml"
+                ))
+            },
         );
-        let opencode = bcode_plugin::StaticBundledPlugin::new(
+        let opencode = bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml"),
-            bcode_plugin_sdk::static_plugin_vtable!(
-                ImportFixture<false>,
-                include_str!("../../../plugins/opencode-session-import-plugin/bcode-plugin.toml")
-            ),
+            || {
+                fixture_definition::<ImportFixture<false>>(include_str!(
+                    "../../../plugins/opencode-session-import-plugin/bcode-plugin.toml"
+                ))
+            },
         );
         for both in [true, false] {
             let directory = crate::tests::test_socket_dir().unwrap();

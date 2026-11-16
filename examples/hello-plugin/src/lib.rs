@@ -263,10 +263,4 @@ fn hello_auth_provider() -> bcode_provider_auth_models::AuthProviderContribution
     }
 }
 
-/// Return the statically linked hello plugin vtable.
-#[must_use]
-pub fn static_plugin() -> StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(HelloPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 bcode_plugin_sdk::define_plugin!(serial HelloPlugin, include_str!("../bcode-plugin.toml"));

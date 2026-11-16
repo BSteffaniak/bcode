@@ -264,7 +264,6 @@ mod tests {
             json!(u64::MAX);
         let invoke = |payload, config| {
             let mut context = NativeServiceContext {
-                diagnostics: None,
                 plugin_id: "bcode.workflow".into(),
                 request: ServiceRequest {
                     interface_id:

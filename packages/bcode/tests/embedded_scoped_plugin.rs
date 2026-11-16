@@ -106,11 +106,10 @@ fn definition() -> ToolDefinition {
 
 #[tokio::test]
 async fn embedded_plugin_uses_same_scope_and_capabilities_as_direct_tools() {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+    let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-        bcode_hello_plugin::static_plugin(),
-    )
-    .with_definition(bcode_hello_plugin::plugin_definition)];
+        bcode_hello_plugin::plugin_definition,
+    )];
     let plugins = bcode_plugin::PluginRuntimeHost::from(
         bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
             &bcode_plugin::PluginSelection::all_enabled(),
@@ -333,11 +332,10 @@ fn shared_config(plugin_id: &str) -> bcode_plugin::ResolvedPluginConfig {
 
 #[cfg(unix)]
 fn static_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
-    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+    let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-        bcode_shell_plugin::static_plugin(),
-    )
-    .with_definition(bcode_shell_plugin::plugin_definition)];
+        bcode_shell_plugin::plugin_definition,
+    )];
     bcode_plugin::PluginRuntimeHost::from(
         bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
             &bcode_plugin::PluginSelection::all_enabled(),

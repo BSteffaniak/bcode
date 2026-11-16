@@ -31,7 +31,6 @@ fn scope(instance: &str) -> PluginCreateContext {
 }
 fn context() -> NativeServiceContext {
     NativeServiceContext {
-        diagnostics: None,
         plugin_id: "bcode.adapter-test".to_owned(),
         request: crate::ServiceRequest {
             interface_id: "bcode.adapter-counter/v1".to_owned(),

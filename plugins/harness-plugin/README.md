@@ -1,6 +1,6 @@
 # Managed harness integration
 
-The disableable `bcode_harness_plugin` (`bcode.harness`) exports `static_plugin()` and
+The disableable `bcode_harness_plugin` (`bcode.harness`) exports `plugin_definition()` and
 five advanced tools/palette commands: `harness.start`, `inspect`, `followup`, `respond`, `interrupt`.
 Each accepts `request_json`, a bounded `ManagedSessionRequest` containing the shared
 `HarnessRequest`, optional `session_id` (instance inspection), optional creation-only

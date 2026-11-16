@@ -267,8 +267,8 @@ mod tests {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::Duration,
     };
-    const MANIFEST: &str = "id='test.observer'\nname='Observer'\nversion='0.0.1'\n[[services]]\ninterface_id='bcode.settled-turn-observer/v1'\nname='Observer'\n[runtime]\ntype='native'\nabi_version=5\nlibrary='unused.dylib'\nevent_symbol='bcode_plugin_handle_event_v1'\n";
-    const FAIL_MANIFEST: &str = "id='test.a-failing'\nname='Failing observer'\nversion='0.0.1'\n[[services]]\ninterface_id='bcode.settled-turn-observer/v1'\nname='Observer'\n[runtime]\ntype='native'\nabi_version=5\nlibrary='unused.dylib'\nevent_symbol='bcode_plugin_handle_event_v1'\n";
+    const MANIFEST: &str = "id='test.observer'\nname='Observer'\nversion='0.0.1'\n[[services]]\ninterface_id='bcode.settled-turn-observer/v1'\nname='Observer'\n[runtime]\ntype='native'\nabi_version=5\nlibrary='unused.dylib'\n";
+    const FAIL_MANIFEST: &str = "id='test.a-failing'\nname='Failing observer'\nversion='0.0.1'\n[[services]]\ninterface_id='bcode.settled-turn-observer/v1'\nname='Observer'\n[runtime]\ntype='native'\nabi_version=5\nlibrary='unused.dylib'\n";
     static OBSERVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static FAILURES: AtomicUsize = AtomicUsize::new(0);
     #[derive(Default)]
@@ -388,13 +388,25 @@ mod tests {
                 disabled: BTreeSet::new(),
             },
             &[
-                bcode_plugin::StaticBundledPlugin::new(
+                bcode_plugin::StaticBundledPlugin::from_definition(
                     FAIL_MANIFEST,
-                    bcode_plugin_sdk::static_plugin_vtable!(FailingObserver, FAIL_MANIFEST),
+                    || {
+ bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<FailingObserver>(
+ FAIL_MANIFEST,
+ <FailingObserver as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+ },
                 ),
-                bcode_plugin::StaticBundledPlugin::new(
+                bcode_plugin::StaticBundledPlugin::from_definition(
                     MANIFEST,
-                    bcode_plugin_sdk::static_plugin_vtable!(FakeObserver, MANIFEST),
+                    || {
+ bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<FakeObserver>(
+ MANIFEST,
+ <FakeObserver as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+ },
                 ),
             ],
         )
@@ -505,9 +517,18 @@ mod tests {
                 enabled: BTreeSet::from(["test.observer".into()]),
                 disabled: BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(FakeObserver, MANIFEST),
+                || {
+                    bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<
+                            FakeObserver,
+                        >(
+                            MANIFEST,
+                            <FakeObserver as bcode_plugin_sdk::RustPlugin>::component_registrations(
+                            ),
+                        )
+                        .expect("fixture definition")
+                },
             )],
         )
         .unwrap();

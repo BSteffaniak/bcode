@@ -10070,15 +10070,6 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        OpenAiCompatibleProviderPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10410,25 +10401,25 @@ mod tests {
 
     #[test]
     fn provider_runtime_survives_host_overlap_and_reopens_after_discovery() {
-        let registration = bcode_plugin_sdk::static_lifecycle::StaticConcurrentInstance::<
-            OpenAiCompatibleProviderPlugin,
-        >::new();
-        registration.activate().expect("discovery activation");
-        registration.deactivate().expect("discovery shutdown");
-        registration.activate().expect("login activation");
-        registration.activate().expect("another host activation");
-        registration.deactivate().expect("other host shutdown");
-        let lease = registration.acquire().expect("login instance");
-        let result = lease
-            .plugin()
+        // Each host scope creates a fresh shared instance; shutting down a
+        // discovery instance must not affect a concurrently active login instance.
+        let discovery = OpenAiCompatibleProviderPlugin::default();
+        discovery
+            .activate_concurrent()
+            .expect("discovery activation");
+        let login = OpenAiCompatibleProviderPlugin::default();
+        login.activate_concurrent().expect("login activation");
+        discovery
+            .deactivate_concurrent()
+            .expect("discovery shutdown");
+        let result = login
             .runtime
             .as_ref()
             .expect("runtime")
             .block_on(async { 42 })
             .expect("runtime must be live");
-        drop(lease);
         assert_eq!(result, 42);
-        registration.deactivate().expect("login shutdown");
+        login.deactivate_concurrent().expect("login shutdown");
     }
 
     #[tokio::test]
@@ -12013,7 +12004,6 @@ mod tests {
             R: serde::de::DeserializeOwned,
         {
             let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
-                diagnostics: None,
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
                     interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),

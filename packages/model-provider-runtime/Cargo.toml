@@ -25,7 +25,9 @@ serde_json           = { workspace = true }
 tokio                = { workspace = true, features = ["net", "rt", "sync", "time"] }
 
 [dev-dependencies]
-bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_fake_provider_plugin = { workspace = true, features = [
+    "script-controls",
+] }
 
 [features]
 default          = []

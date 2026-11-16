@@ -343,9 +343,8 @@ fn prepared_capture_keeps_persistent_images_and_host_occlusion() {
 fn retained_image_frame_uses_authoritative_configure_path() {
     let (view, _) = frontend();
     let resource = publish(&view);
-    let presentation = crate::plugin_tui::PluginTuiPresentation::new(
-        bcode_plugin::PluginHost::load_static_plugins(&[]).unwrap(),
-    );
+    let presentation =
+        crate::plugin_tui::PluginTuiPresentation::new(bcode_plugin::PluginHost::default());
     presentation.retain_frontend(Arc::clone(&view)).unwrap();
     presentation.begin_retained_display();
     let host = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 12, 6));

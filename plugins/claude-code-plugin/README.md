@@ -10,8 +10,9 @@ The coordinator must register workspace membership/dependencies for
 `bcode_claude_code_plugin`, `bcode_claude_code`, and `bcode_harness_models`, and add
 the plugin to the bundled inventory. Other dependencies are existing workspace
 `bcode_plugin_sdk`, `bcode_provider_auth_models`, `serde`, `serde_json`, and `tokio`.
-Static entry type: `bcode_claude_code_plugin::ClaudeCodePlugin`.
-Dynamic entrypoints are emitted by `bcode_plugin_sdk::export_plugin!`.
+Entry type: `bcode_claude_code_plugin::ClaudeCodePlugin`, exposed through the shared
+`plugin_definition()`. Dynamic packaging uses BMUX's shared packager around that same
+definition; the implementation exports no ABI symbols.
 
 Resolved plugin configuration is a typed `instances` map. Each instance has:
 

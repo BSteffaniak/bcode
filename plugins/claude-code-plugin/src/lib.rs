@@ -2020,15 +2020,6 @@ fn reply(request: &HarnessRequest, kind: HarnessServiceResponseKind) -> ServiceR
         ServiceResponse::error("invalid_response", "Harness response encoding failed")
     })
 }
-/// Return the bundled registration using the same manifest as the native plugin.
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        ClaudeCodePlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
 
 // One declaration serves bundled and native packaging; implementations export no ABI symbols.
 bcode_plugin_sdk::define_plugin!(concurrent ClaudeCodePlugin, include_str!("../bcode-plugin.toml"));

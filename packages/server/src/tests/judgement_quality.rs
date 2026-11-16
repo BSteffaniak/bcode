@@ -514,25 +514,28 @@ fn state(arm: QualityArm, feature: Feature) -> ServerState {
     *CALLS.lock().unwrap() = QualityCalls::default();
     FAIL.store(arm == QualityArm::AutoError, Ordering::SeqCst);
     let bundled = [
-        bcode_plugin::StaticBundledPlugin::new(
-            PROVIDER_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(CountedProvider, PROVIDER_MANIFEST),
-        ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(PROVIDER_MANIFEST, || {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<CountedProvider>(
+                PROVIDER_MANIFEST,
+                <CountedProvider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+            )
+            .expect("fixture definition")
+        }),
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
+            bcode_filesystem_plugin::plugin_definition,
         ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../../plugins/skills-plugin/bcode-plugin.toml"),
-            bcode_skills_plugin::static_plugin(),
+            bcode_skills_plugin::plugin_definition,
         ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../../plugins/loop-plugin/bcode-plugin.toml"),
-            bcode_loop_plugin::static_plugin(),
+            bcode_loop_plugin::plugin_definition,
         ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../../plugins/session-derivation-plugin/bcode-plugin.toml"),
-            bcode_session_derivation_plugin::static_plugin(),
+            bcode_session_derivation_plugin::plugin_definition,
         ),
     ];
     let plugins = crate::tests::load_test_plugins(

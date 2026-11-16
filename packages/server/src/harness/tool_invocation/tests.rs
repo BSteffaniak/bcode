@@ -152,19 +152,22 @@ fn fixture_server(
     sessions: bcode_session::SessionManager,
     durable: ExternalHarnessOwner,
 ) -> Arc<ServerState> {
-    let bundle = bcode_plugin::StaticBundledPlugin::new(
-        MANIFEST,
-        bcode_plugin_sdk::static_plugin_vtable!(NeverNative, MANIFEST),
-    );
+    let bundle = bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<NeverNative>(
+            MANIFEST,
+            <NeverNative as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+        )
+        .expect("fixture definition")
+    });
     let mut state = Arc::new(crate::tests::test_server_state_with_plugins(
         sessions,
         bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),
             &[
                 bundle,
-                bcode_plugin::StaticBundledPlugin::new(
+                bcode_plugin::StaticBundledPlugin::from_definition(
                     include_str!("../../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                    bcode_filesystem_plugin::static_plugin(),
+                    bcode_filesystem_plugin::plugin_definition,
                 ),
             ],
         )

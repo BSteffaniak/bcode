@@ -107,8 +107,3 @@ pub fn plugin_definition_with_host(
         host,
     )
 }
-
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(VoxPlugin, include_str!("../bcode-plugin.toml"))
-}

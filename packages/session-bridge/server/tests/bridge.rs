@@ -93,9 +93,9 @@ async fn start_daemon() -> Daemon {
     let plugins = bcode_server::load_embedded_plugins(
         &selection,
         &[
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                bcode_fake_provider_plugin::static_plugin(),
+                bcode_fake_provider_plugin::plugin_definition,
             ),
             bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),

@@ -827,20 +827,20 @@ impl TranscriptScenarioDriver for V2Driver {
             .iter()
             .map(|plugin| match plugin {
                 super::driver::ScenarioPlugin::Filesystem => {
-                    bcode_plugin::StaticBundledPlugin::new(
+                    bcode_plugin::StaticBundledPlugin::from_definition(
                         include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                        bcode_filesystem_plugin::static_plugin(),
+                        bcode_filesystem_plugin::plugin_definition,
                     )
                 }
             })
             .collect::<Vec<_>>();
-        let selected = bcode_plugin::filter_selected_static_plugins(
+        let selected = bcode_plugin::filter_selected_static_registrations(
             &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("bundled plugins select");
         self.model.chat.app.set_plugin_host(std::sync::Arc::new(
-            bcode_plugin::PluginHost::load_static_plugins(&selected).expect("bundled plugins load"),
+            crate::plugin_tui::fixture::load_static(&selected).expect("bundled plugins load"),
         ));
         let keymap = self.model.settings.keymap().shared_registry();
         self.model.chat.app.set_effective_keymap(keymap);

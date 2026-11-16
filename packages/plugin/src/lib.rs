@@ -22,20 +22,16 @@ pub use shared_activation::{
 mod shared_instance_tests;
 mod shared_invocation_host;
 mod shared_native;
+#[cfg(test)]
+mod test_backend;
 
-use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
-    AuthRegistrationCallback, CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback,
-    DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL,
-    DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL,
-    DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
-    EVENT_STATUS_OK, NativeEventContext, NativeServiceContext, PluginConfigContext, PluginEvent,
-    SERVICE_BRIDGE_MAX_REQUEST_BYTES, SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
+    CURRENT_PLUGIN_ABI_VERSION, NativeEventContext, NativeServiceContext, PluginConfigContext,
+    PluginEvent, SERVICE_BRIDGE_MAX_REQUEST_BYTES, SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
     SERVICE_BRIDGE_STATUS_CANCELLED, SERVICE_BRIDGE_STATUS_FAILED,
     SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT, SERVICE_BRIDGE_STATUS_OK,
-    SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE, SERVICE_RESPONSE_CHUNK_PREFIX, SERVICE_STATUS_OK,
-    ServiceBridgeCallback, ServiceBridgeRequest, ServiceBridgeResponse,
-    ServiceCancellationWaitCallback, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
+    SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE, ServiceBridgeRequest, ServiceBridgeResponse,
+    ServiceRequest,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
 pub use bcode_provider_auth_models::{
@@ -157,14 +153,11 @@ pub use bmux_host_adapter::{
     BcodeHostCapabilityMap, BcodePluginRuntimeMode, BmuxHostPluginAdapter,
 };
 use invocation_callbacks::{CallbackGuard, CallbackRegistration};
-use libloading::Library;
 use semver::Version;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::{CStr, CString};
-use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -176,27 +169,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 /// Default plugin manifest file name.
 pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "bcode-plugin.toml";
-
-type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
-type LifecycleFn = unsafe extern "C" fn() -> i32;
-type RegisterCommandsFn =
-    unsafe extern "C" fn(Option<CommandRegistrationCallback>, *mut std::ffi::c_void) -> i32;
-type RegisterAuthProvidersFn =
-    unsafe extern "C" fn(Option<AuthRegistrationCallback>, *mut std::ffi::c_void) -> i32;
-type StreamingServiceFn = unsafe extern "C" fn(
-    *const u8,
-    usize,
-    *mut u8,
-    usize,
-    *mut usize,
-    Option<ServiceEventCallback>,
-    *mut std::ffi::c_void,
-    Option<ServiceBridgeCallback>,
-    *mut std::ffi::c_void,
-    Option<ServiceCancellationWaitCallback>,
-    *mut std::ffi::c_void,
-) -> i32;
-type EventFn = unsafe extern "C" fn(*const u8, usize) -> i32;
 
 /// Sensitive invocation-only credential resolver. Never stores or serializes secret material.
 pub type SensitiveCredentialResolver = Arc<
@@ -210,7 +182,6 @@ pub type SensitiveCredentialResolver = Arc<
 
 struct ServiceCallbackState<'a> {
     on_event: &'a mut dyn FnMut(Vec<u8>),
-    response_chunks: Vec<Vec<u8>>,
 }
 
 // Bridge calls can synchronously wait for nested work that emits service events.
@@ -233,23 +204,6 @@ extern "C" fn service_event_callback(
     user_data: *mut std::ffi::c_void,
 ) {
     if payload_ptr.is_null() || user_data.is_null() {
-        diagnostics::record_loss(user_data as usize, "invalid_event_callback_arguments");
-        return;
-    }
-    // Diagnostic callbacks outlive the invocation stack only through their own retained lease.
-    // Inspect the fixed discriminator before allocating or acquiring ordinary callback state.
-    let bytes = unsafe { std::slice::from_raw_parts(payload_ptr, payload_len) };
-    if let Some(bytes) = bytes
-        .strip_prefix(bcode_plugin_sdk::diagnostics::DIAGNOSTIC_EVENT_PREFIX)
-        .filter(|_| diagnostics::negotiated(user_data as usize))
-    {
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            diagnostics::event(user_data as usize, bytes);
-        }))
-        .is_err()
-        {
-            diagnostics::record_loss(user_data as usize, "event_callback_panicked");
-        }
         return;
     }
     let Some(guard) = CallbackGuard::acquire(user_data) else {
@@ -261,11 +215,7 @@ extern "C" fn service_event_callback(
         // keeps it alive until registration closure drains this callback.
         unsafe {
             guard.with_state::<ServiceCallbackState<'_>, _>(|state| {
-                if let Some(chunk) = payload.strip_prefix(SERVICE_RESPONSE_CHUNK_PREFIX) {
-                    state.response_chunks.push(chunk.to_vec());
-                } else {
-                    (state.on_event)(payload);
-                }
+                (state.on_event)(payload);
             });
         }
     }));
@@ -284,41 +234,7 @@ extern "C" fn service_bridge_callback(
         || user_data.is_null()
         || request_len > SERVICE_BRIDGE_MAX_REQUEST_BYTES
     {
-        diagnostics::record_loss(user_data as usize, "invalid_control_callback_arguments");
         return SERVICE_BRIDGE_STATUS_INVALID_ARGUMENT;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
-    if let Some(bytes) = bytes
-        .strip_prefix(bcode_plugin_sdk::diagnostics::DIAGNOSTIC_CONTROL_PREFIX)
-        .filter(|_| diagnostics::negotiated(user_data as usize))
-    {
-        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Preflight before Acquire/Release or payload retention can change ownership.
-            // Legacy lease replies retain 256 bytes; payload replies require 4096.
-            let required_capacity = diagnostics::control_response_capacity(bytes);
-            if output_ptr.is_null() || output_capacity < required_capacity {
-                diagnostics::record_loss(user_data as usize, "control_response_unavailable");
-                return SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE;
-            }
-            let Some(status) = diagnostics::control(user_data as usize, bytes) else {
-                return SERVICE_BRIDGE_STATUS_CANCELLED;
-            };
-            let Ok(encoded) = serde_json::to_vec(&status) else {
-                return SERVICE_BRIDGE_STATUS_FAILED;
-            };
-            if output_ptr.is_null() || encoded.len() > output_capacity {
-                return SERVICE_BRIDGE_STATUS_RESPONSE_TOO_LARGE;
-            }
-            unsafe {
-                *output_len = encoded.len();
-                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-            }
-            SERVICE_BRIDGE_STATUS_OK
-        }))
-        .unwrap_or_else(|_| {
-            diagnostics::record_loss(user_data as usize, "control_callback_panicked");
-            SERVICE_BRIDGE_STATUS_FAILED
-        });
     }
     let Some(guard) = CallbackGuard::acquire(user_data) else {
         return SERVICE_BRIDGE_STATUS_CANCELLED;
@@ -441,28 +357,6 @@ extern "C" fn native_product_bridge_callback(
         SERVICE_BRIDGE_STATUS_CANCELLED => NATIVE_BRIDGE_CANCELLED_BEFORE_DISPATCH,
         status => status,
     }
-}
-
-extern "C" fn service_cancellation_wait_callback(
-    timeout_ms: u64,
-    user_data: *mut std::ffi::c_void,
-) -> bool {
-    if user_data.is_null() {
-        return false;
-    }
-    let Some(guard) = CallbackGuard::acquire(user_data) else {
-        return false;
-    };
-    // SAFETY: invoke_service_with_bridge registers ServiceCancellation for this handle and keeps
-    // it alive until registration closure drains this callback. Clone under the mutable gate,
-    // but do not hold it while waiting: independent cancellation polls must remain responsive.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cancellation = unsafe {
-            guard.with_state::<bcode_plugin_sdk::ServiceCancellation, _>(|value| value.clone())
-        };
-        cancellation.wait_cancelled(Duration::from_millis(timeout_ms))
-    }))
-    .unwrap_or(true)
 }
 
 /// Stable plugin-owned workflow template contribution version.
@@ -978,7 +872,7 @@ pub fn selected_plugin_manifests(
     };
     let mut manifests = Vec::new();
     let mut static_ids = BTreeSet::new();
-    for (manifest, _) in filter_selected_static_plugins(static_plugins, selection)? {
+    for (manifest, _) in filter_selected_static_registrations(static_plugins, selection)? {
         static_ids.insert(manifest.id.clone());
         match check_manifest_before_load(&manifest) {
             Ok(()) => manifests.push(manifest),
@@ -1294,18 +1188,6 @@ pub enum PluginRuntime {
 pub struct NativePluginRuntime {
     pub abi_version: u16,
     pub library: PathBuf,
-    #[serde(default = "default_manifest_symbol")]
-    pub manifest_symbol: String,
-    #[serde(default = "default_activate_symbol")]
-    pub activate_symbol: String,
-    #[serde(default = "default_deactivate_symbol")]
-    pub deactivate_symbol: String,
-    #[serde(default = "default_streaming_service_symbol")]
-    pub streaming_service_symbol: String,
-    #[serde(default = "default_register_auth_providers_symbol")]
-    pub register_auth_providers_symbol: String,
-    #[serde(default = "default_event_symbol")]
-    pub event_symbol: String,
 }
 
 impl NativePluginRuntime {
@@ -1574,33 +1456,22 @@ pub enum PluginDefaultActivation {
 }
 
 /// Statically bundled plugin registration.
+///
+/// A registration pairs one trusted declaration with the plugin's shared
+/// definition factory. The factory is authoritative: identity or activation
+/// failures are returned to the caller and never fall back to another
+/// implementation.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticBundledPlugin {
     pub manifest_toml: &'static str,
-    /// Explicit legacy implementation, absent for definition-only registrations.
-    pub vtable: Option<StaticPluginVtable>,
-    definition: Option<fn() -> bcode_plugin_sdk::definition::PluginDefinition>,
+    definition: fn() -> bcode_plugin_sdk::definition::PluginDefinition,
+    cli_registration: Option<fn() -> bcode_plugin_sdk::StaticCliRegistration>,
     package_root: Option<&'static str>,
     default_activation: PluginDefaultActivation,
 }
 
 impl StaticBundledPlugin {
-    /// Create a statically bundled plugin registration included in distribution defaults.
-    #[must_use]
-    pub const fn new(manifest_toml: &'static str, vtable: StaticPluginVtable) -> Self {
-        Self {
-            manifest_toml,
-            vtable: Some(vtable),
-            definition: None,
-            package_root: None,
-            default_activation: PluginDefaultActivation::Enabled,
-        }
-    }
-
-    /// Register a shared implementation without a legacy vtable.
-    ///
-    /// The selected factory is authoritative. Identity or activation failures are
-    /// returned to the caller and never fall back to another implementation.
+    /// Register a shared implementation included in distribution defaults.
     #[must_use]
     pub const fn from_definition(
         manifest_toml: &'static str,
@@ -1608,20 +1479,20 @@ impl StaticBundledPlugin {
     ) -> Self {
         Self {
             manifest_toml,
-            vtable: None,
-            definition: Some(definition),
+            definition,
+            cli_registration: None,
             package_root: None,
             default_activation: PluginDefaultActivation::Enabled,
         }
     }
 
-    /// Attach the shared implementation factory used for production dispatch.
+    /// Attach the plugin's Rust-native CLI contribution for bundled hosts.
     #[must_use]
-    pub const fn with_definition(
+    pub const fn with_cli_registration(
         mut self,
-        definition: fn() -> bcode_plugin_sdk::definition::PluginDefinition,
+        registration: fn() -> bcode_plugin_sdk::StaticCliRegistration,
     ) -> Self {
-        self.definition = Some(definition);
+        self.cli_registration = Some(registration);
         self
     }
 
@@ -1648,12 +1519,16 @@ impl StaticBundledPlugin {
         self.default_activation
     }
 
+    /// Return this registration's shared definition factory.
+    #[must_use]
+    pub const fn definition(self) -> fn() -> bcode_plugin_sdk::definition::PluginDefinition {
+        self.definition
+    }
+
     /// Return this plugin's Rust-native CLI contribution, when registered.
     #[must_use]
     pub fn cli_registration(self) -> Option<bcode_plugin_sdk::StaticCliRegistration> {
-        self.vtable
-            .and_then(|vtable| vtable.cli_registration)
-            .map(|registration| registration())
+        self.cli_registration.map(|registration| registration())
     }
 }
 
@@ -1661,59 +1536,8 @@ impl StaticBundledPlugin {
 enum LoadedPluginBackend {
     Shared(Arc<shared_instance::SharedInstance>),
     SharedNative(Arc<shared_native::SharedNative>),
-    Dynamic {
-        _library: ManuallyDrop<Library>,
-        activate: LifecycleFn,
-        register_commands: Option<RegisterCommandsFn>,
-        register_auth_providers: RegisterAuthProvidersFn,
-        deactivate: LifecycleFn,
-        invoke_service_streaming: StreamingServiceFn,
-        handle_event: EventFn,
-    },
-    Static {
-        vtable: StaticPluginVtable,
-    },
-}
-
-struct RegistrationContext<'a> {
-    plugin_id: &'a str,
-    registry: &'a mut AuthProviderRegistry,
-    error: Option<AuthProviderRegistryError>,
-}
-
-extern "C" fn register_auth_provider_callback(
-    payload: *const u8,
-    payload_len: usize,
-    user_data: *mut std::ffi::c_void,
-) {
-    if payload.is_null() || user_data.is_null() {
-        return;
-    }
-    let Some(guard) = CallbackGuard::acquire(user_data) else {
-        return;
-    };
-    let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
-    let contribution = serde_json::from_slice::<AuthProviderContribution>(bytes);
-    // SAFETY: register_auth_providers registers this exact state type and keeps it alive
-    // until callback registration closure drains admitted callbacks.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        guard.with_state::<RegistrationContext<'_>, _>(|context| {
-            if context.error.is_some() {
-                return;
-            }
-            let Ok(contribution) = contribution else {
-                context.error = Some(AuthProviderRegistryError::InvalidContribution(
-                    AuthContractError::InvalidFlowShape(
-                        "authentication registration payload did not decode",
-                    ),
-                ));
-                return;
-            };
-            if let Err(error) = context.registry.register(context.plugin_id, contribution) {
-                context.error = Some(error);
-            }
-        });
-    }));
+    #[cfg(test)]
+    Test(test_backend::TestBackend),
 }
 
 /// Explicit frontend artifact selection. No backend artifact or bundled lookup
@@ -1743,8 +1567,7 @@ impl LoadedPlugin {
     /// Retain extension access to this exact selected shared instance.
     ///
     /// # Errors
-    /// Returns an error for legacy/native adapters not yet exposing an extension port,
-    /// or for an inactive selected instance. No bundled substitute is selected.
+    /// Returns an error for an inactive selected instance. No bundled substitute is selected.
     pub fn product_extensions(
         &self,
     ) -> Result<bcode_plugin_sdk::definition::ProductExtensions, PluginLoadError> {
@@ -1753,7 +1576,8 @@ impl LoadedPlugin {
             LoadedPluginBackend::SharedNative(instance) => Ok(
                 bcode_plugin_sdk::definition::ProductExtensions::new(instance.clone(), None),
             ),
-            _ => Err(shared_instance::error(
+            #[cfg(test)]
+            LoadedPluginBackend::Test(_) => Err(shared_instance::error(
                 &self.manifest.id,
                 "selected_extension_port_unavailable",
             )),
@@ -1764,14 +1588,15 @@ impl LoadedPlugin {
     /// Frontend. Backend observers never become implicit frontend factories.
     ///
     /// # Errors
-    /// Returns an error for a backend/legacy selection or inactive component.
+    /// Returns an error for a backend selection or inactive component.
     pub fn frontend_extensions(
         &self,
     ) -> Result<bcode_plugin_sdk::definition::ProductExtensions, PluginLoadError> {
         let role = match &self.backend {
             LoadedPluginBackend::Shared(instance) => instance.role(),
             LoadedPluginBackend::SharedNative(instance) => instance.role(),
-            _ => {
+            #[cfg(test)]
+            LoadedPluginBackend::Test(_) => {
                 return Err(shared_instance::error(
                     &self.manifest.id,
                     "explicit_frontend_deployment_required",
@@ -1790,7 +1615,7 @@ impl LoadedPlugin {
     /// Return resource authority for the actual selected frontend activation.
     ///
     /// # Errors
-    /// Returns an error for backend/legacy selection, closure or unsupported native authority.
+    /// Returns an error for backend selection, closure or unsupported native authority.
     pub fn frontend_activation_scope(
         &self,
     ) -> Result<bmux_plugin_runtime::ActivationScope, PluginLoadError> {
@@ -1810,7 +1635,8 @@ impl LoadedPlugin {
         match &self.backend {
             LoadedPluginBackend::Shared(instance) => instance.failures(),
             LoadedPluginBackend::SharedNative(instance) => instance.failures(),
-            _ => Vec::new(),
+            #[cfg(test)]
+            LoadedPluginBackend::Test(_) => Vec::new(),
         }
     }
 
@@ -1831,26 +1657,18 @@ impl LoadedPlugin {
     ///
     /// Returns an error if the plugin activation hook returns a non-zero code.
     pub fn activate(&self) -> Result<(), PluginLoadError> {
-        if let LoadedPluginBackend::Shared(instance) = &self.backend {
-            instance.validate_selection(&self.config, &self.manifest.id)?;
-            return instance.activate(&self.manifest.id);
-        }
-        let code = match &self.backend {
-            LoadedPluginBackend::SharedNative(instance) => {
-                return instance.activate(&self.manifest.id);
+        match &self.backend {
+            LoadedPluginBackend::Shared(instance) => {
+                instance.validate_selection(&self.config, &self.manifest.id)?;
+                instance.activate(&self.manifest.id)
             }
-            LoadedPluginBackend::Shared(_) => unreachable!("shared dispatch handled above"),
-            LoadedPluginBackend::Dynamic { activate, .. } => unsafe { activate() },
-            LoadedPluginBackend::Static { vtable } => (vtable.activate)(vtable.instance),
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(PluginLoadError::LifecycleFailed {
-                plugin_id: self.manifest.id.clone(),
-                hook: "activate",
-                code,
-            })
+            LoadedPluginBackend::SharedNative(instance) => instance.activate(&self.manifest.id),
+            #[cfg(test)]
+            LoadedPluginBackend::Test(backend) => test_backend::TestBackend::lifecycle(
+                &self.manifest.id,
+                "activate",
+                (backend.activate)(),
+            ),
         }
     }
 
@@ -1863,76 +1681,22 @@ impl LoadedPlugin {
         &self,
         registry: &mut bcode_command::CommandRegistry,
     ) -> Result<(), PluginLoadError> {
-        extern "C" fn register_command_callback(
-            payload: *const u8,
-            payload_len: usize,
-            user_data: *mut std::ffi::c_void,
-        ) {
-            if payload.is_null() || user_data.is_null() {
-                return;
-            }
-            let Some(guard) = CallbackGuard::acquire(user_data) else {
-                return;
-            };
-            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
-            let Ok(contribution) =
-                serde_json::from_slice::<bcode_command::CommandContribution>(bytes)
-            else {
-                return;
-            };
-            // SAFETY: register_commands registers this exact state type and keeps it alive until
-            // callback registration closure drains admitted callbacks.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                guard.with_state::<bcode_command::CommandRegistry, _>(|registry| {
-                    registry.register(contribution);
-                });
-            }));
-        }
-
-        if let LoadedPluginBackend::Shared(instance) = &self.backend {
-            for contribution in instance.snapshot(&self.manifest.id)?.commands {
-                let contribution = serde_json::from_slice(&contribution)
-                    .map_err(PluginLoadError::ServiceDecode)?;
-                registry.register(contribution);
-            }
-            return Ok(());
-        }
-        let callback_registration = CallbackRegistration::new(registry);
-        let user_data = callback_registration.user_data();
-        let code = match &self.backend {
+        let commands = match &self.backend {
+            LoadedPluginBackend::Shared(instance) => instance.snapshot(&self.manifest.id)?.commands,
             LoadedPluginBackend::SharedNative(instance) => {
-                for contribution in instance.snapshot(&self.manifest.id)?.commands {
-                    registry.register(
-                        serde_json::from_slice(&contribution)
-                            .map_err(PluginLoadError::ServiceDecode)?,
-                    );
-                }
-                return Ok(());
+                instance.snapshot(&self.manifest.id)?.commands
             }
-            LoadedPluginBackend::Shared(_) => unreachable!("shared registration handled above"),
-            LoadedPluginBackend::Dynamic {
-                register_commands: Some(register_commands),
-                ..
-            } => unsafe { register_commands(Some(register_command_callback), user_data) },
-            LoadedPluginBackend::Dynamic {
-                register_commands: None,
-                ..
-            } => 0,
-            LoadedPluginBackend::Static { vtable } => {
-                vtable.register_commands.map_or(0, |register_commands| {
-                    register_commands(vtable.instance, Some(register_command_callback), user_data)
-                })
+            #[cfg(test)]
+            LoadedPluginBackend::Test(backend) => {
+                return backend.register_commands(&self.manifest.id, registry);
             }
         };
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(PluginLoadError::LifecycleFailed {
-                plugin_id: self.manifest.id.clone(),
-                hook: "register_commands",
-                code,
-            })
+        for contribution in commands {
+            registry.register(
+                serde_json::from_slice(&contribution).map_err(PluginLoadError::ServiceDecode)?,
+            );
         }
+        Ok(())
     }
 
     /// Register plugin-owned authentication providers through the activation registration hook.
@@ -1945,72 +1709,27 @@ impl LoadedPlugin {
         &self,
         registry: &mut AuthProviderRegistry,
     ) -> Result<(), PluginLoadError> {
-        if let LoadedPluginBackend::Shared(instance) = &self.backend {
-            for contribution in instance.snapshot(&self.manifest.id)?.auth_providers {
-                let contribution = serde_json::from_slice(&contribution)
-                    .map_err(PluginLoadError::ServiceDecode)?;
-                registry
-                    .register(&self.manifest.id, contribution)
-                    .map_err(|source| PluginLoadError::AuthRegistration {
-                        plugin_id: self.manifest.id.clone(),
-                        source,
-                    })?;
+        let auth_providers = match &self.backend {
+            LoadedPluginBackend::Shared(instance) => {
+                instance.snapshot(&self.manifest.id)?.auth_providers
             }
-            return Ok(());
-        }
-        let mut context = RegistrationContext {
-            plugin_id: &self.manifest.id,
-            registry,
-            error: None,
-        };
-        let callback_registration = CallbackRegistration::new(&mut context);
-        let user_data = callback_registration.user_data();
-        let code = match &self.backend {
             LoadedPluginBackend::SharedNative(instance) => {
-                for contribution in instance.snapshot(&self.manifest.id)?.auth_providers {
-                    let contribution = serde_json::from_slice(&contribution)
-                        .map_err(PluginLoadError::ServiceDecode)?;
-                    registry
-                        .register(&self.manifest.id, contribution)
-                        .map_err(|source| PluginLoadError::AuthRegistration {
-                            plugin_id: self.manifest.id.clone(),
-                            source,
-                        })?;
-                }
-                return Ok(());
+                instance.snapshot(&self.manifest.id)?.auth_providers
             }
-            LoadedPluginBackend::Shared(_) => unreachable!("shared registration handled above"),
-            LoadedPluginBackend::Dynamic {
-                register_auth_providers,
-                ..
-            } => unsafe {
-                register_auth_providers(Some(register_auth_provider_callback), user_data)
-            },
-            LoadedPluginBackend::Static { vtable } => {
-                vtable
-                    .register_auth_providers
-                    .map_or(0, |register_auth_providers| {
-                        register_auth_providers(
-                            vtable.instance,
-                            Some(register_auth_provider_callback),
-                            user_data,
-                        )
-                    })
+            #[cfg(test)]
+            LoadedPluginBackend::Test(backend) => {
+                return backend.register_auth_providers(&self.manifest.id, registry);
             }
         };
-        if code != 0 {
-            return Err(PluginLoadError::LifecycleFailed {
-                plugin_id: self.manifest.id.clone(),
-                hook: "register_auth_providers",
-                code,
-            });
-        }
-        drop(callback_registration);
-        if let Some(source) = context.error {
-            return Err(PluginLoadError::AuthRegistration {
-                plugin_id: self.manifest.id.clone(),
-                source,
-            });
+        for contribution in auth_providers {
+            let contribution =
+                serde_json::from_slice(&contribution).map_err(PluginLoadError::ServiceDecode)?;
+            registry
+                .register(&self.manifest.id, contribution)
+                .map_err(|source| PluginLoadError::AuthRegistration {
+                    plugin_id: self.manifest.id.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -2021,25 +1740,15 @@ impl LoadedPlugin {
     ///
     /// Returns an error if the plugin deactivation hook returns a non-zero code.
     pub fn deactivate(&self) -> Result<(), PluginLoadError> {
-        if let LoadedPluginBackend::Shared(instance) = &self.backend {
-            return instance.deactivate(&self.manifest.id);
-        }
-        let code = match &self.backend {
-            LoadedPluginBackend::SharedNative(instance) => {
-                return instance.deactivate(&self.manifest.id);
-            }
-            LoadedPluginBackend::Shared(_) => unreachable!("shared dispatch handled above"),
-            LoadedPluginBackend::Dynamic { deactivate, .. } => unsafe { deactivate() },
-            LoadedPluginBackend::Static { vtable } => (vtable.deactivate)(vtable.instance),
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(PluginLoadError::LifecycleFailed {
-                plugin_id: self.manifest.id.clone(),
-                hook: "deactivate",
-                code,
-            })
+        match &self.backend {
+            LoadedPluginBackend::Shared(instance) => instance.deactivate(&self.manifest.id),
+            LoadedPluginBackend::SharedNative(instance) => instance.deactivate(&self.manifest.id),
+            #[cfg(test)]
+            LoadedPluginBackend::Test(backend) => test_backend::TestBackend::lifecycle(
+                &self.manifest.id,
+                "deactivate",
+                (backend.deactivate)(),
+            ),
         }
     }
 
@@ -2160,7 +1869,6 @@ impl LoadedPlugin {
         let secrets =
             self.resolve_service_secrets(config, &interface_id, &operation, credentials.is_some())?;
         let context = NativeServiceContext {
-            diagnostics: None,
             plugin_id: self.manifest.id.clone(),
             request: ServiceRequest {
                 interface_id,
@@ -2179,19 +1887,7 @@ impl LoadedPlugin {
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
             transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
         };
-        if matches!(
-            &self.backend,
-            LoadedPluginBackend::SharedNative(_) | LoadedPluginBackend::Shared(_)
-        ) {
-            return self.invoke_shared_service(
-                context,
-                credentials,
-                &mut on_event,
-                &mut on_bridge,
-                cancellation,
-            );
-        }
-        self.invoke_legacy_service(
+        self.invoke_shared_service(
             context,
             credentials,
             &mut on_event,
@@ -2211,155 +1907,70 @@ impl LoadedPlugin {
         ) -> Result<ServiceBridgeResponse, String>,
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<ServiceResponse, PluginLoadError> {
-        if let LoadedPluginBackend::SharedNative(instance) = &self.backend {
-            context.cancellation = cancellation.clone();
-            let mut event_state = ServiceCallbackState {
-                on_event,
-                response_chunks: Vec::new(),
-            };
-            let events = CallbackRegistration::new(&mut event_state);
-            let mut bridge_state = ServiceBridgeCallbackState {
-                credentials,
-                credential_reads: 0,
-                on_bridge,
-                cancellation: cancellation.clone(),
-            };
-            let bridge = CallbackRegistration::new(&mut bridge_state);
-            context.events = bcode_plugin_sdk::ServiceEventEmitter::new(
-                Some(service_event_callback),
-                events.user_data(),
-            );
-            context.bridge = bcode_plugin_sdk::ServiceBridge::new(
-                Some(native_product_bridge_callback),
-                bridge.user_data(),
-                // Real cancellation is checked by the callback before effects.
-                // The SDK façade must not erase a successful post-effect reply.
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            );
-            let response = instance.invoke(&context);
-            drop(bridge);
-            drop(events);
-            return response;
-        }
-        if let LoadedPluginBackend::Shared(instance) = &self.backend {
-            instance.validate_selection(&self.config, &self.manifest.id)?;
-            context.cancellation = cancellation.clone();
-            return instance.invoke(context, |product, mut context, invocation| {
-                let mut event_state = ServiceCallbackState {
-                    on_event,
-                    response_chunks: Vec::new(),
-                };
-                let events = CallbackRegistration::scoped(&mut event_state, invocation);
+        match &self.backend {
+            LoadedPluginBackend::SharedNative(instance) => {
+                context.cancellation = cancellation.clone();
+                let mut event_state = ServiceCallbackState { on_event };
+                let events = CallbackRegistration::new(&mut event_state);
                 let mut bridge_state = ServiceBridgeCallbackState {
                     credentials,
                     credential_reads: 0,
                     on_bridge,
                     cancellation: cancellation.clone(),
                 };
-                let bridge = CallbackRegistration::scoped(&mut bridge_state, invocation);
+                let bridge = CallbackRegistration::new(&mut bridge_state);
                 context.events = bcode_plugin_sdk::ServiceEventEmitter::new(
                     Some(service_event_callback),
                     events.user_data(),
                 );
                 context.bridge = bcode_plugin_sdk::ServiceBridge::new(
-                    Some(service_bridge_callback),
+                    Some(native_product_bridge_callback),
                     bridge.user_data(),
-                    cancellation.clone(),
+                    // Real cancellation is checked by the callback before effects.
+                    // The SDK façade must not erase a successful post-effect reply.
+                    bcode_plugin_sdk::ServiceCancellation::default(),
                 );
-                let response = product.invoke(context);
-                // RAII drains callbacks on both return and unwind, before the runtime
-                // invocation's author admission can retire or deactivation can proceed.
+                let response = instance.invoke(&context);
                 drop(bridge);
                 drop(events);
                 response
-            });
+            }
+            LoadedPluginBackend::Shared(instance) => {
+                instance.validate_selection(&self.config, &self.manifest.id)?;
+                context.cancellation = cancellation.clone();
+                instance.invoke(context, |product, mut context, invocation| {
+                    let mut event_state = ServiceCallbackState { on_event };
+                    let events = CallbackRegistration::scoped(&mut event_state, invocation);
+                    let mut bridge_state = ServiceBridgeCallbackState {
+                        credentials,
+                        credential_reads: 0,
+                        on_bridge,
+                        cancellation: cancellation.clone(),
+                    };
+                    let bridge = CallbackRegistration::scoped(&mut bridge_state, invocation);
+                    context.events = bcode_plugin_sdk::ServiceEventEmitter::new(
+                        Some(service_event_callback),
+                        events.user_data(),
+                    );
+                    context.bridge = bcode_plugin_sdk::ServiceBridge::new(
+                        Some(service_bridge_callback),
+                        bridge.user_data(),
+                        cancellation.clone(),
+                    );
+                    let response = product.invoke(context);
+                    // RAII drains callbacks on both return and unwind, before the runtime
+                    // invocation's author admission can retire or deactivation can proceed.
+                    drop(bridge);
+                    drop(events);
+                    response
+                })
+            }
+            #[cfg(test)]
+            LoadedPluginBackend::Test(backend) => {
+                let _ = (credentials, on_bridge, cancellation);
+                Ok(backend.invoke(context, on_event))
+            }
         }
-        Err(shared_instance::error(
-            &self.manifest.id,
-            "shared_backend_required",
-        ))
-    }
-
-    fn invoke_legacy_service(
-        &self,
-        mut context: NativeServiceContext,
-        credentials: Option<SensitiveCredentialResolver>,
-        on_event: &mut dyn FnMut(Vec<u8>),
-        on_bridge: &mut dyn FnMut(
-            ServiceBridgeRequest,
-            bcode_plugin_sdk::ServiceCancellation,
-        ) -> Result<ServiceBridgeResponse, String>,
-        cancellation: &bcode_plugin_sdk::ServiceCancellation,
-    ) -> Result<ServiceResponse, PluginLoadError> {
-        let output_capacity = 1024 * 1024;
-        let mut output_len = 0_usize;
-        let mut output = vec![0_u8; output_capacity];
-        let mut callback_state = ServiceCallbackState {
-            on_event,
-            response_chunks: Vec::new(),
-        };
-        let callback_registration = CallbackRegistration::new(&mut callback_state);
-        let event_user_data = callback_registration.user_data();
-        let mut bridge_state = ServiceBridgeCallbackState {
-            credentials,
-            credential_reads: 0,
-            on_bridge,
-            cancellation: cancellation.clone(),
-        };
-        let bridge_registration = CallbackRegistration::new(&mut bridge_state);
-        let bridge_user_data = bridge_registration.user_data();
-        // The diagnostic side channel is keyed by the event callback handle. The SDK sends
-        // diagnostic control frames through the bridge callback function with that same key;
-        // both callbacks intercept negotiated diagnostic frames before touching ordinary
-        // invocation state, so the distinct bridge handle never owns diagnostic traffic.
-        let diagnostic_registration = diagnostics::DiagnosticRegistration::new(
-            event_user_data,
-            bcode_xray::CaptureContext::current(),
-        );
-        context.diagnostics = diagnostic_registration
-            .as_ref()
-            .and_then(diagnostics::DiagnosticRegistration::negotiation);
-        let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
-        let mut cancellation_callback_state = cancellation.clone();
-        let cancellation_registration = CallbackRegistration::new(&mut cancellation_callback_state);
-        let cancellation_user_data = cancellation_registration.user_data();
-        let status = self.invoke_service_raw(
-            input.as_ptr(),
-            input.len(),
-            output.as_mut_ptr(),
-            output.len(),
-            &raw mut output_len,
-            Some(service_event_callback),
-            event_user_data,
-            Some(service_bridge_callback),
-            bridge_user_data,
-            Some(service_cancellation_wait_callback),
-            cancellation_user_data,
-        );
-        // End callback authority before reading response state. Native producers may still
-        // hold copied handles when the entry point returns; closure drains admitted callbacks.
-        drop(bridge_registration);
-        drop(cancellation_registration);
-        drop(callback_registration);
-        if output_len > output_capacity {
-            return Err(PluginLoadError::ServiceResponseTooLarge {
-                plugin_id: self.manifest.id.clone(),
-                capacity: output_capacity,
-                required: output_len,
-            });
-        }
-        if status != SERVICE_STATUS_OK {
-            return Err(PluginLoadError::ServiceInvokeFailed {
-                plugin_id: self.manifest.id.clone(),
-                code: status,
-            });
-        }
-        if callback_state.response_chunks.is_empty() {
-            output.truncate(output_len);
-        } else {
-            output = callback_state.response_chunks.concat();
-        }
-        serde_json::from_slice(&output).map_err(PluginLoadError::ServiceDecode)
     }
 
     /// Handle a host event for this plugin.
@@ -2379,24 +1990,11 @@ impl LoadedPlugin {
                 payload,
             },
         };
-        let input = serde_json::to_vec(&context).map_err(PluginLoadError::EventEncode)?;
-        let status = match &self.backend {
-            LoadedPluginBackend::SharedNative(instance) => return instance.event(context),
-            LoadedPluginBackend::Shared(instance) => return instance.event(context),
-            LoadedPluginBackend::Dynamic { handle_event, .. } => unsafe {
-                handle_event(input.as_ptr(), input.len())
-            },
-            LoadedPluginBackend::Static { vtable } => {
-                (vtable.handle_event)(vtable.instance, input.as_ptr(), input.len())
-            }
-        };
-        if status == EVENT_STATUS_OK {
-            Ok(())
-        } else {
-            Err(PluginLoadError::EventHandlerFailed {
-                plugin_id: self.manifest.id.clone(),
-                code: status,
-            })
+        match &self.backend {
+            LoadedPluginBackend::SharedNative(instance) => instance.event(context),
+            LoadedPluginBackend::Shared(instance) => instance.event(context),
+            #[cfg(test)]
+            LoadedPluginBackend::Test(backend) => backend.handle_event(&context),
         }
     }
 
@@ -2424,64 +2022,7 @@ impl LoadedPlugin {
     /// Return true while the dynamic library is retained by this loaded plugin.
     #[must_use]
     pub const fn is_library_retained(&self) -> bool {
-        matches!(
-            self.backend,
-            LoadedPluginBackend::Dynamic { .. } | LoadedPluginBackend::SharedNative(_)
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn invoke_service_raw(
-        &self,
-        input_ptr: *const u8,
-        input_len: usize,
-        output_ptr: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-        event_callback: Option<ServiceEventCallback>,
-        event_user_data: *mut std::ffi::c_void,
-        bridge_callback: Option<ServiceBridgeCallback>,
-        bridge_user_data: *mut std::ffi::c_void,
-        cancellation_callback: Option<ServiceCancellationWaitCallback>,
-        cancellation_user_data: *mut std::ffi::c_void,
-    ) -> i32 {
-        match &self.backend {
-            LoadedPluginBackend::SharedNative(_) | LoadedPluginBackend::Shared(_) => {
-                SERVICE_BRIDGE_STATUS_FAILED
-            }
-            LoadedPluginBackend::Dynamic {
-                invoke_service_streaming,
-                ..
-            } => unsafe {
-                invoke_service_streaming(
-                    input_ptr,
-                    input_len,
-                    output_ptr,
-                    output_capacity,
-                    output_len,
-                    event_callback,
-                    event_user_data,
-                    bridge_callback,
-                    bridge_user_data,
-                    cancellation_callback,
-                    cancellation_user_data,
-                )
-            },
-            LoadedPluginBackend::Static { vtable } => (vtable.invoke_service_streaming)(
-                vtable.instance,
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-                event_callback,
-                event_user_data,
-                bridge_callback,
-                bridge_user_data,
-                cancellation_callback,
-                cancellation_user_data,
-            ),
-        }
+        matches!(self.backend, LoadedPluginBackend::SharedNative(_))
     }
 }
 
@@ -2545,24 +2086,6 @@ pub enum PluginLoadError {
         /// Resolved library path.
         path: PathBuf,
     },
-    #[error("failed to load native library {path}: {source}")]
-    LibraryLoad {
-        path: PathBuf,
-        source: libloading::Error,
-    },
-    #[error("failed to load symbol '{symbol}' from {library}: {source}")]
-    SymbolLoad {
-        library: PathBuf,
-        symbol: String,
-        source: libloading::Error,
-    },
-    #[error("plugin manifest export returned null for library {0}")]
-    NullManifest(PathBuf),
-    #[error("plugin manifest export from {library} was invalid UTF-8: {source}")]
-    ManifestUtf8 {
-        library: PathBuf,
-        source: std::str::Utf8Error,
-    },
     #[error("plugin manifest export from {library} did not parse: {source}")]
     ExportedManifestParse {
         library: PathBuf,
@@ -2602,14 +2125,6 @@ pub enum PluginLoadError {
     ServiceEncode(#[source] serde_json::Error),
     #[error("failed to decode service response: {0}")]
     ServiceDecode(#[source] serde_json::Error),
-    #[error(
-        "plugin '{plugin_id}' service response exceeded {capacity} byte buffer ({required} bytes required)"
-    )]
-    ServiceResponseTooLarge {
-        plugin_id: String,
-        capacity: usize,
-        required: usize,
-    },
     #[error("plugin '{plugin_id}' service invocation failed with code {code}")]
     ServiceInvokeFailed { plugin_id: String, code: i32 },
     #[error("plugin '{plugin_id}' service invocation timed out after {timeout_ms} ms")]
@@ -2781,7 +2296,7 @@ fn parse_static_bundled_manifest(
     Ok(manifest)
 }
 
-/// Select complete static registrations without requiring a legacy vtable.
+/// Select complete static registrations according to an enable/disable policy.
 ///
 /// # Errors
 ///
@@ -2796,32 +2311,6 @@ pub fn filter_selected_static_registrations(
         .filter(|plugin| match plugin {
             Ok((manifest, _)) => selection.is_enabled(&manifest.id),
             Err(_) => true,
-        })
-        .collect()
-}
-
-/// Filter explicit legacy static registrations according to an enable/disable policy.
-///
-/// Use [`filter_selected_static_registrations`] to retain shared definition factories.
-///
-/// # Errors
-///
-/// Returns an error when a static plugin manifest cannot be parsed or a selected
-/// registration has no legacy vtable.
-pub fn filter_selected_static_plugins(
-    plugins: &[StaticBundledPlugin],
-    selection: &PluginSelection,
-) -> Result<Vec<(PluginManifest, StaticPluginVtable)>, PluginLoadError> {
-    filter_selected_static_registrations(plugins, selection)?
-        .into_iter()
-        .map(|(manifest, plugin)| {
-            let vtable = plugin.vtable.ok_or_else(|| {
-                shared_instance::error(
-                    &manifest.id,
-                    "definition_only_registration_requires_shared_loader",
-                )
-            })?;
-            Ok((manifest, vtable))
         })
         .collect()
 }
@@ -6711,25 +6200,15 @@ impl PluginHost {
             keymap_index: std::sync::OnceLock::new(),
         };
         for (manifest, registration) in &static_plugins {
-            if let Some(definition) = registration.definition {
-                let mut loaded = load_plugin_definition_with_config(
-                    manifest.clone(),
-                    definition(),
-                    host.configs.get(&manifest.id).cloned().unwrap_or_default(),
-                )?;
-                if let Some(config) = host.configs.get(&manifest.id).cloned() {
-                    loaded.set_config(config);
-                }
-                host.activate_plugin(loaded)?;
-            } else {
-                let vtable = registration.vtable.ok_or_else(|| {
-                    shared_instance::error(
-                        &manifest.id,
-                        "static_registration_has_no_implementation",
-                    )
-                })?;
-                host.load_static_plugins_into(&[(manifest.clone(), vtable)])?;
+            let mut loaded = load_plugin_definition_with_config(
+                manifest.clone(),
+                (registration.definition())(),
+                host.configs.get(&manifest.id).cloned().unwrap_or_default(),
+            )?;
+            if let Some(config) = host.configs.get(&manifest.id).cloned() {
+                loaded.set_config(config);
             }
+            host.activate_plugin(loaded)?;
         }
         host.load_registered_plugins_into(&plugins)?;
         validate_tool_presentation_declarations(host.loaded.iter().map(LoadedPlugin::manifest))?;
@@ -6756,21 +6235,6 @@ impl PluginHost {
         Ok(host)
     }
 
-    /// Load and activate statically bundled plugins.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when loading or activation fails.
-    pub fn load_static_plugins(
-        plugins: &[(PluginManifest, StaticPluginVtable)],
-    ) -> Result<Self, PluginLoadError> {
-        validate_tool_presentation_declarations(plugins.iter().map(|(manifest, _)| manifest))?;
-        let mut host = Self::default();
-        host.load_static_plugins_into(plugins)?;
-        host.validate_tool_presentation_ownership()?;
-        Ok(host)
-    }
-
     /// Return the number of manifest-declared visual adapters in loaded plugins.
     #[must_use]
     pub fn visual_adapter_count(&self) -> usize {
@@ -6778,22 +6242,6 @@ impl PluginHost {
             .iter()
             .map(|plugin| plugin.manifest.visual_adapters.len())
             .sum()
-    }
-
-    /// Load and activate statically bundled plugins best-effort.
-    ///
-    /// Plugins that fail to load or activate are skipped so independent client-side capabilities can
-    /// remain available.
-    #[must_use]
-    pub fn load_static_plugins_best_effort(
-        plugins: &[(PluginManifest, StaticPluginVtable)],
-    ) -> Self {
-        let mut host = Self::default();
-        for plugin in plugins {
-            let single = [plugin.clone()];
-            let _ = host.load_static_plugins_into(&single);
-        }
-        host
     }
 
     fn activate_plugin(&mut self, loaded: LoadedPlugin) -> Result<(), PluginLoadError> {
@@ -6821,25 +6269,6 @@ impl PluginHost {
         loaded.register_auth_providers(&mut auth)?;
         self.command_registry = commands;
         self.auth_provider_registry = auth;
-        Ok(())
-    }
-
-    fn load_static_plugins_into(
-        &mut self,
-        plugins: &[(PluginManifest, StaticPluginVtable)],
-    ) -> Result<(), PluginLoadError> {
-        for (manifest, vtable) in plugins {
-            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %manifest.id, "loading static plugin");
-            let phase =
-                bcode_metrics::startup::phase_for("plugin.static_load_activate", &manifest.id);
-            let mut loaded = load_static_plugin(manifest.clone(), *vtable)?;
-            if let Some(config) = self.configs.get(&manifest.id).cloned() {
-                loaded.set_config(config);
-            }
-            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
-            self.activate_plugin(loaded)?;
-            phase.finish();
-        }
         Ok(())
     }
 
@@ -7165,76 +6594,15 @@ pub fn load_registered_plugin_with_config(
     config: ResolvedPluginConfig,
 ) -> Result<LoadedPlugin, PluginLoadError> {
     let PluginRuntime::Native(runtime) = &plugin.manifest.runtime;
-    if runtime.manifest_symbol == bmux_plugin_sdk::abi::ENTRY_SYMBOL {
-        let library_path = resolve_library_path(&plugin.manifest_path, &runtime.library);
-        let activation = config.shared_activation.clone().ok_or_else(|| {
-            shared_instance::error(&plugin.manifest.id, "shared_activation_context_required")
-        })?;
-        let instance =
-            shared_native::SharedNative::load(&library_path, &plugin.manifest, activation)?;
-        return Ok(LoadedPlugin {
-            manifest: plugin.manifest.clone(),
-            backend: LoadedPluginBackend::SharedNative(Arc::new(instance)),
-            config,
-        });
-    }
-    tracing::debug!(
-        target: "bcode_plugin::startup",
-        plugin_id = %plugin.manifest.id,
-        abi_version = runtime.abi_version,
-        "validating plugin before load"
-    );
-    let library_path = check_registered_plugin_before_load(plugin)?;
-    tracing::debug!(
-        target: "bcode_plugin::startup",
-        plugin_id = %plugin.manifest.id,
-        library = %display_from_current_dir(&library_path),
-        "loading native library"
-    );
-    let library =
-        unsafe { Library::new(library_path.to_string_lossy().as_ref()) }.map_err(|source| {
-            PluginLoadError::LibraryLoad {
-                path: library_path.clone(),
-                source,
-            }
-        })?;
-
-    tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "native library loaded");
-    let exported_manifest = load_exported_manifest(&library, &library_path, runtime)?;
-    tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "exported manifest loaded");
-    if exported_manifest.id != plugin.manifest.id {
-        return Err(PluginLoadError::ManifestIdMismatch {
-            file_id: plugin.manifest.id.clone(),
-            library_id: exported_manifest.id,
-        });
-    }
-
-    tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading native symbols");
-    let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
-    let register_commands = load_register_commands_symbol(&library);
-    let register_auth_providers = load_register_auth_providers_symbol(
-        &library,
-        &library_path,
-        &runtime.register_auth_providers_symbol,
-    )?;
-    let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
-    let invoke_service_streaming =
-        load_streaming_service_symbol(&library, &library_path, &runtime.streaming_service_symbol)?;
-    let handle_event = load_event_symbol(&library, &library_path, &runtime.event_symbol)?;
-    tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "native symbols loaded");
-
+    let library_path = resolve_library_path(&plugin.manifest_path, &runtime.library);
+    let activation = config.shared_activation.clone().ok_or_else(|| {
+        shared_instance::error(&plugin.manifest.id, "shared_activation_context_required")
+    })?;
+    let instance = shared_native::SharedNative::load(&library_path, &plugin.manifest, activation)?;
     Ok(LoadedPlugin {
         manifest: plugin.manifest.clone(),
-        backend: LoadedPluginBackend::Dynamic {
-            _library: ManuallyDrop::new(library),
-            activate,
-            register_commands,
-            register_auth_providers,
-            deactivate,
-            invoke_service_streaming,
-            handle_event,
-        },
-        config: ResolvedPluginConfig::default(),
+        backend: LoadedPluginBackend::SharedNative(Arc::new(instance)),
+        config,
     })
 }
 
@@ -7311,32 +6679,6 @@ pub fn load_native_component_with_config(
         manifest,
         backend: LoadedPluginBackend::SharedNative(Arc::new(instance)),
         config,
-    })
-}
-
-/// Load an explicitly legacy statically linked plugin from its manifest and vtable.
-///
-/// # Errors
-/// Returns an error for an unsupported ABI or mismatched manifest.
-pub fn load_static_plugin(
-    manifest: PluginManifest,
-    vtable: StaticPluginVtable,
-) -> Result<LoadedPlugin, PluginLoadError> {
-    check_manifest_before_load(&manifest)?;
-
-    let manifest_cache = Box::leak(Box::new(std::sync::OnceLock::new()));
-    let exported_manifest = load_static_exported_manifest(vtable, manifest_cache)?;
-    if exported_manifest.id != manifest.id {
-        return Err(PluginLoadError::ManifestIdMismatch {
-            file_id: manifest.id,
-            library_id: exported_manifest.id,
-        });
-    }
-
-    Ok(LoadedPlugin {
-        manifest,
-        backend: LoadedPluginBackend::Static { vtable },
-        config: ResolvedPluginConfig::default(),
     })
 }
 
@@ -7508,151 +6850,12 @@ fn resolve_library_path(manifest_path: &Path, library_path: &Path) -> PathBuf {
         .join(library_path)
 }
 
-fn load_exported_manifest(
-    library: &Library,
-    library_path: &Path,
-    runtime: &NativePluginRuntime,
-) -> Result<PluginManifest, PluginLoadError> {
-    let manifest_fn = unsafe { library.get::<ManifestFn>(runtime.manifest_symbol.as_bytes()) }
-        .map_err(|source| PluginLoadError::SymbolLoad {
-            library: library_path.to_path_buf(),
-            symbol: runtime.manifest_symbol.clone(),
-            source,
-        })?;
-    let ptr = unsafe { manifest_fn() };
-    if ptr.is_null() {
-        return Err(PluginLoadError::NullManifest(library_path.to_path_buf()));
-    }
-    let manifest_toml = unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|source| {
-        PluginLoadError::ManifestUtf8 {
-            library: library_path.to_path_buf(),
-            source,
-        }
-    })?;
-    toml::from_str(manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
-        library: library_path.to_path_buf(),
-        source: Box::new(source),
-    })
-}
-
-fn load_static_exported_manifest(
-    vtable: StaticPluginVtable,
-    manifest_cache: &'static std::sync::OnceLock<Option<CString>>,
-) -> Result<PluginManifest, PluginLoadError> {
-    let ptr = (vtable.manifest)(manifest_cache);
-    if ptr.is_null() {
-        return Err(PluginLoadError::NullManifest(PathBuf::from("<static>")));
-    }
-    let manifest_toml = unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|source| {
-        PluginLoadError::ManifestUtf8 {
-            library: PathBuf::from("<static>"),
-            source,
-        }
-    })?;
-    toml::from_str(manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
-        library: PathBuf::from("<static>"),
-        source: Box::new(source),
-    })
-}
-
-fn load_lifecycle_symbol(
-    library: &Library,
-    library_path: &Path,
-    symbol: &str,
-) -> Result<LifecycleFn, PluginLoadError> {
-    let loaded = unsafe { library.get::<LifecycleFn>(symbol.as_bytes()) }.map_err(|source| {
-        PluginLoadError::SymbolLoad {
-            library: library_path.to_path_buf(),
-            symbol: symbol.to_string(),
-            source,
-        }
-    })?;
-    Ok(*loaded)
-}
-
-fn load_register_commands_symbol(library: &Library) -> Option<RegisterCommandsFn> {
-    let mut symbol = DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL.as_bytes().to_vec();
-    symbol.push(0);
-    unsafe { library.get::<RegisterCommandsFn>(&*symbol).ok().map(|s| *s) }
-}
-
-fn load_register_auth_providers_symbol(
-    library: &Library,
-    library_path: &Path,
-    symbol: &str,
-) -> Result<RegisterAuthProvidersFn, PluginLoadError> {
-    let loaded =
-        unsafe { library.get::<RegisterAuthProvidersFn>(symbol.as_bytes()) }.map_err(|source| {
-            PluginLoadError::SymbolLoad {
-                library: library_path.to_path_buf(),
-                symbol: symbol.to_owned(),
-                source,
-            }
-        })?;
-    Ok(*loaded)
-}
-
-fn load_streaming_service_symbol(
-    library: &Library,
-    library_path: &Path,
-    symbol: &str,
-) -> Result<StreamingServiceFn, PluginLoadError> {
-    let loaded =
-        unsafe { library.get::<StreamingServiceFn>(symbol.as_bytes()) }.map_err(|source| {
-            PluginLoadError::SymbolLoad {
-                library: library_path.to_path_buf(),
-                symbol: symbol.to_string(),
-                source,
-            }
-        })?;
-    Ok(*loaded)
-}
-
-fn load_event_symbol(
-    library: &Library,
-    library_path: &Path,
-    symbol: &str,
-) -> Result<EventFn, PluginLoadError> {
-    let loaded = unsafe { library.get::<EventFn>(symbol.as_bytes()) }.map_err(|source| {
-        PluginLoadError::SymbolLoad {
-            library: library_path.to_path_buf(),
-            symbol: symbol.to_string(),
-            source,
-        }
-    })?;
-    Ok(*loaded)
-}
-
 fn plugin_subscribes_to(plugin: &LoadedPlugin, topic: &str) -> bool {
     plugin
         .manifest
         .event_subscriptions
         .iter()
         .any(|subscription| subscription.topic == topic)
-}
-
-fn default_manifest_symbol() -> String {
-    DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string()
-}
-
-fn default_activate_symbol() -> String {
-    DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string()
-}
-
-fn default_deactivate_symbol() -> String {
-    DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string()
-}
-
-fn default_streaming_service_symbol() -> String {
-    DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string()
-}
-
-fn default_register_auth_providers_symbol() -> String {
-    DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL.to_string()
-}
-
-fn default_event_symbol() -> String {
-    DEFAULT_NATIVE_EVENT_SYMBOL.to_string()
 }
 
 #[cfg(test)]
@@ -7662,10 +6865,8 @@ mod service_config_view_tests;
 mod tests {
     use super::*;
     static BLOCKED_BRIDGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    use bcode_plugin_sdk::{SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK};
     use semver::Version;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -7808,18 +7009,7 @@ library = "libexample.dylib"
 
     #[test]
     fn static_bundled_plugins_can_be_disabled_by_selection() {
-        fn manifest(
-            _storage: &'static OnceLock<Option<std::ffi::CString>>,
-        ) -> *const std::ffi::c_char {
-            std::ptr::null()
-        }
-        fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
-            SERVICE_STATUS_OK
-        }
-        fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
-            SERVICE_STATUS_OK
-        }
-        let static_plugins = [StaticBundledPlugin::new(
+        let static_plugins = [StaticBundledPlugin::from_definition(
             r#"
 id = "bcode.disabled"
 name = "Disabled"
@@ -7833,17 +7023,7 @@ type = "native"
 abi_version = 1
 library = "libdisabled.dylib"
 "#,
-            StaticPluginVtable {
-                instance: std::ptr::null(),
-                manifest,
-                activate: lifecycle,
-                register_commands: None,
-                register_auth_providers: None,
-                deactivate: lifecycle,
-                invoke_service_streaming: test_streaming_service,
-                cli_registration: None,
-                handle_event: event,
-            },
+            manifest_only_definition,
         )];
         let selection = PluginSelection {
             mode: PluginSelectionMode::All,
@@ -7851,36 +7031,52 @@ library = "libdisabled.dylib"
             disabled: BTreeSet::from(["bcode.disabled".to_string()]),
         };
 
-        let selected = filter_selected_static_plugins(&static_plugins, &selection)
+        let selected = filter_selected_static_registrations(&static_plugins, &selection)
             .expect("static manifest should parse");
 
         assert!(selected.is_empty());
     }
 
-    /// Vtable for registrations whose manifests are only read.
-    fn manifest_only_vtable() -> StaticPluginVtable {
-        fn manifest(
-            _storage: &'static OnceLock<Option<std::ffi::CString>>,
-        ) -> *const std::ffi::c_char {
-            std::ptr::null()
-        }
-        fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
-            SERVICE_STATUS_OK
-        }
-        fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
-            SERVICE_STATUS_OK
-        }
-        StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest,
-            activate: lifecycle,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: lifecycle,
-            invoke_service_streaming: test_streaming_service,
-            cli_registration: None,
-            handle_event: event,
-        }
+    /// Definition for registrations whose manifests are only read.
+    fn manifest_only_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+        unreachable!("manifest-only registrations are never loaded")
+    }
+
+    fn bundled_hello_registration() -> StaticBundledPlugin {
+        StaticBundledPlugin::from_definition(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            bcode_hello_plugin::plugin_definition,
+        )
+    }
+
+    /// Load bundled registrations exactly as production startup does, with one
+    /// explicit test activation scope shared by every selected plugin.
+    fn load_bundled_host(
+        registrations: &[StaticBundledPlugin],
+    ) -> Result<PluginHost, PluginLoadError> {
+        PluginHost::load_discovered_with_static_bundled_and_config(
+            &PluginSelection::all_enabled(),
+            Vec::new(),
+            registrations,
+            bundled_test_configs(registrations),
+        )
+    }
+
+    fn bundled_test_configs(
+        registrations: &[StaticBundledPlugin],
+    ) -> BTreeMap<String, ResolvedPluginConfig> {
+        let runtime = bmux_plugin_runtime::PluginRuntimeScopeId::new();
+        static_bundled_plugin_ids(registrations)
+            .expect("test registrations parse")
+            .into_iter()
+            .map(|id| {
+                let mut config = crate::shared_instance_tests::fixture_config(&id);
+                if let Some(activation) = config.shared_activation.as_mut() {
+                    activation.runtime = runtime;
+                }
+                (id, config)
+            })
+            .collect()
     }
 
     /// An existing file that stands in for a plugin library; selection never
@@ -7996,9 +7192,9 @@ library = "libstatic.dylib"
             )
             .into_boxed_str(),
         );
-        let static_plugins = [StaticBundledPlugin::new(
+        let static_plugins = [StaticBundledPlugin::from_definition(
             static_manifest,
-            manifest_only_vtable(),
+            manifest_only_definition,
         )];
         let present_library = present_test_library();
         let discovered = |id: &str, rules: &str| {
@@ -8062,30 +7258,8 @@ library = "libstatic.dylib"
 
     #[test]
     fn static_bundled_plugin_ids_are_derived_from_manifests() {
-        fn manifest(
-            _storage: &'static OnceLock<Option<std::ffi::CString>>,
-        ) -> *const std::ffi::c_char {
-            std::ptr::null()
-        }
-        fn lifecycle(_instance: *const std::ffi::c_void) -> i32 {
-            SERVICE_STATUS_OK
-        }
-        fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
-            SERVICE_STATUS_OK
-        }
-        let vtable = StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest,
-            activate: lifecycle,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: lifecycle,
-            invoke_service_streaming: test_streaming_service,
-            cli_registration: None,
-            handle_event: event,
-        };
         let static_plugins = [
-            StaticBundledPlugin::new(
+            StaticBundledPlugin::from_definition(
                 r#"
 id = "bcode.example-static"
 name = "Example Static"
@@ -8096,9 +7270,9 @@ type = "native"
 abi_version = 1
 library = "libexample_static.dylib"
 "#,
-                vtable,
+                manifest_only_definition,
             ),
-            StaticBundledPlugin::new(
+            StaticBundledPlugin::from_definition(
                 r#"
 id = "bcode.opt-in-static"
 name = "Opt-in Static"
@@ -8109,7 +7283,7 @@ type = "native"
 abi_version = 1
 library = "libopt_in_static.dylib"
 "#,
-                vtable,
+                manifest_only_definition,
             )
             .with_default_activation(PluginDefaultActivation::Disabled),
         ];
@@ -8172,11 +7346,7 @@ library = "libcommands.dylib"
 
     #[test]
     fn plugin_host_registers_plugin_commands_during_load() {
-        fn register_commands(
-            _instance: *const std::ffi::c_void,
-            callback: Option<CommandRegistrationCallback>,
-            user_data: *mut std::ffi::c_void,
-        ) -> i32 {
+        fn register_commands(registry: &mut bcode_command::CommandRegistry) -> i32 {
             let contribution = bcode_command::CommandContribution {
                 id: "example.run".to_string(),
                 title: "Run Example".to_string(),
@@ -8195,9 +7365,8 @@ library = "libcommands.dylib"
                     command_id: "example.run".to_string(),
                 },
             };
-            let payload = serde_json::to_vec(&contribution).expect("contribution encodes");
-            callback.expect("registration callback")(payload.as_ptr(), payload.len(), user_data);
-            SERVICE_STATUS_OK
+            registry.register(contribution);
+            0
         }
 
         let manifest = toml::from_str::<PluginManifest>(
@@ -8223,21 +7392,10 @@ library = "libcommands.dylib"
         let loaded = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest,
-            backend: LoadedPluginBackend::Static {
-                vtable: StaticPluginVtable {
-                    instance: std::ptr::null(),
-                    manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| {
-                        std::ptr::null()
-                    },
-                    activate: test_activate,
-                    register_commands: Some(register_commands),
-                    register_auth_providers: None,
-                    deactivate: test_deactivate,
-                    invoke_service_streaming: test_streaming_service,
-                    cli_registration: None,
-                    handle_event: test_handle_event,
-                },
-            },
+            backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                register_commands: Some(register_commands),
+                ..test_streaming_vtable()
+            }),
         };
         let mut registry = bcode_command::CommandRegistry::new();
         loaded
@@ -8298,11 +7456,7 @@ invocation_operations = ["invoke"]
 
     #[test]
     fn plugin_host_registers_auth_providers_with_canonical_ownership() {
-        fn register_auth_providers(
-            _instance: *const std::ffi::c_void,
-            callback: Option<AuthRegistrationCallback>,
-            user_data: *mut std::ffi::c_void,
-        ) -> i32 {
+        fn register_auth_providers(contributions: &mut Vec<AuthProviderContribution>) -> i32 {
             let contribution = AuthProviderContribution {
                 external_sources: Vec::new(),
                 schema_version:
@@ -8327,9 +7481,8 @@ invocation_operations = ["invoke"]
                     },
                 ],
             };
-            let payload = serde_json::to_vec(&contribution).expect("contribution encodes");
-            callback.expect("registration callback")(payload.as_ptr(), payload.len(), user_data);
-            SERVICE_STATUS_OK
+            contributions.push(contribution);
+            0
         }
 
         let manifest = toml::from_str::<PluginManifest>(&format!(
@@ -8345,21 +7498,14 @@ library = "libweb_search.dylib"
 "#
         ))
         .expect("manifest should parse");
-        let vtable = StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
-            activate: test_activate,
-            register_commands: None,
+        let vtable = test_backend::TestBackend {
             register_auth_providers: Some(register_auth_providers),
-            deactivate: test_deactivate,
-            invoke_service_streaming: test_streaming_service,
-            cli_registration: None,
-            handle_event: test_handle_event,
+            ..test_streaming_vtable()
         };
         let loaded = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest,
-            backend: LoadedPluginBackend::Static { vtable },
+            backend: LoadedPluginBackend::Test(vtable),
         };
         let mut registry = AuthProviderRegistry::new();
 
@@ -8429,8 +7575,8 @@ library = "libweb_search.dylib"
     #[test]
     fn auth_registration_hook_and_activation_failures_are_reported() {
         fn loaded_with(
-            activate: fn(*const std::ffi::c_void) -> i32,
-            register_auth_providers: Option<bcode_plugin_sdk::StaticAuthRegistrationFn>,
+            activate: fn() -> i32,
+            register_auth_providers: Option<fn(&mut Vec<AuthProviderContribution>) -> i32>,
         ) -> LoadedPlugin {
             let manifest = toml::from_str::<PluginManifest>(&format!(
                 r#"
@@ -8448,21 +7594,11 @@ library = "libauth_test.dylib"
             LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest,
-                backend: LoadedPluginBackend::Static {
-                    vtable: StaticPluginVtable {
-                        instance: std::ptr::null(),
-                        manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
-                            std::ptr::null()
-                        },
-                        activate,
-                        register_commands: None,
-                        register_auth_providers,
-                        deactivate: test_deactivate,
-                        invoke_service_streaming: test_streaming_service,
-                        cli_registration: None,
-                        handle_event: test_handle_event,
-                    },
-                },
+                backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                    activate,
+                    register_auth_providers,
+                    ..test_streaming_vtable()
+                }),
             }
         }
 
@@ -8503,7 +7639,7 @@ library = "libauth_test.dylib"
         runtime.abi_version = CURRENT_PLUGIN_ABI_VERSION - 1;
 
         assert!(matches!(
-            load_static_plugin(manifest, bcode_hello_plugin::static_plugin()),
+            check_manifest_before_load(&manifest),
             Err(PluginLoadError::UnsupportedAbi { actual, expected, .. })
                 if actual + 1 == expected
         ));
@@ -8540,12 +7676,6 @@ library = "libauth_test.dylib"
             runtime: PluginRuntime::Native(NativePluginRuntime {
                 abi_version: 1,
                 library: PathBuf::from("libexample.dylib"),
-                manifest_symbol: default_manifest_symbol(),
-                activate_symbol: default_activate_symbol(),
-                deactivate_symbol: default_deactivate_symbol(),
-                streaming_service_symbol: default_streaming_service_symbol(),
-                register_auth_providers_symbol: default_register_auth_providers_symbol(),
-                event_symbol: default_event_symbol(),
             }),
         };
         let plugin = RegisteredPlugin {
@@ -8589,12 +7719,6 @@ library = "libauth_test.dylib"
             runtime: PluginRuntime::Native(NativePluginRuntime {
                 abi_version: 1,
                 library: PathBuf::from("libinvalid.dylib"),
-                manifest_symbol: default_manifest_symbol(),
-                activate_symbol: default_activate_symbol(),
-                deactivate_symbol: default_deactivate_symbol(),
-                streaming_service_symbol: default_streaming_service_symbol(),
-                register_auth_providers_symbol: default_register_auth_providers_symbol(),
-                event_symbol: default_event_symbol(),
             }),
         };
         let plugin = RegisteredPlugin {
@@ -9011,9 +8135,7 @@ library = "libexample_plugin.dylib"
         let loaded = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest,
-            backend: LoadedPluginBackend::Static {
-                vtable: test_streaming_vtable(),
-            },
+            backend: LoadedPluginBackend::Test(test_streaming_vtable()),
         };
         let host = PluginHost {
             loaded: vec![loaded],
@@ -9103,13 +8225,57 @@ library = "libexample_plugin.dylib"
         ActivatedNativeTestPlugin(Arc::new(plugin))
     }
 
-    fn load_static_hello_plugin() -> LoadedPlugin {
+    /// The bundled build output of the hello plugin's shared definition.
+    fn load_static_hello_plugin() -> ActivatedNativeTestPlugin {
         let manifest = toml::from_str::<PluginManifest>(include_str!(
             "../../../examples/hello-plugin/bcode-plugin.toml"
         ))
         .expect("hello manifest should parse");
-        load_static_plugin(manifest, bcode_hello_plugin::static_plugin())
-            .expect("static hello plugin should load")
+        let config = crate::shared_instance_tests::fixture_config(&manifest.id);
+        let plugin = load_plugin_definition_with_config(
+            manifest,
+            bcode_hello_plugin::plugin_definition(),
+            config,
+        )
+        .expect("bundled hello definition should load");
+        plugin.activate().expect("bundled hello activation");
+        ActivatedNativeTestPlugin(Arc::new(plugin))
+    }
+
+    /// Host-lifecycle fixture with the hello manifest and controllable hooks.
+    fn hello_test_backend_plugin() -> LoadedPlugin {
+        fn register_commands(registry: &mut bcode_command::CommandRegistry) -> i32 {
+            registry.register(bcode_command::CommandContribution {
+                id: "hello.fixture".to_string(),
+                title: "Hello Fixture".to_string(),
+                description: None,
+                category: None,
+                surfaces: BTreeSet::from([bcode_command::CommandSurface::Palette]),
+                slash: None,
+                arguments: Vec::new(),
+                session: bcode_command::CommandSessionRequirement::Optional,
+                execution: bcode_command::CommandExecution::Normal,
+                owner: bcode_command::CommandOwner::Plugin {
+                    plugin_id: "example.hello".to_string(),
+                },
+                action: bcode_command::CommandAction::Plugin {
+                    plugin_id: "example.hello".to_string(),
+                    command_id: "hello.fixture".to_string(),
+                },
+            });
+            0
+        }
+        LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest: toml::from_str::<PluginManifest>(include_str!(
+                "../../../examples/hello-plugin/bcode-plugin.toml"
+            ))
+            .expect("hello manifest should parse"),
+            backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                register_commands: Some(register_commands),
+                ..test_streaming_vtable()
+            }),
+        }
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -9281,8 +8447,8 @@ library = "libexample_plugin.dylib"
     #[tokio::test]
     async fn failed_start_cleanup_survives_runtime_transfer() {
         let mut host = PluginHost::default();
-        let mut plugin = load_static_hello_plugin();
-        let LoadedPluginBackend::Static { vtable } = &mut plugin.backend else {
+        let mut plugin = hello_test_backend_plugin();
+        let LoadedPluginBackend::Test(vtable) = &mut plugin.backend else {
             unreachable!();
         };
         vtable.activate = test_activate_failed;
@@ -9300,8 +8466,8 @@ library = "libexample_plugin.dylib"
     #[test]
     fn failed_start_retains_cleanup_without_publishing_plugin() {
         let mut host = PluginHost::default();
-        let mut plugin = load_static_hello_plugin();
-        let LoadedPluginBackend::Static { vtable } = &mut plugin.backend else {
+        let mut plugin = hello_test_backend_plugin();
+        let LoadedPluginBackend::Test(vtable) = &mut plugin.backend else {
             unreachable!();
         };
         vtable.activate = test_activate_failed;
@@ -9311,7 +8477,7 @@ library = "libexample_plugin.dylib"
         assert_eq!(host.cleanup_pending.len(), 1);
         assert!(host.deactivate_all().is_err());
         assert_eq!(host.cleanup_pending.len(), 1);
-        let LoadedPluginBackend::Static { vtable } = &mut host.cleanup_pending[0].backend else {
+        let LoadedPluginBackend::Test(vtable) = &mut host.cleanup_pending[0].backend else {
             unreachable!();
         };
         vtable.deactivate = test_deactivate;
@@ -9322,8 +8488,8 @@ library = "libexample_plugin.dylib"
     #[test]
     fn failed_auth_registration_does_not_publish_commands() {
         let mut host = PluginHost::default();
-        let mut plugin = load_static_hello_plugin();
-        let LoadedPluginBackend::Static { vtable } = &mut plugin.backend else {
+        let mut plugin = hello_test_backend_plugin();
+        let LoadedPluginBackend::Test(vtable) = &mut plugin.backend else {
             unreachable!();
         };
         vtable.register_auth_providers = Some(test_register_auth_failed);
@@ -9337,7 +8503,8 @@ library = "libexample_plugin.dylib"
     #[test]
     fn dynamic_and_static_hello_plugins_register_auth_providers() {
         let dynamic = load_dynamic_hello_plugin();
-        for plugin in [Arc::clone(&dynamic.0), Arc::new(load_static_hello_plugin())] {
+        let bundled = load_static_hello_plugin();
+        for plugin in [Arc::clone(&dynamic.0), Arc::clone(&bundled.0)] {
             let mut registry = AuthProviderRegistry::new();
             plugin
                 .register_auth_providers(&mut registry)
@@ -9351,13 +8518,7 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn synchronous_runtime_rejects_async_bridge_before_service_dispatch() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .unwrap();
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .unwrap();
+        let host = load_bundled_host(&[bundled_hello_registration()]).unwrap();
         let runtime = PluginRuntimeHost::from(host);
         let bridge = PluginInvocationBridge::new_async(|_, _| async {
             panic!("unsupported bridge must never run")
@@ -9416,13 +8577,8 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn scoped_timeout_propagates_cancellation_to_static_plugin() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .expect("hello manifest should parse");
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .expect("static hello host should load");
+        let host = load_bundled_host(&[bundled_hello_registration()])
+            .expect("static hello host should load");
         let runtime = PluginRuntimeHost::from(host);
         let started = Instant::now();
         let error = runtime
@@ -9449,13 +8605,7 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn cancellable_json_response_round_trips_host_bridge() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .unwrap();
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .unwrap();
+        let host = load_bundled_host(&[bundled_hello_registration()]).unwrap();
         let runtime = PluginRuntimeHost::from(host);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
@@ -9498,13 +8648,7 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn cancelling_json_response_reaches_blocked_host_bridge() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .unwrap();
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .unwrap();
+        let host = load_bundled_host(&[bundled_hello_registration()]).unwrap();
         let runtime = PluginRuntimeHost::from(host);
         let entered = Arc::new(tokio::sync::Notify::new());
         let started = Arc::clone(&entered);
@@ -9556,13 +8700,8 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn cancellable_response_preserves_service_error_envelope() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .expect("hello manifest should parse");
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .expect("static hello host should load");
+        let host = load_bundled_host(&[bundled_hello_registration()])
+            .expect("static hello host should load");
         let runtime = PluginRuntimeHost::from(host);
         let response = runtime
             .invoke_service_json_response_scoped_cancellable(
@@ -9583,13 +8722,8 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn scoped_caller_cancellation_propagates_to_static_plugin() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .expect("hello manifest should parse");
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .expect("static hello host should load");
+        let host = load_bundled_host(&[bundled_hello_registration()])
+            .expect("static hello host should load");
         let runtime = PluginRuntimeHost::from(host);
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         let cancel_signal = cancellation.clone();
@@ -9621,13 +8755,7 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn typed_cancellation_and_timeout_cover_resource_admission() {
-        let manifest = toml::from_str::<PluginManifest>(include_str!(
-            "../../../examples/hello-plugin/bcode-plugin.toml"
-        ))
-        .expect("hello manifest");
-        let host =
-            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
-                .expect("static host");
+        let host = load_bundled_host(&[bundled_hello_registration()]).expect("static host");
         let mut runtime = PluginRuntimeHost::from(host);
         runtime.resources = Arc::new(PluginResourceLimiter::new(1, 1));
         let permit = runtime
@@ -9782,9 +8910,7 @@ library = "libexample_plugin.dylib"
         let plugin = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest: test_manifest("successful-event-queue"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_large_vtable(),
-            },
+            backend: LoadedPluginBackend::Test(test_large_vtable()),
         };
         let metrics = Arc::new(PluginExecutorMetrics::default());
         let (sender, receiver) = mpsc::channel(2);
@@ -9826,7 +8952,7 @@ library = "libexample_plugin.dylib"
         let (started, ready) = oneshot::channel();
         *STARTED.lock().unwrap() = Some(started);
         let mut vtable = test_large_vtable();
-        vtable.handle_event = |_, _, _| {
+        vtable.handle_event = |_| {
             STARTED.lock().unwrap().take().unwrap().send(()).unwrap();
             let wait = RELEASE.lock().unwrap().take().unwrap();
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -9835,7 +8961,7 @@ library = "libexample_plugin.dylib"
         let plugin = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest: test_manifest("panic-queue"),
-            backend: LoadedPluginBackend::Static { vtable },
+            backend: LoadedPluginBackend::Test(vtable),
         };
         let metrics = Arc::new(PluginExecutorMetrics::default());
         let (sender, receiver) = mpsc::channel(2);
@@ -9962,9 +9088,9 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn abandoned_service_future_cancels_running_plugin() {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-            bcode_hello_plugin::static_plugin(),
+            bcode_hello_plugin::plugin_definition,
         )];
         let runtime = PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
             &PluginSelection::all_enabled(),
@@ -10018,9 +9144,9 @@ library = "libexample_plugin.dylib"
 
     #[tokio::test]
     async fn abandoned_streaming_invocation_requests_cancellation() {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-            bcode_hello_plugin::static_plugin(),
+            bcode_hello_plugin::plugin_definition,
         )];
         let runtime = PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
             &PluginSelection::all_enabled(),
@@ -10062,9 +9188,9 @@ library = "libexample_plugin.dylib"
     fn explicit_runtime_discovery_retains_selection_inventory() {
         let mut selection = PluginSelection::all_enabled();
         selection.disabled.insert("example.hello".to_owned());
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-            bcode_hello_plugin::static_plugin(),
+            bcode_hello_plugin::plugin_definition,
         )];
         let runtime = PluginRuntimeHost::load_discovered_with_static_bundled_and_config(
             &selection,
@@ -10085,26 +9211,27 @@ library = "libexample_plugin.dylib"
             manifest_path: PathBuf::from("/nonexistent/bcode-explicit-discovery/bcode-plugin.toml"),
             manifest: toml::from_str(manifest_text).expect("hello manifest"),
         };
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             manifest_text,
-            bcode_hello_plugin::static_plugin(),
+            bcode_hello_plugin::plugin_definition,
         )];
         let mut selection = PluginSelection::all_enabled();
         let host = PluginHost::load_discovered_with_static_bundled_and_config(
             &selection,
             vec![discovered.clone()],
             &bundled,
-            BTreeMap::new(),
+            bundled_test_configs(&bundled),
         )
         .expect("static registration must override nonexistent dynamic library");
         assert!(host.auth_provider_registry().get("example-hello").is_some());
+        drop(host);
 
         selection.disabled.insert("example.hello".to_owned());
         let host = PluginHost::load_discovered_with_static_bundled_and_config(
             &selection,
             vec![discovered],
             &bundled,
-            BTreeMap::new(),
+            bundled_test_configs(&bundled),
         )
         .expect("disabled registrations must not load");
         assert!(host.auth_provider_registry().is_empty());
@@ -10112,15 +9239,21 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn disabled_static_plugin_does_not_contribute_auth_provider() {
-        let static_plugin = StaticBundledPlugin::new(
+        let static_plugin = StaticBundledPlugin::from_definition(
             include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
-            bcode_hello_plugin::static_plugin(),
+            bcode_hello_plugin::plugin_definition,
         );
         let mut selection = PluginSelection::all_enabled();
         selection.disabled.insert("example.hello".to_owned());
-        let selected =
-            filter_selected_static_plugins(&[static_plugin], &selection).expect("static selection");
-        let host = PluginHost::load_static_plugins(&selected).expect("empty selected host");
+        let selected = filter_selected_static_registrations(&[static_plugin], &selection)
+            .expect("static selection");
+        let host = load_bundled_host(
+            &selected
+                .iter()
+                .map(|(_, registration)| *registration)
+                .collect::<Vec<_>>(),
+        )
+        .expect("empty selected host");
 
         assert!(selected.is_empty());
         assert!(host.auth_provider_registry().is_empty());
@@ -10134,7 +9267,7 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn static_blocked_abi_bridge_wakes_on_cancellation() {
-        assert_blocked_plugin_bridge_wakes_on_cancellation(&Arc::new(load_static_hello_plugin()));
+        assert_blocked_plugin_bridge_wakes_on_cancellation(&load_static_hello_plugin().0);
     }
     fn question_dynamic_library_path() -> PathBuf {
         let workspace_library = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -10203,8 +9336,13 @@ library = "libexample_plugin.dylib"
             "../../../plugins/question-plugin/bcode-plugin.toml"
         ))
         .expect("question manifest should parse");
-        let plugin = load_static_plugin(manifest, bcode_question_plugin::static_plugin())
-            .expect("static question plugin should load");
+        let config = crate::shared_instance_tests::fixture_config(&manifest.id);
+        let plugin = load_plugin_definition_with_config(
+            manifest,
+            bcode_question_plugin::plugin_definition(),
+            config,
+        )
+        .expect("bundled question definition should load");
         plugin
             .activate()
             .expect("static question plugin should activate");
@@ -10421,110 +9559,7 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn static_loader_supports_all_bridge_families_and_cancellation() {
-        assert_hello_plugin_bridge_and_cancellation(&Arc::new(load_static_hello_plugin()));
-    }
-
-    #[test]
-    fn static_service_bridge_round_trips_neutral_request() {
-        let plugin = LoadedPlugin {
-            config: ResolvedPluginConfig::default(),
-            manifest: test_manifest("bridge"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_bridge_vtable(),
-            },
-        };
-        let mut requests = Vec::new();
-
-        let response = plugin
-            .invoke_service_with_bridge(
-                "bridge",
-                "run",
-                Vec::new(),
-                |_| {},
-                |request, _| {
-                    requests.push(request);
-                    Ok(ServiceBridgeResponse::Exchange(
-                        bcode_tool::ToolExchangeResolution::Responded {
-                            payload: serde_json::json!({"answer": true}),
-                        },
-                    ))
-                },
-                &bcode_plugin_sdk::ServiceCancellation::default(),
-            )
-            .expect("service should invoke");
-
-        assert_eq!(response.payload, b"bridge-ok");
-        assert_eq!(requests.len(), 1);
-        assert!(matches!(requests[0], ServiceBridgeRequest::Exchange(_)));
-    }
-
-    #[test]
-    fn blocked_static_bridge_call_wakes_on_cancellation() {
-        let _blocked_bridge_guard = BLOCKED_BRIDGE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let plugin = Arc::new(LoadedPlugin {
-            config: ResolvedPluginConfig::default(),
-            manifest: test_manifest("bridge"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_bridge_vtable(),
-            },
-        });
-        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
-        let task_plugin = Arc::clone(&plugin);
-        let task_cancellation = cancellation.clone();
-        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task_started = Arc::clone(&started);
-        let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task_handler_calls = handler_calls.clone();
-        let task = std::thread::spawn(move || {
-            task_plugin.invoke_service_with_bridge(
-                "bridge",
-                "run",
-                Vec::new(),
-                |_| {},
-                |_, cancellation| {
-                    task_handler_calls.fetch_add(1, Ordering::SeqCst);
-                    task_started.store(true, Ordering::SeqCst);
-                    if cancellation.wait_cancelled(Duration::from_secs(5)) {
-                        Err("cancelled".to_string())
-                    } else {
-                        panic!("bridge handler did not wake on cancellation")
-                    }
-                },
-                &task_cancellation,
-            )
-        });
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !started.load(Ordering::SeqCst) {
-            assert!(Instant::now() < deadline, "bridge handler did not start");
-            std::thread::yield_now();
-        }
-        let cancel_started = Instant::now();
-        cancellation.cancel();
-        let response = task
-            .join()
-            .expect("service thread should join")
-            .expect("service invocation should complete");
-
-        assert!(cancel_started.elapsed() < Duration::from_secs(1));
-        assert_eq!(
-            handler_calls.load(Ordering::SeqCst),
-            1,
-            "cancellation does not retry the handler"
-        );
-        let failure = response
-            .error
-            .expect("post-dispatch handler error remains explicit uncertainty");
-        assert_eq!(failure.code, "bridge_outcome_unknown");
-        assert_eq!(
-            failure.message,
-            "bridge handler started but supplied no authoritative response"
-        );
-        assert!(
-            response.payload.is_empty(),
-            "unknown effects are not encoded as a successful result"
-        );
+        assert_hello_plugin_bridge_and_cancellation(&load_static_hello_plugin().0);
     }
 
     #[test]
@@ -10532,9 +9567,7 @@ library = "libexample_plugin.dylib"
         let plugin = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest: test_manifest("events"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_streaming_vtable(),
-            },
+            backend: LoadedPluginBackend::Test(test_streaming_vtable()),
         };
         let mut events = Vec::new();
 
@@ -10805,11 +9838,11 @@ library = "libexample_plugin.dylib"
     #[test]
     fn event_callback_panic_releases_execution_accounting() {
         let mut vtable = test_large_vtable();
-        vtable.handle_event = |_, _, _| panic!("event callback failed");
+        vtable.handle_event = |_| panic!("event callback failed");
         let plugin = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest: test_manifest("panicking-event"),
-            backend: LoadedPluginBackend::Static { vtable },
+            backend: LoadedPluginBackend::Test(vtable),
         };
         let metrics = PluginExecutorMetrics::default();
         let invocation = PluginEventInvocation {
@@ -11025,9 +10058,7 @@ library = "libexample_plugin.dylib"
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest,
-                backend: LoadedPluginBackend::Static {
-                    vtable: test_streaming_vtable(),
-                },
+                backend: LoadedPluginBackend::Test(test_streaming_vtable()),
             }],
         });
         let tokio = tokio::runtime::Builder::new_current_thread()
@@ -11058,50 +10089,6 @@ library = "libexample_plugin.dylib"
             drop(invocation);
             assert_eq!(response.payload, b"ok");
         });
-    }
-
-    #[test]
-    fn chunked_service_response_reassembles_without_retry() {
-        LARGE_CHUNKING_CALLS.store(0, Ordering::SeqCst);
-        let plugin = LoadedPlugin {
-            config: ResolvedPluginConfig::default(),
-            manifest: test_manifest("large"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_large_chunking_vtable(),
-            },
-        };
-
-        let response = plugin
-            .invoke_service("large", "run", Vec::new())
-            .expect("chunked response should invoke");
-
-        assert_eq!(LARGE_CHUNKING_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            response.payload_text().expect("response should be text"),
-            "x".repeat(1024 * 1024 + 1)
-        );
-    }
-
-    #[test]
-    fn oversized_service_response_is_not_retried() {
-        LARGE_CALLS.store(0, Ordering::SeqCst);
-        let plugin = LoadedPlugin {
-            config: ResolvedPluginConfig::default(),
-            manifest: test_manifest("large"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_large_vtable(),
-            },
-        };
-
-        let error = plugin
-            .invoke_service("large", "run", Vec::new())
-            .expect_err("oversized response should fail without retry");
-
-        assert_eq!(LARGE_CALLS.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            error,
-            PluginLoadError::ServiceResponseTooLarge { .. }
-        ));
     }
 
     #[test]
@@ -11158,24 +10145,21 @@ library = "libexample_plugin.dylib"
             std::sync::atomic::AtomicUsize::new(0);
         static SUCCESS_CALLS: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
-        fn retry(_: *const std::ffi::c_void) -> i32 {
+        fn retry() -> i32 {
             i32::from(FAILED_CALLS.fetch_add(1, Ordering::SeqCst) == 0)
         }
-        fn success(_: *const std::ffi::c_void) -> i32 {
+        fn success() -> i32 {
             SUCCESS_CALLS.fetch_add(1, Ordering::SeqCst);
             0
         }
         let mut loaded = Vec::new();
-        for (id, deactivate) in [
-            ("success", success as fn(*const std::ffi::c_void) -> i32),
-            ("retry", retry),
-        ] {
+        for (id, deactivate) in [("success", success as fn() -> i32), ("retry", retry)] {
             let mut vtable = test_large_vtable();
             vtable.deactivate = deactivate;
             loaded.push(LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest: test_manifest(id),
-                backend: LoadedPluginBackend::Static { vtable },
+                backend: LoadedPluginBackend::Test(vtable),
             });
         }
         let mut host = PluginHost {
@@ -11200,7 +10184,7 @@ library = "libexample_plugin.dylib"
     #[test]
     fn exclusive_deactivation_retries_failure_and_remembers_success() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+        fn deactivate() -> i32 {
             i32::from(CALLS.fetch_add(1, Ordering::SeqCst) == 0)
         }
         let tokio = tokio::runtime::Builder::new_current_thread()
@@ -11221,7 +10205,7 @@ library = "libexample_plugin.dylib"
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest,
-                    backend: LoadedPluginBackend::Static { vtable },
+                    backend: LoadedPluginBackend::Test(vtable),
                 }],
             });
             for expected_cleanup_success in [false, true, true] {
@@ -11251,7 +10235,7 @@ library = "libexample_plugin.dylib"
     #[test]
     fn exclusive_deactivation_survives_abandoned_response() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+        fn deactivate() -> i32 {
             CALLS.fetch_add(1, Ordering::SeqCst);
             0
         }
@@ -11267,7 +10251,7 @@ library = "libexample_plugin.dylib"
                 LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("abandoned-cleanup"),
-                    backend: LoadedPluginBackend::Static { vtable },
+                    backend: LoadedPluginBackend::Test(vtable),
                 },
                 receiver,
                 Arc::new(PluginExecutorMetrics::default()),
@@ -11318,9 +10302,7 @@ library = "libexample_plugin.dylib"
                 Arc::new(LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest(id),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: test_large_vtable(),
-                    },
+                    backend: LoadedPluginBackend::Test(test_large_vtable()),
                 }),
                 limit.map(|limit| Arc::new(Semaphore::new(limit))),
             ),
@@ -11872,9 +10854,7 @@ library = "libexample_plugin.dylib"
                 .map(|id| LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest(id),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: test_large_vtable(),
-                    },
+                    backend: LoadedPluginBackend::Test(test_large_vtable()),
                 })
                 .collect(),
         });
@@ -12023,9 +11003,7 @@ library = "libexample_plugin.dylib"
                 Arc::new(LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("limited-cleanup"),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: test_large_vtable(),
-                    },
+                    backend: LoadedPluginBackend::Test(test_large_vtable()),
                 }),
                 Some(Arc::clone(&semaphore)),
             ),
@@ -12079,9 +11057,7 @@ library = "libexample_plugin.dylib"
                 LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("idle-exclusive"),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: test_large_vtable(),
-                    },
+                    backend: LoadedPluginBackend::Test(test_large_vtable()),
                 },
                 receiver,
                 Arc::new(PluginExecutorMetrics::default()),
@@ -12105,9 +11081,7 @@ library = "libexample_plugin.dylib"
                 Arc::new(LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("abandoned-stream-start"),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: test_large_vtable(),
-                    },
+                    backend: LoadedPluginBackend::Test(test_large_vtable()),
                 }),
                 None,
             ),
@@ -12173,9 +11147,7 @@ library = "libexample_plugin.dylib"
                 Arc::new(LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("closed-admission"),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: test_large_vtable(),
-                    },
+                    backend: LoadedPluginBackend::Test(test_large_vtable()),
                 }),
                 None,
             ),
@@ -12238,7 +11210,7 @@ library = "libexample_plugin.dylib"
         static RELEASE: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
         static ENTERED: Mutex<Option<oneshot::Sender<()>>> = Mutex::new(None);
         static CLEANUPS: AtomicUsize = AtomicUsize::new(0);
-        fn event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
+        fn event(_: &NativeEventContext) -> i32 {
             ENTERED.lock().unwrap().take().unwrap().send(()).unwrap();
             let receiver = RELEASE.lock().unwrap().take().unwrap();
             i32::from(receiver.recv_timeout(Duration::from_secs(5)).is_err())
@@ -12250,7 +11222,7 @@ library = "libexample_plugin.dylib"
         CLEANUPS.store(0, Ordering::SeqCst);
         let mut vtable = test_large_vtable();
         vtable.handle_event = event;
-        vtable.deactivate = |_| {
+        vtable.deactivate = || {
             CLEANUPS.fetch_add(1, Ordering::SeqCst);
             0
         };
@@ -12265,7 +11237,7 @@ library = "libexample_plugin.dylib"
                 Arc::new(LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest("abandoned-event"),
-                    backend: LoadedPluginBackend::Static { vtable },
+                    backend: LoadedPluginBackend::Test(vtable),
                 }),
                 limited.then(|| Arc::new(Semaphore::new(1))),
             ),
@@ -12712,9 +11684,7 @@ library = "libexample_plugin.dylib"
         let plugin = LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest: test_manifest("lost-join"),
-            backend: LoadedPluginBackend::Static {
-                vtable: test_large_vtable(),
-            },
+            backend: LoadedPluginBackend::Test(test_large_vtable()),
         };
         let executor = PluginExecutorHandle::new(
             plugin.manifest.clone(),
@@ -12737,7 +11707,7 @@ library = "libexample_plugin.dylib"
     #[tokio::test]
     async fn unknown_cleanup_outcome_does_not_block_other_plugins() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+        fn deactivate() -> i32 {
             CALLS.fetch_add(1, Ordering::SeqCst);
             0
         }
@@ -12755,7 +11725,7 @@ library = "libexample_plugin.dylib"
                 .map(|id| LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: test_manifest(id),
-                    backend: LoadedPluginBackend::Static { vtable },
+                    backend: LoadedPluginBackend::Test(vtable),
                 })
                 .collect(),
         });
@@ -12787,7 +11757,7 @@ library = "libexample_plugin.dylib"
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         CALLS.store(0, Ordering::SeqCst);
         let mut vtable = test_large_vtable();
-        vtable.deactivate = |_| {
+        vtable.deactivate = || {
             CALLS.fetch_add(1, Ordering::SeqCst);
             0
         };
@@ -12800,7 +11770,7 @@ library = "libexample_plugin.dylib"
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest: test_manifest("unpolled-cleanup"),
-                backend: LoadedPluginBackend::Static { vtable },
+                backend: LoadedPluginBackend::Test(vtable),
             }],
         });
         assert!(!runtime.event_dispatchers.is_empty());
@@ -12833,7 +11803,7 @@ library = "libexample_plugin.dylib"
     #[test]
     fn failed_deactivation_remains_retryable_until_success() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+        fn deactivate() -> i32 {
             i32::from(CALLS.fetch_add(1, Ordering::SeqCst) == 0)
         }
         let tokio = tokio::runtime::Builder::new_current_thread()
@@ -12860,7 +11830,7 @@ library = "libexample_plugin.dylib"
                     loaded: vec![LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
                         manifest,
-                        backend: LoadedPluginBackend::Static { vtable },
+                        backend: LoadedPluginBackend::Test(vtable),
                     }],
                 });
                 assert!(matches!(
@@ -12884,7 +11854,7 @@ library = "libexample_plugin.dylib"
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         static RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
             std::sync::Mutex::new(None);
-        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+        fn deactivate() -> i32 {
             CALLS.fetch_add(1, Ordering::SeqCst);
             let receiver = RELEASE.lock().unwrap().take();
             receiver.map_or(0, |receiver| {
@@ -12918,14 +11888,12 @@ library = "libexample_plugin.dylib"
                         LoadedPlugin {
                             config: ResolvedPluginConfig::default(),
                             manifest,
-                            backend: LoadedPluginBackend::Static { vtable },
+                            backend: LoadedPluginBackend::Test(vtable),
                         },
                         LoadedPlugin {
                             config: ResolvedPluginConfig::default(),
                             manifest: test_manifest("a-later-cleanup"),
-                            backend: LoadedPluginBackend::Static {
-                                vtable: test_large_vtable(),
-                            },
+                            backend: LoadedPluginBackend::Test(test_large_vtable()),
                         },
                     ],
                 });
@@ -12990,7 +11958,7 @@ library = "libexample_plugin.dylib"
         static RUNTIME_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
             std::sync::Mutex::new(None);
 
-        fn deactivate(_: *const std::ffi::c_void) -> i32 {
+        fn deactivate() -> i32 {
             i32::from(
                 *RUNTIME_THREAD.lock().expect("thread lock") == Some(std::thread::current().id()),
             )
@@ -13015,7 +11983,7 @@ library = "libexample_plugin.dylib"
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest,
-                    backend: LoadedPluginBackend::Static { vtable },
+                    backend: LoadedPluginBackend::Test(vtable),
                 }],
             });
             let result = runtime.deactivate_all().await;
@@ -13031,15 +11999,15 @@ library = "libexample_plugin.dylib"
         static CALLS: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
         static FAIL: AtomicBool = AtomicBool::new(true);
 
-        fn first(_: *const std::ffi::c_void) -> i32 {
+        fn first() -> i32 {
             CALLS.lock().expect("calls lock").push("z");
             i32::from(FAIL.load(Ordering::SeqCst)) * 17
         }
-        fn second(_: *const std::ffi::c_void) -> i32 {
+        fn second() -> i32 {
             CALLS.lock().expect("calls lock").push("m");
             i32::from(FAIL.load(Ordering::SeqCst)) * 23
         }
-        fn last(_: *const std::ffi::c_void) -> i32 {
+        fn last() -> i32 {
             CALLS.lock().expect("calls lock").push("a");
             0
         }
@@ -13057,11 +12025,7 @@ library = "libexample_plugin.dylib"
                 CALLS.lock().expect("calls lock").clear();
                 FAIL.store(true, Ordering::SeqCst);
                 let mut loaded = Vec::new();
-                for (id, deactivate) in [
-                    ("a", last as fn(*const std::ffi::c_void) -> i32),
-                    ("m", second),
-                    ("z", first),
-                ] {
+                for (id, deactivate) in [("a", last as fn() -> i32), ("m", second), ("z", first)] {
                     let mut vtable = test_large_vtable();
                     vtable.deactivate = deactivate;
                     let mut manifest = test_manifest(id);
@@ -13069,7 +12033,7 @@ library = "libexample_plugin.dylib"
                     loaded.push(LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
                         manifest,
-                        backend: LoadedPluginBackend::Static { vtable },
+                        backend: LoadedPluginBackend::Test(vtable),
                     });
                 }
                 let runtime = PluginRuntimeHost::from(PluginHost {
@@ -13153,10 +12117,6 @@ library = "libexample_plugin.dylib"
     #[allow(clippy::too_many_lines)]
     #[test]
     fn runtime_status_tracks_plugin_local_queueing() {
-        use bcode_plugin_sdk::{
-            SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, StaticPluginVtable,
-        };
-        use std::ffi::c_void;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Mutex as StdMutex, OnceLock};
         use std::time::Duration;
@@ -13165,64 +12125,31 @@ library = "libexample_plugin.dylib"
         static FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
         static SLOW_GATE: OnceLock<StdMutex<()>> = OnceLock::new();
 
-        fn activate(_: *const c_void) -> i32 {
+        fn activate() -> i32 {
             0
         }
 
-        fn deactivate(_: *const c_void) -> i32 {
+        fn deactivate() -> i32 {
             0
         }
 
-        fn handle_event(_: *const c_void, _: *const u8, _: usize) -> i32 {
-            bcode_plugin_sdk::EVENT_STATUS_OK
+        fn handle_event(_: &NativeEventContext) -> i32 {
+            0
         }
 
-        fn write_response(
-            response: &ServiceResponse,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-        ) -> i32 {
-            let encoded = serde_json::to_vec(response).expect("service response encodes");
-            unsafe {
-                *len = encoded.len();
-            }
-            if output.is_null() || cap < encoded.len() {
-                return SERVICE_STATUS_BUFFER_TOO_SMALL;
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
-            }
-            SERVICE_STATUS_OK
-        }
-
-        fn slow_service(
-            _: *const c_void,
-            _: *const u8,
-            _: usize,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-        ) -> i32 {
+        fn slow_service(_: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
             SLOW_CALLS.fetch_add(1, Ordering::SeqCst);
             let _guard = SLOW_GATE
                 .get_or_init(|| StdMutex::new(()))
                 .lock()
                 .expect("gate locks");
             std::thread::sleep(Duration::from_millis(150));
-            write_response(&ServiceResponse::text("slow"), output, cap, len)
+            ServiceResponse::text("slow")
         }
 
-        fn fast_service(
-            _: *const c_void,
-            _: *const u8,
-            _: usize,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-        ) -> i32 {
+        fn fast_service(_: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
             FAST_CALLS.fetch_add(1, Ordering::SeqCst);
-            write_response(&ServiceResponse::text("fast"), output, cap, len)
+            ServiceResponse::text("fast")
         }
 
         fn manifest(id: &str) -> PluginManifest {
@@ -13255,13 +12182,6 @@ library = "libexample_plugin.dylib"
                 runtime: PluginRuntime::Native(NativePluginRuntime {
                     abi_version: CURRENT_PLUGIN_ABI_VERSION,
                     library: PathBuf::from("test"),
-                    manifest_symbol: DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string(),
-                    activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
-                    deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
-                    streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
-                    register_auth_providers_symbol: DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL
-                        .to_string(),
-                    event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
                 }),
             }
         }
@@ -13281,82 +12201,26 @@ library = "libexample_plugin.dylib"
                     LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
                         manifest: manifest("slow"),
-                        backend: LoadedPluginBackend::Static {
-                            vtable: StaticPluginVtable {
-                                instance: std::ptr::null(),
-                                manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
-                                    std::ptr::null()
-                                },
-                                activate,
-                                register_commands: None,
-                                register_auth_providers: None,
-                                deactivate,
-                                invoke_service_streaming:
-                                    |_,
-                                     input_ptr,
-                                     input_len,
-                                     output_ptr,
-                                     output_capacity,
-                                     output_len,
-                                     _,
-                                     _,
-                                     _,
-                                     _,
-                                     _,
-                                     _| {
-                                        slow_service(
-                                            std::ptr::null(),
-                                            input_ptr,
-                                            input_len,
-                                            output_ptr,
-                                            output_capacity,
-                                            output_len,
-                                        )
-                                    },
-                                handle_event,
-                                cli_registration: None,
-                            },
-                        },
+                        backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                            activate,
+                            register_commands: None,
+                            register_auth_providers: None,
+                            deactivate,
+                            invoke: slow_service,
+                            handle_event,
+                        }),
                     },
                     LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
                         manifest: manifest("fast"),
-                        backend: LoadedPluginBackend::Static {
-                            vtable: StaticPluginVtable {
-                                instance: std::ptr::null(),
-                                manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
-                                    std::ptr::null()
-                                },
-                                activate,
-                                register_commands: None,
-                                register_auth_providers: None,
-                                deactivate,
-                                invoke_service_streaming:
-                                    |_,
-                                     input_ptr,
-                                     input_len,
-                                     output_ptr,
-                                     output_capacity,
-                                     output_len,
-                                     _,
-                                     _,
-                                     _,
-                                     _,
-                                     _,
-                                     _| {
-                                        fast_service(
-                                            std::ptr::null(),
-                                            input_ptr,
-                                            input_len,
-                                            output_ptr,
-                                            output_capacity,
-                                            output_len,
-                                        )
-                                    },
-                                handle_event,
-                                cli_registration: None,
-                            },
-                        },
+                        backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                            activate,
+                            register_commands: None,
+                            register_auth_providers: None,
+                            deactivate,
+                            invoke: fast_service,
+                            handle_event,
+                        }),
                     },
                 ],
             });
@@ -13417,51 +12281,21 @@ library = "libexample_plugin.dylib"
     #[allow(clippy::too_many_lines)]
     #[test]
     fn concurrent_shell_invocations_do_not_block_other_sessions() {
-        use bcode_plugin_sdk::StaticPluginVtable;
-        use std::ffi::c_void;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         static SLOW_SHELL_CALLS: AtomicUsize = AtomicUsize::new(0);
         static FAST_SHELL_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-        fn service(
-            _: *const c_void,
-            input_ptr: *const u8,
-            input_len: usize,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-        ) -> i32 {
-            let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-            let context = serde_json::from_slice::<bcode_plugin_sdk::NativeServiceContext>(input)
-                .expect("service context should decode");
-            if context.request.operation == "slow_shell" {
+        fn service(invocation: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
+            if invocation.context.request.operation == "slow_shell" {
                 SLOW_SHELL_CALLS.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(150));
-                write_test_response(&ServiceResponse::text("slow"), output, cap, len)
+                ServiceResponse::text("slow")
             } else {
                 FAST_SHELL_CALLS.fetch_add(1, Ordering::SeqCst);
-                write_test_response(&ServiceResponse::text("fast"), output, cap, len)
+                ServiceResponse::text("fast")
             }
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn service_streaming(
-            _: *const c_void,
-            input_ptr: *const u8,
-            input_len: usize,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-            _: Option<ServiceEventCallback>,
-            _: *mut c_void,
-            _: Option<ServiceBridgeCallback>,
-            _: *mut c_void,
-            _: Option<ServiceCancellationWaitCallback>,
-            _: *mut c_void,
-        ) -> i32 {
-            service(std::ptr::null(), input_ptr, input_len, output, cap, len)
         }
 
         fn manifest() -> PluginManifest {
@@ -13495,21 +12329,14 @@ library = "libexample_plugin.dylib"
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: StaticPluginVtable {
-                            instance: std::ptr::null(),
-                            manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
-                                std::ptr::null()
-                            },
-                            activate: test_activate,
-                            register_commands: None,
-                            register_auth_providers: None,
-                            deactivate: test_deactivate,
-                            invoke_service_streaming: service_streaming,
-                            handle_event: test_handle_event,
-                            cli_registration: None,
-                        },
-                    },
+                    backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                        activate: test_activate,
+                        register_commands: None,
+                        register_auth_providers: None,
+                        deactivate: test_deactivate,
+                        invoke: service,
+                        handle_event: test_handle_event,
+                    }),
                 }],
             });
 
@@ -13556,51 +12383,21 @@ library = "libexample_plugin.dylib"
     #[allow(clippy::too_many_lines)]
     #[test]
     fn concurrent_model_provider_invocations_do_not_block_other_sessions() {
-        use bcode_plugin_sdk::StaticPluginVtable;
-        use std::ffi::c_void;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         static SLOW_MODEL_CALLS: AtomicUsize = AtomicUsize::new(0);
         static FAST_MODEL_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-        fn service(
-            _: *const c_void,
-            input_ptr: *const u8,
-            input_len: usize,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-        ) -> i32 {
-            let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-            let context = serde_json::from_slice::<bcode_plugin_sdk::NativeServiceContext>(input)
-                .expect("service context should decode");
-            if context.request.operation == "slow_start_turn" {
+        fn service(invocation: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
+            if invocation.context.request.operation == "slow_start_turn" {
                 SLOW_MODEL_CALLS.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(150));
-                write_test_response(&ServiceResponse::text("slow"), output, cap, len)
+                ServiceResponse::text("slow")
             } else {
                 FAST_MODEL_CALLS.fetch_add(1, Ordering::SeqCst);
-                write_test_response(&ServiceResponse::text("fast"), output, cap, len)
+                ServiceResponse::text("fast")
             }
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn service_streaming(
-            _: *const c_void,
-            input_ptr: *const u8,
-            input_len: usize,
-            output: *mut u8,
-            cap: usize,
-            len: *mut usize,
-            _: Option<ServiceEventCallback>,
-            _: *mut c_void,
-            _: Option<ServiceBridgeCallback>,
-            _: *mut c_void,
-            _: Option<ServiceCancellationWaitCallback>,
-            _: *mut c_void,
-        ) -> i32 {
-            service(std::ptr::null(), input_ptr, input_len, output, cap, len)
         }
 
         fn manifest() -> PluginManifest {
@@ -13634,21 +12431,14 @@ library = "libexample_plugin.dylib"
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
-                    backend: LoadedPluginBackend::Static {
-                        vtable: StaticPluginVtable {
-                            instance: std::ptr::null(),
-                            manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
-                                std::ptr::null()
-                            },
-                            activate: test_activate,
-                            register_commands: None,
-                            register_auth_providers: None,
-                            deactivate: test_deactivate,
-                            invoke_service_streaming: service_streaming,
-                            handle_event: test_handle_event,
-                            cli_registration: None,
-                        },
-                    },
+                    backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+                        activate: test_activate,
+                        register_commands: None,
+                        register_auth_providers: None,
+                        deactivate: test_deactivate,
+                        invoke: service,
+                        handle_event: test_handle_event,
+                    }),
                 }],
             });
 
@@ -13692,112 +12482,71 @@ library = "libexample_plugin.dylib"
         assert_eq!(FAST_MODEL_CALLS.load(Ordering::SeqCst), 1);
     }
 
-    fn test_activate(_: *const std::ffi::c_void) -> i32 {
+    fn test_activate() -> i32 {
         0
     }
 
-    fn test_activate_failed(_: *const std::ffi::c_void) -> i32 {
+    fn test_activate_failed() -> i32 {
         71
     }
 
-    fn test_register_auth_failed(
-        _: *const std::ffi::c_void,
-        _: Option<AuthRegistrationCallback>,
-        _: *mut std::ffi::c_void,
-    ) -> i32 {
+    fn test_register_auth_failed(_: &mut Vec<AuthProviderContribution>) -> i32 {
         72
     }
 
-    fn test_register_auth_malformed(
-        _: *const std::ffi::c_void,
-        callback: Option<AuthRegistrationCallback>,
-        user_data: *mut std::ffi::c_void,
-    ) -> i32 {
-        let payload = b"not-json";
-        callback.expect("registration callback")(payload.as_ptr(), payload.len(), user_data);
-        0
-    }
-
-    fn test_deactivate(_: *const std::ffi::c_void) -> i32 {
-        0
-    }
-
-    fn test_handle_event(_: *const std::ffi::c_void, _: *const u8, _: usize) -> i32 {
-        bcode_plugin_sdk::EVENT_STATUS_OK
-    }
-
-    fn test_service(
-        _: *const std::ffi::c_void,
-        _: *const u8,
-        _: usize,
-        output: *mut u8,
-        cap: usize,
-        len: *mut usize,
-    ) -> i32 {
-        write_test_response(&ServiceResponse::text("ok"), output, cap, len)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn test_bridge_service(
-        _instance: *const std::ffi::c_void,
-        _input_ptr: *const u8,
-        _input_len: usize,
-        output: *mut u8,
-        cap: usize,
-        len: *mut usize,
-        _event_callback: Option<ServiceEventCallback>,
-        _event_user_data: *mut std::ffi::c_void,
-        bridge_callback: Option<ServiceBridgeCallback>,
-        bridge_user_data: *mut std::ffi::c_void,
-        _cancellation_callback: Option<ServiceCancellationWaitCallback>,
-        _cancellation_user_data: *mut std::ffi::c_void,
-    ) -> i32 {
-        let callback = bridge_callback.expect("bridge callback should be provided");
-        let request = ServiceBridgeRequest::Exchange(bcode_tool::ToolExchangeRequest {
-            invocation_id: "invoke".to_string(),
-            exchange_id: "exchange".to_string(),
-            producer_id: "producer".to_string(),
-            schema: "example.exchange".to_string(),
-            schema_version: 1,
-            payload: serde_json::Value::Null,
-            response_policy: bcode_tool::ToolExchangeResponsePolicy::Required,
+    fn test_register_auth_malformed(contributions: &mut Vec<AuthProviderContribution>) -> i32 {
+        contributions.push(AuthProviderContribution {
+            external_sources: Vec::new(),
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION
+                + 1,
+            provider_id: "malformed".to_owned(),
+            display_name: "Malformed".to_owned(),
+            methods: Vec::new(),
         });
-        let request = serde_json::to_vec(&request).expect("bridge request encodes");
-        let mut bridge_output = vec![0; SERVICE_BRIDGE_MAX_RESPONSE_BYTES];
-        let mut bridge_output_len = 0;
-        let status = callback(
-            request.as_ptr(),
-            request.len(),
-            bridge_output.as_mut_ptr(),
-            bridge_output.len(),
-            &raw mut bridge_output_len,
-            bridge_user_data,
-        );
-        if status == SERVICE_BRIDGE_STATUS_CANCELLED {
-            return write_test_response(
-                &ServiceResponse::text("bridge-cancelled"),
-                output,
-                cap,
-                len,
-            );
+        0
+    }
+
+    fn test_deactivate() -> i32 {
+        0
+    }
+
+    fn test_handle_event(_: &NativeEventContext) -> i32 {
+        0
+    }
+
+    fn test_service(_: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
+        ServiceResponse::text("ok")
+    }
+
+    fn test_streaming_service(
+        invocation: &mut test_backend::TestInvocation<'_>,
+    ) -> ServiceResponse {
+        (invocation.on_event)(b"event".to_vec());
+        (invocation.on_event)(b"thread-event".to_vec());
+        test_service(invocation)
+    }
+
+    fn test_large_service(_: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
+        ServiceResponse::text("x".repeat(1024 * 1024 + 1))
+    }
+
+    /// Lifecycle fixture whose service returns a large response.
+    pub fn test_large_vtable() -> test_backend::TestBackend {
+        test_backend::TestBackend {
+            invoke: test_large_service,
+            ..test_streaming_vtable()
         }
-        if status == SERVICE_BRIDGE_STATUS_FAILED {
-            return write_test_response(
-                &ServiceResponse::error(
-                    "bridge_outcome_unknown",
-                    "bridge handler started but supplied no authoritative response",
-                ),
-                output,
-                cap,
-                len,
-            );
+    }
+
+    fn test_streaming_vtable() -> test_backend::TestBackend {
+        test_backend::TestBackend {
+            activate: test_activate,
+            register_commands: None,
+            register_auth_providers: None,
+            deactivate: test_deactivate,
+            invoke: test_streaming_service,
+            handle_event: test_handle_event,
         }
-        assert_eq!(status, SERVICE_BRIDGE_STATUS_OK);
-        bridge_output.truncate(bridge_output_len);
-        let response = serde_json::from_slice::<ServiceBridgeResponse>(&bridge_output)
-            .expect("bridge response decodes");
-        assert!(matches!(response, ServiceBridgeResponse::Exchange(_)));
-        write_test_response(&ServiceResponse::text("bridge-ok"), output, cap, len)
     }
 
     #[test]
@@ -13806,7 +12555,6 @@ library = "libexample_plugin.dylib"
         let mut on_event = |payload| events.push(payload);
         let mut event_state = ServiceCallbackState {
             on_event: &mut on_event,
-            response_chunks: Vec::new(),
         };
         let event_registration = CallbackRegistration::new(&mut event_state);
         let event_handle = event_registration.user_data();
@@ -13853,157 +12601,6 @@ library = "libexample_plugin.dylib"
         drop(event_registration);
         assert_eq!(events, vec![b"nested-progress".to_vec()]);
         assert!(serde_json::from_slice::<ServiceBridgeResponse>(&response[..response_len]).is_ok());
-    }
-
-    fn test_bridge_vtable() -> StaticPluginVtable {
-        let mut vtable = test_streaming_vtable();
-        vtable.invoke_service_streaming = test_bridge_service;
-        vtable
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn test_streaming_service(
-        instance: *const std::ffi::c_void,
-        input_ptr: *const u8,
-        input_len: usize,
-        output: *mut u8,
-        cap: usize,
-        len: *mut usize,
-        callback: Option<ServiceEventCallback>,
-        user_data: *mut std::ffi::c_void,
-        _bridge_callback: Option<ServiceBridgeCallback>,
-        _bridge_user_data: *mut std::ffi::c_void,
-        _cancellation_callback: Option<ServiceCancellationWaitCallback>,
-        _cancellation_user_data: *mut std::ffi::c_void,
-    ) -> i32 {
-        if let Some(callback) = callback {
-            callback(b"event".as_ptr(), b"event".len(), user_data);
-            let user_data = user_data as usize;
-            std::thread::spawn(move || {
-                callback(
-                    b"thread-event".as_ptr(),
-                    b"thread-event".len(),
-                    user_data as *mut std::ffi::c_void,
-                );
-            })
-            .join()
-            .expect("event thread should join");
-        }
-        test_service(instance, input_ptr, input_len, output, cap, len)
-    }
-
-    static LARGE_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static LARGE_CHUNKING_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_large_service(
-        _: *const std::ffi::c_void,
-        _: *const u8,
-        _: usize,
-        output: *mut u8,
-        cap: usize,
-        len: *mut usize,
-    ) -> i32 {
-        LARGE_CALLS.fetch_add(1, Ordering::SeqCst);
-        let response = ServiceResponse::text("x".repeat(1024 * 1024 + 1));
-        write_test_response(&response, output, cap, len)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn test_large_chunking_service(
-        _: *const std::ffi::c_void,
-        _: *const u8,
-        _: usize,
-        output: *mut u8,
-        cap: usize,
-        len: *mut usize,
-        callback: Option<ServiceEventCallback>,
-        user_data: *mut std::ffi::c_void,
-        _bridge_callback: Option<ServiceBridgeCallback>,
-        _bridge_user_data: *mut std::ffi::c_void,
-        _cancellation_callback: Option<ServiceCancellationWaitCallback>,
-        _cancellation_user_data: *mut std::ffi::c_void,
-    ) -> i32 {
-        LARGE_CHUNKING_CALLS.fetch_add(1, Ordering::SeqCst);
-        let response = ServiceResponse::text("x".repeat(1024 * 1024 + 1));
-        let encoded = serde_json::to_vec(&response).expect("service response encodes");
-        unsafe {
-            *len = encoded.len();
-        }
-        if output.is_null() || cap < encoded.len() {
-            if let Some(callback) = callback {
-                for chunk in encoded.chunks(256 * 1024) {
-                    let mut payload =
-                        Vec::with_capacity(SERVICE_RESPONSE_CHUNK_PREFIX.len() + chunk.len());
-                    payload.extend_from_slice(SERVICE_RESPONSE_CHUNK_PREFIX);
-                    payload.extend_from_slice(chunk);
-                    callback(payload.as_ptr(), payload.len(), user_data);
-                }
-                unsafe {
-                    *len = 0;
-                }
-                return SERVICE_STATUS_OK;
-            }
-            return SERVICE_STATUS_BUFFER_TOO_SMALL;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
-        }
-        SERVICE_STATUS_OK
-    }
-
-    fn test_large_chunking_vtable() -> StaticPluginVtable {
-        StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
-            activate: test_activate,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: test_deactivate,
-            invoke_service_streaming: test_large_chunking_service,
-            cli_registration: None,
-            handle_event: test_handle_event,
-        }
-    }
-
-    pub fn test_large_vtable() -> StaticPluginVtable {
-        StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
-            activate: test_activate,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: test_deactivate,
-            invoke_service_streaming: |instance,
-                                       input_ptr,
-                                       input_len,
-                                       output,
-                                       cap,
-                                       len,
-                                       _,
-                                       _,
-                                       _,
-                                       _,
-                                       _,
-                                       _| {
-                test_large_service(instance, input_ptr, input_len, output, cap, len)
-            },
-            cli_registration: None,
-            handle_event: test_handle_event,
-        }
-    }
-
-    fn test_streaming_vtable() -> StaticPluginVtable {
-        StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
-            activate: test_activate,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: test_deactivate,
-            invoke_service_streaming: test_streaming_service,
-            cli_registration: None,
-            handle_event: test_handle_event,
-        }
     }
 
     fn workflow_template() -> WorkflowTemplateContribution {
@@ -14216,9 +12813,7 @@ library = "libexample_plugin.dylib"
             loaded: vec![LoadedPlugin {
                 manifest: manifest.clone(),
                 config: ResolvedPluginConfig::default(),
-                backend: LoadedPluginBackend::Static {
-                    vtable: test_streaming_vtable(),
-                },
+                backend: LoadedPluginBackend::Test(test_streaming_vtable()),
             }],
             cleanup_pending: Vec::new(),
             configs: BTreeMap::new(),
@@ -14355,34 +12950,8 @@ library = "libexample_plugin.dylib"
             runtime: PluginRuntime::Native(NativePluginRuntime {
                 abi_version: CURRENT_PLUGIN_ABI_VERSION,
                 library: PathBuf::from("test"),
-                manifest_symbol: DEFAULT_NATIVE_MANIFEST_SYMBOL.to_string(),
-                activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
-                deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
-                streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
-                register_auth_providers_symbol: DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL
-                    .to_string(),
-                event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
             }),
         }
-    }
-
-    fn write_test_response(
-        response: &ServiceResponse,
-        output: *mut u8,
-        cap: usize,
-        len: *mut usize,
-    ) -> i32 {
-        let encoded = serde_json::to_vec(response).expect("service response encodes");
-        unsafe {
-            *len = encoded.len();
-        }
-        if output.is_null() || cap < encoded.len() {
-            return SERVICE_STATUS_BUFFER_TOO_SMALL;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len());
-        }
-        SERVICE_STATUS_OK
     }
 
     #[test]

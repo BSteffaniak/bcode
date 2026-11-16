@@ -4,8 +4,9 @@
 
 //! Single source of truth for statically bundled Bcode plugins.
 
-// The same public implementation definition is used by generated dynamic
-// wrappers. Keep the legacy registry below until all host consumers migrate.
+// Each implementation owns one shared definition, used both here and by the
+// generated dynamic wrappers. The registrations below pair that definition
+// with its trusted declaration and host-owned distribution policy.
 include!(concat!(env!("OUT_DIR"), "/shared_definitions.rs"));
 
 #[cfg(test)]
@@ -365,83 +366,77 @@ fn recap_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-vox-plugin")]
 fn vox_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/vox-plugin/bcode-plugin.toml"),
-        bcode_vox_plugin::static_plugin(),
+        bcode_vox_plugin::plugin_definition,
     )
-    .with_definition(bcode_vox_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-auth-broker-plugin")]
 fn auth_broker_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/auth-broker-plugin/bcode-plugin.toml"),
-        bcode_auth_broker_plugin::static_plugin(),
+        bcode_auth_broker_plugin::plugin_definition,
     )
-    .with_definition(bcode_auth_broker_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-auth-broker-provider-plugin")]
 fn auth_broker_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/auth-broker-provider-plugin/bcode-plugin.toml"),
-        bcode_auth_broker_provider_plugin::static_plugin(),
+        bcode_auth_broker_provider_plugin::plugin_definition,
     )
-    .with_definition(bcode_auth_broker_provider_plugin::plugin_definition)
+    .with_cli_registration(bcode_auth_broker_provider_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-xray-plugin")]
 fn xray_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/xray-plugin/bcode-plugin.toml"),
-        bcode_xray_plugin::static_plugin(),
+        bcode_xray_plugin::plugin_definition,
     )
-    .with_definition(bcode_xray_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-claude-code-plugin")]
 fn claude_code_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/claude-code-plugin/bcode-plugin.toml"),
-        bcode_claude_code_plugin::static_plugin(),
+        bcode_claude_code_plugin::plugin_definition,
     )
-    .with_definition(bcode_claude_code_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-codex-harness-plugin")]
 fn codex_harness_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/codex-harness-plugin/bcode-plugin.toml"),
-        bcode_codex_harness_plugin::static_plugin(),
+        bcode_codex_harness_plugin::plugin_definition,
     )
-    .with_definition(bcode_codex_harness_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-harness-plugin")]
 fn harness_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/harness-plugin/bcode-plugin.toml"),
-        bcode_harness_plugin::static_plugin(),
+        bcode_harness_plugin::plugin_definition,
     )
-    .with_definition(bcode_harness_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-usage-plugin")]
 fn usage_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/usage-plugin/bcode-plugin.toml"),
-        bcode_usage_plugin::static_plugin(),
+        bcode_usage_plugin::plugin_definition,
     )
-    .with_definition(bcode_usage_plugin::plugin_definition)
+    .with_cli_registration(bcode_usage_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
 fn bedrock_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/bedrock-provider-plugin/bcode-plugin.toml"),
-        bcode_bedrock_provider_plugin::static_plugin(),
+        bcode_bedrock_provider_plugin::plugin_definition,
     )
-    .with_definition(bcode_bedrock_provider_plugin::plugin_definition)
+    .with_cli_registration(bcode_bedrock_provider_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-blims-plugin")]
@@ -454,11 +449,11 @@ fn blims_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-code-review-plugin")]
 fn code_review_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/code-review-plugin/bcode-plugin.toml"),
-        bcode_code_review_plugin::static_plugin(),
+        bcode_code_review_plugin::plugin_definition,
     )
-    .with_definition(bcode_code_review_plugin::plugin_definition)
+    .with_cli_registration(bcode_code_review_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-prompt-profile-plugin")]
@@ -471,103 +466,79 @@ fn prompt_profile_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-default-agents-plugin")]
 fn default_agents_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-        // StaticBundledPlugin still requires the legacy metadata carrier. No
-        // legacy implementation or singleton is created: production dispatch
-        // uses the shared factory below, and old execution hooks fail closed.
-        bcode_plugin_sdk::StaticPluginVtable {
-            instance: std::ptr::null(),
-            manifest: |cache| {
-                bcode_plugin_sdk::static_manifest_export(
-                    include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
-                    cache,
-                )
-            },
-            activate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
-            invoke_service_streaming: |_, _, _, _, _, _, _, _, _, _, _, _| {
-                bcode_plugin_sdk::EXIT_UNAVAILABLE
-            },
-            handle_event: |_, _, _| bcode_plugin_sdk::EXIT_UNAVAILABLE,
-            cli_registration: None,
-        },
+        bcode_default_agents_plugin::plugin_definition,
     )
-    .with_definition(bcode_default_agents_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-document-plugin")]
 fn document_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/document-plugin/bcode-plugin.toml"),
-        bcode_document_plugin::static_plugin(),
+        bcode_document_plugin::plugin_definition,
     )
-    .with_definition(bcode_document_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-eval-plugin")]
 fn eval_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/eval-plugin/bcode-plugin.toml"),
-        bcode_eval_plugin::static_plugin(),
+        bcode_eval_plugin::plugin_definition,
     )
-    .with_definition(bcode_eval_plugin::plugin_definition)
+    .with_cli_registration(bcode_eval_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-metrics-plugin")]
 fn metrics_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/metrics-plugin/bcode-plugin.toml"),
-        bcode_metrics_plugin::static_plugin(),
+        bcode_metrics_plugin::plugin_definition,
     )
-    .with_definition(bcode_metrics_plugin::plugin_definition)
+    .with_cli_registration(bcode_metrics_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-ocr-plugin")]
 fn ocr_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/ocr-plugin/bcode-plugin.toml"),
-        bcode_ocr_plugin::static_plugin(),
+        bcode_ocr_plugin::plugin_definition,
     )
-    .with_definition(bcode_ocr_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-fake-provider-plugin")]
 fn fake_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-        bcode_fake_provider_plugin::static_plugin(),
+        bcode_fake_provider_plugin::plugin_definition,
     )
-    .with_definition(bcode_fake_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-file-references-plugin")]
 fn file_references_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/file-references-plugin/bcode-plugin.toml"),
-        bcode_file_references_plugin::static_plugin(),
+        bcode_file_references_plugin::plugin_definition,
     )
-    .with_definition(bcode_file_references_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-filesystem-plugin")]
 fn filesystem_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-        bcode_filesystem_plugin::static_plugin(),
+        bcode_filesystem_plugin::plugin_definition,
     )
-    .with_definition(bcode_filesystem_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-git-plugin")]
 fn git_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    let registration = bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
-        bcode_git_plugin::static_plugin(),
-    )
-    .with_definition(bcode_git_plugin::plugin_definition)
+        bcode_git_plugin::plugin_definition,
+    );
+    #[cfg(feature = "git-ui")]
+    let registration = registration.with_cli_registration(bcode_git_plugin::cli_registration);
+    registration
 }
 
 #[cfg(feature = "static-bundled-github-review-publisher-plugin")]
@@ -580,29 +551,26 @@ fn github_review_publisher_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-model-plugin")]
 fn model_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/model-plugin/bcode-plugin.toml"),
-        bcode_model_plugin::static_plugin(),
+        bcode_model_plugin::plugin_definition,
     )
-    .with_definition(bcode_model_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-jev-provider-plugin")]
 fn jev_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
-        bcode_jev_provider_plugin::static_plugin(),
+        bcode_jev_provider_plugin::plugin_definition,
     )
-    .with_definition(bcode_jev_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
 fn openai_compatible_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/openai-compatible-provider-plugin/bcode-plugin.toml"),
-        bcode_openai_compatible_provider_plugin::static_plugin(),
+        bcode_openai_compatible_provider_plugin::plugin_definition,
     )
-    .with_definition(bcode_openai_compatible_provider_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-opencode-session-import-plugin")]
@@ -631,39 +599,37 @@ fn sdk_session_import_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-question-plugin")]
 fn question_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-        bcode_question_plugin::static_plugin(),
+        bcode_question_plugin::plugin_definition,
     )
-    .with_definition(bcode_question_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-loop-plugin")]
 #[must_use]
 pub fn static_loop_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/loop-plugin/bcode-plugin.toml"),
-        bcode_loop_plugin::static_plugin(),
+        bcode_loop_plugin::plugin_definition,
     )
-    .with_definition(bcode_loop_plugin::plugin_definition)
+    .with_cli_registration(bcode_loop_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-read-plugin")]
 fn read_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/read-plugin/bcode-plugin.toml"),
-        bcode_read_plugin::static_plugin(),
+        bcode_read_plugin::plugin_definition,
     )
-    .with_definition(bcode_read_plugin::plugin_definition)
+    .with_cli_registration(bcode_read_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-session-derivation-plugin")]
 fn session_derivation_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/session-derivation-plugin/bcode-plugin.toml"),
-        bcode_session_derivation_plugin::static_plugin(),
+        bcode_session_derivation_plugin::plugin_definition,
     )
-    .with_definition(bcode_session_derivation_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-session-milestones-plugin")]
@@ -676,11 +642,10 @@ fn session_milestones_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-shell-plugin")]
 fn shell_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-        bcode_shell_plugin::static_plugin(),
+        bcode_shell_plugin::plugin_definition,
     )
-    .with_definition(bcode_shell_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-compressed-session-search-plugin")]
@@ -701,48 +666,46 @@ fn tantivy_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
 
 #[cfg(feature = "static-bundled-skills-plugin")]
 fn skills_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/skills-plugin/bcode-plugin.toml"),
-        bcode_skills_plugin::static_plugin(),
+        bcode_skills_plugin::plugin_definition,
     )
-    .with_definition(bcode_skills_plugin::plugin_definition)
+    .with_cli_registration(bcode_skills_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-vim-edit-plugin")]
 fn vim_edit_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
-        bcode_vim_edit_plugin::static_plugin(),
+        bcode_vim_edit_plugin::plugin_definition,
     )
-    .with_definition(bcode_vim_edit_plugin::plugin_definition)
     .with_default_activation(bcode_plugin::PluginDefaultActivation::Disabled)
 }
 
 #[cfg(feature = "static-bundled-web-search-plugin")]
 fn web_search_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/web-search-plugin/bcode-plugin.toml"),
-        bcode_web_search_plugin::static_plugin(),
+        bcode_web_search_plugin::plugin_definition,
     )
-    .with_definition(bcode_web_search_plugin::plugin_definition)
 }
 
 #[cfg(feature = "static-bundled-worktree-plugin")]
 fn worktree_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/worktree-plugin/bcode-plugin.toml"),
-        bcode_worktree_plugin::static_plugin(),
+        bcode_worktree_plugin::plugin_definition,
     )
-    .with_definition(bcode_worktree_plugin::plugin_definition)
+    .with_cli_registration(bcode_worktree_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-workflow-plugin")]
 fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
+    bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
-        bcode_workflow_plugin::static_plugin(),
+        bcode_workflow_plugin::plugin_definition,
     )
-    .with_definition(bcode_workflow_plugin::plugin_definition)
+    .with_cli_registration(bcode_workflow_plugin::cli_registration)
     .with_package_root(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../plugins/workflow-plugin"
@@ -768,14 +731,10 @@ mod tests {
         assert_eq!(selected.len(), 1);
         let (manifest, registration) = &selected[0];
         assert_eq!(manifest.id, "bcode.recap");
-        assert!(registration.vtable.is_none());
         assert_eq!(
             registration.default_activation(),
             bcode_plugin::PluginDefaultActivation::Enabled
         );
-        // The legacy-only API must not invent a carrier or silently drop this
-        // selected definition. Production callers retain the complete registration.
-        assert!(bcode_plugin::filter_selected_static_plugins(&bundles, &selection).is_err());
         let disabled = bcode_plugin::PluginSelection {
             disabled: std::collections::BTreeSet::from(["bcode.recap".into()]),
             ..selection
@@ -789,16 +748,8 @@ mod tests {
 
     #[cfg(feature = "static-bundled-default-agents-plugin")]
     #[test]
-    fn default_agents_legacy_carrier_is_metadata_only() {
+    fn default_agents_definition_matches_registered_declaration() {
         let registration = super::default_agents_plugin();
-        let vtable = registration
-            .vtable
-            .expect("default agents explicit legacy carrier");
-        assert!(vtable.instance.is_null());
-        assert_eq!(
-            (vtable.activate)(vtable.instance),
-            bcode_plugin_sdk::EXIT_UNAVAILABLE
-        );
         let definition = bcode_default_agents_plugin::plugin_definition();
         assert_eq!(definition.metadata.plugin_id, "bcode.default-agents");
         let embedded: toml::Value =

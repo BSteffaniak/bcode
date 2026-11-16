@@ -8,8 +8,9 @@ contract, not a model provider. Verified against the installed Codex CLI `0.164.
 
 * Plugin ID `bcode.codex-harness`; auth provider `bcode.codex`, vault method and
   credential `api_key`, storage key `CODEX_API_KEY`. No ambient credential discovery.
-* `static_plugin()` under `static-bundled` returns the SDK static (concurrent) vtable and
-  excludes dynamic exports. Distribution enablement is host-owned.
+* `plugin_definition()` is the plugin's single shared definition; bundled hosts register
+  it directly and dynamic packaging wraps the same definition. Distribution enablement
+  is host-owned.
 * Services declared in `bcode-plugin.toml`:
   * `bcode.harness/v3` — managed sessions;
   * `bcode.harness.candidates/v1` — setup discovery (`discover_candidates`,

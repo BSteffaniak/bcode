@@ -30,7 +30,7 @@ pub use question_native::question_tui_registry;
 #[cfg(feature = "native")]
 pub use question_native::{
     QuestionPlugin, plugin_definition, plugin_definition_with_host, product_registrations,
-    question_interaction_adapter, question_interaction_registry, static_plugin,
+    question_interaction_adapter, question_interaction_registry,
 };
 pub use question_types::*;
 #[cfg(feature = "native")]

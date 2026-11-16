@@ -2823,11 +2823,7 @@ fn bounded_message(message: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use bcode_plugin::{PluginHost, PluginManifest};
-    use bcode_plugin_sdk::{
-        NativeServiceContext, ServiceCancellationWaitCallback, ServiceEventCallback,
-        ServiceResponse, StaticPluginVtable,
-    };
+    use bcode_plugin_sdk::{NativeServiceContext, ServiceResponse};
     use bcode_session_models::SessionId;
     use bcode_session_search::{
         CURRENT_NORMALIZATION_VERSION, CURRENT_SEARCH_POLICY_VERSION,
@@ -2837,8 +2833,6 @@ pub(crate) mod tests {
         SessionSearchLocator, SessionSearchPlanPolicy, SessionSearchRouteMode, SessionSearchStatus,
     };
     use std::collections::{BTreeMap, BTreeSet};
-    use std::ffi::c_void;
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use switchy::database::query::FilterableQuery as _;
@@ -2863,7 +2857,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_integration_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const SLOW_PROVIDER_MANIFEST: &str = concat!(
         "id = \"test.slow-session-search\"\n",
@@ -2878,7 +2871,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_integration_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const MALFORMED_PROVIDER_MANIFEST: &str = concat!(
         "id = \"test.malformed-session-search\"\n",
@@ -2893,7 +2885,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_integration_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const FAST_SEQUENCE: u64 = 11;
     static SLOW_SEARCH_STARTED: AtomicBool = AtomicBool::new(false);
@@ -2920,7 +2911,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_future_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const FUTURE_CAPABILITY_PROVIDER_MANIFEST: &str = concat!(
         "id = \"test.future-capability-session-search\"\n",
@@ -2935,7 +2925,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_future_capability_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
     const CRASH_PROVIDER_MANIFEST: &str = concat!(
         "id = \"test.crash-session-search\"\n",
@@ -2950,7 +2939,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_crash_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
 
     const UNAVAILABLE_PROVIDER_MANIFEST: &str = concat!(
@@ -2966,7 +2954,6 @@ pub(crate) mod tests {
         "type = \"native\"\n",
         "library = \"libsession_search_unavailable_provider.dylib\"\n",
         "abi_version = 5\n",
-        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
     );
 
     #[derive(Debug, Clone, Copy)]
@@ -3015,62 +3002,6 @@ pub(crate) mod tests {
     struct TestProviderInstance {
         provider_id: &'static str,
         behavior: TestProviderBehavior,
-    }
-
-    fn provider_manifest(provider_id: &str) -> PluginManifest {
-        toml::from_str(match provider_id {
-            FAST_PROVIDER_ID => FAST_PROVIDER_MANIFEST,
-            SLOW_PROVIDER_ID => SLOW_PROVIDER_MANIFEST,
-            MALFORMED_PROVIDER_ID => MALFORMED_PROVIDER_MANIFEST,
-            FUTURE_PROVIDER_ID => FUTURE_PROVIDER_MANIFEST,
-            FUTURE_CAPABILITY_PROVIDER_ID => FUTURE_CAPABILITY_PROVIDER_MANIFEST,
-            CRASH_PROVIDER_ID => CRASH_PROVIDER_MANIFEST,
-            UNAVAILABLE_PROVIDER_ID => UNAVAILABLE_PROVIDER_MANIFEST,
-            _ => panic!("unknown test provider {provider_id}"),
-        })
-        .expect("test provider manifest")
-    }
-
-    fn fast_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(FAST_PROVIDER_MANIFEST, cached)
-    }
-
-    fn slow_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(SLOW_PROVIDER_MANIFEST, cached)
-    }
-
-    fn malformed_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(MALFORMED_PROVIDER_MANIFEST, cached)
-    }
-
-    fn future_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(FUTURE_PROVIDER_MANIFEST, cached)
-    }
-
-    fn future_capability_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(FUTURE_CAPABILITY_PROVIDER_MANIFEST, cached)
-    }
-
-    fn crash_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(CRASH_PROVIDER_MANIFEST, cached)
-    }
-
-    fn unavailable_provider_manifest_export(
-        cached: &'static OnceLock<Option<std::ffi::CString>>,
-    ) -> *const std::ffi::c_char {
-        bcode_plugin_sdk::static_manifest_export(UNAVAILABLE_PROVIDER_MANIFEST, cached)
     }
 
     fn provider_capabilities(provider_id: &str) -> SessionSearchCapabilities {
@@ -3143,27 +3074,41 @@ pub(crate) mod tests {
         ServiceResponse::json(value).expect("test service response encodes")
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    /// Behaviors selected for the providers loaded by the current test.
+    static PROVIDER_BEHAVIORS: std::sync::Mutex<BTreeMap<&'static str, TestProviderBehavior>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    /// Shared-definition provider whose behavior is selected by its plugin identity.
+    #[derive(Default)]
+    struct TestProvider;
+
+    impl bcode_plugin_sdk::RustPlugin for TestProvider {}
+
+    impl bcode_plugin_sdk::ConcurrentRustPlugin for TestProvider {
+        fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+            let provider = PROVIDER_BEHAVIORS
+                .lock()
+                .expect("provider behaviors")
+                .get_key_value(context.plugin_id.as_str())
+                .map(|(provider_id, behavior)| TestProviderInstance {
+                    provider_id,
+                    behavior: *behavior,
+                })
+                .expect("selected test provider behavior");
+            test_provider_service(&provider, &context)
+        }
+    }
+
+    fn unavailable_response() -> ServiceResponse {
+        ServiceResponse::error("plugin_unavailable", "plugin service invocation failed")
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn test_provider_service(
-        instance: *const c_void,
-        input_ptr: *const u8,
-        input_len: usize,
-        output: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-        event_callback: Option<ServiceEventCallback>,
-        event_user_data: *mut c_void,
-        _bridge_callback: Option<bcode_plugin_sdk::ServiceBridgeCallback>,
-        _bridge_user_data: *mut c_void,
-        cancellation_callback: Option<ServiceCancellationWaitCallback>,
-        cancellation_user_data: *mut c_void,
-    ) -> i32 {
-        let provider = unsafe { &*instance.cast::<TestProviderInstance>() };
-        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-        let Ok(context) = serde_json::from_slice::<NativeServiceContext>(input) else {
-            return bcode_plugin_sdk::SERVICE_STATUS_DECODE_FAILED;
-        };
-        let response = match context.request.operation.as_str() {
+        provider: &TestProviderInstance,
+        context: &NativeServiceContext,
+    ) -> ServiceResponse {
+        match context.request.operation.as_str() {
             OP_CAPABILITIES
                 if matches!(provider.behavior, TestProviderBehavior::FutureCapability) =>
             {
@@ -3178,19 +3123,14 @@ pub(crate) mod tests {
                     STATUS_STARTED.store(true, Ordering::SeqCst);
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);
                     while !STATUS_RELEASE.load(Ordering::SeqCst) {
-                        if cancellation_callback
-                            .is_some_and(|callback| callback(10, cancellation_user_data))
+                        if context
+                            .cancellation
+                            .wait_cancelled(Duration::from_millis(10))
                         {
                             STATUS_CANCELLED.store(true, Ordering::SeqCst);
-                            return bcode_plugin_sdk::write_service_response(
-                                &ServiceResponse::error("cancelled", "status bootstrap cancelled"),
-                                output,
-                                output_capacity,
-                                output_len,
-                                &bcode_plugin_sdk::ServiceEventEmitter::new(
-                                    event_callback,
-                                    event_user_data,
-                                ),
+                            return ServiceResponse::error(
+                                "cancelled",
+                                "status bootstrap cancelled",
                             );
                         }
                         if std::time::Instant::now() >= deadline {
@@ -3232,7 +3172,7 @@ pub(crate) mod tests {
             }
             OP_APPLY_BATCH => {
                 if matches!(provider.behavior, TestProviderBehavior::UnavailableApply) {
-                    return bcode_plugin_sdk::SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+                    return unavailable_response();
                 }
                 if let Some((code, message)) = match provider.behavior {
                     TestProviderBehavior::QuotaApply => {
@@ -3259,16 +3199,7 @@ pub(crate) mod tests {
                     | TestProviderBehavior::GatedStatus
                     | TestProviderBehavior::UnavailableApply => None,
                 } {
-                    return bcode_plugin_sdk::write_service_response(
-                        &ServiceResponse::error(code, message),
-                        output,
-                        output_capacity,
-                        output_len,
-                        &bcode_plugin_sdk::ServiceEventEmitter::new(
-                            event_callback,
-                            event_user_data,
-                        ),
-                    );
+                    return ServiceResponse::error(code, message);
                 }
                 let request = context
                     .request
@@ -3276,8 +3207,9 @@ pub(crate) mod tests {
                     .expect("apply batch request");
                 if matches!(provider.behavior, TestProviderBehavior::Slow) {
                     SLOW_APPLY_STARTED.store(true, Ordering::SeqCst);
-                    let cancelled = cancellation_callback
-                        .is_some_and(|callback| callback(5_000, cancellation_user_data));
+                    let cancelled = context
+                        .cancellation
+                        .wait_cancelled(Duration::from_millis(5_000));
                     SLOW_APPLY_CANCELLED.store(cancelled, Ordering::SeqCst);
                     let acknowledgment = {
                         let mut sender = SLOW_APPLY_ACK.lock().unwrap();
@@ -3286,23 +3218,14 @@ pub(crate) mod tests {
                     if let Some(acknowledgment) = acknowledgment {
                         let _ = acknowledgment.send(cancelled);
                     }
-                    return bcode_plugin_sdk::write_service_response(
-                        &if cancelled {
-                            ServiceResponse::error("cancelled", "cancelled by host")
-                        } else {
-                            ServiceResponse::error(
-                                "not_cancelled",
-                                "host cancellation was not observed",
-                            )
-                        },
-                        output,
-                        output_capacity,
-                        output_len,
-                        &bcode_plugin_sdk::ServiceEventEmitter::new(
-                            event_callback,
-                            event_user_data,
-                        ),
-                    );
+                    return if cancelled {
+                        ServiceResponse::error("cancelled", "cancelled by host")
+                    } else {
+                        ServiceResponse::error(
+                            "not_cancelled",
+                            "host cancellation was not observed",
+                        )
+                    };
                 }
                 assert!(request.records.iter().all(|record| {
                     matches!(
@@ -3426,9 +3349,7 @@ pub(crate) mod tests {
                 TestProviderBehavior::Malformed
                 | TestProviderBehavior::FutureStatus
                 | TestProviderBehavior::FutureCapability => ServiceResponse::text("not-json"),
-                TestProviderBehavior::Crash => {
-                    return bcode_plugin_sdk::SERVICE_STATUS_PLUGIN_UNAVAILABLE;
-                }
+                TestProviderBehavior::Crash => unavailable_response(),
                 TestProviderBehavior::Fast
                 | TestProviderBehavior::RejectCleanup
                 | TestProviderBehavior::Stateful
@@ -3448,8 +3369,9 @@ pub(crate) mod tests {
                 }
                 TestProviderBehavior::Slow => {
                     SLOW_SEARCH_STARTED.store(true, Ordering::SeqCst);
-                    let cancelled = cancellation_callback
-                        .is_some_and(|callback| callback(5_000, cancellation_user_data));
+                    let cancelled = context
+                        .cancellation
+                        .wait_cancelled(Duration::from_millis(5_000));
                     SLOW_SEARCH_CANCELLED.store(cancelled, Ordering::SeqCst);
                     SLOW_SEARCH_FINISHED.store(true, Ordering::SeqCst);
                     if cancelled {
@@ -3466,58 +3388,42 @@ pub(crate) mod tests {
                 "unsupported_operation",
                 format!("unsupported operation {operation}"),
             ),
-        };
-        bcode_plugin_sdk::write_service_response(
-            &response,
-            output,
-            output_capacity,
-            output_len,
-            &bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
-        )
-    }
-
-    fn test_activate(_: *const c_void) -> i32 {
-        bcode_plugin_sdk::EXIT_OK
-    }
-
-    fn test_deactivate(_: *const c_void) -> i32 {
-        bcode_plugin_sdk::EXIT_OK
-    }
-
-    fn test_handle_event(_: *const c_void, _: *const u8, _: usize) -> i32 {
-        bcode_plugin_sdk::EVENT_STATUS_OK
-    }
-
-    fn provider_vtable(
-        provider_id: &'static str,
-        behavior: TestProviderBehavior,
-    ) -> StaticPluginVtable {
-        let instance = Box::leak(Box::new(TestProviderInstance {
-            provider_id,
-            behavior,
-        }));
-        let manifest = match provider_id {
-            FAST_PROVIDER_ID => fast_provider_manifest_export,
-            SLOW_PROVIDER_ID => slow_provider_manifest_export,
-            MALFORMED_PROVIDER_ID => malformed_provider_manifest_export,
-            FUTURE_PROVIDER_ID => future_provider_manifest_export,
-            FUTURE_CAPABILITY_PROVIDER_ID => future_capability_provider_manifest_export,
-            CRASH_PROVIDER_ID => crash_provider_manifest_export,
-            UNAVAILABLE_PROVIDER_ID => unavailable_provider_manifest_export,
-            _ => panic!("unknown test provider {provider_id}"),
-        };
-        StaticPluginVtable {
-            instance: std::ptr::from_ref(instance).cast(),
-            manifest,
-            activate: test_activate,
-            register_commands: None,
-            register_auth_providers: None,
-            deactivate: test_deactivate,
-            invoke_service_streaming: test_provider_service,
-            cli_registration: None,
-            handle_event: test_handle_event,
         }
     }
+
+    fn provider_registration(provider_id: &str) -> bcode_plugin::StaticBundledPlugin {
+        fn definition<const MANIFEST: usize>() -> bcode_plugin_sdk::definition::PluginDefinition {
+            bcode_plugin_sdk::definition::concurrent_plugin_definition_from_manifest::<TestProvider>(
+                PROVIDER_MANIFESTS[MANIFEST],
+                bcode_plugin_sdk::definition::ProductRegistrations::default(),
+            )
+            .expect("test provider definition")
+        }
+        let (index, definition): (
+            usize,
+            fn() -> bcode_plugin_sdk::definition::PluginDefinition,
+        ) = match provider_id {
+            FAST_PROVIDER_ID => (0, definition::<0>),
+            SLOW_PROVIDER_ID => (1, definition::<1>),
+            MALFORMED_PROVIDER_ID => (2, definition::<2>),
+            FUTURE_PROVIDER_ID => (3, definition::<3>),
+            FUTURE_CAPABILITY_PROVIDER_ID => (4, definition::<4>),
+            CRASH_PROVIDER_ID => (5, definition::<5>),
+            UNAVAILABLE_PROVIDER_ID => (6, definition::<6>),
+            _ => panic!("unknown test provider {provider_id}"),
+        };
+        bcode_plugin::StaticBundledPlugin::from_definition(PROVIDER_MANIFESTS[index], definition)
+    }
+
+    const PROVIDER_MANIFESTS: [&str; 7] = [
+        FAST_PROVIDER_MANIFEST,
+        SLOW_PROVIDER_MANIFEST,
+        MALFORMED_PROVIDER_MANIFEST,
+        FUTURE_PROVIDER_MANIFEST,
+        FUTURE_CAPABILITY_PROVIDER_MANIFEST,
+        CRASH_PROVIDER_MANIFEST,
+        UNAVAILABLE_PROVIDER_MANIFEST,
+    ];
 
     pub async fn lock_search_tests() -> tokio::sync::MutexGuard<'static, ()> {
         SEARCH_TEST_LOCK.lock().await
@@ -3535,18 +3441,19 @@ pub(crate) mod tests {
     pub fn state_with_providers(
         providers: &[(&'static str, TestProviderBehavior)],
     ) -> crate::ServerState {
-        let loaded = providers
+        let mut behaviors = PROVIDER_BEHAVIORS.lock().expect("provider behaviors");
+        behaviors.clear();
+        behaviors.extend(providers.iter().copied());
+        drop(behaviors);
+        let registrations = providers
             .iter()
-            .map(|(provider_id, behavior)| {
-                (
-                    provider_manifest(provider_id),
-                    provider_vtable(provider_id, *behavior),
-                )
-            })
+            .map(|(provider_id, _)| provider_registration(provider_id))
             .collect::<Vec<_>>();
-        let plugins = PluginHost::load_static_plugins(&loaded)
-            .expect("load test providers")
-            .into();
+        let plugins = crate::tests::load_test_plugins(
+            &bcode_plugin::PluginSelection::all_enabled(),
+            &registrations,
+        )
+        .expect("load test providers");
         crate::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::persistent_lazy(
                 tempfile::tempdir().expect("session root").keep(),

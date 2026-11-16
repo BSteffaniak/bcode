@@ -504,25 +504,25 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
         },
         &[
             bcode_bundled_plugins::static_loop_plugin(),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/worktree-plugin/bcode-plugin.toml"),
-                bcode_worktree_plugin::static_plugin(),
+                bcode_worktree_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                bcode_filesystem_plugin::static_plugin(),
+                bcode_filesystem_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/shell-plugin/bcode-plugin.toml"),
-                bcode_shell_plugin::static_plugin(),
+                bcode_shell_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/workflow-plugin/bcode-plugin.toml"),
-                bcode_workflow_plugin::static_plugin(),
+                bcode_workflow_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                bcode_fake_provider_plugin::static_plugin(),
+                bcode_fake_provider_plugin::plugin_definition,
             ),
             crate::tests::shared_test_plugin(
                 include_str!("../../../../plugins/default-agents-plugin/bcode-plugin.toml"),

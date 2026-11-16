@@ -2988,14 +2988,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        ShellPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 #[cfg(feature = "tui")]
 #[must_use]
 pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
@@ -3087,7 +3079,6 @@ mod tests {
         bridge: ServiceBridge,
     ) -> NativeServiceContext {
         NativeServiceContext {
-            diagnostics: None,
             plugin_id: "bcode.shell".to_string(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),

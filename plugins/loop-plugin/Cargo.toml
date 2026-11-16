@@ -51,7 +51,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 bcode_model_schema          = { workspace = true }
-bcode_workflow_plugin       = { workspace = true, features = ["static-bundled"] }
+bcode_workflow_plugin       = { workspace = true }
 jsonschema                  = { workspace = true }
 switchy_database            = { workspace = true }
 switchy_database_connection = { workspace = true }
@@ -60,5 +60,4 @@ tempfile                    = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
 test-fixtures    = []

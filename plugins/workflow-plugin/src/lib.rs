@@ -1568,17 +1568,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-/// Transitional compatibility adapter; new consumers must use the shared definition.
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_plugin_vtable!(
-        WorkflowPlugin,
-        include_str!("../bcode-plugin.toml")
-    );
-    vtable.cli_registration = Some(cli_registration);
-    vtable
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

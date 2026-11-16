@@ -4950,9 +4950,7 @@ mod explicit_provider_auth_tests {
 
     #[test]
     fn sdk_preserves_explicit_invoker_after_configuring_tool_runtime() {
-        let plugins = bcode_plugin::PluginRuntimeHost::from(
-            bcode_plugin::PluginHost::load_static_plugins(&[]).expect("empty plugin host"),
-        );
+        let plugins = bcode_plugin::PluginRuntimeHost::from(bcode_plugin::PluginHost::default());
         let provider = PluginModelProviderInvoker::new(plugins.clone()).auth_inputs(
             bcode_config::BcodeConfig::default(),
             bcode_config::RuntimeAuthSubscriptions::default(),
@@ -4997,9 +4995,7 @@ mod explicit_provider_auth_tests {
         let path = root.path().join("auth");
         let store = Arc::new(bcode_provider_auth::store::AuthStore::create(&path).unwrap());
         let weak = Arc::downgrade(&store);
-        let plugins = bcode_plugin::PluginRuntimeHost::from(
-            bcode_plugin::PluginHost::load_static_plugins(&[]).unwrap(),
-        );
+        let plugins = bcode_plugin::PluginRuntimeHost::from(bcode_plugin::PluginHost::default());
         let provider = PluginModelProviderInvoker::new(plugins)
             .auth_store(bcode_config::BcodeConfig::default(), store);
         let sdk = Bcode::builder().provider_invoker(provider).build();
@@ -5014,9 +5010,7 @@ mod explicit_provider_auth_tests {
 
     #[test]
     fn explicit_inputs_use_shared_auth_validation_without_discovery() {
-        let plugins = bcode_plugin::PluginRuntimeHost::from(
-            bcode_plugin::PluginHost::load_static_plugins(&[]).expect("empty plugin host"),
-        );
+        let plugins = bcode_plugin::PluginRuntimeHost::from(bcode_plugin::PluginHost::default());
         let provider = PluginModelProviderInvoker::new(plugins).auth_inputs(
             bcode_config::BcodeConfig::default(),
             bcode_config::RuntimeAuthSubscriptions::default(),

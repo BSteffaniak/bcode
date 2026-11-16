@@ -1249,10 +1249,6 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedInstance {
                 bmux_plugin_sdk::PluginCommandError::unavailable("selected implementation retired")
             })?;
             let context = bcode_plugin_sdk::NativeServiceContext {
-                // Extension dispatch never registers a native diagnostic side channel
-                // (negotiation is keyed by the raw ABI event callback handle), so there is
-                // no negotiated diagnostic context to forward for this invocation.
-                diagnostics: None,
                 plugin_id: id.clone(),
                 request: bcode_plugin_sdk::ServiceRequest {
                     interface_id: contract.clone(),
@@ -1328,10 +1324,6 @@ impl bcode_plugin_sdk::definition::ProductExtensionPort for SharedInstance {
                 bmux_plugin_sdk::PluginCommandError::unavailable("selected implementation retired")
             })?;
             let context = bcode_plugin_sdk::NativeServiceContext {
-                // Extension dispatch never registers a native diagnostic side channel
-                // (negotiation is keyed by the raw ABI event callback handle), so there is
-                // no negotiated diagnostic context to forward for this invocation.
-                diagnostics: None,
                 plugin_id: id.clone(),
                 request: bcode_plugin_sdk::ServiceRequest {
                     interface_id: contract.clone(),

@@ -5231,16 +5231,19 @@ pub fn load_embedded_plugins(
     load_embedded_plugins_with_config(selection, plugins, std::collections::BTreeMap::new())
 }
 
-/// [`load_embedded_plugins`] with caller-resolved plugin configuration. Supplied
-/// activation contexts are preserved; other enabled plugins share one runtime scope.
+/// Grant every enabled static registration explicit activation authority from one
+/// new shared plugin runtime scope. Supplied activation contexts are preserved.
 ///
 /// # Errors
-/// Returns manifest, selection, activation or load failures.
-pub fn load_embedded_plugins_with_config(
+/// Returns an error when a registration manifest cannot be parsed.
+pub fn bind_shared_plugin_activations(
     selection: &bcode_plugin::PluginSelection,
     plugins: &[bcode_plugin::StaticBundledPlugin],
     mut configs: std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
-) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
+) -> Result<
+    std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
+    bcode_plugin::PluginLoadError,
+> {
     let runtime = shared_plugin_runtime::Runtime::new();
     let ids = bcode_plugin::static_bundled_plugin_ids(plugins)?;
     let enabled = ids
@@ -5259,6 +5262,20 @@ pub fn load_embedded_plugins_with_config(
             }
         }
     }
+    Ok(configs)
+}
+
+/// [`load_embedded_plugins`] with caller-resolved plugin configuration. Supplied
+/// activation contexts are preserved; other enabled plugins share one runtime scope.
+///
+/// # Errors
+/// Returns manifest, selection, activation or load failures.
+pub fn load_embedded_plugins_with_config(
+    selection: &bcode_plugin::PluginSelection,
+    plugins: &[bcode_plugin::StaticBundledPlugin],
+    configs: std::collections::BTreeMap<String, bcode_plugin::ResolvedPluginConfig>,
+) -> Result<bcode_plugin::PluginRuntimeHost, bcode_plugin::PluginLoadError> {
+    let configs = bind_shared_plugin_activations(selection, plugins, configs)?;
     bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled_and_config(
         selection, plugins, configs,
     )
@@ -48170,28 +48187,12 @@ mod tests {
         ));
     }
 
-    /// Metadata-only carrier for a shared test definition; legacy hooks are never executable.
+    /// Registration for a shared test definition.
     pub fn shared_test_plugin(
         manifest: &'static str,
         definition: fn() -> bcode_plugin_sdk::definition::PluginDefinition,
     ) -> bcode_plugin::StaticBundledPlugin {
-        bcode_plugin::StaticBundledPlugin::new(
-            manifest,
-            bcode_plugin_sdk::StaticPluginVtable {
-                instance: std::ptr::null(),
-                manifest: |_| std::ptr::null(),
-                activate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
-                register_commands: None,
-                register_auth_providers: None,
-                deactivate: |_| bcode_plugin_sdk::EXIT_UNAVAILABLE,
-                invoke_service_streaming: |_, _, _, _, _, _, _, _, _, _, _, _| {
-                    bcode_plugin_sdk::EXIT_UNAVAILABLE
-                },
-                handle_event: |_, _, _| bcode_plugin_sdk::EXIT_UNAVAILABLE,
-                cli_registration: None,
-            },
-        )
-        .with_definition(definition)
+        bcode_plugin::StaticBundledPlugin::from_definition(manifest, definition)
     }
 
     /// Load fixtures using the serving host's configured shared activation factory.
@@ -53959,7 +53960,6 @@ interface_id = "bcode.judgement-model-provider/v1"
 type = "native"
 library = "libbcode_test_advisory_boundary.dylib"
 abi_version = 5
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
 
     impl bcode_plugin_sdk::RustPlugin for AdvisoryBoundaryFixture {
@@ -54047,12 +54047,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     fn advisory_boundary_fixture_state() -> ServerState {
-        let fixture = bcode_plugin::StaticBundledPlugin::new(
+        let fixture = bcode_plugin::StaticBundledPlugin::from_definition(
             ADVISORY_FIXTURE_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(
-                AdvisoryBoundaryFixture,
-                ADVISORY_FIXTURE_MANIFEST
-            ),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<AdvisoryBoundaryFixture>(
+ ADVISORY_FIXTURE_MANIFEST,
+ <AdvisoryBoundaryFixture as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+            },
         );
         let plugins = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
@@ -54716,21 +54719,31 @@ type = "concurrent"
 type = "native"
 abi_version = 5
 library = "libbcode_test_preparing_workflow_block.dylib"
-event_symbol = "bcode_plugin_handle_event_v1"
 "#
     }
 
-    fn preparing_workflow_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-        bcode_plugin_sdk::static_plugin_vtable!(
+    fn preparing_workflow_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<
             PreparingWorkflowBlockPlugin,
-            preparing_workflow_manifest()
+        >(
+            preparing_workflow_manifest(),
+            <PreparingWorkflowBlockPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(
+            ),
         )
+        .expect("fixture definition")
     }
 
-    fn delayed_workflow_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-        bcode_plugin_sdk::static_plugin_vtable!(
+    fn delayed_workflow_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<
             DelayedWorkflowBlockPlugin,
-            r#"
+        >(
+            DELAYED_WORKFLOW_MANIFEST,
+            <DelayedWorkflowBlockPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+        )
+        .expect("fixture definition")
+    }
+
+    const DELAYED_WORKFLOW_MANIFEST: &str = r#"
 id = "bcode.test-workflow-block"
 name = "Test Workflow Block"
 version = "0.0.1"
@@ -54766,10 +54779,7 @@ type = "concurrent"
 type = "native"
 abi_version = 5
 library = "libbcode_test_workflow_block.dylib"
-event_symbol = "bcode_plugin_handle_event_v1"
-"#
-        )
-    }
+"#;
 
     fn open_progress_snapshot(
         revision: u64,
@@ -55206,10 +55216,13 @@ type = "native"
 abi_version = 5
 library = "test"
 "#;
-        bcode_plugin::StaticBundledPlugin::new(
-            MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(NonReturningCancelProvider, MANIFEST),
-        )
+        bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<NonReturningCancelProvider>(
+ MANIFEST,
+ <NonReturningCancelProvider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+        })
     }
 
     #[tokio::test]
@@ -55348,10 +55361,13 @@ type = "native"
 abi_version = 5
 library = "test"
 "#;
-        bcode_plugin::StaticBundledPlugin::new(
-            MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(NonReturningSearchProvider, MANIFEST),
-        )
+        bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<NonReturningSearchProvider>(
+ MANIFEST,
+ <NonReturningSearchProvider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+        })
     }
 
     #[tokio::test]
@@ -73673,7 +73689,6 @@ type = "concurrent"
 type = "native"
 abi_version = 5
 library = "libbcode_shell_plugin.dylib"
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
         fn subscribing_shell_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
             shell_definition_declaring(SUBSCRIBING_SHELL_MANIFEST)
@@ -90135,9 +90150,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 enabled: BTreeSet::from(["bcode.test-preparing-workflow-block".to_string()]),
                 disabled: BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 preparing_workflow_manifest(),
-                preparing_workflow_plugin(),
+                preparing_workflow_definition,
             )],
         )
         .expect("plugins"),);
@@ -90291,7 +90306,6 @@ type = "concurrent"
 type = "native"
 abi_version = 5
 library = "libbcode_test_workflow_block.dylib"
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(manifest_toml).expect("manifest");
@@ -90350,9 +90364,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
                 disabled: BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 manifest_toml,
-                delayed_workflow_plugin(),
+                delayed_workflow_definition,
             )],
         )
         .expect("plugins"),);
@@ -90478,7 +90492,6 @@ type = "concurrent"
 type = "native"
 abi_version = 5
 library = "libbcode_test_workflow_block.dylib"
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(manifest_toml).expect("manifest");
@@ -90537,9 +90550,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
                 disabled: BTreeSet::new(),
             },
-            &[bcode_plugin::StaticBundledPlugin::new(
+            &[bcode_plugin::StaticBundledPlugin::from_definition(
                 manifest_toml,
-                delayed_workflow_plugin(),
+                delayed_workflow_definition,
             )],
         )
         .expect("plugins"),);

@@ -907,12 +907,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-/// Transitional compatibility adapter; new consumers must use the shared definition.
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(DocumentPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[cfg(feature = "tui")]
 #[must_use]
 pub fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {

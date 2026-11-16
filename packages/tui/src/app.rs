@@ -5224,7 +5224,7 @@ mod tests {
                 Ok(())
             }
         }
-        let host = bcode_plugin::PluginHost::load_static_plugins(&[]).unwrap();
+        let host = bcode_plugin::PluginHost::default();
         let presentation = Arc::new(crate::plugin_tui::PluginTuiPresentation::new(host));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut registry = PluginTuiRegistry::default();

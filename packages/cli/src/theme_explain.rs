@@ -910,9 +910,15 @@ library = "libbundled.dylib"
         // Only the registration's manifest is read; the vtable is never used.
         let bundled_manifest: &'static str =
             Box::leak(BUNDLED.replace("abi_version = 1", &abi).into_boxed_str());
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
             bundled_manifest,
-            bcode_plugin_sdk::static_plugin_vtable!(ManifestOnly, BUNDLED),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<ManifestOnly>(
+                    BUNDLED,
+                    <ManifestOnly as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            },
         )];
         // An existing file stands in for the installed library; nothing is
         // opened.
@@ -1110,9 +1116,15 @@ library = "libgit.dylib"
                 )
                 .into_boxed_str(),
         );
-        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        let bundled = [bcode_plugin::StaticBundledPlugin::from_definition(
             manifest,
-            bcode_plugin_sdk::static_plugin_vtable!(ManifestOnly, MANIFEST),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<ManifestOnly>(
+                    MANIFEST,
+                    <ManifestOnly as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            },
         )];
         let plugins = plugin_rule_layers(
             &bcode_plugin::PluginSelection::all_enabled(),

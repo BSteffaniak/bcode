@@ -342,7 +342,6 @@ mod tests {
             },
             config: PluginConfigContext::default(),
             events: ServiceEventEmitter::default(),
-            diagnostics: None,
             cancellation: ServiceCancellation::default(),
             bridge: ServiceBridge::default(),
             transient_progress_limits: TransientProgressLimits::default(),

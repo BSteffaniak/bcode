@@ -37,4 +37,5 @@ tokio                        = { workspace = true, features = ["sync"] }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []
+# Process-local script gate and compaction signal controls used by host tests.
+script-controls = []

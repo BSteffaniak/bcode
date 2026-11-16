@@ -41,7 +41,6 @@ pub(super) fn context(config: Value, operation: &str, payload: &Value) -> Native
             ..PluginConfigContext::default()
         },
         events: ServiceEventEmitter::default(),
-        diagnostics: None,
         cancellation: ServiceCancellation::default(),
         bridge: ServiceBridge::default(),
         transient_progress_limits: TransientProgressLimits::default(),

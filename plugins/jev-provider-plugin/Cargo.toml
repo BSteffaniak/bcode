@@ -27,4 +27,3 @@ tokio                      = { workspace = true, features = ["rt", "time"] }
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []

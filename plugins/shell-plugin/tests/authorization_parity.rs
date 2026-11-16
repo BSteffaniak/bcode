@@ -24,7 +24,6 @@ fn context(source: &str) -> NativeServiceContext {
         host_context: Vec::new(),
     };
     NativeServiceContext {
-        diagnostics: None,
         plugin_id: "bcode.shell".to_owned(),
         request: ServiceRequest {
             interface_id: TOOL_SERVICE_INTERFACE_ID.to_owned(),
@@ -70,39 +69,4 @@ fn concurrent_entrypoint_produces_stable_authorization_facts() {
         assert_eq!(command.as_deref(), Some(source));
         assert_ne!(analysis.is_some(), analysis_error.is_some());
     }
-}
-
-#[cfg(feature = "tui")]
-#[test]
-fn static_bundled_entrypoint_produces_same_fact_as_concurrent_plugin() {
-    let source = "printf ok; rm generated";
-    let expected = preparation(source);
-    let context = context(source);
-    let encoded = serde_json::to_vec(&context).unwrap();
-    let vtable = bcode_shell_plugin::static_plugin();
-    assert_eq!((vtable.activate)(vtable.instance), 0);
-    let mut output = vec![0_u8; 1024 * 1024];
-    let mut output_len = 0_usize;
-    let status = (vtable.invoke_service_streaming)(
-        vtable.instance,
-        encoded.as_ptr(),
-        encoded.len(),
-        output.as_mut_ptr(),
-        output.len(),
-        &raw mut output_len,
-        None,
-        std::ptr::null_mut(),
-        None,
-        std::ptr::null_mut(),
-        None,
-        std::ptr::null_mut(),
-    );
-    assert_eq!(status, 0);
-    let response: bcode_plugin_sdk::ServiceResponse = serde_json::from_slice(&output[..output_len])
-        .expect("static service response should decode");
-    let actual = response
-        .payload_json::<ToolPreparationResponse>()
-        .expect("static preparation should decode");
-    assert_eq!(actual.authorization, expected.authorization);
-    assert_eq!((vtable.deactivate)(vtable.instance), 0);
 }

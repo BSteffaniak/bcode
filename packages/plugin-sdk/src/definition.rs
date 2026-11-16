@@ -708,13 +708,6 @@ impl<P: ProductImplementation> ProductInstance<P> {
             .resolve(&call)
             .map_err(|error| product_error(&error))?;
         let response = self.implementation.invoke(NativeServiceContext {
-            // The only diagnostic transport (`NativeDiagnosticMode::CallbackV1`) is
-            // the legacy raw-callback side channel installed by the native export
-            // wrappers before `invoke_service`. The shared invocation port carries
-            // no diagnostic negotiation and no capture sink is installed here, so
-            // advertising a negotiation would claim a channel that does not exist.
-            // Absent negotiation means "diagnostics disabled", never a service error.
-            diagnostics: None,
             plugin_id: self.plugin_id.clone(),
             request: crate::ServiceRequest {
                 interface_id: context.request.service.interface_id,
@@ -1319,16 +1312,6 @@ pub fn concurrent_plugin_definition_from_manifest<P: ConcurrentRustPlugin>(
 /// packaging targets use BMUX's separate `export_plugin_entrypoint!` macro.
 #[macro_export]
 macro_rules! define_plugin {
-    (concurrent $plugin:ty, metadata = $metadata:expr, registrations = $registrations:expr, host = $host:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::concurrent_plugin_definition_with_registrations::<$plugin>($metadata, $registrations, $host)
-        }
-    };
-    ($plugin:ty, metadata = $metadata:expr, registrations = $registrations:expr, host = $host:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::rust_plugin_definition_with_registrations::<$plugin>($metadata, $registrations, $host)
-        }
-    };
     (concurrent $plugin:ty, metadata = $metadata:expr, registrations = $registrations:expr $(,)?) => {
         pub fn plugin_definition() -> $crate::definition::PluginDefinition {
             $crate::definition::concurrent_plugin_definition_with_registrations::<$plugin>(
@@ -1340,50 +1323,6 @@ macro_rules! define_plugin {
             $crate::definition::rust_plugin_definition_with_registrations::<$plugin>(
                 $metadata, $registrations, |_| std::sync::Arc::new($crate::definition::SharedInvocationHost))
         }
-    };
-    (concurrent $plugin:ty, metadata = $metadata:expr, host = $host:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::concurrent_plugin_definition_with_host::<$plugin>($metadata, $host)
-        }
-    };
-    ($plugin:ty, metadata = $metadata:expr, host = $host:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::rust_plugin_definition_with_host::<$plugin>($metadata, $host)
-        }
-    };
-    ($plugin:ty, metadata = $metadata:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::rust_plugin_definition::<$plugin>($metadata)
-        }
-    };
-    (concurrent $plugin:ty, metadata = $metadata:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::concurrent_plugin_definition::<$plugin>($metadata)
-        }
-    };
-    (serial $plugin:ty, $manifest:expr, registrations = $registrations:expr, host = $host:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            let registrations = $registrations;
-            let metadata = $crate::definition::metadata_from_manifest($manifest, &registrations)
-                .expect("embedded Bcode plugin metadata must be valid");
-            $crate::definition::rust_plugin_definition_with_registrations::<$plugin>(metadata, registrations, $host)
-        }
-    };
-    (concurrent $plugin:ty, $manifest:expr, registrations = $registrations:expr, host = $host:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            let registrations = $registrations;
-            let metadata = $crate::definition::metadata_from_manifest($manifest, &registrations)
-                .expect("embedded Bcode plugin metadata must be valid");
-            $crate::definition::concurrent_plugin_definition_with_registrations::<$plugin>(metadata, registrations, $host)
-        }
-    };
-    (serial $plugin:ty, $manifest:expr, host = $host:expr $(,)?) => {
-        $crate::define_plugin!(serial $plugin, $manifest,
-            registrations = <$plugin as $crate::RustPlugin>::component_registrations(), host = $host);
-    };
-    (concurrent $plugin:ty, $manifest:expr, host = $host:expr $(,)?) => {
-        $crate::define_plugin!(concurrent $plugin, $manifest,
-            registrations = <$plugin as $crate::RustPlugin>::component_registrations(), host = $host);
     };
     (serial $plugin:ty, $manifest:expr, registrations = $registrations:expr $(,)?) => {
         pub fn plugin_definition() -> $crate::definition::PluginDefinition {
@@ -1405,5 +1344,4 @@ macro_rules! define_plugin {
         $crate::define_plugin!(concurrent $plugin, $manifest,
             registrations = <$plugin as $crate::RustPlugin>::component_registrations());
     };
-
 }

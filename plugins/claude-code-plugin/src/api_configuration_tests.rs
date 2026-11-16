@@ -85,7 +85,6 @@ fn context(grant: &Grant) -> NativeServiceContext {
         },
         config: PluginConfigContext::default(),
         events: bcode_plugin_sdk::ServiceEventEmitter::default(),
-        diagnostics: None,
         cancellation: ServiceCancellation::default(),
         bridge: ServiceBridge::new(
             Some(credential_callback),

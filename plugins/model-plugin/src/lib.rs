@@ -260,12 +260,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-/// Transitional compatibility adapter; new consumers must use the shared definition.
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(ModelPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[must_use]
 pub fn model_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
@@ -842,7 +836,6 @@ mod tests {
         };
         let captured = (expected.clone(), std::cell::Cell::new(0usize));
         let context = NativeServiceContext {
-            diagnostics: None,
             plugin_id: "bcode.model".to_owned(),
             request: ServiceRequest {
                 interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),

@@ -347,15 +347,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-/// Transitional compatibility adapter; new consumers must use the shared definition.
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        QuestionPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 #[must_use]
 pub fn question_interaction_adapter(
     platform_id: &str,

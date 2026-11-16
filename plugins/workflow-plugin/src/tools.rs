@@ -1489,7 +1489,6 @@ mod tests {
         for &(category, message) in categories {
             let mut code = category.to_owned();
             let context = NativeServiceContext {
-                diagnostics: None,
                 plugin_id: "bcode.workflow".into(),
                 request: ServiceRequest {
                     interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.into(),

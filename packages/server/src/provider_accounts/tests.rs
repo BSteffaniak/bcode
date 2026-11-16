@@ -18,7 +18,6 @@ interface_id = "bcode.model-provider/v1"
 type = "native"
 library = "libaccount_fixture.dylib"
 abi_version = 5
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
 
 fn method() -> AuthMethodContribution {
@@ -172,10 +171,13 @@ fn fixture_state(
     sessions: bcode_session::SessionManager,
     config: bcode_config::BcodeConfig,
 ) -> ServerState {
-    let fixture = bcode_plugin::StaticBundledPlugin::new(
-        MANIFEST,
-        bcode_plugin_sdk::static_plugin_vtable!(Provider, MANIFEST),
-    );
+    let fixture = bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<Provider>(
+            MANIFEST,
+            <Provider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+        )
+        .expect("fixture definition")
+    });
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection {
             mode: bcode_plugin::PluginSelectionMode::Explicit,

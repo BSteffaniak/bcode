@@ -1157,11 +1157,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-#[must_use]
-pub fn static_plugin() -> StaticPluginVtable {
-    static_plugin_vtable!(VimEditPlugin, include_str!("../bcode-plugin.toml"))
-}
-
 #[cfg(feature = "tui")]
 #[must_use]
 pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {

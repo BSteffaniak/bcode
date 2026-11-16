@@ -606,6 +606,13 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
     }
 }
 
+/// Return the interactive `bcode git` CLI contribution for bundled hosts.
+#[cfg(feature = "git-ui")]
+#[must_use]
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+    cli::registration()
+}
+
 // Identity and service declarations come from the embedded manifest only.
 bcode_plugin_sdk::define_plugin!(serial GitPlugin, include_str!("../bcode-plugin.toml"));
 
@@ -640,18 +647,6 @@ pub fn plugin_definition_with_host(
         plugin_definition().metadata,
         host,
     )
-}
-
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    #[cfg_attr(not(feature = "git-ui"), allow(unused_mut))]
-    let mut vtable =
-        bcode_plugin_sdk::static_plugin_vtable!(GitPlugin, include_str!("../bcode-plugin.toml"));
-    #[cfg(feature = "git-ui")]
-    {
-        vtable.cli_registration = Some(cli::registration);
-    }
-    vtable
 }
 
 #[cfg(feature = "tui")]

@@ -985,15 +985,5 @@ mod tests {
     }
 }
 
-/// Return this plugin's native static registration using the same manifest as dynamic loading.
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        CodexHarnessPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 // One declaration serves bundled and native packaging; implementations export no ABI symbols.
 bcode_plugin_sdk::define_plugin!(concurrent CodexHarnessPlugin, include_str!("../bcode-plugin.toml"));

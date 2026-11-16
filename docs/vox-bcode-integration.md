@@ -67,14 +67,13 @@ serde_json = { workspace = true }
 [features]
 default = []
 fail-on-warnings = []
-static-bundled = []
 ```
 
 Add the workspace member/path dependency and follow bundled usage-plugin wiring:
 `packages/bundled-plugins/Cargo.toml` optional dependency and default-enabled,
-fully disableable `static-bundled-vox-plugin` feature enabling
-`bcode_vox_plugin/static-bundled`; register `bcode_vox_plugin::static_plugin()` in
-the existing bundled static entry inventory. Inspect that inventory's current
+fully disableable `static-bundled-vox-plugin` feature; register
+`bcode_vox_plugin::plugin_definition` in the existing bundled registration
+inventory. Inspect that inventory's current
 location before editing; do not duplicate one. No dependency versions are newly
 selected here. `bcode-plugin.toml` is present with ABI 5 and the Linux `.so` name;
 non-Linux packaging must select its actual artifact filename by the established
@@ -105,9 +104,9 @@ the SDK/client frontend boundary, not a Vox-specific branch. Minimal contract:
 
 Exact existing integration points inspected:
 
-1. `packages/plugin-sdk/src/lib.rs`: `StaticPluginVtable` and static registration
-   plumbing beside CLI/TUI lifecycle registrations can carry an optional generic
-   local provider registration. Native dynamic registration needs an equally
+1. `packages/plugin-sdk/src/definition.rs`: `ProductRegistrations` beside the
+   CLI/TUI component registrations can carry an optional generic local provider
+   registration. Native dynamic registration needs an equally
    explicit client-local lifecycle API; do not serialize Rust trait objects or
    reuse the daemon native instance. An initial static implementation may reject
    dynamic local actions safely until this is available.

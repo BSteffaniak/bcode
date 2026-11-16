@@ -623,22 +623,11 @@ impl ConcurrentRustPlugin for AuthBrokerProviderPlugin {
     }
 }
 /// Local-only OIDC bootstrap CLI contribution.
-#[cfg(feature = "static-bundled")]
 #[must_use]
-pub fn static_cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
+pub fn cli_registration() -> bcode_plugin_sdk::StaticCliRegistration {
     cli::registration()
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    let mut vtable = bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        AuthBrokerProviderPlugin,
-        include_str!("../bcode-plugin.toml")
-    );
-    vtable.cli_registration = Some(static_cli_registration);
-    vtable
-}
 bcode_plugin_sdk::define_plugin!(
     concurrent AuthBrokerProviderPlugin,
     include_str!("../bcode-plugin.toml")
@@ -650,11 +639,9 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "static-bundled")]
     #[test]
-    fn bundled_vtable_exposes_local_bootstrap_cli() {
-        let vtable = static_plugin();
-        let registration = vtable.cli_registration.expect("bundled CLI registration")();
+    fn bundled_registration_exposes_local_bootstrap_cli() {
+        let registration = cli_registration();
         let matches = (registration.command)()
             .try_get_matches_from([
                 "auth-broker",

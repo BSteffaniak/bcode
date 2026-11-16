@@ -167,21 +167,21 @@ impl Drop for ActixChild {
 
 fn static_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     vec![
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-            bcode_fake_provider_plugin::static_plugin(),
+            bcode_fake_provider_plugin::plugin_definition,
         ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
-            bcode_question_plugin::static_plugin(),
+            bcode_question_plugin::plugin_definition,
         ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
-            bcode_shell_plugin::static_plugin(),
+            bcode_shell_plugin::plugin_definition,
         ),
-        bcode_plugin::StaticBundledPlugin::new(
+        bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-            bcode_filesystem_plugin::static_plugin(),
+            bcode_filesystem_plugin::plugin_definition,
         ),
     ]
 }

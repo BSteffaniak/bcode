@@ -1,8 +1,5 @@
 //! Behavioral coverage for immutable service configurations over shared executors.
 use super::*;
-use bcode_plugin_sdk::{SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK, StaticPluginVtable};
-use std::ffi::c_void;
-use std::sync::OnceLock;
 
 fn config(label: &str) -> ResolvedPluginConfig {
     let label = label.to_owned();
@@ -14,35 +11,12 @@ fn config(label: &str) -> ResolvedPluginConfig {
         }))
 }
 
-fn lifecycle(_: *const c_void) -> i32 {
-    SERVICE_STATUS_OK
+fn lifecycle() -> i32 {
+    0
 }
 
-#[allow(clippy::too_many_arguments)]
-fn service(
-    _: *const c_void,
-    input: *const u8,
-    input_len: usize,
-    output: *mut u8,
-    capacity: usize,
-    length: *mut usize,
-    _: Option<ServiceEventCallback>,
-    _: *mut c_void,
-    _: Option<ServiceBridgeCallback>,
-    _: *mut c_void,
-    _: Option<ServiceCancellationWaitCallback>,
-    _: *mut c_void,
-) -> i32 {
-    let input = unsafe { std::slice::from_raw_parts(input, input_len) };
-    let context: NativeServiceContext = serde_json::from_slice(input).unwrap();
-    let response = ServiceResponse::json(&context.config).unwrap();
-    let encoded = serde_json::to_vec(&response).unwrap();
-    unsafe { *length = encoded.len() };
-    if encoded.len() > capacity {
-        return SERVICE_STATUS_BUFFER_TOO_SMALL;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
-    SERVICE_STATUS_OK
+fn service(invocation: &mut test_backend::TestInvocation<'_>) -> ServiceResponse {
+    ServiceResponse::json(&invocation.context.config).unwrap()
 }
 
 fn runtime(concurrency: PluginConcurrencyConfig) -> PluginRuntimeHost {
@@ -51,19 +25,14 @@ fn runtime(concurrency: PluginConcurrencyConfig) -> PluginRuntimeHost {
     let plugin = LoadedPlugin {
         config: config("default"),
         manifest,
-        backend: LoadedPluginBackend::Static {
-            vtable: StaticPluginVtable {
-                instance: std::ptr::null(),
-                manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
-                activate: lifecycle,
-                deactivate: lifecycle,
-                register_commands: None,
-                register_auth_providers: None,
-                invoke_service_streaming: service,
-                cli_registration: None,
-                handle_event: |_, _, _| SERVICE_STATUS_OK,
-            },
-        },
+        backend: LoadedPluginBackend::Test(test_backend::TestBackend {
+            activate: lifecycle,
+            deactivate: lifecycle,
+            register_commands: None,
+            register_auth_providers: None,
+            invoke: service,
+            handle_event: |_| 0,
+        }),
     };
     let mut host = PluginHost::default();
     host.activate_plugin(plugin).unwrap();

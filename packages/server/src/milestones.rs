@@ -553,7 +553,7 @@ mod tests {
     static PROVIDER_WAITING: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     static PROVIDER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    const PROVIDER_MANIFEST: &str = "id='bcode.fake-provider'\nname='Milestone fixture'\nversion='0.0.1'\n[[services]]\ninterface_id='bcode.model-provider/v3'\nname='Fixture streaming'\n[[services]]\ninterface_id='bcode.model-provider/v2'\nname='Fixture model discovery'\n[runtime]\ntype='native'\nabi_version=5\nlibrary='unused.dylib'\nevent_symbol='bcode_plugin_handle_event_v1'\n";
+    const PROVIDER_MANIFEST: &str = "id='bcode.fake-provider'\nname='Milestone fixture'\nversion='0.0.1'\n[[services]]\ninterface_id='bcode.model-provider/v3'\nname='Fixture streaming'\n[[services]]\ninterface_id='bcode.model-provider/v2'\nname='Fixture model discovery'\n[runtime]\ntype='native'\nabi_version=5\nlibrary='unused.dylib'\n";
 
     impl bcode_plugin_sdk::RustPlugin for FixtureProvider {
         fn invoke_service(
@@ -641,10 +641,13 @@ mod tests {
 
     fn fixture_plugins() -> bcode_plugin::PluginRuntimeHost {
         let plugins = [
-            bcode_plugin::StaticBundledPlugin::new(
-                PROVIDER_MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(FixtureProvider, PROVIDER_MANIFEST),
-            ),
+            bcode_plugin::StaticBundledPlugin::from_definition(PROVIDER_MANIFEST, || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<FixtureProvider>(
+ PROVIDER_MANIFEST,
+ <FixtureProvider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+            }),
             crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/session-milestones-plugin/bcode-plugin.toml"),
                 bcode_session_milestones_plugin::plugin_definition,

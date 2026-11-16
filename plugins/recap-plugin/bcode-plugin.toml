@@ -16,7 +16,6 @@ name         = "Recap Tools"
 type = "exclusive"
 
 [runtime]
-abi_version  = 5
-event_symbol = "bcode_plugin_handle_event_v1"
-library      = "libbcode_recap_plugin.so"
-type         = "native"
+abi_version = 5
+library     = "libbcode_recap_plugin.so"
+type        = "native"

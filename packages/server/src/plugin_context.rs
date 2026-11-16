@@ -1130,7 +1130,6 @@ service_interface_id = "bcode.composer/v1"
 type = "native"
 abi_version = 5
 library = "libtest_composer_wait.dylib"
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
 
     const COMMAND_MANIFEST: &str = r#"
@@ -1181,10 +1180,13 @@ library = "libtest_command_context.dylib"
 
     fn command_plugins() -> [bcode_plugin::StaticBundledPlugin; 2] {
         [
-            bcode_plugin::StaticBundledPlugin::new(
-                COMMAND_MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(CommandPlugin, COMMAND_MANIFEST),
-            ),
+            bcode_plugin::StaticBundledPlugin::from_definition(COMMAND_MANIFEST, || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<CommandPlugin>(
+                    COMMAND_MANIFEST,
+                    <CommandPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            }),
             crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
                 bcode_default_agents_plugin::plugin_definition,
@@ -1748,10 +1750,13 @@ library = "libtest_composer_dispatch.dylib"
     async fn outer_dispatch_selects_exact_contribution_and_rejects_ambiguous_legacy() {
         let temp = tempfile::tempdir().unwrap();
         let plugins = [
-            bcode_plugin::StaticBundledPlugin::new(
-                DISPATCH_MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(DispatchPlugin, DISPATCH_MANIFEST),
-            ),
+            bcode_plugin::StaticBundledPlugin::from_definition(DISPATCH_MANIFEST, || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<DispatchPlugin>(
+ DISPATCH_MANIFEST,
+ <DispatchPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+            }),
             crate::tests::shared_test_plugin(
                 include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
                 bcode_default_agents_plugin::plugin_definition,
@@ -1896,7 +1901,6 @@ library = "libtest_wait_second.dylib"
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         cancellation.cancel();
         let context = bcode_plugin_sdk::NativeServiceContext {
-            diagnostics: None,
             plugin_id: "test.composer-wait".into(),
             config: bcode_plugin_sdk::PluginConfigContext::default(),
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
@@ -1936,10 +1940,13 @@ library = "libtest_wait_second.dylib"
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
     ) {
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
-            WAIT_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(WaitPlugin, WAIT_MANIFEST),
-        );
+        let plugin = bcode_plugin::StaticBundledPlugin::from_definition(WAIT_MANIFEST, || {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<WaitPlugin>(
+                WAIT_MANIFEST,
+                <WaitPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+            )
+            .expect("fixture definition")
+        });
         let runtime = crate::tests::load_test_plugins(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
@@ -1952,10 +1959,15 @@ library = "libtest_wait_second.dylib"
             },
             &[
                 plugin,
-                bcode_plugin::StaticBundledPlugin::new(
-                    WAIT_LEAF_MANIFEST,
-                    bcode_plugin_sdk::static_plugin_vtable!(WaitPlugin, WAIT_LEAF_MANIFEST),
-                ),
+                bcode_plugin::StaticBundledPlugin::from_definition(WAIT_LEAF_MANIFEST, || {
+                    bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<
+                            WaitPlugin,
+                        >(
+                            WAIT_LEAF_MANIFEST,
+                            <WaitPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                        )
+                        .expect("fixture definition")
+                }),
                 crate::tests::shared_test_plugin(
                     include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
                     bcode_default_agents_plugin::plugin_definition,
@@ -2168,14 +2180,20 @@ library = "libtest_wait_second.dylib"
     async fn ambiguous_nested_provider_fails_closed() {
         let temp = tempfile::tempdir().unwrap();
         let plugins = [
-            bcode_plugin::StaticBundledPlugin::new(
-                WAIT_LEAF_MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(WaitPlugin, WAIT_LEAF_MANIFEST),
-            ),
-            bcode_plugin::StaticBundledPlugin::new(
-                SECOND_WAIT_MANIFEST,
-                bcode_plugin_sdk::static_plugin_vtable!(WaitPlugin, SECOND_WAIT_MANIFEST),
-            ),
+            bcode_plugin::StaticBundledPlugin::from_definition(WAIT_LEAF_MANIFEST, || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<WaitPlugin>(
+                    WAIT_LEAF_MANIFEST,
+                    <WaitPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            }),
+            bcode_plugin::StaticBundledPlugin::from_definition(SECOND_WAIT_MANIFEST, || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<WaitPlugin>(
+                    SECOND_WAIT_MANIFEST,
+                    <WaitPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+                )
+                .expect("fixture definition")
+            }),
         ];
         let state = super::super::tests::test_server_state_with_plugins(
             bcode_session::SessionManager::default(),

@@ -78,7 +78,6 @@ type = "exclusive"
 type = "native"
 abi_version = 5
 library = "unused-test-library"
-event_symbol = "bcode_plugin_handle_event_v1"
 "#;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -760,13 +759,16 @@ fn fixture_with_workflow_family(root: &std::path::Path, production: bool) -> Arc
         },
     )
     .unwrap();
-    let plugin = bcode_plugin::StaticBundledPlugin::new(
-        MANIFEST,
-        bcode_plugin_sdk::static_plugin_vtable!(OfflineHarness, MANIFEST),
-    );
-    let provider = bcode_plugin::StaticBundledPlugin::new(
+    let plugin = bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+        bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<OfflineHarness>(
+            MANIFEST,
+            <OfflineHarness as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+        )
+        .expect("fixture definition")
+    });
+    let provider = bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-        bcode_fake_provider_plugin::static_plugin(),
+        bcode_fake_provider_plugin::plugin_definition,
     );
     let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
         &bcode_plugin::PluginSelection {

@@ -723,7 +723,6 @@ fn authorized_service_invocation_returns_only_paths() {
     let grant = root.grant();
     let cancellation = ServiceCancellation::default();
     let context = NativeServiceContext {
-        diagnostics: None,
         plugin_id: "bcode.filesystem".into(),
         request: ServiceRequest {
             interface_id: "bcode.filesystem/v1".into(),
@@ -770,7 +769,6 @@ fn cooperative_deadline_is_observed_before_more_enumeration() {
 #[test]
 fn missing_bridge_and_caller_supplied_root_fail_closed() {
     let mut context = NativeServiceContext {
-        diagnostics: None,
         plugin_id: "bcode.filesystem".into(),
         request: ServiceRequest {
             interface_id: "bcode.filesystem/v1".into(),

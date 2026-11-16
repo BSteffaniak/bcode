@@ -33,4 +33,3 @@ tokio = { workspace = true, features = ["macros", "time"] }
 default          = []
 fail-on-warnings = []
 frontend         = ["bcode_tui_components", "bmux_tui"]
-static-bundled   = ["frontend"]

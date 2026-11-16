@@ -676,15 +676,6 @@ fn normalize_answer(question: &Question, answer: AnswerWire) -> Result<Answer, &
     }
 }
 
-#[cfg(feature = "static-bundled")]
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-        JevProviderPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 bcode_plugin_sdk::define_plugin!(
     concurrent JevProviderPlugin,
     include_str!("../bcode-plugin.toml")

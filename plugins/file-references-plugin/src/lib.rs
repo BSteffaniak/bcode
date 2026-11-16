@@ -43,14 +43,6 @@ pub fn plugin_definition_with_host(
     )
 }
 
-#[must_use]
-pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(
-        FileReferencesPlugin,
-        include_str!("../bcode-plugin.toml")
-    )
-}
-
 /// Enabled plugin-local composer adapters; disabling the plugin drops this registry.
 ///
 /// # Panics

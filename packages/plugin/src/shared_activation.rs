@@ -137,7 +137,8 @@ impl SharedActivationContext {
             crate::LoadedPluginBackend::SharedNative(instance) => {
                 instance.retain_host_session(services, limits)
             }
-            _ => Err(host_session_error(
+            #[cfg(test)]
+            crate::LoadedPluginBackend::Test(_) => Err(host_session_error(
                 "selected retained host backend unavailable",
             )),
         }
@@ -161,7 +162,8 @@ impl SharedActivationContext {
             crate::LoadedPluginBackend::SharedNative(instance) => {
                 instance.host_session_page(after, limit)
             }
-            _ => Err(host_session_error(
+            #[cfg(test)]
+            crate::LoadedPluginBackend::Test(_) => Err(host_session_error(
                 "selected retained host backend unavailable",
             )),
         }
@@ -184,7 +186,8 @@ impl SharedActivationContext {
             crate::LoadedPluginBackend::SharedNative(instance) => {
                 instance.forget_released_host_session(id)
             }
-            _ => Err(host_session_error(
+            #[cfg(test)]
+            crate::LoadedPluginBackend::Test(_) => Err(host_session_error(
                 "selected retained host backend unavailable",
             )),
         }
@@ -214,7 +217,11 @@ impl SharedActivationContext {
             crate::LoadedPluginBackend::Shared(instance) => self.drive(async {
                 instance.start_product_host_extension(job, contract, version, payload)
             }),
-            _ => Err(host_session_error(
+            crate::LoadedPluginBackend::SharedNative(_) => Err(host_session_error(
+                "retained extension transport unavailable; no fallback",
+            )),
+            #[cfg(test)]
+            crate::LoadedPluginBackend::Test(_) => Err(host_session_error(
                 "retained extension transport unavailable; no fallback",
             )),
         }

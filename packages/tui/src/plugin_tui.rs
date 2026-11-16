@@ -2721,13 +2721,7 @@ library = "libdynamic_visual_test.dylib"
     }
 
     fn dynamic_visual_test_plugin() -> StaticBundledPlugin {
-        StaticBundledPlugin::new(
-            DYNAMIC_TEST_MANIFEST,
-            bcode_plugin_sdk::static_concurrent_plugin_vtable!(
-                DynamicVisualTestPlugin,
-                DYNAMIC_TEST_MANIFEST
-            ),
-        )
+        StaticBundledPlugin::from_definition(DYNAMIC_TEST_MANIFEST, dynamic_visual_test_definition)
     }
 
     fn dynamic_visual_test_definition() -> bcode_plugin_sdk::definition::PluginDefinition {
@@ -2737,9 +2731,9 @@ library = "libdynamic_visual_test.dylib"
             &registrations,
         )
         .expect("fixture metadata");
-        // The fixture implements its services through `ConcurrentRustPlugin`, matching
-        // `static_concurrent_plugin_vtable!`; the exclusive adapter would only see the
-        // unsupported `RustPlugin::invoke_service` default.
+        // The fixture implements its services through `ConcurrentRustPlugin`; the
+        // exclusive adapter would only see the unsupported `RustPlugin::invoke_service`
+        // default.
         bcode_plugin_sdk::definition::concurrent_plugin_definition_with_registrations::<
             DynamicVisualTestPlugin,
         >(metadata, registrations, |_| {
@@ -2751,7 +2745,7 @@ library = "libdynamic_visual_test.dylib"
         PluginHost::load_discovered_with_static_bundled_and_config(
             &bcode_plugin::PluginSelection::all_enabled(),
             Vec::new(),
-            &[dynamic_visual_test_plugin().with_definition(dynamic_visual_test_definition)],
+            &[dynamic_visual_test_plugin()],
             BTreeMap::from([(
                 "test.dynamic-visual".to_owned(),
                 super::fixture::config("test.dynamic-visual"),
@@ -2809,12 +2803,15 @@ library = "libcomposer_fixture.dylib"
 
     #[test]
     fn presentation_fallback_retains_composer_only_activation() {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             COMPOSER_FALLBACK_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(
-                DynamicVisualTestPlugin,
-                COMPOSER_FALLBACK_MANIFEST
-            ),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<DynamicVisualTestPlugin>(
+ COMPOSER_FALLBACK_MANIFEST,
+ <DynamicVisualTestPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+            },
         )];
         let extensions = [bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
             "test.composer-fallback",
@@ -2861,12 +2858,15 @@ library = "libcomposer_fixture.dylib"
 
     #[test]
     fn portable_policy_uses_loaded_manifests_not_registered_factories() {
-        let bundled = [StaticBundledPlugin::new(
+        let bundled = [StaticBundledPlugin::from_definition(
             COMPOSER_FALLBACK_MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(
-                DynamicVisualTestPlugin,
-                COMPOSER_FALLBACK_MANIFEST
-            ),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<DynamicVisualTestPlugin>(
+ COMPOSER_FALLBACK_MANIFEST,
+ <DynamicVisualTestPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+            },
         )];
         let extensions = [bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
             "test.composer-fallback",
@@ -2895,7 +2895,7 @@ library = "libcomposer_fixture.dylib"
         assert_eq!(policy.preferred, preferences.preferred);
         assert_eq!(policy.disabled, preferences.disabled);
         drop(presentation);
-        let empty = PluginHost::load_static_plugins_best_effort(&[]);
+        let empty = PluginHost::default();
         let presentation = PluginTuiPresentation::with_runtime_config_and_extensions(
             empty.into(),
             bcode_config::TuiVisualAdapterConfig::default(),
@@ -2952,9 +2952,15 @@ library = "libcomposer_fixture.dylib"
 
     #[test]
     fn startup_loading_failure_is_not_replaced_with_a_bundled_presentation_host() {
-        let invalid_plugin = StaticBundledPlugin::new(
+        let invalid_plugin = StaticBundledPlugin::from_definition(
             "not a valid plugin manifest",
-            bcode_plugin_sdk::static_plugin_vtable!(DynamicVisualTestPlugin, DYNAMIC_TEST_MANIFEST),
+            || {
+                bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<DynamicVisualTestPlugin>(
+ DYNAMIC_TEST_MANIFEST,
+ <DynamicVisualTestPlugin as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+ )
+ .expect("fixture definition")
+            },
         );
         let result = load_default_host_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),
@@ -3732,7 +3738,7 @@ library = "libcomposer_fixture.dylib"
 
     #[test]
     fn selected_frontend_rejects_an_adapter_without_its_backend() {
-        let host = PluginHost::load_static_plugins(&[]).unwrap();
+        let host = PluginHost::default();
         let result = PluginTuiPresentation::with_runtime_config_and_registries(
             host.into(),
             bcode_config::TuiVisualAdapterConfig::default(),
@@ -3761,10 +3767,7 @@ library = "libcomposer_fixture.dylib"
             ),
         ];
         let selected = bcode_plugin::filter_selected_static_registrations(
-            &[
-                dynamic_visual_test_plugin().with_definition(dynamic_visual_test_definition),
-                bundled[1],
-            ],
+            &bundled,
             &bcode_plugin::PluginSelection::all_enabled(),
         )
         .expect("select isolated dynamic visual test plugins");

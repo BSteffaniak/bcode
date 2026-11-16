@@ -246,17 +246,17 @@ fn configure_coding_plugins(state: &mut ServerState) {
             disabled: BTreeSet::new(),
         },
         &[
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
-                bcode_filesystem_plugin::static_plugin(),
+                bcode_filesystem_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
-                bcode_fake_provider_plugin::static_plugin(),
+                bcode_fake_provider_plugin::plugin_definition,
             ),
-            bcode_plugin::StaticBundledPlugin::new(
+            bcode_plugin::StaticBundledPlugin::from_definition(
                 include_str!("../../../../plugins/workflow-plugin/bcode-plugin.toml"),
-                bcode_workflow_plugin::static_plugin(),
+                bcode_workflow_plugin::plugin_definition,
             ),
         ],
     )

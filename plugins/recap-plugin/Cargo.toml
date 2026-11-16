@@ -29,4 +29,3 @@ tokio                      = { workspace = true, features = ["rt-multi-thread", 
 [features]
 default          = []
 fail-on-warnings = []
-static-bundled   = []

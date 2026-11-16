@@ -171,7 +171,6 @@ mod tests {
 
     fn context(label: &str) -> bcode_plugin_sdk::NativeServiceContext {
         bcode_plugin_sdk::NativeServiceContext {
-            diagnostics: None,
             plugin_id: "test.authority".to_string(),
             request: bcode_plugin_sdk::ServiceRequest {
                 interface_id: "test-service".to_string(),

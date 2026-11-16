@@ -144,10 +144,13 @@ impl Fixture {
             r#"{"type":"api","key":"synthetic-first"}"#,
         )
         .unwrap();
-        let plugin = bcode_plugin::StaticBundledPlugin::new(
-            MANIFEST,
-            bcode_plugin_sdk::static_plugin_vtable!(SyntheticProvider, MANIFEST),
-        );
+        let plugin = bcode_plugin::StaticBundledPlugin::from_definition(MANIFEST, || {
+            bcode_plugin_sdk::definition::rust_plugin_definition_from_manifest::<SyntheticProvider>(
+                MANIFEST,
+                <SyntheticProvider as bcode_plugin_sdk::RustPlugin>::component_registrations(),
+            )
+            .expect("fixture definition")
+        });
         let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection {
                 mode: bcode_plugin::PluginSelectionMode::Explicit,
