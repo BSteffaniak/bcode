@@ -94,12 +94,59 @@ pub fn invocation(command: Option<ReviewCommand>) -> Result<Invocation, CliError
         });
     };
     match entry_of(command) {
-        Ok((repo, entry)) => Ok(Invocation::Open {
+        Ok((repo, Opened::Entry(entry))) => Ok(Invocation::Open {
             repo: resolve_repo_argument(&repo)?,
             entry,
         }),
+        Ok((repo, Opened::Selectors { texts, repository })) => {
+            selector_invocation(&repo, &texts, repository, &std::env::current_dir()?)
+        }
         Err(request) => Ok(Invocation::Publish(request)),
     }
+}
+
+/// Open a transient review of path selectors written relative to `cwd` when it is inside the
+/// repository at `repo`, else to the repository root: a files review, or a repository review
+/// limited to folders.
+///
+/// # Errors
+///
+/// * [`CliError::Review`] when the repository does not exist, or a selector does not parse,
+///   leaves the repository, or names nothing.
+fn selector_invocation(
+    repo: &Path,
+    texts: &[String],
+    repository: bool,
+    cwd: &Path,
+) -> Result<Invocation, CliError> {
+    use bcode_code_review::selectors;
+    let repo = resolve_repo_argument(repo)?;
+    let root = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .ok_or_else(|| CliError::Review(format!("{} is not a git repository", repo.display())))?;
+    let root = std::fs::canonicalize(&root)?;
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let base = if cwd.starts_with(&root) {
+        cwd
+    } else {
+        root.clone()
+    };
+    let selected = selectors::parse_selectors(&root, &base, texts).map_err(CliError::Review)?;
+    let source = if repository {
+        selectors::repository_source(selected).map_err(CliError::Review)?
+    } else {
+        selectors::files_source(selected, Vec::new())
+    };
+    Ok(Invocation::Open {
+        repo: root,
+        entry: sources(source),
+    })
 }
 
 /// Run `command`: open the app, or publish. `bcode_program` is the Bcode executable the app
@@ -185,8 +232,24 @@ pub enum ReviewCommand {
         #[arg(long)]
         two_dot: bool,
     },
-    /// Browse repository files and comment anywhere.
+    /// Browse repository files as they are now and comment anywhere.
     Repo {
+        /// Repository path.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Limit the review to this folder (repeatable), relative to the current directory
+        /// when it is inside the repository, else to the repository root.
+        #[arg(long = "path", value_name = "FOLDER")]
+        paths: Vec<String>,
+    },
+    /// Review files, folders, globs or line ranges as they are now (not a change). Folders and
+    /// globs are listed again whenever the review opens.
+    Files {
+        /// What to review: `path`, `folder/`, a glob such as `'src/**/*.rs'`, or
+        /// `path:START-END`; relative to the current directory when it is inside the
+        /// repository, else to the repository root.
+        #[arg(required = true, value_name = "SELECTOR")]
+        selectors: Vec<String>,
         /// Repository path.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -329,9 +392,22 @@ impl From<ReviewTargetArg> for ReviewTarget {
     }
 }
 
+/// What an interactive subcommand opens: an entry, or path selectors still to be read against
+/// the working tree.
+#[derive(Debug)]
+enum Opened {
+    Entry(Entry),
+    Selectors {
+        /// Selectors as written.
+        texts: Vec<String>,
+        /// Whether they limit a repository review (folders only) rather than name files.
+        repository: bool,
+    },
+}
+
 /// The entry an interactive subcommand opens, or the publish request of `publish`.
-fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Entry), Box<PublishCliRequest>> {
-    Ok(match command {
+fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Opened), Box<PublishCliRequest>> {
+    let (repo, entry) = match command {
         ReviewCommand::Unstaged { repo } => (repo, sources(ReviewSourceKind::WorkingTreeUnstaged)),
         ReviewCommand::Staged { repo } => (repo, sources(ReviewSourceKind::IndexStaged)),
         ReviewCommand::All { repo } => (repo, sources(ReviewSourceKind::WorkingTreeAndIndex)),
@@ -349,7 +425,27 @@ fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Entry), Box<PublishCliRe
                 merge_base: !two_dot,
             }),
         ),
-        ReviewCommand::Repo { repo } => (repo, sources(ReviewSourceKind::Repository)),
+        ReviewCommand::Repo { repo, paths } if paths.is_empty() => {
+            (repo, sources(ReviewSourceKind::Repository))
+        }
+        ReviewCommand::Repo { repo, paths } => {
+            return Ok((
+                repo,
+                Opened::Selectors {
+                    texts: paths,
+                    repository: true,
+                },
+            ));
+        }
+        ReviewCommand::Files { selectors, repo } => {
+            return Ok((
+                repo,
+                Opened::Selectors {
+                    texts: selectors,
+                    repository: false,
+                },
+            ));
+        }
         ReviewCommand::Branch { base, repo } => {
             (repo, sources(ReviewSourceKind::CurrentBranch { base }))
         }
@@ -400,7 +496,8 @@ fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Entry), Box<PublishCliRe
                 target: target.into(),
             }));
         }
-    })
+    };
+    Ok((repo, Opened::Entry(entry)))
 }
 
 /// A transient review of one source.
@@ -673,6 +770,103 @@ mod tests {
             ),
             (vec!["review", "repo"], review(ReviewSourceKind::Repository)),
         ]);
+    }
+
+    #[test]
+    fn files_and_repo_path_subcommands_review_selectors_as_they_are_now() {
+        use bcode_code_review_models::PathSelector;
+        let fixture = bcode_code_review::testing::fixture::GitFixture::empty();
+        let root = fixture.root();
+        for path in ["examples/hello-plugin/src/lib.rs", "docs/guide.md"] {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, "x\n").expect("write");
+        }
+        let open = |args: &[&str], cwd: &Path| {
+            let command = parse(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(!requires_daemon(command.as_ref()), "{args:?}");
+            let Ok((repo, Opened::Selectors { texts, repository })) =
+                entry_of(command.expect("a subcommand"))
+            else {
+                panic!("{args:?} reads selectors");
+            };
+            selector_invocation(&repo, &texts, repository, cwd)
+        };
+        let repo = root.display().to_string();
+        let review = |source| Entry::Sources {
+            title: None,
+            sources: vec![source],
+        };
+        let folder = |path: &str| PathSelector::Folder { path: path.into() };
+        let cases = [
+            (
+                vec!["review", "files", "examples/hello-plugin", "--repo", &repo],
+                root.to_path_buf(),
+                review(ReviewSourceKind::FileSet {
+                    include: vec![folder("examples/hello-plugin")],
+                    exclude: Vec::new(),
+                }),
+            ),
+            // Relative to the current directory inside the repository.
+            (
+                vec!["review", "files", "src/lib.rs:4-2", "--repo", &repo],
+                root.join("examples/hello-plugin"),
+                review(ReviewSourceKind::FileRange {
+                    path: "examples/hello-plugin/src/lib.rs".into(),
+                    start: 2,
+                    end: 4,
+                }),
+            ),
+            (
+                vec!["review", "files", "docs/", "**/*.rs", "--repo", &repo],
+                std::env::temp_dir(),
+                review(ReviewSourceKind::FileSet {
+                    include: vec![
+                        folder("docs"),
+                        PathSelector::Glob {
+                            pattern: "**/*.rs".into(),
+                        },
+                    ],
+                    exclude: Vec::new(),
+                }),
+            ),
+            (
+                vec![
+                    "review", "repo", "--path", "docs", "--path", "examples", "--repo", &repo,
+                ],
+                root.to_path_buf(),
+                review(ReviewSourceKind::FileSet {
+                    include: vec![folder("docs"), folder("examples")],
+                    exclude: Vec::new(),
+                }),
+            ),
+        ];
+        for (args, cwd, expected) in cases {
+            let Ok(Invocation::Open { repo, entry }) = open(&args, &cwd) else {
+                panic!("{args:?} opens the app");
+            };
+            assert_eq!(repo, root, "{args:?}");
+            assert_eq!(entry, expected, "{args:?}");
+        }
+        let missing = open(
+            &["review", "files", "examples/helo-plugin", "--repo", &repo],
+            root,
+        );
+        assert!(
+            matches!(&missing, Err(CliError::Review(message)) if message == "examples/helo-plugin: no such file or folder"),
+            "{missing:?}"
+        );
+        assert!(
+            open(
+                &["review", "repo", "--path", "docs/guide.md", "--repo", &repo],
+                root
+            )
+            .is_err()
+        );
+        assert!(
+            parse(&["review", "files"]).is_err(),
+            "a selector is required"
+        );
     }
 
     #[test]

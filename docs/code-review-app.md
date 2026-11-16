@@ -30,7 +30,8 @@ subcommand takes `--repo PATH` (default `.`). Without a subcommand the app opens
 | `all` | Staged and unstaged changes together. |
 | `last-commit` | The last commit. |
 | `range BASE HEAD [--two-dot]` | A revision range (merge-base semantics unless `--two-dot`). |
-| `repo` | Browse the repository's files and comment anywhere. |
+| `repo [--path FOLDER]...` | Browse the repository's files as they are now (tracked, and untracked files that are not ignored) and comment anywhere; with `--path`, only those folders. |
+| `files SELECTOR...` | Files, folders, globs or line ranges as they are now, not a change: `path`, `folder/`, `'src/**/*.rs'`, `path:START-END`. Folders and globs are listed again whenever the review opens. Selectors are relative to the current directory when it is inside the repository, else to its root; one that names nothing fails before the app opens ("examples/helo-plugin: no such file or folder"). See [Reviewing files and folders](review-files-and-folders.md). |
 | `branch [BASE]` | The current branch against its base (the upstream, else the default branch). |
 | `compare BASE HEAD [--two-dot]` | Two branches or revisions. |
 | `commit REV...` | One or more commits (one range when they form a first-parent chain). |
@@ -306,7 +307,8 @@ review in the app once.
 | `code_review.mark_viewed` | write | Marks many files viewed or not viewed at their current content in one call, selected by `paths`, a `glob`, `layers` (pull request numbers or source ids), `all`, or `unchanged_since_look` (files whose change is the same as when you last looked at their layer, or completed a pass); selectors narrow each other. Answers with the files changed, those already in that state and named paths not in the review. |
 | `code_review.add_comments` | write | Several draft comments in one call, each like `add_comment`, with a result per comment. |
 | `code_review.resolve_threads` | write | Resolves or reopens several local threads in one call. |
-| `code_review.create_review` | write | Creates a saved review from `sources`: `pull_request` (`number` or `url`), `stack_layers` (stepped through, bottom first), `stack` (one diff), `branch`, `current_branch`, `range`, `commits`, `commit`, `last_commit`, and `working_tree`, `staged` or `unstaged` limited to `paths`. With `directory`, the review is created in that directory's repository and uncommitted changes are limited to it. |
+| `code_review.create_review` | write | Creates a saved review from `sources`: `pull_request` (`number` or `url`), `stack_layers` (stepped through, bottom first), `stack` (one diff), `branch`, `current_branch`, `range`, `commits`, `commit`, `last_commit`, `working_tree`, `staged` or `unstaged` limited to `paths`, `files` (`paths` in the selector syntax: files, folders, globs, `path:START-END`; optional `exclude`), and `repository` (whole, or `paths` folders). With `directory`, the review is created in that directory's repository, and uncommitted changes, files and repository sources without `paths` are limited to it. Every kind the wizard creates can be created here. |
+| `code_review.find_paths` | read | Repository paths by what the user calls them: folder names, package names (`Cargo.toml`, `package.json`, `pyproject.toml`), file names and path endings, best first, with file counts and `ambiguous`. Ignored files only with `include_ignored`. |
 | `code_review.update_review` | write | Renames, archives or restores one review (`review`) or several (`reviews`). |
 | `code_review.delete_review` | write | Deletes reviews for good (their comments stay in the store, unreachable). |
 | `code_review.suggest_change` | write | A suggested comment the reviewer accepts or rejects, optionally replacing the lines (a `suggestion` block). |
