@@ -1709,8 +1709,19 @@ mod tests {
         ))
     }
 
+    /// A newly connected client, as every IPC caller of the application is.
+    fn connected_caller(state: &Arc<ServerState>) -> ClientId {
+        let caller = ClientId::new();
+        state
+            .clients
+            .try_lock()
+            .expect("test server state is not contended")
+            .insert(caller);
+        caller
+    }
+
     fn application(state: &Arc<ServerState>) -> SessionApplicationHandle<'_> {
-        application_for(state, ClientId::new())
+        application_for(state, connected_caller(state))
     }
 
     fn application_for(state: &Arc<ServerState>, caller: ClientId) -> SessionApplicationHandle<'_> {
@@ -1884,7 +1895,7 @@ mod tests {
             bcode_session::SessionManager::persistent(root.path()).unwrap(),
         ));
         {
-            let caller = ClientId::new();
+            let caller = connected_caller(&state);
             let session = application_for(&state, caller)
                 .create_session(CreateSessionRequest {
                     origin: None,
@@ -1994,7 +2005,7 @@ mod tests {
             .skills
             .enabled = false;
         {
-            let caller = ClientId::new();
+            let caller = connected_caller(&state);
             let session = application_for(&state, caller)
                 .create_session(CreateSessionRequest {
                     origin: None,

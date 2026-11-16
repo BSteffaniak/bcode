@@ -1131,34 +1131,6 @@ impl Drop for EnvVarGuard {
     }
 }
 
-const DEFAULT_AGENT_TOOL_IDS: &[&str] = &[
-    "shell.run",
-    "filesystem.read",
-    "filesystem.exists",
-    "filesystem.list",
-    "filesystem.find",
-    "filesystem.grep",
-    "filesystem.stat",
-    "filesystem.write",
-    "filesystem.edit",
-    "vim_edit.preview",
-    "vim_edit.apply",
-    "web.search",
-    "web.fetch",
-    "web.status",
-    "web.inspect",
-    "git.clone",
-    "github.clone",
-    "worktree.list",
-    "worktree.create",
-    "worktree.remove",
-    "document.extract",
-    "ocr.extract",
-    "ocr.status",
-    "question",
-    "ask",
-];
-
 fn variant_artifact_dir(rep_dir: &Path) -> &Path {
     rep_dir.parent().and_then(Path::parent).unwrap_or(rep_dir)
 }
@@ -1278,31 +1250,43 @@ fn toml_key(key: &str) -> String {
     format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-fn prepare_agent_policy_overlay(
+/// The agent id whose tool policy a variant restricts.
+fn variant_agent_id(variant: &EvalVariant) -> &str {
+    variant
+        .metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("build")
+}
+
+/// Write the permissions overlay that restricts a variant's agent to `allowed_tools`.
+///
+/// Agent tool policy enables tools by exact ID and leaves unlisted tools at the host default, so
+/// a restriction must name every other tool the daemon offers. `disabled` lists those tools; it
+/// comes from the daemon's own report ([`reconcile_agent_policy_overlay`]), never from a fixed
+/// inventory that new plugins would silently bypass.
+fn write_agent_policy_overlay(
     variant: &EvalVariant,
     rep_dir: &Path,
+    disabled: &std::collections::BTreeSet<String>,
 ) -> Result<Option<PathBuf>, EvalError> {
     if variant.allowed_tools.is_empty() {
         return Ok(None);
     }
-    let agent_id = variant
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("build");
+    let agent_id = variant_agent_id(variant);
     let variant_dir = variant_artifact_dir(rep_dir);
     fs::create_dir_all(variant_dir)?;
     let path = variant_dir.join("permissions.toml");
-    let allowed_tools = variant
-        .allowed_tools
+    let mut tool_entries = disabled
         .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut tool_entries = DEFAULT_AGENT_TOOL_IDS
-        .iter()
-        .map(|tool| ((*tool).to_string(), allowed_tools.contains(*tool)))
+        .map(|tool| (tool.clone(), false))
         .collect::<std::collections::BTreeMap<_, _>>();
-    tool_entries.extend(allowed_tools.into_iter().map(|tool| (tool, true)));
+    tool_entries.extend(
+        variant
+            .allowed_tools
+            .iter()
+            .map(|tool| (tool.clone(), true)),
+    );
     let allowed = tool_entries
         .iter()
         .map(|(tool, enabled)| format!("{} = {enabled}", toml_key(tool)))
@@ -1315,54 +1299,78 @@ fn prepare_agent_policy_overlay(
     Ok(Some(path))
 }
 
-async fn validate_agent_policy_overlay(
+/// The tools the running daemon enables for a variant's agent.
+async fn enabled_agent_tools(
     client: &bcode_client::BcodeClient,
     variant: &EvalVariant,
-) -> Result<Vec<EvalDiagnostic>, EvalError> {
-    if variant.allowed_tools.is_empty() {
-        return Ok(Vec::new());
-    }
+) -> Result<std::collections::BTreeSet<String>, EvalError> {
     let status = client
         .agent_policy_status()
         .await
         .map_err(|error| EvalError::Client(error.to_string()))?;
-    let agent_id = variant
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("build");
-    let enabled = if agent_id == "plan" {
-        &status.plan_enabled_tools
+    let enabled = if variant_agent_id(variant) == "plan" {
+        status.plan_enabled_tools
     } else {
-        &status.build_enabled_tools
+        status.build_enabled_tools
     };
-    let allowed_tools = variant
+    Ok(enabled.into_iter().collect())
+}
+
+/// Make the running daemon enable exactly `allowed_tools` for the variant's agent.
+///
+/// Tools the daemon enables beyond the allowlist are disabled in the overlay and an isolated
+/// daemon is restarted to load it. A variant whose tool set still differs fails setup: running
+/// it would measure a different tool surface than the suite declares.
+///
+/// # Errors
+///
+/// Returns a validation error naming the missing and extra tools when the daemon cannot be made
+/// to enable exactly the allowed tools, and client errors from status or restart.
+async fn reconcile_agent_policy_overlay(
+    client: &bcode_client::BcodeClient,
+    variant: &EvalVariant,
+    rep_dir: &Path,
+    timeout: Duration,
+) -> Result<(), EvalError> {
+    if variant.allowed_tools.is_empty() {
+        return Ok(());
+    }
+    let allowed = variant
         .allowed_tools
         .iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    let missing = variant
-        .allowed_tools
-        .iter()
-        .filter(|tool| !enabled.contains(tool))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut enabled = enabled_agent_tools(client, variant).await?;
     let extra = enabled
-        .iter()
-        .filter(|tool| !allowed_tools.contains(*tool))
+        .difference(&allowed)
         .cloned()
-        .collect::<Vec<_>>();
-    if missing.is_empty() && extra.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(vec![EvalDiagnostic {
-            severity: EvalDiagnosticSeverity::Warning,
-            message: format!(
-                "agent policy overlay may not be active for variant {}; missing enabled tools {:?}; extra enabled tools {:?}; policy source: {}",
-                variant.id, missing, extra, status.source
-            ),
-        }])
+        .collect::<std::collections::BTreeSet<_>>();
+    if !extra.is_empty() && agent_daemon_isolation_mode(variant) != "shared" {
+        write_agent_policy_overlay(variant, rep_dir, &extra)?;
+        client.release_idle_connections();
+        let stopped = agent_cleanup::stop_idle(timeout).await;
+        if !stopped.execution_release_verified() {
+            return Err(EvalError::Client(
+                "idle daemon stop for the agent tool policy was not verified".into(),
+            ));
+        }
+        client.ensure_daemon_available().await.map_err(|error| {
+            EvalError::Client(format!("daemon restart for the agent tool policy: {error}"))
+        })?;
+        enabled = enabled_agent_tools(client, variant).await?;
     }
+    if enabled == allowed {
+        return Ok(());
+    }
+    Err(EvalError::Validation(format!(
+        "variant {} restricts agent {} to {:?}, but the daemon enables {:?} (missing {:?}, extra {:?})",
+        variant.id,
+        variant_agent_id(variant),
+        allowed,
+        enabled,
+        allowed.difference(&enabled).collect::<Vec<_>>(),
+        enabled.difference(&allowed).collect::<Vec<_>>(),
+    )))
 }
 
 fn direct_tool_preparation_request(
@@ -1651,7 +1659,8 @@ async fn execute_agent_variant_async(
 ) -> Result<ExecutionOutput, EvalError> {
     let prompt = rendered_prompt(case, variant);
     let _daemon_env = prepare_agent_daemon_isolation(variant, rep_dir)?;
-    let policy_overlay = prepare_agent_policy_overlay(variant, rep_dir)?;
+    let policy_overlay =
+        write_agent_policy_overlay(variant, rep_dir, &std::collections::BTreeSet::new())?;
     let _policy_env = policy_overlay
         .as_ref()
         .map(|path| EnvVarGuard::set_path("BCODE_PERMISSIONS_STATE", path));
@@ -1674,7 +1683,13 @@ async fn execute_agent_variant_async(
             .ensure_daemon_available()
             .await
             .map_err(|error| EvalError::Client(error.to_string()))?;
-        let mut policy_diagnostics = validate_agent_policy_overlay(&client, variant).await?;
+        reconcile_agent_policy_overlay(
+            &client,
+            variant,
+            rep_dir,
+            std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
+        )
+        .await?;
         progress(format!(
             "agent setup: variant={} case={} rep={} creating session",
             variant.id, case.id, repetition
@@ -1765,7 +1780,6 @@ async fn execute_agent_variant_async(
         );
         add_cost_estimates(variant, &mut measurements);
         let mut diagnostics = telemetry.diagnostics;
-        diagnostics.append(&mut policy_diagnostics);
         if telemetry.timed_out {
             diagnostics.push(EvalDiagnostic {
                 severity: EvalDiagnosticSeverity::Error,

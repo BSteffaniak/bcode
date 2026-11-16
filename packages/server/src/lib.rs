@@ -615,6 +615,11 @@ pub struct ServerState {
     /// What each connected client said about itself, and when it was last active.
     client_info: StdMutex<BTreeMap<ClientId, ClientInfo>>,
     client_runtime_contexts: Mutex<BTreeMap<ClientId, ClientRuntimeContext>>,
+    /// Configuration context of clients that disconnected while their connection still has
+    /// requests to finish. Requests complete after a disconnect, so configuration admission
+    /// uses the context the client connected with until its connection handler ends; liveness
+    /// (interaction consumers, ingestion) uses only `client_runtime_contexts`.
+    departed_client_contexts: Mutex<BTreeMap<ClientId, Option<ClientRuntimeContext>>>,
     client_session_namespaces: Mutex<BTreeMap<ClientId, String>>,
     active_session_namespaces: Mutex<BTreeMap<SessionId, ActiveSessionNamespace>>,
     message_accepted_clients: Mutex<BTreeSet<ClientId>>,
@@ -2835,6 +2840,7 @@ impl ServerState {
             clients: Mutex::default(),
             client_info: StdMutex::default(),
             client_runtime_contexts: Mutex::default(),
+            departed_client_contexts: Mutex::default(),
             client_session_namespaces: Mutex::default(),
             active_session_namespaces: Mutex::default(),
             message_accepted_clients: Mutex::default(),
@@ -2931,7 +2937,7 @@ impl ServerState {
     }
 
     async fn unregister_client(self: &Arc<Self>, client_id: ClientId) {
-        self.clients.lock().await.remove(&client_id);
+        let was_connected = self.clients.lock().await.remove(&client_id);
         self.client_info_mut().remove(&client_id);
         self.activity_changes.notify();
         self.activity_watches.remove_client(client_id);
@@ -2948,7 +2954,13 @@ impl ServerState {
             .lock()
             .await
             .retain(|_, plan| plan.client_id != client_id);
-        self.client_runtime_contexts.lock().await.remove(&client_id);
+        let context = self.client_runtime_contexts.lock().await.remove(&client_id);
+        if was_connected {
+            self.departed_client_contexts
+                .lock()
+                .await
+                .insert(client_id, context);
+        }
         interaction_operations::resolve_exchanges_without_consumers(self).await;
         self.client_session_namespaces
             .lock()
@@ -3127,6 +3139,11 @@ impl ServerState {
         self.abort_client_forwarders(client_id).await;
         let detach_result = self.detach_client_session(client_id).await;
         self.unregister_client(client_id).await;
+        // Every request of this connection has finished; nothing admits configuration for it.
+        self.departed_client_contexts
+            .lock()
+            .await
+            .remove(&client_id);
         detach_result?;
         Ok(())
     }
@@ -3184,6 +3201,31 @@ impl ServerState {
             .into_iter()
             .find(|client| contexts.contains_key(client))
             .or_else(|| contexts.contains_key(&preferred).then_some(preferred))
+    }
+
+    /// The configuration context a client's requests are admitted under.
+    ///
+    /// * `Some(Some(context))`: the client supplied a runtime context.
+    /// * `Some(None)`: the client supplied none, which means the daemon's startup configuration.
+    /// * `None`: the caller is not a client whose requests may still run.
+    ///
+    /// A client that disconnected keeps the context it connected with until its connection
+    /// handler has finished the requests it already sent.
+    pub(crate) async fn client_configuration_context(
+        &self,
+        client_id: ClientId,
+    ) -> Option<Option<ClientRuntimeContext>> {
+        if let Some(context) = self.client_runtime_context(client_id).await {
+            return Some(Some(context));
+        }
+        if self.clients.lock().await.contains(&client_id) {
+            return Some(None);
+        }
+        self.departed_client_contexts
+            .lock()
+            .await
+            .get(&client_id)
+            .cloned()
     }
 
     async fn client_runtime_context(&self, client_id: ClientId) -> Option<ClientRuntimeContext> {

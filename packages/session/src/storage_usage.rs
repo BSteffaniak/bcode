@@ -117,27 +117,34 @@ pub fn measure_session_storage_with_backups(
             usage.visited_entries += 1;
             require_directory(&backup_root)?;
             require_confined(&backup_root, root.parent().unwrap_or(&root))?;
-            if backup.parent() != Some(backup_root.as_path())
-                || !seen.insert(backup.clone())
-                || backup
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir))
+            if backup
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "invalid retained backup root",
                 ));
             }
+            // Identity is the resolved location: `root` (and so `backup_root`) is canonical,
+            // while callers name backups through the state path they were given, which may
+            // pass through symlinked directories. The backup itself must not be a link.
             require_directory(backup)?;
-            require_confined(backup, &backup_root)?;
-            if backup.canonicalize()?.parent() != Some(backup_root.as_path()) {
+            let canonical = backup.canonicalize()?;
+            if canonical.parent() != Some(backup_root.as_path()) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "retained backup must be an immediate child",
                 ));
             }
+            if !seen.insert(canonical.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid retained backup root",
+                ));
+            }
             visit(
-                backup,
+                &canonical,
                 &backup_root,
                 Category::RetainedBackup,
                 entry_budget,
@@ -346,6 +353,39 @@ mod tests {
                     .blocks();
             assert_eq!(usage.retained_backups.allocated_bytes, Some(expected * 512));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_named_through_a_linked_state_directory_are_measured() {
+        let (state, _root, id, _backup) = backup_fixture();
+        let alias = tempfile::tempdir().expect("alias parent");
+        let linked_state = alias.path().join("state");
+        std::os::unix::fs::symlink(state.path(), &linked_state).expect("linked state");
+        let backup = linked_state.join("session-migration-backups/recovery");
+
+        let usage = measure_session_storage_with_backups(
+            &linked_state.join("sessions"),
+            id,
+            100,
+            std::slice::from_ref(&backup),
+        )
+        .expect("measurement through a linked state directory");
+
+        assert_eq!(usage.retained_backups.files, 1);
+        assert!(
+            measure_session_storage_with_backups(
+                &linked_state.join("sessions"),
+                id,
+                100,
+                &[
+                    backup,
+                    state.path().join("session-migration-backups/recovery")
+                ],
+            )
+            .is_err(),
+            "the same backup named two ways is a duplicate"
+        );
     }
 
     #[test]

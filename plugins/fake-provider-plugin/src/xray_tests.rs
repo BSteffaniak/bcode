@@ -54,11 +54,20 @@ async fn real_fake_adapter_and_push_stream_are_captured_without_changing_respons
     foreign.finalize().unwrap();
     let mut request_seen = false;
     let mut stream_seen = false;
+    let mut outcome_seen = false;
     while let Some(envelope) = deep.recv().await {
         if envelope.event.domain != "provider.fake" {
             continue;
         }
-        assert!(envelope.event.sensitive);
+        // Deep observation adds content to the content-free facts every observer receives:
+        // only content records are sensitive.
+        let content_free = envelope.event.name == "normalized_outcome";
+        outcome_seen |= content_free;
+        assert_eq!(
+            envelope.event.sensitive, !content_free,
+            "{}",
+            envelope.event.name
+        );
         assert_eq!(
             envelope.event.correlation.turn_id.as_deref(),
             Some("xray-fixture-turn")
@@ -76,7 +85,7 @@ async fn real_fake_adapter_and_push_stream_are_captured_without_changing_respons
         }
         stream_seen |= envelope.event.name == "stream_record";
     }
-    assert!(request_seen && stream_seen);
+    assert!(request_seen && stream_seen && outcome_seen);
     while let Some(envelope) = shallow.recv().await {
         if envelope.event.domain == "provider.fake" {
             assert_eq!(envelope.event.name, "normalized_outcome");

@@ -11025,6 +11025,10 @@ mod tests {
         let state = browser_auth_state(vec![listener], "automatic-state");
         let callback = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).expect("connect callback");
+            // A browser that never gets an answer must fail this test, not hang the suite.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("callback read timeout");
             stream
                 .write_all(
                     b"GET /auth/callback?code=automatic-code&state=automatic-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -11041,17 +11045,29 @@ mod tests {
             r#"{"access_token":"automatic-access","refresh_token":"automatic-refresh","expires_in":3600}"#,
         )]);
         let runtime = ProviderRuntime::new().expect("runtime");
-        let response = runtime
-            .block_on(
-                OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
-                    Arc::clone(&state),
-                    "browser-state".to_owned(),
-                    None,
-                    server.endpoint("/token"),
-                ),
-            )
-            .expect("browser runtime")
-            .expect("automatic completion");
+        // Poll as the host does: the browser may call back after any number of continuations,
+        // each of which reports `Pending` with a wait until it does.
+        let response = (0..OPENAI_BROWSER_MAX_POLLS)
+            .find_map(|_| {
+                let response = runtime
+                    .block_on(
+                        OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                            Arc::clone(&state),
+                            "browser-state".to_owned(),
+                            None,
+                            server.endpoint("/token"),
+                        ),
+                    )
+                    .expect("browser runtime")
+                    .expect("browser continuation");
+                if response.status == AuthFlowStatus::Pending {
+                    thread::sleep(Duration::from_millis(10));
+                    None
+                } else {
+                    Some(response)
+                }
+            })
+            .expect("automatic completion before the poll limit");
         server.finish();
         let callback_response = callback.join().expect("callback thread");
         assert!(callback_response.contains("received OpenAI authorization"));
@@ -12060,6 +12076,16 @@ mod tests {
         }
     }
 
+    /// Structured conformance output; a strict provider sends `null` for an optional field it
+    /// leaves out.
+    fn conformance_structured_delta(format: &serde_json::Value) -> &'static str {
+        if format.pointer("/schema/properties/note").is_some() {
+            "{\"ok\":true,\"note\":null}"
+        } else {
+            "{\"ok\":true}"
+        }
+    }
+
     fn serve_openai_conformance_request(mut stream: TcpStream) {
         stream
             .set_nonblocking(false)
@@ -12098,15 +12124,9 @@ mod tests {
         }
         let mut events = Vec::new();
         if let Some(format) = body.get("text").and_then(|text| text.get("format")) {
-            // A strict provider sends `null` for an optional field it leaves out.
-            let delta = if format.pointer("/schema/properties/note").is_some() {
-                "{\"ok\":true,\"note\":null}"
-            } else {
-                "{\"ok\":true}"
-            };
             events.push(serde_json::json!({
                 "type": "response.output_text.delta",
-                "delta": delta
+                "delta": conformance_structured_delta(format)
             }));
         } else if body.get("response_format").is_some() {
             events.push(serde_json::json!({

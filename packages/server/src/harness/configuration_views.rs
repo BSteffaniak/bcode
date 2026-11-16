@@ -376,14 +376,14 @@ pub async fn declarative_for_client(
     client_id: ClientId,
 ) -> Result<PluginServiceConfigView, ManagedHarnessError> {
     let context = state
-        .client_runtime_context(client_id)
+        .client_configuration_context(client_id)
         .await
-        .ok_or_else(|| {
-            rejected(
-                "client_runtime_context_missing",
-                ManagedHarnessError::StaleOwner,
-            )
-        })?;
+        .ok_or_else(|| rejected("client_not_connected", ManagedHarnessError::StaleOwner))?;
+    // A client that omits its runtime context supplies no configuration: like a context
+    // without supplied configuration, that means the daemon's startup configuration.
+    let Some(context) = context else {
+        return baseline(state);
+    };
     let startup = state.startup_config.clone();
     let durable_root = state.state_root.join("plugins");
     tracing::trace!(target: "bcode_server::harness",
@@ -584,6 +584,40 @@ pub(super) async fn for_caller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clients_without_runtime_context_use_startup_configuration_until_their_connection_ends()
+    {
+        let state = Arc::new(crate::tests::test_server_state(
+            crate::SessionManager::default(),
+        ));
+        let connected = ClientId::new();
+        state.register_client(connected).await;
+
+        let view = for_client(&state, connected)
+            .await
+            .expect("startup configuration");
+        assert!(view.same_config_view(&baseline(&state).unwrap()));
+        drop(view);
+
+        assert_eq!(
+            for_client(&state, ClientId::new()).await.err(),
+            Some(ManagedHarnessError::StaleOwner)
+        );
+        // A disconnected client's queued requests still run under its configuration.
+        state.unregister_client(connected).await;
+        let view = for_client(&state, connected)
+            .await
+            .expect("departed client configuration");
+        assert!(view.same_config_view(&baseline(&state).unwrap()));
+        drop(view);
+        state.close_client(connected).await.unwrap();
+        assert_eq!(
+            for_client(&state, connected).await.err(),
+            Some(ManagedHarnessError::StaleOwner)
+        );
+        drop(state);
+    }
 
     #[tokio::test]
     async fn legacy_and_exact_clients_use_loaded_baseline_without_reconstruction() {
