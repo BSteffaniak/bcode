@@ -34,8 +34,9 @@ Before this work:
 ## Decisions
 
 1. **A selected folder is a folder selector, not a frozen file list.** Reopening a review lists
-   the folder again, so files added since appear and deleted files disappear. The UI always shows
-   how many files a selector resolves to now.
+   the folder again, so files added since appear and deleted files disappear. The tree picker
+   shows how many files the selection resolves to now, and the wizard's last step shows each
+   picked source's count as it was chosen; a review shows the files it lists when it opens.
 2. **Uncommitted changes are marked in whole-file views** of files, folder and repository
    reviews: lines changed since `HEAD` (staged or not) and untracked files. On by default
    (`files.uncommitted_marks`), toggled live per review (`w`, the palette, and the marks menu).
@@ -157,16 +158,24 @@ Normal interactive paths stay bounded:
 * `files.max_files` (default 5,000, at most 100,000) caps one source's listing. Beyond it the
   listing keeps the first `max_files` paths in path order, and `review.index.get` reports the
   full count as `untruncated_entries` (the count is only known once the source is listed, so it
-  is not a resolve diagnostic). The client shows it as a warning built by
-  `listing_truncated_message` (code `listing_truncated`) that names the count and the remedy:
-  "examples/ resolves to 12,345 files; showing the first 5,000 (files.max_files). Choose
-  narrower folders or raise the limit." The file panel and the source header say "5,000 of
-  12,345 files".
+  is not a resolve diagnostic). The review warns once per cut source, with a "Some files are
+  not listed" toast whose text `listing_truncated_message` builds: "Files in examples/ resolves
+  to 12,345 files; showing the first 5,000 (files.max_files). Choose narrower folders or raise
+  the limit." A refresh that cuts the same way does not repeat it. `code_review.list_files`
+  puts the same messages in `truncated`, ahead of the files, so they survive the tool output
+  limit. The file panel and the source header count the files listed.
 * Each git listing is read as a stream: the first `max_files` records are kept and the rest only
   counted, so a folder of millions of files costs the memory of `max_files` paths.
 * Ignored listings use `--directory` when they only feed the picker (below), so an ignored
-  `target/` costs one entry, not millions. A review that includes ignored files lists them in
-  full, under `max_files`.
+  `target/` costs one entry, not millions. A folder git prints along with its ignored files (a
+  folder that is not ignored itself but holds only ignored files) keeps its files instead. With
+  ignored files shown, selector counts list each ignored folder a folder selector covers with
+  git, at most 100,000 files each (beyond that `truncated` marks counts as lower bounds). A
+  review that includes ignored files lists them in full, under `max_files`.
+* Listings and the path index leave out what is not a file now: a tracked file deleted from
+  the working tree (`git ls-files --deleted`), and a nested repository that is not a submodule
+  (an untracked clone, printed by git as its folder with a trailing `/`). A submodule is listed
+  once, as its commit.
 * Whole-file content stays bounded by the existing blob limits (64 MiB per blob, the blob cache,
   and document residency).
 * Selectors per source: at most 200 include and 200 exclude selectors (an `invalid_request`
@@ -196,9 +205,9 @@ New operations of the code review service (typed requests and responses in the m
 |---|---|---|
 | `review.paths.list` | `repo_path`, `dir` (`""` for the root), `include_ignored`, `refresh`, `cursor`, `limit` | The folder's children, folders first: `name`, `path` (folders end with `/`), `kind` (`file`/`folder`), `files` (count under a folder; `None` for an ignored folder), `changed` (files changed since `HEAD`, untracked included), `status` (`tracked`/`untracked`/`ignored`); `total_entries`, `truncated`. A folder inside an ignored folder is read from the file system. |
 | `review.paths.search` | `repo_path`, `query` (fuzzy text, or a glob), `include_ignored`, `refresh`, `limit` | Matching files and folders, best first (the ranking `review.files.search` uses); a glob's file matches in path order; `total_matches`, `glob`, `truncated` |
-| `review.paths.resolve` | `repo_path`, `include`, `exclude`, `include_ignored`, `refresh` | Per selector: `files` now (or an `error` such as "missing.rs: no such file"), per exclusion the files it removes, and the `total` after exclusions |
+| `review.paths.resolve` | `repo_path`, `include`, `exclude`, `include_ignored`, `refresh` | Per selector: `files` now (or an `error` such as "missing.rs: no such file"), per exclusion the files it removes, the `total` after exclusions, and `changed`, the files of `total` changed since `HEAD` |
 | `review.paths.find` | `repo_path`, `query`, `kinds`, `include_ignored`, `limit` | `find_paths` matches (below) |
-| `review.worktree.marks` | `repo_path`, `paths` (at most 100, so the viewport's files take one request) | Per path: `untracked`, `missing`, `added: Vec<LineSpan>`, `removed: Vec<RemovedSince>` (position and text), `was` (a changed line's text at `HEAD`, for word marks), `additions`, `deletions`, `too_large` |
+| `review.worktree.marks` | `repo_path`, `paths` (at most 100, so the viewport's files take one request) | Per path: `untracked`, `missing`, `added: Vec<LineSpan>`, `removed: Vec<RemovedSince>` (position and text), `was` (a changed line's text at `HEAD`, for word marks), `additions`, `deletions`, `too_large`, `binary` (content changed, no lines), `renamed_from` (the path at `HEAD` of a staged rename) |
 
 `review.files.search` stays for older clients.
 
@@ -206,10 +215,15 @@ New operations of the code review service (typed requests and responses in the m
 
 A browse file's lines that differ from `HEAD` are marked in the whole-file view.
 
-* **Computation.** `review.worktree.marks` runs one `git ls-files` (which files are tracked) and
-  one `git diff --no-color --no-ext-diff --no-textconv --no-renames -U0 HEAD -- <paths>` for the
+* **Computation.** `review.worktree.marks` runs one `git ls-files` (which files are tracked),
+  one `git diff --cached -M --name-status --diff-filter=R HEAD` (renames staged since `HEAD`:
+  a renamed file's previous path is outside the request, so rename detection reads the whole
+  index), and one `git diff --no-color --no-ext-diff --no-textconv -U0 HEAD -- <paths>` for the
   request's tracked files (staged and unstaged together, against `HEAD`; against the empty tree in
-  a repository without commits). Added and modified new-side lines become `added` spans; a
+  a repository without commits), with `-M` and the previous paths when some were renamed, else
+  `--no-renames`. A renamed file is compared with its previous content, so a pure rename marks
+  no lines; a binary change has no lines and answers `binary`. Paths are read as git prints
+  them: unquoted, without the tab git appends to a name with a space. Added and modified new-side lines become `added` spans; a
   changed line's old text is in `was`; removed lines beyond the changed ones become markers before
   the new-side line they precede, with their text. Untracked files are `untracked: true` and carry
   no spans. A file over 4 MiB answers `too_large` before git runs.
@@ -220,8 +234,9 @@ A browse file's lines that differ from `HEAD` are marked in the whole-file view.
   `compare.mark_style`, and removed code as a one-row marker, "▾ 2 lines removed since HEAD",
   expanding to the removed text. Themes get `theme.uncommitted.bar` and `theme.uncommitted.diff`,
   which default to the `theme.since` roles.
-* **Headers and panel.** A changed file's header carries `uncommitted +3 −1`; an untracked file's
-  `untracked`; an ignored file's `ignored`. File panel rows carry `M`, `?` and `!` status
+* **Headers and panel.** A changed file's header carries `uncommitted +3 −1`; a renamed one
+  `uncommitted renamed` (with counts when it was also edited), a changed binary file
+  `uncommitted binary`; an untracked file's `untracked`; an ignored file's `ignored`. File panel rows carry `M`, `?` and `!` status
   letters and folders aggregate them. The source header adds `· 2 uncommitted`.
 * **Navigation.** `]`/`[` (next and previous change) stop on marked runs in a browse file.
 * **Narrow widths.** The bar takes the first gutter cell (BMUX `DiffRowColumn::cells`) and is
@@ -261,8 +276,13 @@ A browse file's lines that differ from `HEAD` are marked in the whole-file view.
   the marks menu toggle it; the choice is stored as `show_ignored: Option<bool>` in
   `ReviewPresentationState` and passed as `include_ignored` when the review resolves.
 * In the picker, `alt+i` (`bcode.code_review.wizard_show_ignored`, scope `code-review-wizard`)
-  toggles it for the picker. A review created while the picker shows ignored files starts with
-  `show_ignored = Some(true)`.
+  toggles it for the picker. The picker opens with `files.show_ignored` (when editing, with the
+  review's own choice). A review created or edited after a picker chose differently stores that
+  choice as `show_ignored` (the workspace create request takes initial `presentation`).
+* `code_review.create_review` takes `show_ignored`; the assistant reads a review's files with
+  the review's choice.
+* In a review without folder, glob or repository sources, `alt+i` changes nothing and says so;
+  likewise `w` in a review without whole working-tree files.
 * Explicit `File` and `FileRange` selectors include their file regardless.
 
 ## The tree picker
@@ -347,8 +367,9 @@ to none. At zero width nothing paints and no hit region is registered.
   unselecting an explicit selector removes it.
 * Unselecting a `[-]` folder removes every selector and exclusion under it.
 * **Filter.** Typing filters the tree by fuzzy name across the whole repository
-  (`review.paths.search`): matches show with their ancestors expanded, at most 500 rows, with
-  "500 of 2,345 matches" in the frame. Folders match by name too.
+  (`review.paths.search`): matches show as a flat list of whole paths, best first, at most 500
+  rows; when there are more, the frame title says "500 of 2,345 matches, type more to narrow".
+  Folders match by name too.
 * **Glob.** When the filter contains `*`, `?` or `[`, it is a glob: the tree shows its matches,
   and the first row is `Select pattern src/**/*.rs · 42 files now`, which adds a `Glob`
   selector. Individual matches can still be selected one by one.
@@ -401,8 +422,9 @@ picker.
 
 ### Mouse
 
-* A click on a row's label focuses it; on a folder it also expands or collapses it.
-* A click on a row's check selects or unselects it.
+* A click on a row focuses it; on a folder of the tree it also expands or collapses it, on any
+  other row it selects or unselects it.
+* A right click on any row, a folder of the tree included, selects or unselects it.
 * A click on the filter enters filter mode; a click on the summary row or the selection list
   focuses the list; a click on a selection row's check removes it.
 * A click on **Show ignored files** toggles it; the wheel scrolls the pane under the pointer.
@@ -444,8 +466,9 @@ Stack, Files, Repository.
   `File`, `FileRange`, `Repository` or `WorkingTreePaths` source opens the picker on it, and its
   result replaces the source with its id kept, so threads and viewed marks stay attached. `enter`
   keeps removing a source and `tab` keeps including or excluding it.
-* The step-3 source list shows each picker source's current count: `Files in
-  examples/hello-plugin/ · 7 files`.
+* The step-3 source list shows the count each picker source selected when it was chosen:
+  `Files in examples/hello-plugin/ · 7 files now · enter removes` (changed files for
+  uncommitted changes in paths). A source not chosen in the picker shows none.
 
 ## Entry points
 
@@ -640,7 +663,8 @@ What was built differs from the sections above as follows.
 * **No BMUX check column.** Bcode can rely on a BMUX change only once its dependency is
   updated, so the picker ships the fallback: a click on a file row selects or unselects it, a
   click on a folder row of the tree expands or collapses it, and folders are selected with the
-  keyboard or by a click on a folder the filter found (a filter list has no expansion). Check
+  keyboard, a right click, or a click on a folder the filter found (a filter list has no
+  expansion). Check
   glyphs are painted as part of the row label (`[x]`, `[-]`, `[ ]`); hit testing uses the tree
   view's own `row_rect` over the painted layout, never the glyph's cells.
 * **One pane at every width.** The selection list replaces the tree (`alt+l`, or a click on the
@@ -649,15 +673,12 @@ What was built differs from the sections above as follows.
   expanded.
 * **Filter mode keys.** `enter` continues from filter mode too (with nothing selected it selects
   the focused row first), `esc` returns to tree mode, and `space` types a space (`tab` selects).
-* **The ignored toggle of the picker** does not carry into the created review's presentation
-  state; the review follows `files.show_ignored` until `alt+i`.
 * **No marks menu on `b`, no mark style or theme roles of their own, no `]`/`[` stops.** The
   marks use the comparison's `compare.mark_style` and `theme.since` roles; `w`, `alt+i` and the
   palette toggle them.
 * **Badges.** The header badge is `uncommitted +N −M`, part of the header facts that give way
   as a whole at narrow widths; untracked and ignored files show the `untracked` and `ignored`
-  flags. The file panel and the source header carry no uncommitted counts, and the step-3 source
-  list shows no live file count.
+  flags. The file panel and the source header carry no uncommitted counts.
 * **One file per marks request.** A document need asks `review.worktree.marks` for one file as
   its content becomes resident, like comparison marks, instead of batching the viewport.
 

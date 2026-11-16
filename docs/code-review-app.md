@@ -294,7 +294,7 @@ review in the app once.
 |---|---|---|
 | `code_review.list_reviews` | read | Saved reviews of the repository, most recently updated first: id, title, kind (`stack_step_through`, `whole_stack`, `pull_request`, `branch`, `range`, `working_tree`, ...), source labels, pull request numbers, viewed files, archived, created and updated times. `include_archived`, `query` (title, kind, label or pull request number). |
 | `code_review.summary` | read | Title, sources and the revisions they resolve to, stack layers, files and lines, viewed files, threads, suggestions. |
-| `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed. |
+| `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed; `truncated` first names sources cut at `files.max_files`. |
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
 | `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). |
 | `code_review.list_threads` | read | The review's local threads (location, kind, severity, resolved, comments), pending suggestions, and a page of its pull requests' threads (`origin = "pull_request"`: pull request, authors, the first and latest comments, resolved, outdated, where each was written and where the review shows it). `include_resolved`, `path` (the file a thread was written on or is shown on, matched whole), `offset`, `limit` (50, at most 100); the page has `total`, `next_offset`, and how many resolved threads it left out. |
@@ -447,27 +447,34 @@ A review of code as it is now, not of a change (see
   excludes it, and folders show `[x]` (all), `[-]` (some) or `[ ]` (none). Typing any other
   letter (or `/` first, for names starting with `h`, `j`, `k` or `l`) filters by name across the
   repository; a filter with `*`, `?` or `[` offers **Select pattern … · N files now**, and one
-  ending in `:START-END` offers **Add lines START–END of PATH**. `enter` continues with the
+  ending in `:START-END` offers **Add lines START–END of PATH**; when the filter finds more than
+  the 500 rows listed, the frame title says how many. `enter` continues with the
   selection (with nothing selected, it selects the focused row first); `esc` leaves the filter,
-  clears it, then goes back a step. The summary row counts the selection's files now; `alt+l`
+  clears it, then goes back a step. The summary row counts the selection's files now (changed
+  files, for uncommitted changes in paths), and the last step shows each picked source's count; `alt+l`
   (or a click on it) shows the selected items with their counts, where `space`, `x`, `delete` or
   `backspace` removes one. Untracked files show `?`, files changed since `HEAD` `M`, and ignored
-  files (`alt+i`, or a click on **Show ignored files**) `!`; `ctrl+r` lists the repository again.
+  files (`alt+i`, or a click on **Show ignored files**; it opens as `files.show_ignored` sets,
+  and the created review keeps the picker's choice) `!`; `ctrl+r` lists the repository again.
   With the mouse, a click on a folder expands or collapses it, a click on a file selects or
-  unselects it, and folders found by the filter are selected by a click too.
+  unselects it, a right click selects or unselects any row (folders included), and folders
+  found by the filter are selected by a click too.
 * **Editing.** On the wizard's last step, `ctrl+e` on a files, folder, repository or
   uncommitted-paths source opens it in the tree; the edited source keeps its id, so its threads and
   viewed marks stay attached.
 * **Uncommitted changes.** Whole files of the working tree mark the lines changed since `HEAD`
   (staged or not) with the comparison marks, removed lines behind a "lines removed since HEAD"
-  marker, and their headers say `uncommitted +N −M`; untracked and ignored files say `untracked`
+  marker, and their headers say `uncommitted +N −M` (`uncommitted renamed` for a staged rename,
+  `uncommitted binary` for a changed binary file); untracked and ignored files say `untracked`
   and `ignored`. `w` shows or hides the marks in this review (`files.uncommitted_marks` sets the
-  default).
+  default); in a review without whole working-tree files it says so and changes nothing.
 * **Ignored files** are left out of folder, glob and repository sources until `alt+i` lists them
-  in this review (`files.show_ignored` sets the default); a file named directly is always
-  included. Both choices are saved with the review, never in configuration.
+  in this review (`files.show_ignored` sets the default; in a review without such sources it
+  says so and changes nothing); a file named directly is always included. Both choices are
+  saved with the review, never in configuration.
 * **Limits.** A source lists at most `files.max_files` files (default 5,000), keeping the first in
-  path order.
+  path order; the review warns "Some files are not listed" with the full count. Files deleted
+  from the working tree and nested repositories that are not submodules are not listed.
 
 ### Review list
 
