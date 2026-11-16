@@ -122,6 +122,7 @@ fn branch_compare_index(
         crate::testing::fixture_branch_compare().into();
     let source = service
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![ReviewSource {
                 id: "source-1".into(),

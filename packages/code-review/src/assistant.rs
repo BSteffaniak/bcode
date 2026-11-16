@@ -538,6 +538,7 @@ impl<'a> ReviewTools<'a> {
             Vec::new()
         };
         let response = self.data.resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: workspace.repo_root.clone(),
             sources: workspace.sources.clone(),
             provider_resolutions,

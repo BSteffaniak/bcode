@@ -3,14 +3,16 @@
 use super::{DataError, git};
 use crate::cache::{CacheKind, ReviewCache};
 use bcode_code_review_models::{
+    BrowseOptions, BrowseSelection, BrowseUntracked, PathSelector,
     REVIEW_DIAGNOSTIC_PROVIDER_FAILED, REVIEW_DIAGNOSTIC_PROVIDER_REQUIRED,
     REVIEW_DIAGNOSTIC_UNRESOLVED_REVISION, REVIEW_DIAGNOSTIC_UNSUPPORTED_SOURCE,
-    REVIEW_ERROR_PATH_REJECTED, REVIEW_REPO_STATE_MAX_AHEAD, ResolveReviewSourcesResponse,
-    ResolvedReviewStack, ResolvedSource, ResolvedSourceMode, ResolvedSourcePart,
-    ResolvedStackLayer, ReviewChangeCount, ReviewLineInterval, ReviewPullFetchResult,
-    ReviewRepoStateResponse, ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity,
-    ReviewSourceKind, ReviewSourceProviderOutcome, ReviewSourceProviderResolution,
-    ReviewSourcesTokenResponse, ReviewStack, RevisionRef, source_kind_requires_provider,
+    REVIEW_ERROR_PATH_REJECTED, REVIEW_MAX_SELECTORS, REVIEW_REPO_STATE_MAX_AHEAD,
+    ResolveReviewSourcesResponse, ResolvedReviewStack, ResolvedSource, ResolvedSourceMode,
+    ResolvedSourcePart, ResolvedStackLayer, ReviewChangeCount, ReviewLineInterval,
+    ReviewPullFetchResult, ReviewRepoStateResponse, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSourceProviderOutcome,
+    ReviewSourceProviderResolution, ReviewSourcesTokenResponse, ReviewStack, RevisionRef,
+    source_kind_requires_provider,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +50,7 @@ pub fn resolve_sources(
     sources: &[ReviewSource],
     provider_resolutions: &[ReviewSourceProviderResolution],
     merge_bases: &MergeBases,
+    options: BrowseOptions,
 ) -> Result<ResolveReviewSourcesResponse, DataError> {
     // Only local sources are relative to HEAD; a review of pull requests never reads it.
     let head = if sources.iter().any(|source| {
@@ -68,23 +71,24 @@ pub fn resolve_sources(
         let provided = provider_resolutions
             .iter()
             .find(|resolution| resolution.source_id == source.id);
-        let resolution = match resolve_source(root, head.as_deref(), source, provided, &mut memo) {
-            Ok(resolution) => resolution,
-            // Invalid user-provided revisions and paths are a per-source problem, not a request
-            // failure: a failing source never fails the others.
-            Err(
-                DataError::InvalidRequest(message)
-                | DataError::Git(message)
-                | DataError::NotFound(message)
-                | DataError::TooLarge(message),
-            ) => unresolved(message),
-            Err(error @ DataError::PathRejected(_)) => Resolution::Diagnostic {
-                severity: ReviewSourceDiagnosticSeverity::Error,
-                code: REVIEW_ERROR_PATH_REJECTED,
-                message: format!("{error}; edit the source to use a repository-relative path"),
-            },
-            Err(error @ (DataError::CursorStale | DataError::Io(_))) => return Err(error),
-        };
+        let resolution =
+            match resolve_source(root, head.as_deref(), source, provided, &mut memo, options) {
+                Ok(resolution) => resolution,
+                // Invalid user-provided revisions and paths are a per-source problem, not a request
+                // failure: a failing source never fails the others.
+                Err(
+                    DataError::InvalidRequest(message)
+                    | DataError::Git(message)
+                    | DataError::NotFound(message)
+                    | DataError::TooLarge(message),
+                ) => unresolved(message),
+                Err(error @ DataError::PathRejected(_)) => Resolution::Diagnostic {
+                    severity: ReviewSourceDiagnosticSeverity::Error,
+                    code: REVIEW_ERROR_PATH_REJECTED,
+                    message: format!("{error}; edit the source to use a repository-relative path"),
+                },
+                Err(error @ (DataError::CursorStale | DataError::Io(_))) => return Err(error),
+            };
         match resolution {
             Resolution::Resolved(resolved) => response.sources.extend(resolved),
             Resolution::Stack(resolved) => {
@@ -113,6 +117,7 @@ fn diff(source: &ReviewSource, base: RevisionRef, head: RevisionRef) -> Resoluti
 
 fn diff_source(source: &ReviewSource, base: RevisionRef, head: RevisionRef) -> ResolvedSource {
     ResolvedSource {
+        selection: None,
         source_id: source.id.clone(),
         base,
         head,
@@ -123,10 +128,13 @@ fn diff_source(source: &ReviewSource, base: RevisionRef, head: RevisionRef) -> R
     }
 }
 
+/// A browse source of the working tree listing `selection` (`paths` stays for clients that do
+/// not know selections: they list the tracked files under it).
 fn browse(
     source: &ReviewSource,
     paths: Vec<String>,
     line_range: Option<ReviewLineInterval>,
+    selection: BrowseSelection,
 ) -> Resolution {
     Resolution::Resolved(vec![ResolvedSource {
         source_id: source.id.clone(),
@@ -136,7 +144,76 @@ fn browse(
         paths,
         line_range,
         part: None,
+        selection: Some(selection),
     }])
+}
+
+/// The selection of `include` minus `exclude`, with untracked files and the limit `options`
+/// asks for.
+fn selection(
+    include: Vec<PathSelector>,
+    exclude: Vec<PathSelector>,
+    options: BrowseOptions,
+) -> BrowseSelection {
+    BrowseSelection {
+        include,
+        exclude,
+        untracked: BrowseUntracked::with_ignored(options.include_ignored),
+        max_files: options.max_files(),
+    }
+}
+
+/// Require confined selectors within the per-source bounds; exclusions name files or folders.
+///
+/// # Errors
+///
+/// * [`DataError::PathRejected`] for an unconfined path or glob.
+/// * [`DataError::InvalidRequest`] for too many selectors or an excluded glob or range.
+pub fn validate_selectors(
+    include: &[PathSelector],
+    exclude: &[PathSelector],
+) -> Result<(), DataError> {
+    if include.len() > REVIEW_MAX_SELECTORS || exclude.len() > REVIEW_MAX_SELECTORS {
+        return Err(DataError::InvalidRequest(format!(
+            "a source has at most {REVIEW_MAX_SELECTORS} selectors and as many exclusions"
+        )));
+    }
+    for selector in include.iter().chain(exclude) {
+        match selector {
+            PathSelector::Glob { pattern } => git::validate_glob(pattern)?,
+            other => git::validate_relative_path(other.path().unwrap_or_default())?,
+        }
+    }
+    if let Some(selector) = exclude.iter().find(|selector| {
+        !matches!(
+            selector,
+            PathSelector::File { .. } | PathSelector::Folder { .. }
+        )
+    }) {
+        return Err(DataError::InvalidRequest(format!(
+            "only files and folders can be excluded, not {selector}"
+        )));
+    }
+    Ok(())
+}
+
+/// Files, folders and globs as they are now.
+fn file_set(
+    source: &ReviewSource,
+    include: &[PathSelector],
+    exclude: &[PathSelector],
+    options: BrowseOptions,
+) -> Result<Resolution, DataError> {
+    if include.is_empty() {
+        return Ok(unresolved("name at least one file, folder or glob"));
+    }
+    validate_selectors(include, exclude)?;
+    Ok(browse(
+        source,
+        Vec::new(),
+        None,
+        selection(include.to_vec(), exclude.to_vec(), options),
+    ))
 }
 
 fn head_or_empty(head: Option<&str>) -> RevisionRef {
@@ -168,12 +245,54 @@ fn working_tree_paths(
     Ok(Resolution::Resolved(vec![resolved]))
 }
 
+/// A file, range, repository, or file set source: browse its files as they are now.
+fn browse_kind(source: &ReviewSource, options: BrowseOptions) -> Result<Resolution, DataError> {
+    Ok(match &source.kind {
+        ReviewSourceKind::File { path } => {
+            git::validate_relative_path(path)?;
+            let include = vec![PathSelector::File { path: path.clone() }];
+            browse(
+                source,
+                vec![path.clone()],
+                None,
+                selection(include, Vec::new(), options),
+            )
+        }
+        ReviewSourceKind::FileRange { path, start, end } => {
+            git::validate_relative_path(path)?;
+            let (start, end) = (*start.min(end), *start.max(end));
+            let include = vec![PathSelector::FileRange {
+                path: path.clone(),
+                start,
+                end,
+            }];
+            browse(
+                source,
+                vec![path.clone()],
+                Some(ReviewLineInterval { start, end }),
+                selection(include, Vec::new(), options),
+            )
+        }
+        ReviewSourceKind::Repository => browse(
+            source,
+            Vec::new(),
+            None,
+            selection(Vec::new(), Vec::new(), options),
+        ),
+        ReviewSourceKind::FileSet { include, exclude } => {
+            file_set(source, include, exclude, options)?
+        }
+        _ => unresolved("not a browse source"),
+    })
+}
+
 fn resolve_source(
     root: &Path,
     head: Option<&str>,
     source: &ReviewSource,
     provided: Option<&ReviewSourceProviderResolution>,
     memo: &mut GitMemo<'_>,
+    options: BrowseOptions,
 ) -> Result<Resolution, DataError> {
     Ok(match &source.kind {
         ReviewSourceKind::WorkingTreeUnstaged => {
@@ -206,22 +325,10 @@ fn resolve_source(
             head_branch,
             merge_base,
         } => range(root, source, base_branch, head_branch, *merge_base)?,
-        ReviewSourceKind::File { path } => {
-            git::validate_relative_path(path)?;
-            browse(source, vec![path.clone()], None)
-        }
-        ReviewSourceKind::FileRange { path, start, end } => {
-            git::validate_relative_path(path)?;
-            browse(
-                source,
-                vec![path.clone()],
-                Some(ReviewLineInterval {
-                    start: *start.min(end),
-                    end: *start.max(end),
-                }),
-            )
-        }
-        ReviewSourceKind::Repository => browse(source, Vec::new(), None),
+        ReviewSourceKind::File { .. }
+        | ReviewSourceKind::FileRange { .. }
+        | ReviewSourceKind::Repository
+        | ReviewSourceKind::FileSet { .. } => browse_kind(source, options)?,
         ReviewSourceKind::Commits { revs } => commits(root, source, revs)?,
         ReviewSourceKind::CurrentBranch { base } => {
             current_branch(root, source, head, base.as_deref())?
@@ -922,6 +1029,7 @@ fn commits(root: &Path, source: &ReviewSource, revs: &[String]) -> Result<Resolu
         .filter_map(|(index, oid)| {
             let info = infos.get(oid)?;
             Some(ResolvedSource {
+                selection: None,
                 source_id: source.id.clone(),
                 base: head_or_empty(info.parent.as_deref()),
                 head: RevisionRef::commit(info.oid.clone()),

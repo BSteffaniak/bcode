@@ -207,6 +207,7 @@ pub async fn stats(
     let repo = workspace.repo_root.clone();
     let resolved: ResolveReviewSourcesResponse = services
         .call(ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.clone(),
             sources: workspace.sources.clone(),
             provider_resolutions: Vec::new(),

@@ -54,6 +54,11 @@ pub fn dispatch_data(data: &ReviewData, request: &ServiceRequest) -> Option<Serv
         models::OP_REVIEW_COMPARE_LAYERS => serve(request, |req| data.compare_layers(&req)),
         models::OP_REVIEW_COMPARE_MARKS => serve(request, |req| data.compare_marks(&req)),
         models::OP_REVIEW_VERSIONS_KEEP => serve(request, |req| data.versions_keep(&req)),
+        models::OP_REVIEW_PATHS_LIST => serve(request, |req| data.paths_list(&req)),
+        models::OP_REVIEW_PATHS_SEARCH => serve(request, |req| data.paths_search(&req)),
+        models::OP_REVIEW_PATHS_RESOLVE => serve(request, |req| data.paths_resolve(&req)),
+        models::OP_REVIEW_PATHS_FIND => serve(request, |req| data.paths_find(&req)),
+        models::OP_REVIEW_WORKTREE_MARKS => serve(request, |req| data.worktree_marks(&req)),
         _ => return None,
     })
 }

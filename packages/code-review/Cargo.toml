@@ -33,6 +33,7 @@ switchy = { workspace = true, features = [
 tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -725,6 +725,7 @@ fn provider_failures_and_missing_commits_become_diagnostics() {
     let missing = "0123456789abcdef0123456789abcdef01234567";
     let response = ReviewData::default()
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![pull_source("pr", 103)],
             provider_resolutions: vec![ReviewSourceProviderResolution {
@@ -750,6 +751,7 @@ fn provider_failures_and_missing_commits_become_diagnostics() {
     // Stack sources need the provider's stack.
     let response = ReviewData::default()
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![layer_source("layer", 102)],
             provider_resolutions: vec![ReviewSourceProviderResolution {
@@ -834,6 +836,7 @@ fn whole_stack_attribution_labels_each_layers_region_of_the_shared_file() {
         .file_hunks_get(&ReviewFileHunksRequest {
             repo_path: repo.to_path_buf(),
             source: bcode_code_review_models::ResolvedSource {
+                selection: None,
                 source_id: "stack".into(),
                 base: RevisionRef::commit(stack.base_oid.clone()),
                 head: RevisionRef::commit(stack.top_oid().expect("top").to_string()),

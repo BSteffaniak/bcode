@@ -9,6 +9,7 @@ mod compare;
 mod conversation;
 mod data;
 mod history;
+mod paths;
 mod review_discovery;
 mod review_source;
 
@@ -17,12 +18,14 @@ pub use compare::*;
 pub use conversation::*;
 pub use data::*;
 pub use history::*;
+pub use paths::*;
 pub use review_discovery::*;
 pub use review_source::*;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 
 /// Code review plugin service interface.
@@ -654,6 +657,18 @@ pub enum ReviewSourceKind {
         #[serde(default = "default_true")]
         unstaged: bool,
     },
+    /// Files, folders, and globs as they are now, in one source.
+    ///
+    /// A kind of its own so a version that does not know it preserves it as
+    /// [`ReviewSourceKind::Unsupported`] instead of reviewing something else. A repository
+    /// limited to some folders is a set of [`PathSelector::Folder`] selectors.
+    FileSet {
+        /// What is reviewed (at least one).
+        include: Vec<PathSelector>,
+        /// Files and folders left out of the folders and globs of `include`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<PathSelector>,
+    },
     /// A kind this version does not recognize, preserved verbatim.
     #[serde(skip)]
     Unsupported {
@@ -749,6 +764,21 @@ impl ReviewSourceKind {
                     [path] => format!("{what} in {path}"),
                     [first, rest @ ..] => format!("{what} in {first} +{}", rest.len()),
                 }
+            }
+            Self::FileSet { include, exclude } => {
+                let mut label = match include.as_slice() {
+                    [] => "Files".to_string(),
+                    [PathSelector::Folder { path }] => format!("Files in {path}/"),
+                    [selector] => format!("Files: {selector}"),
+                    [first, second] => format!("Files: {first}, {second}"),
+                    [first, second, rest @ ..] => {
+                        format!("Files: {first}, {second} +{}", rest.len())
+                    }
+                };
+                if !exclude.is_empty() {
+                    let _ = write!(label, " ({} excluded)", exclude.len());
+                }
+                label
             }
             Self::Unsupported { kind, .. } => format!("Unsupported source ({kind})"),
         }
@@ -3424,6 +3454,56 @@ mod workspace_compat_tests {
         ))
         .unwrap();
         assert!(source.kind.is_unsupported());
+    }
+
+    #[test]
+    fn file_set_round_trips_and_an_older_build_preserves_it() {
+        let kind = ReviewSourceKind::FileSet {
+            include: vec![
+                PathSelector::Folder {
+                    path: "examples/hello-plugin".into(),
+                },
+                PathSelector::Glob {
+                    pattern: "src/**/*.rs".into(),
+                },
+                PathSelector::FileRange {
+                    path: "src/lib.rs".into(),
+                    start: 10,
+                    end: 40,
+                },
+            ],
+            exclude: vec![PathSelector::Folder {
+                path: "examples/hello-plugin/tmp".into(),
+            }],
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ReviewSourceKind>(&json).unwrap(),
+            kind
+        );
+        assert_eq!(
+            kind.label(),
+            "Files: examples/hello-plugin/, src/**/*.rs +1 (1 excluded)"
+        );
+        let folder = ReviewSourceKind::FileSet {
+            include: vec![PathSelector::Folder {
+                path: "examples/hello-plugin".into(),
+            }],
+            exclude: Vec::new(),
+        };
+        assert_eq!(folder.label(), "Files in examples/hello-plugin/");
+        assert_eq!(
+            serde_json::to_string(&folder).unwrap(),
+            r#"{"kind":"file_set","include":[{"kind":"folder","path":"examples/hello-plugin"}]}"#
+        );
+        // A build that knows no selectors of a newer kind keeps the source unchanged.
+        let newer = r#"{"kind":"file_set","include":[{"kind":"symbol","name":"f"}]}"#;
+        let preserved: ReviewSourceKind = serde_json::from_str(newer).unwrap();
+        assert!(preserved.is_unsupported());
+        assert_eq!(
+            serde_json::to_value(&preserved).unwrap(),
+            serde_json::from_str::<serde_json::Value>(newer).unwrap()
+        );
     }
 
     #[test]

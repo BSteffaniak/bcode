@@ -1593,6 +1593,7 @@ fn materialize_context_source(
         | ReviewSourceKind::Stack { .. }
         | ReviewSourceKind::CurrentBranch { .. }
         | ReviewSourceKind::WorkingTreePaths { .. }
+        | ReviewSourceKind::FileSet { .. }
         | ReviewSourceKind::Unsupported { .. } => {
             return Err(StoreError::InvalidRequest(format!(
                 "source kind '{}' is not supported by this review view",
@@ -1709,6 +1710,7 @@ fn review_target_from_source_kind(kind: &ReviewSourceKind) -> Option<ReviewTarge
         | ReviewSourceKind::Stack { .. }
         | ReviewSourceKind::CurrentBranch { .. }
         | ReviewSourceKind::WorkingTreePaths { .. }
+        | ReviewSourceKind::FileSet { .. }
         | ReviewSourceKind::Unsupported { .. } => None,
     }
 }

@@ -12,6 +12,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+mod browse;
+
 /// Immutable (commit-to-commit) listings kept in memory: every layer of a large stack, so a
 /// reopened step-through review lists nothing again. Listings are small (one entry per file).
 const MAX_CACHED_LISTINGS: usize = 256;
@@ -26,6 +28,9 @@ pub struct IndexListing {
     entries: Vec<ReviewIndexEntry>,
     additions: u64,
     deletions: u64,
+    /// Files the source selects when the listing was cut to its file limit.
+    #[serde(default)]
+    untruncated: Option<u32>,
 }
 
 /// Bounded cache of listings whose sides are both immutable commits, backed by the on-disk
@@ -89,6 +94,7 @@ pub fn index_page(
         total_entries: u32::try_from(listing.entries.len()).unwrap_or(u32::MAX),
         total_additions: listing.additions,
         total_deletions: listing.deletions,
+        untruncated_entries: listing.untruncated,
     })
 }
 
@@ -97,6 +103,9 @@ fn listing_key(root: &Path, source: &ResolvedSource) -> Result<(String, bool), D
     for path in &source.paths {
         git::validate_relative_path(path)?;
     }
+    if let Some(selection) = &source.selection {
+        super::resolve::validate_selectors(&selection.include, &selection.exclude)?;
+    }
     let immutable = !source.base.is_live() && !source.head.is_live();
     let key = serde_json::to_string(&(
         root,
@@ -104,6 +113,7 @@ fn listing_key(root: &Path, source: &ResolvedSource) -> Result<(String, bool), D
         &source.head,
         &source.mode,
         &source.paths,
+        &source.selection,
     ))
     .map_err(|error| DataError::InvalidRequest(error.to_string()))?;
     Ok((key, immutable))
@@ -225,6 +235,7 @@ pub fn list_together(cache: &Mutex<IndexCache>, root: &Path, sources: &[Resolved
             entries,
             additions,
             deletions,
+            untruncated: None,
         };
         if disk.enabled()
             && let Ok(text) = serde_json::to_string(&listing)
@@ -344,6 +355,9 @@ fn compute_listing(
             (output, entries)
         }
         ResolvedSourceMode::Browse => {
+            if let Some(selection) = &source.selection {
+                return browse::listing(root, &source.source_id, selection, key);
+            }
             let mut args = vec!["ls-files", "-z", "--stage", "--"];
             args.extend(source.paths.iter().map(String::as_str));
             let output = git::output(root, &args)?;
@@ -357,6 +371,7 @@ fn compute_listing(
         entries,
         additions,
         deletions,
+        untruncated: None,
     }))
 }
 
@@ -582,34 +597,46 @@ fn parse_ls_files_stage(source_id: &str, output: &[u8]) -> Vec<ReviewIndexEntry>
     let mut seen = BTreeSet::new();
     git::split_nul(output)
         .into_iter()
-        .filter_map(|record| {
-            let (meta, path) = record.split_once('\t')?;
-            if !seen.insert(path.to_string()) {
-                return None;
-            }
-            let mode = meta.split(' ').next().unwrap_or_default().to_string();
-            Some(ReviewIndexEntry {
-                source_id: source_id.to_string(),
-                path: path.to_string(),
-                old_path: None,
-                status: ReviewFileStatus::Unknown,
-                old_blob: ReviewBlobRef::WorkingTree,
-                new_blob: ReviewBlobRef::WorkingTree,
-                old_mode: Some(mode.clone()),
-                new_mode: Some(mode.clone()),
-                similarity: None,
-                additions: 0,
-                deletions: 0,
-                flags: [
-                    (ReviewIndexFlag::Symlink, mode == MODE_SYMLINK),
-                    (ReviewIndexFlag::Submodule, mode == MODE_GITLINK),
-                ]
-                .into_iter()
-                .filter_map(|(flag, set)| set.then_some(flag))
-                .collect(),
-            })
-        })
+        .filter_map(|record| stage_entry(source_id, &record))
+        .filter(|entry| seen.insert(entry.path.clone()))
         .collect()
+}
+
+/// One `git ls-files --stage` record (`MODE OID STAGE\tPATH`) as a browse entry.
+fn stage_entry(source_id: &str, record: &str) -> Option<ReviewIndexEntry> {
+    let (meta, path) = record.split_once('\t')?;
+    let mode = meta.split(' ').next().unwrap_or_default();
+    Some(browse_entry(source_id, path, mode, None))
+}
+
+/// A browse entry of the working-tree file `path` with `mode`, flagged `extra`.
+fn browse_entry(
+    source_id: &str,
+    path: &str,
+    mode: &str,
+    extra: Option<ReviewIndexFlag>,
+) -> ReviewIndexEntry {
+    ReviewIndexEntry {
+        source_id: source_id.to_string(),
+        path: path.to_string(),
+        old_path: None,
+        status: ReviewFileStatus::Unknown,
+        old_blob: ReviewBlobRef::WorkingTree,
+        new_blob: ReviewBlobRef::WorkingTree,
+        old_mode: Some(mode.to_owned()),
+        new_mode: Some(mode.to_owned()),
+        similarity: None,
+        additions: 0,
+        deletions: 0,
+        flags: [
+            (ReviewIndexFlag::Symlink, mode == MODE_SYMLINK),
+            (ReviewIndexFlag::Submodule, mode == MODE_GITLINK),
+        ]
+        .into_iter()
+        .filter_map(|(flag, set)| set.then_some(flag))
+        .chain(extra)
+        .collect(),
+    }
 }
 
 /// Number of cached listings, for tests that inspect the cache.
@@ -655,6 +682,7 @@ mod tests {
             .windows(2)
             .enumerate()
             .map(|(index, pair)| ResolvedSource {
+                selection: None,
                 source_id: format!("s{index}"),
                 base: RevisionRef::commit(commit(root, pair[0])),
                 head: RevisionRef::commit(commit(root, pair[1])),

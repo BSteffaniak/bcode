@@ -384,6 +384,7 @@ fn resolve_and_list(
 ) -> Result<ControlFlow<()>, DataError> {
     let ids: Vec<&str> = sources.iter().map(|source| source.id.as_str()).collect();
     let resolved = data.resolve_sources(&ResolveReviewSourcesRequest {
+        browse: bcode_code_review_models::BrowseOptions::default(),
         repo_path: request.repo_path.clone(),
         sources: sources.iter().map(|source| (*source).clone()).collect(),
         provider_resolutions: resolutions
@@ -609,6 +610,7 @@ fn placeholder(
     let whole = matches!(source.kind, ReviewSourceKind::Stack { .. });
     Some(OpenedSource {
         source: ResolvedSource {
+            selection: None,
             source_id: source.id.clone(),
             base: RevisionRef::commit(if whole {
                 trunk_oid.clone()

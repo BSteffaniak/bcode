@@ -128,6 +128,7 @@ fn open_at(service: &ReviewData, layer: &Layer, head: &str) -> ReviewDocument {
     let repo = layer.repo.root.as_path();
     let resolved: Vec<ResolvedSource> = service
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![ReviewSource {
                 id: SOURCE.into(),

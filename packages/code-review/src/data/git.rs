@@ -86,8 +86,23 @@ pub fn spawned(repo_root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Global options for commands whose every pathspec carries explicit magic (`:(literal)…`,
+/// `:(glob)…`, `:(exclude,literal)…`): [`GLOBAL_ARGS`] without `--literal-pathspecs`, which
+/// would read the magic itself as part of a path.
+const MAGIC_GLOBAL_ARGS: [&str; 2] = ["-c", "core.quotepath=false"];
+
 /// Build a git command for `repo_root` with the service's global options.
 pub fn command(repo_root: &Path, args: &[&str]) -> Command {
+    build(repo_root, &GLOBAL_ARGS, args)
+}
+
+/// Build a git command whose pathspecs all carry explicit magic (see [`MAGIC_GLOBAL_ARGS`]).
+/// Never pass a plain path to it: it would be read as a pattern.
+pub fn magic_command(repo_root: &Path, args: &[&str]) -> Command {
+    build(repo_root, &MAGIC_GLOBAL_ARGS, args)
+}
+
+fn build(repo_root: &Path, globals: &[&str], args: &[&str]) -> Command {
     #[cfg(test)]
     {
         let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
@@ -100,7 +115,7 @@ pub fn command(repo_root: &Path, args: &[&str]) -> Command {
     }
     let mut command = Command::new("git");
     command
-        .args(GLOBAL_ARGS)
+        .args(globals)
         .args(args)
         .current_dir(repo_root)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -125,6 +140,99 @@ pub fn output(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>, DataError> {
     Err(DataError::Git(
         String::from_utf8_lossy(&output.stderr).trim().to_string(),
     ))
+}
+
+/// The first NUL-terminated records of a git command's output, how many it printed in all, and
+/// a digest of all of it.
+#[derive(Debug, Default)]
+pub struct LimitedRecords {
+    /// The first records, at most the limit asked for.
+    pub records: Vec<String>,
+    /// Records printed in all.
+    pub total: u64,
+    /// SHA-256 of the whole output.
+    pub digest: Vec<u8>,
+}
+
+/// Run `command` (built by [`command`] or [`magic_command`]) and keep its first `keep`
+/// NUL-terminated records; the rest is read, counted and digested, never held, so a listing of
+/// millions of paths costs no more memory than `keep` of them.
+///
+/// # Errors
+///
+/// * [`DataError::Io`] when git cannot be started or read.
+/// * [`DataError::Git`] when git exits unsuccessfully.
+pub fn limited_records(mut command: Command, keep: usize) -> Result<LimitedRecords, DataError> {
+    use sha2::Digest as _;
+    use std::io::{BufRead as _, Read as _};
+    let _slot = Slot::acquire();
+    let mut child = command.spawn()?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| DataError::Git("git stderr unavailable".to_owned()))?;
+    // Read on another thread so a chatty stderr cannot fill its pipe and stall stdout.
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| DataError::Git("git stdout unavailable".to_owned()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut result = LimitedRecords::default();
+    for record in std::io::BufReader::new(stdout).split(0) {
+        let record = record?;
+        hasher.update(&record);
+        hasher.update([0]);
+        result.total += 1;
+        if result.records.len() < keep {
+            result
+                .records
+                .push(String::from_utf8_lossy(&record).into_owned());
+        }
+    }
+    let status = child.wait()?;
+    let errors = errors.join().unwrap_or_default();
+    if !status.success() {
+        return Err(DataError::Git(errors.trim().to_owned()));
+    }
+    result.digest = hasher.finalize().to_vec();
+    Ok(result)
+}
+
+/// Require a confined glob: non-empty, relative, without `.`/`..` or `.git` segments, and
+/// without NUL or newline characters.
+///
+/// # Errors
+///
+/// * [`DataError::PathRejected`] when the glob violates any of these rules.
+pub fn validate_glob(pattern: &str) -> Result<(), DataError> {
+    let rejected = |reason: &str| Err(DataError::PathRejected(format!("{pattern:?}: {reason}")));
+    if pattern.is_empty() {
+        return rejected("empty glob");
+    }
+    if pattern.contains(['\0', '\n', '\r']) {
+        return rejected("control character in glob");
+    }
+    if pattern.starts_with('/') || pattern.starts_with(':') {
+        return rejected("absolute glob");
+    }
+    if pattern
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return rejected("relative directory component");
+    }
+    if pattern
+        .split('/')
+        .any(|segment| segment.eq_ignore_ascii_case(".git"))
+    {
+        return rejected("repository metadata component");
+    }
+    Ok(())
 }
 
 /// Run git with extra environment variables and return its standard output.

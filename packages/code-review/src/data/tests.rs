@@ -23,6 +23,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+mod files;
+
 fn source(id: &str, kind: ReviewSourceKind) -> ReviewSource {
     ReviewSource {
         id: id.to_string(),
@@ -35,6 +37,7 @@ fn source(id: &str, kind: ReviewSourceKind) -> ReviewSource {
 fn resolve_one(service: &ReviewData, repo: &Path, kind: ReviewSourceKind) -> ResolvedSource {
     let response = service
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![source("s", kind)],
             provider_resolutions: Vec::new(),
@@ -312,6 +315,7 @@ fn commit_selection_resolves_to_one_range_or_parts() {
 
     let response = service
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![source(
                 "s",
@@ -370,6 +374,7 @@ fn provider_unsupported_and_missing_sources_produce_diagnostics_without_failing_
     let (pr_provider, pr_repo, pr_number) = provider(1);
     let response = service
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources: vec![
                 source(
@@ -678,6 +683,7 @@ fn uncommitted_changes_limited_to_paths_list_only_those_paths() {
     }
     // An unsafe path is refused rather than widened.
     let response = service.resolve_sources(&ResolveReviewSourcesRequest {
+        browse: bcode_code_review_models::BrowseOptions::default(),
         repo_path: repo.to_path_buf(),
         sources: vec![source(
             "s",

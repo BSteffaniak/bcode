@@ -20,6 +20,7 @@ fn source(id: &str, kind: ReviewSourceKind) -> ReviewSource {
 
 fn resolved(id: &str) -> ResolvedSource {
     ResolvedSource {
+        selection: None,
         source_id: id.into(),
         base: RevisionRef::commit("b".repeat(40)),
         head: RevisionRef::commit("h".repeat(40)),

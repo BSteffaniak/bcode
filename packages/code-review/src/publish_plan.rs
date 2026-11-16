@@ -309,6 +309,7 @@ fn place(
             let (layer, thread) = match mapped {
                 Some((layer, mapped)) => {
                     let diff = ResolvedSource {
+                        selection: None,
                         source_id: stack.source_id.clone(),
                         base: RevisionRef::commit(&layer.base_oid),
                         head: RevisionRef::commit(&layer.head_oid),

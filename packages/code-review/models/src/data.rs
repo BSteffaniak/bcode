@@ -12,8 +12,8 @@
 //! cursor with the `cursor_stale` error code and the client restarts from the first page.
 
 use crate::{
-    ResolvedReviewStack, ReviewFileStatus, ReviewHunk, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceKind, ReviewSourceProviderResolution,
+    BrowseOptions, BrowseSelection, ResolvedReviewStack, ReviewFileStatus, ReviewHunk,
+    ReviewSource, ReviewSourceDiagnostic, ReviewSourceKind, ReviewSourceProviderResolution,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -172,6 +172,10 @@ pub struct ResolvedSource {
     /// non-contiguous commit selection.
     #[serde(default)]
     pub part: Option<ResolvedSourcePart>,
+    /// What a browse source lists, instead of `paths`: selectors, untracked files, and the
+    /// file limit. Absent, a browse source lists the tracked files under `paths`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<BrowseSelection>,
 }
 
 /// Request payload for `review.sources.resolve`.
@@ -186,6 +190,9 @@ pub struct ResolveReviewSourcesRequest {
     /// `provider_required` diagnostic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_resolutions: Vec<ReviewSourceProviderResolution>,
+    /// How folder, glob, file, and repository sources list their files.
+    #[serde(default, skip_serializing_if = "BrowseOptions::is_default")]
+    pub browse: BrowseOptions,
 }
 
 /// Response payload for `review.sources.resolve`.
@@ -332,6 +339,10 @@ pub enum ReviewIndexFlag {
     Symlink,
     /// Either side is a submodule (gitlink).
     Submodule,
+    /// A browse file git does not track (and does not ignore).
+    Untracked,
+    /// A browse file git ignores.
+    Ignored,
 }
 
 /// One file of a resolved source.
@@ -445,6 +456,10 @@ pub struct ReviewIndexResponse {
     pub total_additions: u64,
     /// Total removed lines across all pages.
     pub total_deletions: u64,
+    /// Files the source selects when its listing was cut to its file limit (`total_entries`
+    /// is then the limit); see [`crate::listing_truncated_message`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untruncated_entries: Option<u32>,
 }
 
 /// Request payload for `review.file.hunks.get`.

@@ -158,6 +158,16 @@ data_operations! {
         models::OP_REVIEW_COMPARE_MARKS, compare_marks;
     models::ReviewVersionsKeepRequest => models::ReviewVersionsKeepResponse,
         models::OP_REVIEW_VERSIONS_KEEP, versions_keep;
+    models::ReviewPathsListRequest => models::ReviewPathsListResponse,
+        models::OP_REVIEW_PATHS_LIST, paths_list;
+    models::ReviewPathsSearchRequest => models::ReviewPathsSearchResponse,
+        models::OP_REVIEW_PATHS_SEARCH, paths_search;
+    models::ReviewPathsResolveRequest => models::ReviewPathsResolveResponse,
+        models::OP_REVIEW_PATHS_RESOLVE, paths_resolve;
+    models::ReviewPathsFindRequest => models::ReviewPathsFindResponse,
+        models::OP_REVIEW_PATHS_FIND, paths_find;
+    models::ReviewWorktreeMarksRequest => models::ReviewWorktreeMarksResponse,
+        models::OP_REVIEW_WORKTREE_MARKS, worktree_marks;
 }
 
 store_operations! {

@@ -106,17 +106,21 @@ FileSet {
 
 ### Resolution
 
-`resolve_sources` turns `FileSet` into one browse `ResolvedSource`, with two new fields
-(`#[serde(default)]`, so older peers ignore them and older payloads keep tracked-only listing):
+`resolve_sources` turns `FileSet` into one browse `ResolvedSource` with one new field,
+`selection: Option<BrowseSelection>` (absent when serialized empty, so older peers ignore it and
+a source without it keeps today's tracked-only listing of `paths`):
 
-* `selectors: Vec<PathSelector>` and `exclude: Vec<PathSelector>`: used instead of `paths` when
-  not empty.
+* `include: Vec<PathSelector>` and `exclude: Vec<PathSelector>`: used instead of `paths`; an
+  empty `include` lists the whole repository.
 * `untracked: BrowseUntracked`: `Tracked` (the default when absent: today's behavior),
   `Unignored` (tracked plus untracked files that are not ignored), or `All` (ignored files too).
+* `max_files`: the listing limit (below).
 
-`ResolveReviewSourcesRequest` gains `include_ignored: bool` (`#[serde(default)]`). The client
-sets it from the review's ignored toggle; `Repository` and `FileSet` resolve to `Unignored` or
-`All` accordingly.
+`ResolveReviewSourcesRequest` gains `browse: BrowseOptions { include_ignored, max_files }`
+(`#[serde(default)]`). The client sets it from the review's ignored toggle and `files.max_files`;
+`Repository`, `FileSet`, `File` and `FileRange` resolve to `Unignored` or `All` accordingly.
+`File` and `FileRange` carry a selection of their one file, so a single untracked or ignored file
+is listed too (an older client, which drops the selection, lists it only when tracked).
 
 The browse listing (`compute_listing`, `ResolvedSourceMode::Browse`) runs, with the selectors'
 pathspecs and each exclusion as `:(exclude,literal)…`:
@@ -140,11 +144,16 @@ added under a selected folder appears on reopen without any stored state changin
 
 Normal interactive paths stay bounded:
 
-* `files.max_files` (default 5,000) caps one source's listing. Beyond it the listing keeps the
-  first `max_files` paths in path order and the source gets a warning diagnostic that names the
-  count and the remedy: "examples/ resolves to 12,345 files; showing the first 5,000
-  (files.max_files). Choose narrower folders or raise the limit." The file panel and the source
-  header say "5,000 of 12,345 files".
+* `files.max_files` (default 5,000, at most 100,000) caps one source's listing. Beyond it the
+  listing keeps the first `max_files` paths in path order, and `review.index.get` reports the
+  full count as `untruncated_entries` (the count is only known once the source is listed, so it
+  is not a resolve diagnostic). The client shows it as a warning built by
+  `listing_truncated_message` (code `listing_truncated`) that names the count and the remedy:
+  "examples/ resolves to 12,345 files; showing the first 5,000 (files.max_files). Choose
+  narrower folders or raise the limit." The file panel and the source header say "5,000 of
+  12,345 files".
+* Each git listing is read as a stream: the first `max_files` records are kept and the rest only
+  counted, so a folder of millions of files costs the memory of `max_files` paths.
 * Ignored listings use `--directory` when they only feed the picker (below), so an ignored
   `target/` costs one entry, not millions. A review that includes ignored files lists them in
   full, under `max_files`.
@@ -161,12 +170,13 @@ Normal interactive paths stay bounded:
   (tracked, untracked, and with the toggle, ignored files collapsed to directories) built into a
   path trie with per-folder file counts, held by the code review service in an LRU of 8
   repositories, keyed by repository root and `include_ignored`. An entry is reused for at most
-  2 seconds and only while `HEAD`, the index file's size and modification time, and the request's
-  fingerprint are unchanged; the picker asks for a fresh index when it opens and on `ctrl+r`.
+  2 seconds and only while the git index file's size and modification time are unchanged (a
+  commit, checkout or `git add` rewrites it); `review.paths.{list,search,resolve}` take
+  `refresh`, which the picker sets when it opens and on `ctrl+r`.
   The trie holds at most 200,000 paths; beyond that the index is marked `truncated`, folder
   counts read "200,000+", and the picker says so.
-* **Uncommitted marks:** per file, keyed by path, `HEAD`, and the file's size and modification
-  time, in a bounded in-memory LRU (1,024 files); dropped on refresh.
+* **Uncommitted marks:** per file, keyed by path, `HEAD`, the index file's stamp, and the file's
+  size and modification time, in a bounded in-memory LRU (1,024 files).
 
 ### Service operations
 
@@ -174,11 +184,11 @@ New operations of the code review service (typed requests and responses in the m
 
 | Operation | Request | Response |
 |---|---|---|
-| `review.paths.list` | `repo_path`, `dir` (`""` for the root), `include_ignored`, `cursor`, `limit` | The folder's children: `name`, `path`, `kind` (`file`/`folder`), `files` (count under a folder), `status` (`tracked`/`untracked`/`ignored`), `uncommitted` (a file changed since `HEAD`), `truncated` |
-| `review.paths.search` | `repo_path`, `query` (fuzzy text, or a glob), `include_ignored`, `limit` | Matching files and folders, best first (the ranking `review.files.search` uses), with the same fields, and `total_matches` |
-| `review.paths.resolve` | `repo_path`, `include`, `exclude`, `include_ignored` | Per selector: `files` now (or an error such as "no such file"), and the total after exclusions; bounded by `max_files` |
+| `review.paths.list` | `repo_path`, `dir` (`""` for the root), `include_ignored`, `refresh`, `cursor`, `limit` | The folder's children, folders first: `name`, `path` (folders end with `/`), `kind` (`file`/`folder`), `files` (count under a folder; `None` for an ignored folder), `changed` (files changed since `HEAD`, untracked included), `status` (`tracked`/`untracked`/`ignored`); `total_entries`, `truncated`. A folder inside an ignored folder is read from the file system. |
+| `review.paths.search` | `repo_path`, `query` (fuzzy text, or a glob), `include_ignored`, `refresh`, `limit` | Matching files and folders, best first (the ranking `review.files.search` uses); a glob's file matches in path order; `total_matches`, `glob`, `truncated` |
+| `review.paths.resolve` | `repo_path`, `include`, `exclude`, `include_ignored`, `refresh` | Per selector: `files` now (or an `error` such as "missing.rs: no such file"), per exclusion the files it removes, and the `total` after exclusions |
 | `review.paths.find` | `repo_path`, `query`, `kinds`, `include_ignored`, `limit` | `find_paths` matches (below) |
-| `review.worktree.marks` | `repo_path`, `path` | `untracked`, `added: Vec<LineSpan>`, `removed: Vec<RemovedSince>` (count, position and text), `too_large` |
+| `review.worktree.marks` | `repo_path`, `paths` (at most 100, so the viewport's files take one request) | Per path: `untracked`, `missing`, `added: Vec<LineSpan>`, `removed: Vec<RemovedSince>` (position and text), `was` (a changed line's text at `HEAD`, for word marks), `additions`, `deletions`, `too_large` |
 
 `review.files.search` stays for older clients.
 
@@ -186,12 +196,13 @@ New operations of the code review service (typed requests and responses in the m
 
 A browse file's lines that differ from `HEAD` are marked in the whole-file view.
 
-* **Computation.** `review.worktree.marks` runs `git diff --no-color --no-ext-diff
-  --no-textconv -U0 HEAD -- :(literal)<path>` (staged and unstaged together, against `HEAD`;
-  against the empty tree in a repository without commits). Added and modified new-side lines
-  become `added` spans; removed runs become markers before the new-side line they precede, with
-  their text. Untracked files are `untracked: true` and carry no spans. A file over 4 MiB or
-  100,000 lines answers `too_large`.
+* **Computation.** `review.worktree.marks` runs one `git ls-files` (which files are tracked) and
+  one `git diff --no-color --no-ext-diff --no-textconv --no-renames -U0 HEAD -- <paths>` for the
+  request's tracked files (staged and unstaged together, against `HEAD`; against the empty tree in
+  a repository without commits). Added and modified new-side lines become `added` spans; a
+  changed line's old text is in `was`; removed lines beyond the changed ones become markers before
+  the new-side line they precede, with their text. Untracked files are `untracked: true` and carry
+  no spans. A file over 4 MiB answers `too_large` before git runs.
 * **Document.** The marks reuse the document's existing per-file marks slot (`MarksState` and
   `Marks`), loaded through a document need for files in the viewport, exactly as comparison
   marks are; a browse file's marks request is the worktree request instead of a comparison one.
@@ -497,7 +508,7 @@ Answer:
   "matches": [
     {"path": "examples/hello-plugin/", "kind": "package", "package": "hello-plugin",
      "manifest": "examples/hello-plugin/Cargo.toml", "files": 7, "matched": "package name", "score": 100},
-    {"path": "examples/hello-plugin/", "kind": "folder", "files": 7, "matched": "folder name", "score": 95}
+    {"path": "examples/hello-plugin/src/hello_plugin.rs", "kind": "file", "files": 1, "matched": "file name", "score": 90}
   ],
   "total": 2,
   "ambiguous": false,
@@ -523,8 +534,9 @@ Matching rules (`review.paths.find`, over the path index, so `.gitignore` is res
    * 80: every query word is a name word or a name word's prefix;
    * 60: every name word is a query word (the name is a part of what was asked);
    * up to 40: a fuzzy subsequence match of the joined words (`review.files.search` scoring).
-   Package matches outrank folder matches of the same path by 5; a duplicate path keeps its best
-   match.
+   Folder matches score 5 lower, so a package or file of the same quality ranks first; each path
+   appears once, with its best match (a package on a tie). A package at the repository root is
+   not a candidate: it is the whole repository, not a folder of it.
 4. **Order.** Score, then depth (shallower first), then path length, then path.
 5. **Ambiguity.** `ambiguous` is true when the two best matches name different paths and score
    within 5 of each other at 80 or more; the assistant asks which one only then.

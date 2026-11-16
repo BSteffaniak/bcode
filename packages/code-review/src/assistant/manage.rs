@@ -33,7 +33,9 @@ pub const fn source_kind_name(kind: &ReviewSourceKind) -> &'static str {
         ReviewSourceKind::Commit { .. } => "commit",
         ReviewSourceKind::CommitRange { .. } => "range",
         ReviewSourceKind::BranchCompare { .. } => "branch",
-        ReviewSourceKind::File { .. } | ReviewSourceKind::FileRange { .. } => "files",
+        ReviewSourceKind::File { .. }
+        | ReviewSourceKind::FileRange { .. }
+        | ReviewSourceKind::FileSet { .. } => "files",
         ReviewSourceKind::Repository => "repository",
         ReviewSourceKind::Commits { .. } => "commits",
         ReviewSourceKind::PullRequest { .. } => "pull_request",

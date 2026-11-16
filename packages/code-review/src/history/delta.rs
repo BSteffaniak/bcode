@@ -368,12 +368,12 @@ fn parse_numstat(output: &[u8]) -> Vec<(String, u32, u32)> {
 
 /// One hunk of a `git diff -U0`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ZeroHunk {
-    old_start: u32,
-    old_count: u32,
-    new_start: u32,
-    new_count: u32,
-    removed: Vec<String>,
+pub(crate) struct ZeroHunk {
+    pub(crate) old_start: u32,
+    pub(crate) old_count: u32,
+    pub(crate) new_start: u32,
+    pub(crate) new_count: u32,
+    pub(crate) removed: Vec<String>,
 }
 
 impl ZeroHunk {
@@ -387,7 +387,7 @@ impl ZeroHunk {
         }
     }
 
-    const fn new_before(&self) -> u32 {
+    pub(crate) const fn new_before(&self) -> u32 {
         Self::before(self.new_start, self.new_count)
     }
 
@@ -405,6 +405,20 @@ fn parse_range(range: &str) -> Option<(u32, u32)> {
 /// The hunks of the file section of `output` (a `git diff -U0` limited to a file's paths) whose
 /// new side is one of `paths` (the first that has one); none when no section names them.
 fn zero_hunks(output: &str, paths: &[&str]) -> Vec<ZeroHunk> {
+    let mut sections = zero_hunk_sections(output);
+    paths
+        .iter()
+        .find_map(|path| {
+            sections
+                .iter()
+                .position(|(name, _)| name == path)
+                .map(|index| sections.swap_remove(index).1)
+        })
+        .unwrap_or_default()
+}
+
+/// Every file section of `output` (a `git diff -U0`): its new-side path and its hunks.
+pub(crate) fn zero_hunk_sections(output: &str) -> Vec<(String, Vec<ZeroHunk>)> {
     let mut sections: Vec<(String, Vec<ZeroHunk>)> = Vec::new();
     let mut in_header = false;
     for line in output.lines() {
@@ -446,15 +460,7 @@ fn zero_hunks(output: &str, paths: &[&str]) -> Vec<ZeroHunk> {
             hunk.removed.push(text.to_owned());
         }
     }
-    paths
-        .iter()
-        .find_map(|path| {
-            sections
-                .iter()
-                .position(|(name, _)| name == path)
-                .map(|index| sections.swap_remove(index).1)
-        })
-        .unwrap_or_default()
+    sections
 }
 
 /// Where new-side line `line` of `hunks` (old → new) is on the old side: `None` when the hunks

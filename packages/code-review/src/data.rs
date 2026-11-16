@@ -15,10 +15,12 @@ mod flight;
 pub(crate) mod git;
 mod hunks;
 mod index;
+mod paths;
 mod rereview;
 mod resolve;
 mod search;
 mod stack;
+mod worktree;
 
 pub use blob::{BlobService, CatFileRegistry};
 pub use stack::MAX_ATTRIBUTION_LINES;
@@ -35,6 +37,12 @@ use bcode_code_review_models::{
     ReviewRepoStateResponse, ReviewRevisionsCompareRequest, ReviewRevisionsCompareResponse,
     ReviewSourcesTokenRequest, ReviewSourcesTokenResponse, ReviewStackAttributionRequest,
     ReviewStackAttributionResponse,
+};
+use bcode_code_review_models::{
+    ReviewPathsFindRequest, ReviewPathsFindResponse, ReviewPathsListRequest,
+    ReviewPathsListResponse, ReviewPathsResolveRequest, ReviewPathsResolveResponse,
+    ReviewPathsSearchRequest, ReviewPathsSearchResponse, ReviewWorktreeMarksRequest,
+    ReviewWorktreeMarksResponse,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -103,6 +111,8 @@ pub struct ReviewData {
     indexes: Mutex<index::IndexCache>,
     hunks: Mutex<hunks::HunkCache>,
     merge_bases: resolve::MergeBases,
+    path_indexes: paths::PathIndexCache,
+    worktree_marks: Mutex<worktree::MarksCache>,
     /// The on-disk cache, for comparisons (disabled by default).
     disk: Arc<crate::cache::ReviewCache>,
 }
@@ -144,6 +154,7 @@ impl ReviewData {
             &request.sources,
             &request.provider_resolutions,
             &self.merge_bases,
+            request.browse,
         )
     }
 
@@ -437,6 +448,81 @@ impl ReviewData {
     ) -> Result<ReviewFilesSearchResponse, DataError> {
         let root = self.repo_root(&request.repo_path)?;
         search::files_search(&root, request)
+    }
+
+    /// List one folder's children in the repository's path index.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::PathRejected`] for an unconfined folder.
+    /// * [`DataError::NotFound`] for a folder without files.
+    /// * [`DataError::InvalidRequest`] / [`DataError::CursorStale`] for bad cursors.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn paths_list(
+        &self,
+        request: &ReviewPathsListRequest,
+    ) -> Result<ReviewPathsListResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        paths::list(&self.path_indexes, &root, request)
+    }
+
+    /// Search the path index by fuzzy name, or by glob when the query is one.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::PathRejected`] / [`DataError::InvalidRequest`] for a bad glob.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn paths_search(
+        &self,
+        request: &ReviewPathsSearchRequest,
+    ) -> Result<ReviewPathsSearchResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        paths::search(&self.path_indexes, &root, request)
+    }
+
+    /// Count the files path selectors select now.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::PathRejected`] for unconfined paths or globs.
+    /// * [`DataError::InvalidRequest`] for too many selectors, a bad glob, or an excluded glob
+    ///   or range.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn paths_resolve(
+        &self,
+        request: &ReviewPathsResolveRequest,
+    ) -> Result<ReviewPathsResolveResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        paths::resolve(&self.path_indexes, &root, request)
+    }
+
+    /// Resolve a natural name ("the hello plugin") to repository paths: folders, packages, and
+    /// files by name.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn paths_find(
+        &self,
+        request: &ReviewPathsFindRequest,
+    ) -> Result<ReviewPathsFindResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        paths::find(&self.path_indexes, &root, request)
+    }
+
+    /// Mark files' lines changed since `HEAD`, staged or not.
+    ///
+    /// # Errors
+    ///
+    /// * [`DataError::InvalidRequest`] for too many paths.
+    /// * [`DataError::PathRejected`] for unconfined paths.
+    /// * [`DataError::Git`] / [`DataError::Io`] when git fails.
+    pub fn worktree_marks(
+        &self,
+        request: &ReviewWorktreeMarksRequest,
+    ) -> Result<ReviewWorktreeMarksResponse, DataError> {
+        let root = self.repo_root(&request.repo_path)?;
+        worktree::marks(&self.worktree_marks, &root, request)
     }
 
     /// Blob reader state, for inspection in tests.

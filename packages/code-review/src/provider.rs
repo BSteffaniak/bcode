@@ -643,6 +643,7 @@ pub fn resolve_request_with_providers(
         Vec::new()
     };
     ResolveReviewSourcesRequest {
+        browse: bcode_code_review_models::BrowseOptions::default(),
         repo_path: repo_path.to_path_buf(),
         sources,
         provider_resolutions,

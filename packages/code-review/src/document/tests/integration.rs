@@ -66,6 +66,7 @@ fn lines_at(fixture: &GitFixture, revision: &RevisionRef, path: &str) -> Vec<Str
 fn resolve(service: &ReviewData, repo: &Path, sources: Vec<ReviewSource>) -> Vec<ResolvedSource> {
     service
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: repo.to_path_buf(),
             sources,
             provider_resolutions: Vec::new(),

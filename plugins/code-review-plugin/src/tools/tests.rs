@@ -127,6 +127,7 @@ impl Harness {
         );
         let resolved = ReviewData::default()
             .resolve_sources(&ResolveReviewSourcesRequest {
+                browse: bcode_code_review_models::BrowseOptions::default(),
                 repo_path: self.fixture.root().to_path_buf(),
                 sources: workspace.sources[..1].to_vec(),
                 provider_resolutions: Vec::new(),
@@ -156,6 +157,7 @@ impl Harness {
         let data = ReviewData::default();
         let resolved = data
             .resolve_sources(&ResolveReviewSourcesRequest {
+                browse: bcode_code_review_models::BrowseOptions::default(),
                 repo_path: self.fixture.root().to_path_buf(),
                 sources: ReviewWorkspace::from_target(
                     self.fixture.root().to_path_buf(),
@@ -1273,6 +1275,7 @@ fn files_are_marked_viewed_by_list_glob_layer_and_unchanged_since_a_pass() {
     let mut workspace = stored(&harness, harness.fixture.root(), &id);
     let resolved = ReviewData::default()
         .resolve_sources(&ResolveReviewSourcesRequest {
+            browse: bcode_code_review_models::BrowseOptions::default(),
             repo_path: harness.fixture.root().to_path_buf(),
             sources: workspace.sources.clone(),
             provider_resolutions: Vec::new(),

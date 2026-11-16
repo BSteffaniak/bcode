@@ -338,6 +338,7 @@ pub const SOURCE: &str = "source-1";
 #[must_use]
 pub fn resolved(source_id: &str) -> ResolvedSource {
     ResolvedSource {
+        selection: None,
         source_id: source_id.to_string(),
         base: RevisionRef::commit("base"),
         head: RevisionRef::commit("head"),
