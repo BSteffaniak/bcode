@@ -4726,7 +4726,7 @@ fn apply_root_slash_command_outcome(
             model_id,
         } => {
             chat.app
-                .apply_local_model_selection(provider_plugin_id, &model_id);
+                .apply_local_model_selection(provider_plugin_id, &model_id, None);
         }
         SlashCommandOutcome::SetSessionModel {
             session_id,
@@ -4859,6 +4859,7 @@ fn apply_root_slash_command_outcome(
                         .selected_provider_plugin_id()
                         .map(ToOwned::to_owned),
                     model_id: chat.app.selected_model_id().map(ToOwned::to_owned),
+                    account_reference: chat.app.selected_account_reference().map(ToOwned::to_owned),
                     agent_id: Some(chat.app.display_agent_id().to_owned()),
                     reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
                     reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
@@ -5214,6 +5215,7 @@ fn resend_retained_native(
             launch_working_directory: launch_working_directory.to_path_buf(),
             provider_plugin_id: None,
             model_id: None,
+            account_reference: None,
             agent_id: None,
             native_agent: None,
             native_agent_change: None,
@@ -7285,6 +7287,7 @@ mod scheduler_tests {
             placement: bcode_ipc::PromptPlacement::FollowUp,
             provider_plugin_id: None,
             model_id: None,
+            account_reference: None,
             agent_id: None,
             native_agent: None,
             native_agent_change: None,

@@ -213,8 +213,11 @@ impl PluginTuiHost for BcodePluginTuiHost {
             super::effects::apply_submit_runtime_selections(
                 &client,
                 session_id,
-                launch.provider,
-                launch.model,
+                super::effects::SubmitModelSelection {
+                    provider_plugin_id: launch.provider,
+                    model_id: launch.model,
+                    account_reference: None,
+                },
                 launch.agent,
                 launch.effort,
                 launch.summary,

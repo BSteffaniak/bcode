@@ -3785,13 +3785,19 @@ impl BmuxApp {
     }
 
     /// Apply a locally selected model before a persisted session exists.
-    pub fn apply_local_model_selection(&mut self, provider: Option<String>, model: &str) {
+    pub fn apply_local_model_selection(
+        &mut self,
+        provider: Option<String>,
+        model: &str,
+        account_reference: Option<String>,
+    ) {
         self.session_view.set_model_selection(
             provider,
             model_to_display_selection(model),
             None,
             None,
         );
+        self.session_view.set_account_reference(account_reference);
         self.reasoning_support = ReasoningSupport::Unsupported;
         self.reasoning_effort_values.clear();
         self.pending_reasoning_effort = None;
@@ -6144,6 +6150,22 @@ mod tests {
                 .footer_summary(None, 0, &cost, false)
                 .ends_with("spent 0 tok · estimated $0.02 (not billed)")
         );
+    }
+
+    #[test]
+    fn draft_model_selection_retains_and_clears_account() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[]);
+
+        app.apply_local_model_selection(
+            Some("bcode.openai-compatible".into()),
+            "gemini-4-argon",
+            Some("opencode-go".into()),
+        );
+        assert_eq!(app.selected_model_id(), Some("gemini-4-argon"));
+        assert_eq!(app.selected_account_reference(), Some("opencode-go"));
+
+        app.apply_local_model_selection(Some("bcode.openai-compatible".into()), "gpt-5", None);
+        assert_eq!(app.selected_account_reference(), None);
     }
 
     #[test]

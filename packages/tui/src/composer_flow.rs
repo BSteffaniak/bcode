@@ -134,6 +134,10 @@ pub fn stage_session_message(
         .is_none()
         .then(|| chat.app.selected_model_id().map(ToOwned::to_owned))
         .flatten();
+    let draft_account_reference = session_id
+        .is_none()
+        .then(|| chat.app.selected_account_reference().map(ToOwned::to_owned))
+        .flatten();
     let expected_native_turn_id = match &chat.app.managed_composer.placement {
         Some(bcode_harness_models::HarnessPlacement::Steer {
             expected_native_turn_id,
@@ -184,6 +188,7 @@ pub fn stage_session_message(
             placement,
             provider_plugin_id: draft_provider_plugin_id,
             model_id: draft_model_id,
+            account_reference: draft_account_reference,
             agent_id,
             native_agent,
             native_agent_change,

@@ -792,6 +792,8 @@ pub struct SubmitMessageRequest {
     pub provider_plugin_id: Option<String>,
     /// Model to apply before sending, if any.
     pub model_id: Option<String>,
+    /// Enrolled provider account to apply with the model, if any.
+    pub account_reference: Option<String>,
     /// Agent to apply before sending, if any.
     pub agent_id: Option<String>,
     /// Bcode agent (id and name) to announce to a native agent with this message, when it
@@ -847,6 +849,8 @@ pub struct SkillActionRequest {
     pub provider_plugin_id: Option<String>,
     /// Model to apply before invoking a skill, if any.
     pub model_id: Option<String>,
+    /// Enrolled provider account to apply with the model, if any.
+    pub account_reference: Option<String>,
     /// Agent to apply before invoking a skill, if any.
     pub agent_id: Option<String>,
     /// Reasoning effort captured for the invocation.
@@ -3745,6 +3749,7 @@ async fn skill_action(
         arguments,
         provider_plugin_id,
         model_id,
+        account_reference,
         agent_id,
         reasoning_effort,
         reasoning_summary,
@@ -3792,8 +3797,11 @@ async fn skill_action(
             apply_submit_runtime_selections(
                 client,
                 session_id,
-                provider_plugin_id,
-                model_id,
+                SubmitModelSelection {
+                    provider_plugin_id,
+                    model_id,
+                    account_reference,
+                },
                 None,
                 reasoning_effort.clone(),
                 reasoning_summary.clone(),
@@ -3845,16 +3853,34 @@ async fn run_submit_message(
     }
 }
 
+/// Model selection applied before a submission, with the account it was chosen under.
+pub struct SubmitModelSelection {
+    /// Provider plugin id, when explicitly selected.
+    pub provider_plugin_id: Option<String>,
+    /// Model to apply, if any.
+    pub model_id: Option<String>,
+    /// Enrolled provider account to apply atomically with the model, if any.
+    pub account_reference: Option<String>,
+}
+
 pub async fn apply_submit_runtime_selections(
     client: &BcodeClient,
     session_id: SessionId,
-    provider_plugin_id: Option<String>,
-    model_id: Option<String>,
+    model: SubmitModelSelection,
     agent_id: Option<String>,
     reasoning_effort: Option<String>,
     reasoning_summary: Option<String>,
 ) -> Result<(), ClientError> {
-    if let Some(model_id) = model_id {
+    let SubmitModelSelection {
+        provider_plugin_id,
+        model_id,
+        account_reference,
+    } = model;
+    if let (Some(model_id), Some(account)) = (model_id.clone(), account_reference) {
+        client
+            .set_session_model_with_account(session_id, provider_plugin_id, model_id, account)
+            .await?;
+    } else if let Some(model_id) = model_id {
         execute_session_view_action(
             client,
             SessionViewAction::SetModel {
@@ -4107,8 +4133,11 @@ async fn submit_model_composer(
     apply_submit_runtime_selections(
         client,
         result.session_id,
-        request.provider_plugin_id,
-        request.model_id,
+        SubmitModelSelection {
+            provider_plugin_id: request.provider_plugin_id,
+            model_id: request.model_id,
+            account_reference: request.account_reference,
+        },
         None,
         request.reasoning_effort.clone(),
         request.reasoning_summary.clone(),

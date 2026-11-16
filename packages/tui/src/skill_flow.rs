@@ -209,6 +209,9 @@ pub fn start_skill_action(
     let model_id = (action == SkillActionKind::Invoke && session_id.is_none())
         .then(|| chat.app.selected_model_id().map(ToOwned::to_owned))
         .flatten();
+    let account_reference = (action == SkillActionKind::Invoke && session_id.is_none())
+        .then(|| chat.app.selected_account_reference().map(ToOwned::to_owned))
+        .flatten();
     chat.start_effect(TuiEffect::SkillAction {
         request: Box::new(SkillActionRequest {
             session_id,
@@ -218,6 +221,7 @@ pub fn start_skill_action(
             arguments,
             provider_plugin_id,
             model_id,
+            account_reference,
             agent_id,
             reasoning_effort: (action == SkillActionKind::Invoke)
                 .then(|| chat.app.reasoning_effort().map(ToOwned::to_owned))

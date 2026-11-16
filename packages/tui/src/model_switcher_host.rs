@@ -154,6 +154,10 @@ fn choose(chat: &mut ActiveChat, state: &mut ChatLoopState, choice: Box<Choice>)
             chat.app.apply_local_model_selection(
                 Some(provider_plugin_id.clone()),
                 &model.model.model_id,
+                match &choice.entry.access {
+                    Access::Account { account_reference } => Some(account_reference.clone()),
+                    _ => None,
+                },
             );
             state.model_switcher = None;
         }
