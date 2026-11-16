@@ -161,6 +161,151 @@ pub fn is_glob(text: &str) -> bool {
     )
 }
 
+/// A glob matcher with git's `:(glob)` rules (`*` stays within a folder, `**` crosses them).
+///
+/// # Errors
+///
+/// * A message naming the glob when it is not a valid git glob.
+pub fn glob_matcher(pattern: &str) -> Result<globset::GlobMatcher, String> {
+    git::validate_glob(pattern).map_err(|error| error.to_string())?;
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .backslash_escape(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|error| format!("invalid glob {pattern:?}: {error}"))
+}
+
+/// Whether `path` lies strictly inside `folder` (both repository-relative, without trailing
+/// `/`).
+#[must_use]
+pub fn is_under(path: &str, folder: &str) -> bool {
+    path.strip_prefix(folder)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether `selector` selects file `path`; `glob` is the selector's compiled glob.
+#[must_use]
+pub fn selects(selector: &PathSelector, glob: Option<&globset::GlobMatcher>, path: &str) -> bool {
+    match selector {
+        PathSelector::File { path: file } | PathSelector::FileRange { path: file, .. } => {
+            file == path
+        }
+        PathSelector::Folder { path: folder } => is_under(path, folder),
+        PathSelector::Glob { .. } => glob.is_some_and(|glob| glob.is_match(path)),
+    }
+}
+
+/// Include and exclude selectors compiled once.
+///
+/// It answers which files and folders they select with the service's rules: a file is selected
+/// when an include selector selects it and no exclude selector does. A glob that does not
+/// compile selects nothing.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionMatcher {
+    include: Vec<(PathSelector, Option<globset::GlobMatcher>)>,
+    exclude: Vec<(PathSelector, Option<globset::GlobMatcher>)>,
+}
+
+/// How much of a folder a selection selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderSelection {
+    /// Nothing under it.
+    None,
+    /// Some of its files.
+    Partial,
+    /// Every file under it, now and as files are added.
+    All,
+}
+
+impl SelectionMatcher {
+    /// Compile `include` and `exclude`.
+    #[must_use]
+    pub fn new(include: &[PathSelector], exclude: &[PathSelector]) -> Self {
+        let compile = |selectors: &[PathSelector]| {
+            selectors
+                .iter()
+                .map(|selector| {
+                    let glob = match selector {
+                        PathSelector::Glob { pattern } => glob_matcher(pattern).ok(),
+                        _ => None,
+                    };
+                    (selector.clone(), glob)
+                })
+                .collect()
+        };
+        Self {
+            include: compile(include),
+            exclude: compile(exclude),
+        }
+    }
+
+    /// Whether file `path` is selected.
+    #[must_use]
+    pub fn file(&self, path: &str) -> bool {
+        self.include
+            .iter()
+            .any(|(selector, glob)| selects(selector, glob.as_ref(), path))
+            && !self.excluded(path)
+    }
+
+    /// Whether an exclude selector leaves file `path` out.
+    #[must_use]
+    pub fn excluded(&self, path: &str) -> bool {
+        self.exclude
+            .iter()
+            .any(|(selector, glob)| selects(selector, glob.as_ref(), path))
+    }
+
+    /// How much of folder `folder` (without trailing `/`) is selected, judged from the
+    /// selectors alone: a folder covered by a selected folder with nothing excluded inside it
+    /// is [`FolderSelection::All`]; one with selectors or exclusions inside it, or a glob that
+    /// may match inside it, is [`FolderSelection::Partial`].
+    #[must_use]
+    pub fn folder(&self, folder: &str) -> FolderSelection {
+        let covers = |selector: &PathSelector| match selector {
+            PathSelector::Folder { path } => path == folder || is_under(folder, path),
+            _ => false,
+        };
+        let inside = |selector: &PathSelector| match selector {
+            PathSelector::Glob { pattern } => glob_may_match_under(pattern, folder),
+            other => other.path().is_some_and(|path| is_under(path, folder)),
+        };
+        let excluded = self.exclude.iter().any(|(selector, _)| covers(selector));
+        let covered = self.include.iter().any(|(selector, _)| covers(selector));
+        let exclusions_inside = self.exclude.iter().any(|(selector, _)| inside(selector));
+        let selections_inside = self.include.iter().any(|(selector, _)| inside(selector));
+        if excluded {
+            FolderSelection::None
+        } else if covered {
+            if exclusions_inside {
+                FolderSelection::Partial
+            } else {
+                FolderSelection::All
+            }
+        } else if selections_inside {
+            FolderSelection::Partial
+        } else {
+            FolderSelection::None
+        }
+    }
+}
+
+/// Whether glob `pattern` may match a file under `folder`: its literal leading folders lead into
+/// `folder` or lie inside it.
+fn glob_may_match_under(pattern: &str, folder: &str) -> bool {
+    let literal: Vec<&str> = pattern
+        .split('/')
+        .take_while(|part| !part.contains(['*', '?', '[', '\\']))
+        .collect();
+    let folder_parts: Vec<&str> = folder.split('/').collect();
+    literal
+        .iter()
+        .zip(&folder_parts)
+        .all(|(left, right)| left == right)
+        && (literal.len() < pattern.split('/').count() || literal.len() > folder_parts.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +375,34 @@ mod tests {
         assert!(parse(root, "../outside").is_err());
         assert!(parse(root, ".").is_err());
         assert!(parse(root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn the_matcher_selects_files_and_judges_folders_like_the_service() {
+        let folder = |path: &str| PathSelector::Folder { path: path.into() };
+        let file = |path: &str| PathSelector::File { path: path.into() };
+        let matcher = SelectionMatcher::new(&[folder("a")], &[file("a/b/x.rs")]);
+        assert!(matcher.file("a/y.rs"));
+        assert!(!matcher.file("a/b/x.rs"));
+        assert!(!matcher.file("ab/y.rs"));
+        assert_eq!(matcher.folder("a"), FolderSelection::Partial);
+        assert_eq!(matcher.folder("a/b"), FolderSelection::Partial);
+        assert_eq!(matcher.folder("a/c"), FolderSelection::All);
+        assert_eq!(matcher.folder("b"), FolderSelection::None);
+        let matcher = SelectionMatcher::new(&[file("a/b/x.rs")], &[]);
+        assert_eq!(matcher.folder("a"), FolderSelection::Partial);
+        assert_eq!(matcher.folder("a/b/x.rs"), FolderSelection::None);
+        let glob = PathSelector::Glob {
+            pattern: "src/**/*.rs".into(),
+        };
+        let matcher = SelectionMatcher::new(&[glob], &[folder("src/gen")]);
+        assert!(matcher.file("src/a/b.rs"));
+        assert!(!matcher.file("src/gen/b.rs"));
+        assert!(!matcher.file("docs/b.rs"));
+        assert_eq!(matcher.folder("src"), FolderSelection::Partial);
+        assert_eq!(matcher.folder("src/deep"), FolderSelection::Partial);
+        assert_eq!(matcher.folder("docs"), FolderSelection::None);
+        assert_eq!(matcher.folder("src/gen"), FolderSelection::None);
     }
 
     #[test]

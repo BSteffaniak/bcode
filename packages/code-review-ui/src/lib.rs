@@ -63,6 +63,7 @@ pub mod options_form;
 pub mod palette;
 pub mod panels;
 pub mod path_completion;
+pub mod path_picker;
 pub mod picker;
 pub mod publish;
 pub mod rows;

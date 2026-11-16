@@ -276,13 +276,7 @@ impl PathIndex {
 
     /// Whether `selector` selects the indexed file `path`.
     fn selects(selector: &PathSelector, glob: Option<&globset::GlobMatcher>, path: &str) -> bool {
-        match selector {
-            PathSelector::File { path: file } | PathSelector::FileRange { path: file, .. } => {
-                file == path
-            }
-            PathSelector::Folder { path: folder } => is_under(path, folder),
-            PathSelector::Glob { .. } => glob.is_some_and(|glob| glob.is_match(path)),
-        }
+        crate::selectors::selects(selector, glob, path)
     }
 
     fn packages(&self, root: &Path) -> &[Package] {
@@ -335,12 +329,6 @@ fn join(dir: &str, name: &str) -> String {
     } else {
         format!("{dir}/{name}")
     }
-}
-
-/// Whether `path` is under `folder`.
-fn is_under(path: &str, folder: &str) -> bool {
-    path.strip_prefix(folder)
-        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The children of a folder inside an ignored folder, read from the file system (git does not
@@ -571,12 +559,7 @@ pub fn list(
 /// A glob matcher with git's `:(glob)` rules (`*` stays within a folder, `**` crosses them).
 fn glob_matcher(pattern: &str) -> Result<globset::GlobMatcher, DataError> {
     git::validate_glob(pattern)?;
-    globset::GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .backslash_escape(true)
-        .build()
-        .map(|glob| glob.compile_matcher())
-        .map_err(|error| DataError::InvalidRequest(format!("invalid glob {pattern:?}: {error}")))
+    crate::selectors::glob_matcher(pattern).map_err(DataError::InvalidRequest)
 }
 
 /// Files and folders matching a fuzzy name or a glob (`review.paths.search`).

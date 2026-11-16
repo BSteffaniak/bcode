@@ -1,21 +1,23 @@
 //! The new-review wizard: a BMUX `stepper` over a [`Picker`] per step.
 //!
 //! 1. **Source type**: working tree, current branch, compare branches, commits, pull request,
-//!    stack, or files.
+//!    stack, files, or repository.
 //! 2. **Details**, by type: unstaged / staged / both with counts (`review.repo.state`); the
 //!    current branch's base (detected base prefilled, any reference pickable); base and head
 //!    references (`review.refs.search`); commits from the paged log (`review.commits.page`) with
 //!    `tab` marking commits and `shift+tab` marking the contiguous range from the last mark; the
 //!    provider's pull requests (review requested from me first); a pull request's stack (whole
-//!    stack, step through every layer, or one layer); repository files (`review.files.search`),
-//!    marked with `tab`, with `:START-END` selecting a line range.
+//!    stack, step through every layer, or one layer); files, folders, globs, and line ranges in
+//!    the tree picker ([`PathPicker`]); the whole repository, or the tree picker limited to
+//!    folders; uncommitted changes limited to paths chosen in the tree picker.
 //! 3. **Title** (prefilled) and the sources so far; "Add another source" returns to step 1 for
 //!    a composite review, and "Create review" finishes.
 //!
 //! **Editing a review's sources** ([`Wizard::editing`]) opens step 3 with
 //! the review's title and sources: sources can be added (step 1 again), removed (`enter` on
-//! one), and included or excluded (`tab` on one); "Save changes" returns them with their ids
-//! kept, so threads and viewed marks stay attached.
+//! one), included or excluded (`tab` on one), and a files, folder, repository, or
+//! uncommitted-paths source edited in the tree picker (`ctrl+e` on one); "Save changes" returns
+//! them with their ids kept, so threads and viewed marks stay attached.
 //!
 //! Every list loads on host-spawned tasks, paged on demand; stale answers (an older query) are
 //! dropped. Without a review-source provider, or when it fails (for example without
@@ -24,16 +26,16 @@
 use super::chrome::{self, Status};
 use super::entry::{NO_PROVIDER, default_title};
 use super::home::model::PullsAnswer;
+use super::path_picker::{PathChoice, PathPicker, PathPickerOutcome, PathPurpose};
 use super::picker::{Picker, PickerItem, PickerMessage, PickerOutcome};
 use super::theme::ReviewTheme;
 use crate::context::UiContext;
 use crate::services::ReviewServices;
 use bcode_code_review::discovery::ProvisionalLayer;
 use bcode_code_review_models::{
-    PullRequestSummary, ReviewCommitEntry, ReviewCommitsPageRequest, ReviewCommitsPageResponse,
-    ReviewFilesSearchRequest, ReviewFilesSearchResponse, ReviewRefEntry, ReviewRefKind,
-    ReviewRefsSearchRequest, ReviewRefsSearchResponse, ReviewRepoStateResponse, ReviewSource,
-    ReviewSourceKind, ReviewStack,
+    PathSelector, PullRequestSummary, ReviewCommitEntry, ReviewCommitsPageRequest,
+    ReviewCommitsPageResponse, ReviewRefEntry, ReviewRefKind, ReviewRefsSearchRequest,
+    ReviewRefsSearchResponse, ReviewRepoStateResponse, ReviewSource, ReviewSourceKind, ReviewStack,
 };
 use bmux_keyboard::KeyStroke;
 use bmux_tui::event::Event;
@@ -43,12 +45,13 @@ use bmux_tui::text::{Line, Span};
 use bmux_tui_components::status_bar::StatusSeverity;
 use bmux_tui_components::stepper::{StepItem, StepStatus, StepperComponent, StepperPolicy};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Keymap scope of the wizard.
 pub const WIZARD_SCOPE: &str = "code-review-wizard";
-/// Page size of reference, commit, and file listings.
+/// Page size of reference and commit listings.
 const PAGE: u32 = 100;
 
 /// Source types of step 1.
@@ -66,13 +69,15 @@ pub enum SourceType {
     PullRequest,
     /// A provider stack.
     Stack,
-    /// Repository files or line ranges.
+    /// Files, folders, globs, or line ranges as they are now.
     Files,
+    /// The whole repository, or some folders, as it is now.
+    Repository,
 }
 
 impl SourceType {
     /// Every type, in menu order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::WorkingTree,
         Self::CurrentBranch,
         Self::CompareBranches,
@@ -80,6 +85,7 @@ impl SourceType {
         Self::PullRequest,
         Self::Stack,
         Self::Files,
+        Self::Repository,
     ];
 
     /// Stable id.
@@ -93,6 +99,7 @@ impl SourceType {
             Self::PullRequest => "pull-request",
             Self::Stack => "stack",
             Self::Files => "files",
+            Self::Repository => "repository",
         }
     }
 
@@ -107,6 +114,7 @@ impl SourceType {
             Self::PullRequest => "Pull request",
             Self::Stack => "Stack",
             Self::Files => "Files",
+            Self::Repository => "Repository",
         }
     }
 
@@ -118,7 +126,8 @@ impl SourceType {
             Self::Commits => "one commit, a range, or a selection",
             Self::PullRequest => "an open pull request",
             Self::Stack => "stacked pull requests: whole, step through, or one layer",
-            Self::Files => "whole files or line ranges",
+            Self::Files => "whole files, folders, globs, or line ranges as they are now",
+            Self::Repository => "the whole repository, or some folders, as it is now",
         }
     }
 
@@ -186,11 +195,23 @@ struct Chosen {
 enum Details {
     WorkingTree,
     Branch,
-    Compare { base: Option<String> },
+    Compare {
+        base: Option<String>,
+    },
     Commits,
     Pull,
     Stack(StackStage),
-    Files,
+    /// The whole repository, or limited to folders.
+    Repository,
+    /// The tree picker; `replace` is the index of the chosen source it edits.
+    Paths {
+        purpose: PathPurpose,
+        replace: Option<usize>,
+    },
+    /// Which uncommitted changes of `paths`.
+    Staging {
+        paths: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,11 +241,6 @@ enum WizardMessage {
         seq: u64,
         append: bool,
         result: Result<ReviewCommitsPageResponse, String>,
-    },
-    Files {
-        seq: u64,
-        append: bool,
-        result: Result<ReviewFilesSearchResponse, String>,
     },
     Pulls(Result<Option<PullsAnswer>, String>),
     PullLookup {
@@ -276,7 +292,6 @@ struct Listing {
     next: Option<String>,
     refs: Vec<ReviewRefEntry>,
     commits: Vec<ReviewCommitEntry>,
-    files: Vec<String>,
     error: Option<String>,
 }
 
@@ -309,6 +324,8 @@ pub struct Wizard {
     /// loaded list does not show.
     pull_lookup: Option<PullLookup>,
     listing: Listing,
+    /// The tree picker of a paths step.
+    paths: Option<PathPicker>,
     marked: Vec<String>,
     /// Last explicitly marked id (start of a range mark).
     anchor: Option<String>,
@@ -349,6 +366,10 @@ const HINT_ACTIONS: &[&str] = &[
     "wizard_mark_range",
     "wizard_back",
     "wizard_assistant",
+    "wizard_show_ignored",
+    "wizard_selection",
+    "wizard_relist",
+    "wizard_edit_source",
 ];
 
 fn type_picker() -> Picker {
@@ -374,6 +395,7 @@ impl Wizard {
             pulls_requested: false,
             pull_lookup: None,
             listing: Listing::default(),
+            paths: None,
             marked: Vec::new(),
             anchor: None,
             sources: Vec::new(),
@@ -676,24 +698,12 @@ impl Wizard {
                     }
                 });
             }
-            Details::Files => {
-                let (query, _) = split_range(&query);
-                let request = ReviewFilesSearchRequest {
-                    repo_path: repo,
-                    query: query.trim().to_owned(),
-                    revision: None,
-                    cursor,
-                    limit: Some(PAGE),
-                };
-                self.spawn(host, async move {
-                    WizardMessage::Files {
-                        seq,
-                        append,
-                        result: services.call(request).await.map_err(|error| error.message),
-                    }
-                });
-            }
-            Details::WorkingTree | Details::Pull | Details::Stack(_) => {
+            Details::WorkingTree
+            | Details::Pull
+            | Details::Stack(_)
+            | Details::Repository
+            | Details::Paths { .. }
+            | Details::Staging { .. } => {
                 self.listing.loading = false;
             }
         }
@@ -750,6 +760,9 @@ impl Wizard {
             changed = true;
             self.apply(message, host);
         }
+        if let Some(paths) = self.paths.as_mut() {
+            changed |= paths.poll(host);
+        }
         if self.pending_items {
             self.pending_items = false;
             self.refresh_items(theme);
@@ -772,9 +785,7 @@ impl Wizard {
     const fn listing_outdated(&self) -> bool {
         matches!(
             self.step,
-            Step::Details(
-                Details::Branch | Details::Compare { .. } | Details::Commits | Details::Files
-            )
+            Step::Details(Details::Branch | Details::Compare { .. } | Details::Commits)
         ) && (self.listing.loading || self.listing.again)
     }
 
@@ -827,27 +838,6 @@ impl Wizard {
                                 self.listing.commits.clear();
                             }
                             self.listing.commits.extend(response.commits);
-                            self.listing.next = response.next_cursor;
-                            self.listing.error = None;
-                        }
-                        Err(error) => self.listing.error = Some(error),
-                    }
-                }
-            }
-            WizardMessage::Files {
-                seq,
-                append,
-                result,
-            } => {
-                if self.finish_listing(seq, host) {
-                    match result {
-                        Ok(response) => {
-                            if !append {
-                                self.listing.files.clear();
-                            }
-                            self.listing
-                                .files
-                                .extend(response.files.into_iter().map(|file| file.path));
                             self.listing.next = response.next_cursor;
                             self.listing.error = None;
                         }
@@ -921,6 +911,11 @@ impl Wizard {
 
     fn enter_details(&mut self, kind: SourceType, host: &UiContext) {
         self.chosen_type = Some(kind);
+        self.paths = None;
+        if kind == SourceType::Files {
+            self.enter_paths(PathPurpose::Files, None, Vec::new(), Vec::new());
+            return;
+        }
         self.listing.reset();
         self.marked.clear();
         self.anchor = None;
@@ -989,15 +984,13 @@ impl Wizard {
                     "enter resolve its stack · esc back".to_owned(),
                 )
             }
-            SourceType::Files => (
-                Details::Files,
-                Picker::new(
-                    "wizard.files",
-                    "Files",
-                    Some("search files · add :START-END for a line range"),
-                ),
-                format!("enter review · {mark} mark · esc back"),
+            SourceType::Repository => (
+                Details::Repository,
+                Picker::new("wizard.repository", "Which part of the repository?", None),
+                "enter choose · esc back".to_owned(),
             ),
+            // Entered above, in the tree picker.
+            SourceType::Files => return,
         };
         self.step = Step::Details(details);
         self.replace_picker(picker, &footer);
@@ -1034,7 +1027,49 @@ impl Wizard {
                     "enter resolve its stack · esc back",
                 );
             }
+            Step::Details(Details::Paths {
+                replace: Some(_), ..
+            }) => {
+                self.paths = None;
+                self.enter_confirm();
+            }
+            Step::Details(Details::Paths {
+                purpose: PathPurpose::Folders,
+                ..
+            }) => {
+                self.paths = None;
+                self.step = Step::Details(Details::Repository);
+                self.replace_picker(
+                    Picker::new("wizard.repository", "Which part of the repository?", None),
+                    "enter choose · esc back",
+                );
+            }
+            Step::Details(Details::Paths {
+                purpose: PathPurpose::Uncommitted,
+                ..
+            }) => {
+                self.paths = None;
+                self.step = Step::Details(Details::WorkingTree);
+                self.replace_picker(
+                    Picker::new("wizard.worktree", "Which changes?", None),
+                    "enter choose · esc back",
+                );
+            }
+            Step::Details(Details::Staging { paths }) => {
+                let include = paths
+                    .iter()
+                    .map(|path| {
+                        if self.repo.join(path).is_dir() {
+                            PathSelector::Folder { path: path.clone() }
+                        } else {
+                            PathSelector::File { path: path.clone() }
+                        }
+                    })
+                    .collect();
+                self.enter_paths(PathPurpose::Uncommitted, None, include, Vec::new());
+            }
             Step::Details(_) => {
+                self.paths = None;
                 self.step = Step::Type;
                 self.replace_picker(type_picker(), "enter choose · esc back to reviews");
                 // Back on the type that was being configured.
@@ -1046,6 +1081,140 @@ impl Wizard {
                 self.replace_picker(type_picker(), "enter choose · esc back");
             }
         }
+        WizardOutcome::Redraw
+    }
+
+    /// Open the tree picker for `purpose` with `include` and `exclude` selected; `replace` is
+    /// the index of the chosen source the choice replaces.
+    fn enter_paths(
+        &mut self,
+        purpose: PathPurpose,
+        replace: Option<usize>,
+        include: Vec<PathSelector>,
+        exclude: Vec<PathSelector>,
+    ) {
+        let picker = PathPicker::new(self.services.clone(), self.repo.clone(), purpose)
+            .with_selection(include, exclude, false);
+        self.paths = Some(picker);
+        self.step = Step::Details(Details::Paths { purpose, replace });
+        self.pending_items = true;
+    }
+
+    /// The tree picker finished with `choice`.
+    fn paths_done(&mut self, purpose: PathPurpose, replace: Option<usize>, choice: PathChoice) {
+        let kind = match purpose {
+            PathPurpose::Files => {
+                bcode_code_review::selectors::files_source(choice.include, choice.exclude)
+            }
+            PathPurpose::Folders => {
+                match bcode_code_review::selectors::repository_source(choice.include) {
+                    Ok(kind) => kind,
+                    Err(error) => {
+                        self.set_status(error, StatusSeverity::Warning);
+                        return;
+                    }
+                }
+            }
+            PathPurpose::Uncommitted => {
+                let paths: Vec<String> = choice
+                    .include
+                    .iter()
+                    .filter_map(PathSelector::path)
+                    .map(str::to_owned)
+                    .collect();
+                let kept = replace
+                    .and_then(|index| self.sources.get(index))
+                    .and_then(|source| match source.kind {
+                        ReviewSourceKind::WorkingTreePaths {
+                            staged, unstaged, ..
+                        } => Some((staged, unstaged)),
+                        _ => None,
+                    });
+                let Some((staged, unstaged)) = kept else {
+                    self.paths = None;
+                    self.step = Step::Details(Details::Staging { paths });
+                    self.replace_picker(
+                        Picker::new("wizard.staging", "Which changes in those paths?", None),
+                        "enter choose · esc back",
+                    );
+                    return;
+                };
+                ReviewSourceKind::WorkingTreePaths {
+                    paths,
+                    staged,
+                    unstaged,
+                }
+            }
+        };
+        self.paths = None;
+        let label = kind.label();
+        match replace.and_then(|index| self.sources.get_mut(index)) {
+            Some(source) => {
+                source.kind = kind;
+                source.label = label;
+                self.enter_confirm();
+            }
+            None => self.add_sources(vec![(kind, label)]),
+        }
+    }
+
+    /// `ctrl+e` on step 3: edit the focused files, folder, repository, or uncommitted-paths
+    /// source in the tree picker.
+    fn edit_source(&mut self) -> WizardOutcome {
+        let Some(index) = self
+            .picker
+            .focused()
+            .and_then(|id| id.strip_prefix("source-"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            return WizardOutcome::Ignored;
+        };
+        let Some(source) = self.sources.get(index) else {
+            return WizardOutcome::Ignored;
+        };
+        let (purpose, include, exclude) = match &source.kind {
+            ReviewSourceKind::FileSet { include, exclude } => {
+                (PathPurpose::Files, include.clone(), exclude.clone())
+            }
+            ReviewSourceKind::File { path } => (
+                PathPurpose::Files,
+                vec![PathSelector::File { path: path.clone() }],
+                Vec::new(),
+            ),
+            ReviewSourceKind::FileRange { path, start, end } => (
+                PathPurpose::Files,
+                vec![PathSelector::FileRange {
+                    path: path.clone(),
+                    start: *start,
+                    end: *end,
+                }],
+                Vec::new(),
+            ),
+            ReviewSourceKind::Repository => (PathPurpose::Folders, Vec::new(), Vec::new()),
+            ReviewSourceKind::WorkingTreePaths { paths, .. } => (
+                PathPurpose::Uncommitted,
+                paths
+                    .iter()
+                    .map(|path| {
+                        let path = path.trim_end_matches('/').to_owned();
+                        if self.repo.join(&path).is_dir() {
+                            PathSelector::Folder { path }
+                        } else {
+                            PathSelector::File { path }
+                        }
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            _ => {
+                self.set_status(
+                    "only files, folder, repository, and uncommitted-paths sources edit in the tree",
+                    StatusSeverity::Info,
+                );
+                return WizardOutcome::Redraw;
+            }
+        };
+        self.enter_paths(purpose, Some(index), include, exclude);
         WizardOutcome::Redraw
     }
 
@@ -1215,10 +1384,51 @@ impl Wizard {
                         ),
                         PickerItem::new("staged", row("Staged changes".into(), counts(staged))),
                         PickerItem::new("both", row("Unstaged and staged".into(), counts(both))),
+                        PickerItem::new(
+                            "paths",
+                            row(
+                                "Limit to paths…".into(),
+                                "uncommitted changes in some files or folders".into(),
+                            ),
+                        ),
                     ],
                     None,
                 )
             }
+            Step::Details(Details::Repository) => (
+                vec![
+                    PickerItem::new(
+                        "whole",
+                        row(
+                            "Whole repository".into(),
+                            "every file as it is now; ignored files hidden".into(),
+                        ),
+                    ),
+                    PickerItem::new(
+                        "folders",
+                        row(
+                            "Limit to folders…".into(),
+                            "choose folders in the tree".into(),
+                        ),
+                    ),
+                ],
+                None,
+            ),
+            Step::Details(Details::Staging { paths }) => {
+                let detail = match paths.as_slice() {
+                    [only] => only.clone(),
+                    _ => format!("{} paths", paths.len()),
+                };
+                (
+                    vec![
+                        PickerItem::new("both", row("Unstaged and staged".into(), detail.clone())),
+                        PickerItem::new("unstaged", row("Unstaged changes".into(), detail.clone())),
+                        PickerItem::new("staged", row("Staged changes".into(), detail)),
+                    ],
+                    None,
+                )
+            }
+            Step::Details(Details::Paths { .. }) => (Vec::new(), None),
             Step::Details(Details::Branch | Details::Compare { .. }) => {
                 let items: Vec<PickerItem> = self
                     .listing
@@ -1281,37 +1491,6 @@ impl Wizard {
                     .collect();
                 let message = if items.is_empty() {
                     listing_message("No matching commits")
-                } else {
-                    None
-                };
-                (items, message)
-            }
-            Step::Details(Details::Files) => {
-                let marked: BTreeSet<&str> = self.marked.iter().map(String::as_str).collect();
-                let items: Vec<PickerItem> = self
-                    .listing
-                    .files
-                    .iter()
-                    .map(|path| {
-                        let mark = marked.contains(path.as_str());
-                        PickerItem::new(
-                            path.clone(),
-                            Line::from_spans(vec![
-                                Span::styled(
-                                    if mark {
-                                        format!("{} ", theme.icons.viewed)
-                                    } else {
-                                        "  ".to_owned()
-                                    },
-                                    theme.viewed,
-                                ),
-                                Span::styled(path.clone(), theme.path),
-                            ]),
-                        )
-                    })
-                    .collect();
-                let message = if items.is_empty() {
-                    listing_message("No matching files")
                 } else {
                     None
                 };
@@ -1425,12 +1604,27 @@ impl Wizard {
                     ),
                 ];
                 let editing = self.editing.is_some();
+                let edit_key = self
+                    .action_keys
+                    .get("wizard_edit_source")
+                    .cloned()
+                    .unwrap_or_else(|| "ctrl+e".to_owned());
                 items.extend(self.sources.iter().enumerate().map(|(index, source)| {
-                    let detail = match (editing, source.included) {
+                    let mut detail = match (editing, source.included) {
                         (false, _) => "enter removes".to_owned(),
                         (true, true) => "included · tab excludes · enter removes".to_owned(),
                         (true, false) => "excluded · tab includes · enter removes".to_owned(),
                     };
+                    if matches!(
+                        source.kind,
+                        ReviewSourceKind::FileSet { .. }
+                            | ReviewSourceKind::File { .. }
+                            | ReviewSourceKind::FileRange { .. }
+                            | ReviewSourceKind::Repository
+                            | ReviewSourceKind::WorkingTreePaths { .. }
+                    ) {
+                        let _ = write!(detail, " · {edit_key} edits");
+                    }
                     PickerItem::new(format!("source-{index}"), row(source.kind.label(), detail))
                 }));
                 (items, None)
@@ -1591,7 +1785,17 @@ impl Wizard {
         let action = host
             .keymap_action(WIZARD_SCOPE, stroke)
             .map(|action| action.trim_start_matches("bcode.code_review.").to_owned());
+        if action.as_deref() != Some("wizard_assistant")
+            && let Some(outcome) = self.paths_key(stroke, action.as_deref())
+        {
+            if self.pending_items {
+                self.pending_items = false;
+                self.refresh_items(theme);
+            }
+            return outcome;
+        }
         let outcome = match action.as_deref() {
+            Some("wizard_edit_source") if matches!(self.step, Step::Confirm) => self.edit_source(),
             Some("wizard_back") => self.back(),
             Some("wizard_assistant") => {
                 self.link.requested = true;
@@ -1635,8 +1839,53 @@ impl Wizard {
         outcome
     }
 
+    /// The tree picker's step, when one is shown.
+    const fn paths_step(&self) -> Option<(PathPurpose, Option<usize>)> {
+        match self.step {
+            Step::Details(Details::Paths { purpose, replace }) if self.paths.is_some() => {
+                Some((purpose, replace))
+            }
+            _ => None,
+        }
+    }
+
+    /// Act on what the tree picker did.
+    fn paths_outcome(&mut self, outcome: PathPickerOutcome) -> WizardOutcome {
+        let Some((purpose, replace)) = self.paths_step() else {
+            return WizardOutcome::Ignored;
+        };
+        match outcome {
+            PathPickerOutcome::Ignored => WizardOutcome::Ignored,
+            PathPickerOutcome::Redraw => WizardOutcome::Redraw,
+            PathPickerOutcome::Back => self.back(),
+            PathPickerOutcome::Done(choice) => {
+                self.paths_done(purpose, replace, choice);
+                WizardOutcome::Redraw
+            }
+        }
+    }
+
+    /// A key on the tree picker's step; `None` on any other step.
+    fn paths_key(&mut self, stroke: KeyStroke, action: Option<&str>) -> Option<WizardOutcome> {
+        self.paths_step()?;
+        let outcome = self.paths.as_mut()?.key(stroke, action);
+        Some(self.paths_outcome(outcome))
+    }
+
+    /// The tree picker, while a paths step shows it.
+    #[must_use]
+    pub fn path_picker(&self) -> Option<&PathPicker> {
+        self.paths_step().and(self.paths.as_ref())
+    }
+
     /// Insert pasted text into the step's input.
     pub fn paste(&mut self, text: &str, host: &UiContext, theme: &ReviewTheme) -> WizardOutcome {
+        if self.paths_step().is_some()
+            && let Some(paths) = self.paths.as_mut()
+        {
+            let outcome = paths.paste(text);
+            return self.paths_outcome(outcome);
+        }
         let outcome = self.picker.paste(text);
         let outcome = self.picker_outcome(outcome, host);
         if self.pending_items {
@@ -1648,6 +1897,17 @@ impl Wizard {
 
     /// Route a pointer event through the painted picker.
     pub fn mouse(&mut self, event: &Event, host: &UiContext, theme: &ReviewTheme) -> WizardOutcome {
+        if self.paths_step().is_some()
+            && let Some(paths) = self.paths.as_mut()
+        {
+            let outcome = paths.mouse(event);
+            let outcome = self.paths_outcome(outcome);
+            if self.pending_items {
+                self.pending_items = false;
+                self.refresh_items(theme);
+            }
+            return outcome;
+        }
         let outcome = self.picker.mouse(event, theme);
         let outcome = self.picker_outcome(outcome, host);
         if self.pending_items {
@@ -1658,7 +1918,7 @@ impl Wizard {
     }
 
     const fn markable(&self) -> bool {
-        matches!(self.step, Step::Details(Details::Commits | Details::Files))
+        matches!(self.step, Step::Details(Details::Commits))
             || (matches!(self.step, Step::Confirm) && self.editing.is_some())
     }
 
@@ -1750,9 +2010,8 @@ impl Wizard {
                 WizardOutcome::Redraw
             }
             PickerOutcome::Edited => {
-                if let Step::Details(
-                    Details::Branch | Details::Compare { .. } | Details::Commits | Details::Files,
-                ) = &self.step
+                if let Step::Details(Details::Branch | Details::Compare { .. } | Details::Commits) =
+                    &self.step
                 {
                     self.request_listing(host, false);
                 }
@@ -1775,6 +2034,32 @@ impl Wizard {
                 if let Some(kind) = SourceType::from_id(id) {
                     self.enter_details(kind, host);
                 }
+            }
+            Step::Details(Details::WorkingTree) if id == "paths" => {
+                self.enter_paths(PathPurpose::Uncommitted, None, Vec::new(), Vec::new());
+            }
+            Step::Details(Details::Repository) => {
+                if id == "folders" {
+                    self.enter_paths(PathPurpose::Folders, None, Vec::new(), Vec::new());
+                } else {
+                    let kind = ReviewSourceKind::Repository;
+                    let label = kind.label();
+                    self.add_sources(vec![(kind, label)]);
+                }
+            }
+            Step::Details(Details::Staging { paths }) => {
+                let (staged, unstaged) = match id {
+                    "staged" => (true, false),
+                    "unstaged" => (false, true),
+                    _ => (true, true),
+                };
+                let kind = ReviewSourceKind::WorkingTreePaths {
+                    paths,
+                    staged,
+                    unstaged,
+                };
+                let label = kind.label();
+                self.add_sources(vec![(kind, label)]);
             }
             Step::Details(Details::WorkingTree) => {
                 let (kind, title) = match id {
@@ -1855,33 +2140,6 @@ impl Wizard {
                 };
                 self.add_sources(vec![source]);
             }
-            Step::Details(Details::Files) => {
-                let (_, range) = split_range(&self.picker.query());
-                let sources: Vec<(ReviewSourceKind, String)> = if self.marked.is_empty() {
-                    vec![match range {
-                        Some((start, end)) => (
-                            ReviewSourceKind::FileRange {
-                                path: id.to_owned(),
-                                start,
-                                end,
-                            },
-                            format!("{id}:{start}-{end}"),
-                        ),
-                        None => (
-                            ReviewSourceKind::File {
-                                path: id.to_owned(),
-                            },
-                            id.to_owned(),
-                        ),
-                    }]
-                } else {
-                    self.marked
-                        .iter()
-                        .map(|path| (ReviewSourceKind::File { path: path.clone() }, path.clone()))
-                        .collect()
-                };
-                self.add_sources(sources);
-            }
             Step::Details(Details::Pull) => {
                 let Some(Ok(Some(answer))) = &self.pulls else {
                     return WizardOutcome::Ignored;
@@ -1909,7 +2167,7 @@ impl Wizard {
                     self.request_stack(host, number);
                 }
             }
-            Step::Details(Details::Stack(StackStage::Resolving(_))) => {}
+            Step::Details(Details::Paths { .. } | Details::Stack(StackStage::Resolving(_))) => {}
             Step::Details(Details::Stack(StackStage::Mode(stack))) => {
                 if id == STACK_LIMIT_WARNING_ID {
                     self.stack_limit_dismissed = Some(stack.requested);
@@ -2032,6 +2290,30 @@ impl Wizard {
             ("enter".to_owned(), "choose".to_owned()),
             ("↑↓".to_owned(), "move".to_owned()),
         ];
+        if self.paths_step().is_some() {
+            let mut hints = vec![
+                ("space".to_owned(), "select".to_owned()),
+                ("←→".to_owned(), "fold".to_owned()),
+                ("/".to_owned(), "filter".to_owned()),
+                ("enter".to_owned(), "continue".to_owned()),
+            ];
+            for (action, label) in [
+                ("wizard_selection", "selected"),
+                ("wizard_show_ignored", "ignored"),
+                ("wizard_back", "back"),
+                ("wizard_assistant", "Ask AI"),
+            ] {
+                if let Some(key) = self.action_keys.get(action) {
+                    hints.push((key.clone(), label.to_owned()));
+                }
+            }
+            return hints;
+        }
+        if matches!(self.step, Step::Confirm)
+            && let Some(key) = self.action_keys.get("wizard_edit_source")
+        {
+            hints.push((key.clone(), "edit source".to_owned()));
+        }
         if matches!(self.step, Step::Confirm) && self.markable() {
             if let Some(key) = self.action_keys.get("wizard_mark") {
                 hints.push((key.clone(), "include or exclude".to_owned()));
@@ -2137,7 +2419,13 @@ impl Wizard {
         let top = area.y + if header { 3 } else { 0 };
         let bottom = area.bottom() - u16::from(footer);
         let body = Rect::new(area.x, top, area.width, bottom.saturating_sub(top));
-        self.picker.paint(theme, body, cx);
+        if self.paths_step().is_some()
+            && let Some(paths) = self.paths.as_mut()
+        {
+            paths.paint(theme, body, cx);
+        } else {
+            self.picker.paint(theme, body, cx);
+        }
         if footer {
             let hints = self.hints();
             chrome::paint_footer(
@@ -2170,20 +2458,6 @@ fn pull_item(theme: &ReviewTheme, pull: &PullRequestSummary) -> PickerItem {
         theme.muted,
     ));
     PickerItem::new(pull.number.to_string(), Line::from_spans(spans))
-}
-
-/// Split a trailing `:START-END` line range off a file query.
-fn split_range(query: &str) -> (&str, Option<(u32, u32)>) {
-    let Some((path, range)) = query.rsplit_once(':') else {
-        return (query, None);
-    };
-    let Some((start, end)) = range.split_once('-') else {
-        return (query, None);
-    };
-    match (start.trim().parse::<u32>(), end.trim().parse::<u32>()) {
-        (Ok(start), Ok(end)) if start > 0 && end >= start => (path, Some((start, end))),
-        _ => (query, None),
-    }
 }
 
 /// Rows for a stack being resolved, as discovery sees it: a heading saying it is unconfirmed,
@@ -2244,7 +2518,7 @@ impl Wizard {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceType, Wizard, split_range};
+    use super::{SourceType, Wizard};
     use crate::testing::backend::TestBackend;
     use crate::testing::fixture::{FixtureSpec, GitFixture};
     use crate::testing::harness::ScriptedHost;
@@ -2263,9 +2537,10 @@ mod tests {
             TestBackend::default().services(),
             fixture.root().to_path_buf(),
         );
-        // The commit log is requested, then the reviewer moves on to files before it answers.
+        // The commit log is requested, then the reviewer moves on to references before it
+        // answers.
         wizard.enter_details(SourceType::Commits, &host);
-        wizard.enter_details(SourceType::Files, &host);
+        wizard.enter_details(SourceType::CompareBranches, &host);
         scripted.run_until_idle(&runtime);
         let theme = crate::theme::ReviewTheme::derive(None, crate::theme::IconStyle::default());
         assert!(wizard.poll(&host, &theme));
@@ -2273,20 +2548,7 @@ mod tests {
             wizard.listing.commits.is_empty(),
             "the commit log answer belongs to the previous step"
         );
-        assert_ne!(wizard.listing.files.len(), 0);
+        assert_ne!(wizard.listing.refs.len(), 0);
         assert!(!wizard.listing.loading);
-    }
-
-    #[test]
-    fn file_queries_split_off_line_ranges() {
-        assert_eq!(
-            split_range("src/lib.rs:10-20"),
-            ("src/lib.rs", Some((10, 20)))
-        );
-        assert_eq!(split_range("lib:3-3"), ("lib", Some((3, 3))));
-        assert_eq!(split_range("lib:9-3"), ("lib:9-3", None));
-        assert_eq!(split_range("lib:0-3"), ("lib:0-3", None));
-        assert_eq!(split_range("lib.rs"), ("lib.rs", None));
-        assert_eq!(split_range("a:b-c"), ("a:b-c", None));
     }
 }

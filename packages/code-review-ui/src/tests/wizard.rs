@@ -10,7 +10,7 @@ use crate::testing::fake_provider::{FAKE_PROVIDER, FAKE_REPOSITORY, FakeProvider
 use crate::testing::fixture::{BASE_BRANCH, GitFixture, HEAD_BRANCH, UNICODE_FILE};
 use crate::testing::harness::{Scenario, Screen};
 use bcode_code_review_models::{
-    REVIEW_SOURCE_ERROR_UNAUTHENTICATED, ReviewSourceKind, ReviewWorkspace,
+    PathSelector, REVIEW_SOURCE_ERROR_UNAUTHENTICATED, ReviewSourceKind, ReviewWorkspace,
 };
 use std::sync::Arc;
 
@@ -250,15 +250,58 @@ fn commits_mark_single_ranges_and_selections() {
     assert!(screen.contains("No matching commits"), "{}", screen.text());
 }
 
+/// The tree picker of the wizard's paths step.
+fn paths(scenario: &Scenario<ReviewApp>) -> &crate::path_picker::PathPicker {
+    scenario
+        .surface()
+        .wizard()
+        .and_then(crate::wizard::Wizard::path_picker)
+        .expect("tree picker")
+}
+
+/// Move the tree picker's focus down until it is on `path`.
+fn focus_path(scenario: &mut Scenario<ReviewApp>, path: &str) {
+    for _ in 0..200 {
+        if paths(scenario).focused().as_deref() == Some(path) {
+            return;
+        }
+        scenario.key("down");
+        settled(scenario);
+    }
+    panic!("{path} is not in the tree:\n{}", settled(scenario).text());
+}
+
+/// The fixture with a folder of CJK, emoji, and combining-mark names (untracked), and an
+/// ignored folder.
+fn paths_fixture() -> GitFixture {
+    let fixture = fixture();
+    for (path, text) in [
+        ("名前/説明書.txt", "説明\n"),
+        ("名前/🎉 party.txt", "party\n"),
+        ("名前/cafe\u{301}.txt", "cafe\n"),
+        ("ignored-dir/secret.txt", "secret\n"),
+        (".gitignore", "ignored-dir/\n"),
+    ] {
+        let full = fixture.root().join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, text).expect("write");
+    }
+    fixture
+}
+
 #[test]
-fn files_pick_whole_files_marked_files_and_line_ranges() {
+fn files_pick_line_ranges_and_globs_from_the_filter() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default());
     let mut scenario = wizard(&fixture, &backend);
     pick_type(&mut scenario, 6);
     scenario.paste(&format!("{UNICODE_FILE}:2-4"));
     let screen = settled(&mut scenario);
-    assert!(screen.contains(UNICODE_FILE), "{}", screen.text());
+    assert!(
+        screen.contains(&format!("Add lines 2–4 of {UNICODE_FILE}")),
+        "{}",
+        screen.text()
+    );
     scenario.key("enter");
     settled(&mut scenario);
     let created = create(&mut scenario, &backend, &fixture);
@@ -271,25 +314,291 @@ fn files_pick_whole_files_marked_files_and_line_ranges() {
         }]
     );
 
-    // Two marked files become two sources.
+    // A glob filter offers its pattern, counted now.
     let mut scenario = wizard(&fixture, &backend);
     pick_type(&mut scenario, 6);
-    let first = scenario
-        .surface()
-        .wizard()
-        .unwrap()
-        .picker()
-        .focused()
-        .unwrap()
-        .to_owned();
-    scenario.key("tab");
-    scenario.key("down");
-    scenario.key("tab");
+    scenario.paste("docs/*.txt");
+    let screen = settled(&mut scenario);
+    let row = screen.find("Select pattern").expect("pattern row");
+    assert!(screen.row_text(row.y).contains("now"), "{}", screen.text());
     scenario.key("enter");
     settled(&mut scenario);
-    let wizard = scenario.surface().wizard().unwrap();
-    assert_eq!(wizard.source_labels().len(), 2);
-    assert_eq!(wizard.source_labels()[0], first);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(
+        kinds(&created),
+        [ReviewSourceKind::FileSet {
+            include: vec![PathSelector::Glob {
+                pattern: "docs/*.txt".to_owned()
+            }],
+            exclude: Vec::new(),
+        }]
+    );
+}
+
+#[test]
+fn the_tree_selects_folders_files_and_exclusions_with_tri_state_checks() {
+    let fixture = paths_fixture();
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 6);
+    // Untracked folders are listed; ignored ones are not until shown.
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("名前/"), "{}", screen.text());
+    assert!(!screen.contains("ignored-dir"), "{}", screen.text());
+    // Select docs/, expand it, and unselect its first file: the folder is partly selected.
+    focus_path(&mut scenario, "docs/");
+    scenario.key("space");
+    scenario.key("l");
+    settled(&mut scenario);
+    scenario.key("l");
+    let screen = settled(&mut scenario);
+    let child = paths(&scenario).focused().expect("first child");
+    assert!(child.starts_with("docs/"), "{child}");
+    assert!(screen.contains("[x] docs/"), "{}", screen.text());
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("[-] docs/"), "{}", screen.text());
+    assert_eq!(
+        paths(&scenario).exclude(),
+        [PathSelector::File {
+            path: child.clone()
+        }]
+    );
+    // `h` goes back to the folder and collapses it.
+    scenario.keys(&["h", "h"]);
+    settled(&mut scenario);
+    assert_eq!(paths(&scenario).focused().as_deref(), Some("docs/"));
+    // Select one file of the untracked folder too; the selection counts files now.
+    focus_path(&mut scenario, "名前/");
+    scenario.key("l");
+    settled(&mut scenario);
+    scenario.key("l");
+    settled(&mut scenario);
+    let file = paths(&scenario).focused().expect("file");
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("[-] 名前/"), "{}", screen.text());
+    assert!(screen.contains("Selected: 3 items"), "{}", screen.text());
+    // docs/ has one file, excluded; the untracked file is the one counted.
+    assert_eq!(paths(&scenario).total(), Some(1));
+    // The selection list removes entries.
+    scenario.key("alt+l");
+    let screen = settled(&mut scenario);
+    assert!(paths(&scenario).showing_selection());
+    assert!(
+        screen.contains(&format!("{} docs/", "[x]")),
+        "{}",
+        screen.text()
+    );
+    scenario.key("alt+l");
+    settled(&mut scenario);
+    scenario.key("enter");
+    settled(&mut scenario);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(
+        kinds(&created),
+        [ReviewSourceKind::FileSet {
+            include: vec![
+                PathSelector::Folder {
+                    path: "docs".to_owned()
+                },
+                PathSelector::File { path: file },
+            ],
+            exclude: vec![PathSelector::File { path: child }],
+        }]
+    );
+}
+
+#[test]
+fn the_tree_shows_ignored_files_on_request_and_removes_selected_items() {
+    let fixture = paths_fixture();
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 6);
+    scenario.key("alt+i");
+    let screen = settled(&mut scenario);
+    assert!(paths(&scenario).shows_ignored());
+    assert!(screen.contains("ignored-dir/"), "{}", screen.text());
+    assert!(
+        screen.contains("[x] Show ignored files"),
+        "{}",
+        screen.text()
+    );
+    // A click on the toggle hides them again.
+    let point = screen.find("Show ignored files").expect("toggle");
+    scenario.click(point.x, point.y);
+    let screen = settled(&mut scenario);
+    assert!(!paths(&scenario).shows_ignored());
+    assert!(!screen.contains("ignored-dir/"), "{}", screen.text());
+    // Select two folders, then remove one from the selection list.
+    focus_path(&mut scenario, "docs/");
+    scenario.key("space");
+    focus_path(&mut scenario, "名前/");
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    let point = screen.find("Selected: 2 items").expect("summary");
+    scenario.click(point.x, point.y);
+    settled(&mut scenario);
+    assert!(paths(&scenario).showing_selection());
+    scenario.key("x");
+    settled(&mut scenario);
+    assert_eq!(
+        paths(&scenario).include(),
+        [PathSelector::Folder {
+            path: "名前".to_owned()
+        }]
+    );
+    // Esc goes back to the tree, then back to step 1.
+    scenario.key("esc");
+    settled(&mut scenario);
+    assert!(!paths(&scenario).showing_selection());
+    scenario.key("esc");
+    settled(&mut scenario);
+    assert_eq!(step(&scenario), 1);
+}
+
+#[test]
+fn clicks_on_tree_rows_expand_folders_and_select_files_at_every_width() {
+    let fixture = paths_fixture();
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 6);
+    for (width, height) in [(120, 30), (60, 20), (20, 12), (8, 6), (0, 0), (140, 40)] {
+        scenario.resize(width, height);
+        let screen = settled(&mut scenario);
+        if width == 0 {
+            // Nothing painted: a click lands on nothing.
+            scenario.click(0, 0);
+            settled(&mut scenario);
+            continue;
+        }
+        if width < 60 {
+            continue;
+        }
+        // The row painted with the folder's name is the row a click expands.
+        let Some(point) = screen.find("名前/") else {
+            panic!("{width}x{height}:\n{}", screen.text());
+        };
+        scenario.click(point.x, point.y);
+        let screen = settled(&mut scenario);
+        let file = screen
+            .find("説明書.txt")
+            .unwrap_or_else(|| panic!("{width}x{height}:\n{}", screen.text()));
+        scenario.click(file.x, file.y);
+        let screen = settled(&mut scenario);
+        assert_eq!(
+            paths(&scenario).include(),
+            [PathSelector::File {
+                path: "名前/説明書.txt".to_owned()
+            }],
+            "{width}x{height}:\n{}",
+            screen.text()
+        );
+        assert!(screen.contains("[x] 説明書.txt"), "{}", screen.text());
+        // Clicking the file again unselects it; clicking the folder collapses it.
+        scenario.click(file.x, file.y);
+        let screen = settled(&mut scenario);
+        assert_eq!(paths(&scenario).include(), []);
+        // Expanding scrolled the rows: the folder is clicked where it is painted now.
+        let point = screen.find("名前/").expect("folder row");
+        scenario.click(point.x, point.y);
+        let screen = settled(&mut scenario);
+        assert!(!screen.contains("説明書.txt"), "{}", screen.text());
+    }
+    // At a tiny width the keyboard still selects, and emoji names stay inside the frame.
+    scenario.resize(20, 12);
+    focus_path(&mut scenario, "名前/");
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    for y in 0..12 {
+        assert!(
+            bmux_tui::text::Line::raw(screen.row_text(y)).width() <= 20,
+            "{}",
+            screen.text()
+        );
+    }
+    assert_eq!(
+        paths(&scenario).include(),
+        [PathSelector::Folder {
+            path: "名前".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn repository_reviews_are_whole_or_limited_to_folders() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    let screen = pick_type(&mut scenario, 7);
+    assert!(screen.contains("Whole repository"), "{}", screen.text());
+    scenario.key("enter");
+    settled(&mut scenario);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(kinds(&created), [ReviewSourceKind::Repository]);
+
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 7);
+    scenario.keys(&["down", "enter"]);
+    let screen = settled(&mut scenario);
+    // Only folders are listed.
+    assert!(!screen.contains("README"), "{}", screen.text());
+    focus_path(&mut scenario, "docs/");
+    scenario.keys(&["space", "enter"]);
+    settled(&mut scenario);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(
+        kinds(&created),
+        [ReviewSourceKind::FileSet {
+            include: vec![PathSelector::Folder {
+                path: "docs".to_owned()
+            }],
+            exclude: Vec::new(),
+        }]
+    );
+}
+
+#[test]
+fn uncommitted_changes_limit_to_paths_and_sources_edit_in_the_tree() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 0);
+    scenario.keys(&["down", "down", "down", "enter"]);
+    settled(&mut scenario);
+    focus_path(&mut scenario, "docs/");
+    scenario.keys(&["space", "enter"]);
+    let screen = settled(&mut scenario);
+    assert!(
+        screen.contains("Which changes in those paths?"),
+        "{}",
+        screen.text()
+    );
+    scenario.keys(&["down", "enter"]);
+    settled(&mut scenario);
+    assert_eq!(step(&scenario), 3);
+    // ctrl+e on the source opens it in the tree; adding a folder replaces it.
+    scenario.keys(&["down", "down"]);
+    scenario.key("ctrl+e");
+    settled(&mut scenario);
+    assert_eq!(
+        paths(&scenario).include(),
+        [PathSelector::Folder {
+            path: "docs".to_owned()
+        }]
+    );
+    focus_path(&mut scenario, "large/");
+    scenario.keys(&["space", "enter"]);
+    settled(&mut scenario);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(
+        kinds(&created),
+        [ReviewSourceKind::WorkingTreePaths {
+            paths: vec!["docs".to_owned(), "large".to_owned()],
+            staged: false,
+            unstaged: true,
+        }]
+    );
 }
 
 #[test]
@@ -751,6 +1060,16 @@ fn every_wizard_mode_can_be_created_through_create_review() {
                 vec![Key("enter")],
                 vec![Key("down"), Key("enter")],
                 vec![Key("down"), Key("down"), Key("enter")],
+                // Limit to paths: the tree's first folder, both kinds of changes.
+                vec![
+                    Key("down"),
+                    Key("down"),
+                    Key("down"),
+                    Key("enter"),
+                    Key("space"),
+                    Key("enter"),
+                    Key("enter"),
+                ],
             ],
             // The detected base, and the provider's first pull request.
             SourceType::CurrentBranch | SourceType::PullRequest => vec![vec![Key("enter")]],
@@ -770,8 +1089,25 @@ fn every_wizard_mode_can_be_created_through_create_review() {
                 vec![Key("enter"), Key("end"), Key("enter")],
             ],
             SourceType::Files => vec![
+                // The tree's first row, a range, a glob, a single file, and a folder with an
+                // exclusion and another file.
                 vec![Key("enter")],
                 vec![Paste(format!("{UNICODE_FILE}:2-4")), Key("enter")],
+                vec![Paste("docs/*.txt".to_owned()), Key("enter")],
+                vec![Paste(UNICODE_FILE.to_owned()), Key("tab"), Key("enter")],
+                vec![
+                    Key("space"),
+                    Key("l"),
+                    Key("l"),
+                    Key("space"),
+                    Paste(UNICODE_FILE.to_owned()),
+                    Key("tab"),
+                    Key("enter"),
+                ],
+            ],
+            SourceType::Repository => vec![
+                vec![Key("enter")],
+                vec![Key("down"), Key("enter"), Key("space"), Key("enter")],
             ],
         };
         for run in runs {

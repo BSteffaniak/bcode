@@ -423,10 +423,10 @@ keymap_actions = [
         ":",
         "ctrl+p",
     ] },
-    { id = "bcode.code_review.wizard_mark", scope = "code-review-wizard", description = "Mark or unmark the commit or file (include or exclude a source when editing)", defaults = [
+    { id = "bcode.code_review.wizard_mark", scope = "code-review-wizard", description = "Mark or unmark the commit, select or unselect the tree row (include or exclude a source when editing)", defaults = [
         "tab",
     ] },
-    { id = "bcode.code_review.wizard_mark_range", scope = "code-review-wizard", description = "Mark every commit or file from the last mark", defaults = [
+    { id = "bcode.code_review.wizard_mark_range", scope = "code-review-wizard", description = "Mark every commit or tree row from the last mark", defaults = [
         "shift+tab",
     ] },
     { id = "bcode.code_review.wizard_back", scope = "code-review-wizard", description = "Back one step", defaults = [
@@ -434,6 +434,18 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.wizard_assistant", scope = "code-review-wizard", description = "Ask AI: open, focus, or close the review assistant", defaults = [
         "ctrl+k",
+    ] },
+    { id = "bcode.code_review.wizard_show_ignored", scope = "code-review-wizard", description = "Show / hide ignored files in the tree picker", defaults = [
+        "alt+i",
+    ] },
+    { id = "bcode.code_review.wizard_selection", scope = "code-review-wizard", description = "Show the tree picker's selected items (and back to the tree)", defaults = [
+        "alt+l",
+    ] },
+    { id = "bcode.code_review.wizard_relist", scope = "code-review-wizard", description = "List the repository again in the tree picker", defaults = [
+        "ctrl+r",
+    ] },
+    { id = "bcode.code_review.wizard_edit_source", scope = "code-review-wizard", description = "Edit the files, folder, repository, or uncommitted-paths source in the tree picker", defaults = [
+        "ctrl+e",
     ] },
     { id = "bcode.code_review.assistant_close", scope = "code-review-assistant", description = "Close the assistant", defaults = [
         "ctrl+k",
