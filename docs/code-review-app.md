@@ -30,8 +30,8 @@ subcommand takes `--repo PATH` (default `.`). Without a subcommand the app opens
 | `all` | Staged and unstaged changes together. |
 | `last-commit` | The last commit. |
 | `range BASE HEAD [--two-dot]` | A revision range (merge-base semantics unless `--two-dot`). |
-| `repo [--path FOLDER]...` | Browse the repository's files as they are now (tracked, and untracked files that are not ignored) and comment anywhere; with `--path`, only those folders. |
-| `files SELECTOR...` | Files, folders, globs or line ranges as they are now, not a change: `path`, `folder/`, `'src/**/*.rs'`, `path:START-END`. Folders and globs are listed again whenever the review opens. Selectors are relative to the current directory when it is inside the repository, else to its root; one that names nothing fails before the app opens ("examples/helo-plugin: no such file or folder"). See [Reviewing files and folders](review-files-and-folders.md). |
+| `repo [--path FOLDER]... [--show-ignored]` | Browse the repository's files as they are now (tracked, and untracked files that are not ignored) and comment anywhere; with `--path`, only those folders; with `--show-ignored`, ignored files too. |
+| `files SELECTOR... [--show-ignored]` | Files, folders, globs or line ranges as they are now, not a change: `path`, `folder/`, `'src/**/*.rs'`, `path:START-END`. Folders and globs are listed again whenever the review opens. Selectors are relative to the current directory when it is inside the repository, else to its root; one that names nothing fails before the app opens ("examples/helo-plugin: no such file or folder"). See [Reviewing files and folders](review-files-and-folders.md). |
 | `branch [BASE]` | The current branch against its base (the upstream, else the default branch). |
 | `compare BASE HEAD [--two-dot]` | Two branches or revisions. |
 | `commit REV...` | One or more commits (one range when they form a first-parent chain). |
@@ -428,6 +428,47 @@ keeps the selected file selected (a selected directory hands its selection to it
 and directories closed in the tree are closed again when it comes back. The choice is saved with
 the review; until a review has one, `file_layout` decides (see Configuration).
 
+### Files, folders and the repository as they are now
+
+A review of code as it is now, not of a change (see
+[Reviewing files and folders](review-files-and-folders.md)):
+
+* **Starting one.** The new-review wizard's **Files** type opens the tree picker; its
+  **Repository** type reviews the whole repository or, with **Limit to folders…**, folders chosen
+  in the same tree. **Working tree** → **Limit to paths…** chooses files and folders in the tree,
+  then which uncommitted changes in them. Home's **Review files or folders…** suggestion
+  (`shift+n`) opens the tree directly; in a review, `alt+r` (also in the palette) reviews the file
+  panel's selected folder or file, or the cursor file's folder, as it is now; and `bcode review
+  files` / `bcode review repo` do it from the command line.
+* **Tree picker.** Folders expand and collapse (`right`/`l`, `left`/`h`; `left` on a file goes to
+  its folder), `space` (or `tab`) selects a file or a whole folder, and `shift+tab` selects every
+  row from the last one selected. A selected folder stays a folder: files added to it later are
+  reviewed when the review opens again. Unselecting a file or folder inside a selected folder
+  excludes it, and folders show `[x]` (all), `[-]` (some) or `[ ]` (none). Typing any other
+  letter (or `/` first, for names starting with `h`, `j`, `k` or `l`) filters by name across the
+  repository; a filter with `*`, `?` or `[` offers **Select pattern … · N files now**, and one
+  ending in `:START-END` offers **Add lines START–END of PATH**. `enter` continues with the
+  selection (with nothing selected, it selects the focused row first); `esc` leaves the filter,
+  clears it, then goes back a step. The summary row counts the selection's files now; `alt+l`
+  (or a click on it) shows the selected items with their counts, where `space`, `x`, `delete` or
+  `backspace` removes one. Untracked files show `?`, files changed since `HEAD` `M`, and ignored
+  files (`alt+i`, or a click on **Show ignored files**) `!`; `ctrl+r` lists the repository again.
+  With the mouse, a click on a folder expands or collapses it, a click on a file selects or
+  unselects it, and folders found by the filter are selected by a click too.
+* **Editing.** On the wizard's last step, `ctrl+e` on a files, folder, repository or
+  uncommitted-paths source opens it in the tree; the edited source keeps its id, so its threads and
+  viewed marks stay attached.
+* **Uncommitted changes.** Whole files of the working tree mark the lines changed since `HEAD`
+  (staged or not) with the comparison marks, removed lines behind a "lines removed since HEAD"
+  marker, and their headers say `uncommitted +N −M`; untracked and ignored files say `untracked`
+  and `ignored`. `w` shows or hides the marks in this review (`files.uncommitted_marks` sets the
+  default).
+* **Ignored files** are left out of folder, glob and repository sources until `alt+i` lists them
+  in this review (`files.show_ignored` sets the default); a file named directly is always
+  included. Both choices are saved with the review, never in configuration.
+* **Limits.** A source lists at most `files.max_files` files (default 5,000), keeping the first in
+  path order.
+
 ### Review list
 
 Home's "Updated" column, its order, and `resume` follow when a review last changed: its title,
@@ -697,6 +738,7 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | `enter` | Open the review (fold a group) |
 | `space` | Fold or unfold the group |
 | `n` | New review |
+| `shift+n` | New review: files or folders as they are now… |
 | `c` | Continue the latest review |
 | `/` | Filter reviews |
 | `r` | Rename the review |
@@ -715,10 +757,17 @@ motion repeats it. While a search is active, `n` moves to the next match.
 
 | Keys | Action |
 |---|---|
-| `tab` | Mark or unmark the commit or file (include or exclude a source when editing) |
-| `shift+tab` | Mark every commit or file from the last mark |
+| `tab` | Mark or unmark the commit, select or unselect the tree row (include or exclude a source when editing) |
+| `shift+tab` | Mark every commit or tree row from the last mark |
 | `esc` | Back one step |
 | `ctrl+k` | Ask AI: open, focus, or close the review assistant |
+| `alt+i` | Show / hide ignored files in the tree picker |
+| `alt+l` | Show the tree picker's selected items (and back to the tree) |
+| `ctrl+r` | List the repository again in the tree picker |
+| `ctrl+e` | Edit the files, folder, repository, or uncommitted-paths source in the tree picker |
+
+In the tree picker, arrows, `h`/`j`/`k`/`l`, `space`, `/` and typed text are the picker's own
+keys (see [Files, folders and the repository as they are now](#files-folders-and-the-repository-as-they-are-now)).
 
 ### Review (`code-review`)
 
@@ -831,6 +880,9 @@ motion repeats it. While a search is active, `n` moves to the next match.
 | palette only | Pull request: read its conversation again |
 | palette only | Stack: approve every fully viewed layer… |
 | `shift+b` | Stack history: how each pull request changed in each push (compares in place) |
+| `w` | Show / hide uncommitted changes (lines changed since HEAD) in whole files |
+| `alt+i` | Show / hide ignored files in folder, glob, and repository sources |
+| `alt+r` | Review this folder as it is now (the file panel's folder or file, else the cursor file's folder) |
 
 ### File panel (focused) (`code-review-files`)
 
@@ -1001,6 +1053,18 @@ bcode's own (`--print-config-paths` lists them in order):
   `pause_unfocused` (default true), and `providers.<id>`, passed to that provider's watch as is
   (GitHub reads `interval_ms`, default 30000, at least 10000). Invalid values are reported and
   the defaults are used.
+* `[plugins.config."bcode.code_review".files]`: reviews of files, folders and the repository as
+  they are now. `uncommitted_marks` (default true: whole working-tree files mark their lines
+  changed since `HEAD`; `w` toggles it per review), `show_ignored` (default false: folder, glob
+  and repository sources leave ignored files out; `alt+i` toggles it per review) and `max_files`
+  (default 5,000, at most 100,000: files one source lists). An invalid table is reported and the
+  defaults are used.
+
+  ```toml
+  [plugins.config."bcode.code_review".files]
+  uncommitted_marks = false
+  show_ignored = true
+  ```
 * `[tui.keybindings.scopes."code-review*"]`: keybinding overrides of the review scopes
   `code-review`, `code-review-home`, `code-review-wizard`, `code-review-files`,
   `code-review-threads`, `code-review-composer`, `code-review-feed` and `code-review-assistant`.

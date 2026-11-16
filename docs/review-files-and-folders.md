@@ -8,14 +8,15 @@ file panel, CLI, review assistant), and the order in which it is built.
 
 ## Status
 
-Steps 1 and 2 of the build plan are built: the source model, resolution, uncommitted marks and
-path services in the data layer, the `files` and `repository` kinds of `create_review`,
-`code_review.find_paths`, the profile recipes, `bcode review files` and `bcode review repo
---path`, and the parity test for the wizard's current modes. Steps 3 to 5 (the BMUX check
-column, the wizard tree picker and entry points, marks and toggles in the review) are not built
-yet; until step 5, the review UI resolves with the default browse options (ignored files hidden,
-5,000 files) and shows no uncommitted marks. Deviations from the design found while building are
-written into the sections below.
+Built: the source model, resolution, uncommitted marks and path services in the data layer; the
+`files` and `repository` kinds of `create_review`, `code_review.find_paths`, the profile recipes
+and the parity test over every wizard mode; `bcode review files`, `bcode review repo --path` and
+`--show-ignored`; the tree picker for Files, Repository limited to folders, **Limit to paths…**
+and editing sources; the home suggestion and the file panel action; worktree marks in whole
+files with `w`, the ignored-files toggle `alt+i`, both saved per review, and the `files.*`
+configuration. The BMUX check column (step 3) is not built, and the picker ships its keyboard
+fallback for folders (see [Deviations](#deviations-in-the-picker-and-the-review)). Deviations
+found while building are written into the sections below and listed at the end.
 
 Before this work:
 
@@ -627,6 +628,34 @@ Each step is one or more commits that build, pass `cargo fmt`, `cargo clippy --w
    `open_review` without a question, and the review shows every file under the folder with a
    modified file marked; and a tmux run of the wizard picker that selects a folder and a file and
    creates the review.
+
+## Deviations in the picker and the review
+
+What was built differs from the sections above as follows.
+
+* **No BMUX check column.** Bcode can rely on a BMUX change only once its dependency is
+  updated, so the picker ships the fallback: a click on a file row selects or unselects it, a
+  click on a folder row of the tree expands or collapses it, and folders are selected with the
+  keyboard or by a click on a folder the filter found (a filter list has no expansion). Check
+  glyphs are painted as part of the row label (`[x]`, `[-]`, `[ ]`); hit testing uses the tree
+  view's own `row_rect` over the painted layout, never the glyph's cells.
+* **One pane at every width.** The selection list replaces the tree (`alt+l`, or a click on the
+  summary row) instead of standing beside it at wide widths.
+* **Filter results are a flat list** of whole paths, best first, not the tree with ancestors
+  expanded.
+* **Filter mode keys.** `enter` continues from filter mode too (with nothing selected it selects
+  the focused row first), `esc` returns to tree mode, and `space` types a space (`tab` selects).
+* **The ignored toggle of the picker** does not carry into the created review's presentation
+  state; the review follows `files.show_ignored` until `alt+i`.
+* **No marks menu on `b`, no mark style or theme roles of their own, no `]`/`[` stops.** The
+  marks use the comparison's `compare.mark_style` and `theme.since` roles; `w`, `alt+i` and the
+  palette toggle them.
+* **Badges.** The header badge is `uncommitted +N −M`, part of the header facts that give way
+  as a whole at narrow widths; untracked and ignored files show the `untracked` and `ignored`
+  flags. The file panel and the source header carry no uncommitted counts, and the step-3 source
+  list shows no live file count.
+* **One file per marks request.** A document need asks `review.worktree.marks` for one file as
+  its content becomes resident, like comparison marks, instead of batching the viewport.
 
 ## See also
 
