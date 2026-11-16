@@ -474,6 +474,14 @@ pub struct ReviewPresentationState {
     /// How pull request layers are compared with earlier versions.
     #[serde(default, skip_serializing_if = "ReviewCompareChoice::is_default")]
     pub compare: ReviewCompareChoice,
+    /// Whole working-tree files mark their uncommitted changes (`Some(true)`) or not; unset
+    /// follows the configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncommitted_marks: Option<bool>,
+    /// Folder, glob, and repository sources list ignored files (`Some(true)`) or not; unset
+    /// follows the configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_ignored: Option<bool>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -495,6 +503,8 @@ impl Default for ReviewPresentationState {
             hide_resolved_threads: false,
             hide_viewed_files: false,
             flat_files: None,
+            uncommitted_marks: None,
+            show_ignored: None,
             all_stack_layers: false,
             conversation_seen: BTreeMap::new(),
             collapsed_files: BTreeSet::new(),

@@ -254,11 +254,23 @@ fn header_facts(
         trailing.push(badge);
         trailing.push(Span::raw(" "));
     }
+    if let Some(uncommitted) = item.uncommitted {
+        trailing.push(Span::styled(
+            format!(
+                "uncommitted +{} {}{}",
+                uncommitted.additions, theme.icons.minus, uncommitted.deletions
+            ),
+            theme.status_modified,
+        ));
+        trailing.push(Span::raw(" "));
+    }
     for (flag, label, style) in [
         (ReviewIndexFlag::Binary, "binary", theme.status_binary),
         (ReviewIndexFlag::ModeChanged, "mode", theme.muted),
         (ReviewIndexFlag::Symlink, "symlink", theme.muted),
         (ReviewIndexFlag::Submodule, "submodule", theme.muted),
+        (ReviewIndexFlag::Untracked, "untracked", theme.status_added),
+        (ReviewIndexFlag::Ignored, "ignored", theme.muted),
     ] {
         if item.flags.contains(&flag) {
             trailing.push(Span::styled(label, style));
@@ -811,6 +823,7 @@ mod tests {
                 removed: 1,
             }),
             versions,
+            uncommitted: None,
             position: 1,
             count: 3,
             collapsed: false,

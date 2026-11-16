@@ -325,6 +325,12 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.edit_sources", scope = "code-review", description = "Edit the review's sources…", defaults = [
     ] },
+    { id = "bcode.code_review.uncommitted_marks", scope = "code-review", description = "Show / hide uncommitted changes (lines changed since HEAD) in whole files", defaults = [
+        "w",
+    ] },
+    { id = "bcode.code_review.show_ignored", scope = "code-review", description = "Show / hide ignored files in folder, glob, and repository sources", defaults = [
+        "alt+i",
+    ] },
     { id = "bcode.code_review.files_review_folder", scope = "code-review", description = "Review this folder as it is now (the file panel's folder or file, else the cursor file's folder)", defaults = [
         "alt+r",
     ] },

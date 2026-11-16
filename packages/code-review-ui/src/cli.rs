@@ -98,9 +98,20 @@ pub fn invocation(command: Option<ReviewCommand>) -> Result<Invocation, CliError
             repo: resolve_repo_argument(&repo)?,
             entry,
         }),
-        Ok((repo, Opened::Selectors { texts, repository })) => {
-            selector_invocation(&repo, &texts, repository, &std::env::current_dir()?)
-        }
+        Ok((
+            repo,
+            Opened::Selectors {
+                texts,
+                repository,
+                show_ignored,
+            },
+        )) => selector_invocation(
+            &repo,
+            &texts,
+            repository,
+            show_ignored,
+            &std::env::current_dir()?,
+        ),
         Err(request) => Ok(Invocation::Publish(request)),
     }
 }
@@ -117,6 +128,7 @@ fn selector_invocation(
     repo: &Path,
     texts: &[String],
     repository: bool,
+    show_ignored: bool,
     cwd: &Path,
 ) -> Result<Invocation, CliError> {
     use bcode_code_review::selectors;
@@ -143,10 +155,20 @@ fn selector_invocation(
     } else {
         selectors::files_source(selected, Vec::new())
     };
-    Ok(Invocation::Open {
-        repo: root,
-        entry: sources(source),
-    })
+    let entry = if show_ignored {
+        let mut workspace =
+            bcode_code_review::scope::transient_workspace(root.clone(), None, vec![source]);
+        workspace.presentation = Some(bcode_code_review_models::ReviewPresentationState {
+            show_ignored: Some(true),
+            ..bcode_code_review_models::ReviewPresentationState::default()
+        });
+        Entry::Workspace {
+            workspace: Box::new(workspace),
+        }
+    } else {
+        sources(source)
+    };
+    Ok(Invocation::Open { repo: root, entry })
 }
 
 /// Run `command`: open the app, or publish. `bcode_program` is the Bcode executable the app
@@ -241,6 +263,9 @@ pub enum ReviewCommand {
         /// when it is inside the repository, else to the repository root.
         #[arg(long = "path", value_name = "FOLDER")]
         paths: Vec<String>,
+        /// List ignored files too (the review's ignored-files toggle starts on).
+        #[arg(long)]
+        show_ignored: bool,
     },
     /// Review files, folders, globs or line ranges as they are now (not a change). Folders and
     /// globs are listed again whenever the review opens.
@@ -253,6 +278,10 @@ pub enum ReviewCommand {
         /// Repository path.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// List ignored files in folders and globs too (the review's ignored-files toggle
+        /// starts on).
+        #[arg(long)]
+        show_ignored: bool,
     },
     /// Review the current branch against its base (merge-base semantics).
     Branch {
@@ -402,6 +431,8 @@ enum Opened {
         texts: Vec<String>,
         /// Whether they limit a repository review (folders only) rather than name files.
         repository: bool,
+        /// Whether the review lists ignored files.
+        show_ignored: bool,
     },
 }
 
@@ -425,27 +456,21 @@ fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Opened), Box<PublishCliR
                 merge_base: !two_dot,
             }),
         ),
-        ReviewCommand::Repo { repo, paths } if paths.is_empty() => {
-            (repo, sources(ReviewSourceKind::Repository))
-        }
-        ReviewCommand::Repo { repo, paths } => {
-            return Ok((
-                repo,
-                Opened::Selectors {
-                    texts: paths,
-                    repository: true,
-                },
-            ));
-        }
-        ReviewCommand::Files { selectors, repo } => {
-            return Ok((
-                repo,
-                Opened::Selectors {
-                    texts: selectors,
-                    repository: false,
-                },
-            ));
-        }
+        ReviewCommand::Repo {
+            repo,
+            paths,
+            show_ignored: false,
+        } if paths.is_empty() => (repo, sources(ReviewSourceKind::Repository)),
+        ReviewCommand::Repo {
+            repo,
+            paths,
+            show_ignored,
+        } => return Ok(selected(repo, paths, true, show_ignored)),
+        ReviewCommand::Files {
+            selectors,
+            repo,
+            show_ignored,
+        } => return Ok(selected(repo, selectors, false, show_ignored)),
         ReviewCommand::Branch { base, repo } => {
             (repo, sources(ReviewSourceKind::CurrentBranch { base }))
         }
@@ -498,6 +523,23 @@ fn entry_of(command: ReviewCommand) -> Result<(PathBuf, Opened), Box<PublishCliR
         }
     };
     Ok((repo, Opened::Entry(entry)))
+}
+
+/// Selectors still to be read against the working tree of `repo`.
+const fn selected(
+    repo: PathBuf,
+    texts: Vec<String>,
+    repository: bool,
+    show_ignored: bool,
+) -> (PathBuf, Opened) {
+    (
+        repo,
+        Opened::Selectors {
+            texts,
+            repository,
+            show_ignored,
+        },
+    )
 }
 
 /// A transient review of one source.
@@ -785,12 +827,18 @@ mod tests {
         let open = |args: &[&str], cwd: &Path| {
             let command = parse(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
             assert!(!requires_daemon(command.as_ref()), "{args:?}");
-            let Ok((repo, Opened::Selectors { texts, repository })) =
-                entry_of(command.expect("a subcommand"))
+            let Ok((
+                repo,
+                Opened::Selectors {
+                    texts,
+                    repository,
+                    show_ignored,
+                },
+            )) = entry_of(command.expect("a subcommand"))
             else {
                 panic!("{args:?} reads selectors");
             };
-            selector_invocation(&repo, &texts, repository, cwd)
+            selector_invocation(&repo, &texts, repository, show_ignored, cwd)
         };
         let repo = root.display().to_string();
         let review = |source| Entry::Sources {
@@ -867,6 +915,46 @@ mod tests {
             parse(&["review", "files"]).is_err(),
             "a selector is required"
         );
+    }
+
+    #[test]
+    fn show_ignored_starts_files_and_repository_reviews_with_ignored_files_listed() {
+        let fixture = bcode_code_review::testing::fixture::GitFixture::empty();
+        let root = fixture.root();
+        std::fs::create_dir_all(root.join("docs")).expect("mkdir");
+        std::fs::write(root.join("docs/guide.md"), "x\n").expect("write");
+        let repo = root.display().to_string();
+        for args in [
+            vec!["review", "files", "docs", "--show-ignored", "--repo", &repo],
+            vec!["review", "repo", "--show-ignored", "--repo", &repo],
+        ] {
+            let command = parse(&args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            let Ok((
+                repo,
+                Opened::Selectors {
+                    texts,
+                    repository,
+                    show_ignored,
+                },
+            )) = entry_of(command.expect("a subcommand"))
+            else {
+                panic!("{args:?} reads selectors");
+            };
+            let Ok(Invocation::Open {
+                entry: Entry::Workspace { workspace },
+                ..
+            }) = selector_invocation(&repo, &texts, repository, show_ignored, root)
+            else {
+                panic!("{args:?} opens a workspace");
+            };
+            assert_eq!(
+                workspace
+                    .presentation
+                    .and_then(|presentation| presentation.show_ignored),
+                Some(true),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

@@ -52,6 +52,8 @@ pub struct OpenRequest {
     /// stops at its next step, and providers that check (see
     /// [`bcode_code_review_provider::cancelled`]) between their requests.
     pub cancel: crate::provider::Cancel,
+    /// How browse sources list: ignored files, and the file limit.
+    pub browse: bcode_code_review_models::BrowseOptions,
 }
 
 /// What [`open`] is doing.
@@ -384,7 +386,7 @@ fn resolve_and_list(
 ) -> Result<ControlFlow<()>, DataError> {
     let ids: Vec<&str> = sources.iter().map(|source| source.id.as_str()).collect();
     let resolved = data.resolve_sources(&ResolveReviewSourcesRequest {
-        browse: bcode_code_review_models::BrowseOptions::default(),
+        browse: request.browse,
         repo_path: request.repo_path.clone(),
         sources: sources.iter().map(|source| (*source).clone()).collect(),
         provider_resolutions: resolutions

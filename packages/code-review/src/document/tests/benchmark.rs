@@ -93,6 +93,12 @@ fn answer(doc: &mut ReviewDocument, cache: &mut BTreeMap<String, SynthFile>, nee
         DocumentNeed::Marks { ticket, .. } => {
             doc.accept_marks(*ticket, ReviewCompareMarksResponse::default());
         }
+        DocumentNeed::WorktreeMarks { ticket, .. } => {
+            doc.accept_worktree_marks(
+                *ticket,
+                bcode_code_review_models::ReviewWorktreeMarksResponse::default(),
+            );
+        }
     }
 }
 

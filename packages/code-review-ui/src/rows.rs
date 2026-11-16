@@ -516,6 +516,8 @@ enum ContentStamp {
         /// The file's versions: steps that changed it, steps, the version shown, the step
         /// shown, and whether it can step back and forward.
         versions: Option<(usize, usize, usize, Option<usize>, bool, bool)>,
+        /// Lines added and removed since `HEAD` (the uncommitted badge).
+        uncommitted: Option<(u32, u32)>,
     },
     /// A file's break: whether the file (and the next) is folded, and the next file's place.
     End {
@@ -588,6 +590,9 @@ impl ContentStamp {
                         versions.next,
                     )
                 }),
+                uncommitted: header
+                    .uncommitted
+                    .map(|counts| (counts.additions, counts.deletions)),
             },
             ReviewItem::FileDetails(details) => Self::File {
                 flags: u8::from(details.viewed) | u8::from(details.collapsed) << 1,
@@ -596,6 +601,7 @@ impl ContentStamp {
                 layers: details.layers.len(),
                 since: None,
                 versions: None,
+                uncommitted: None,
             },
             ReviewItem::FileEnd(end) => Self::End {
                 folded: end.folded,
@@ -796,6 +802,19 @@ impl RowContext<'_> {
         Some(composer.layout(width, self.gutter_indent(width), &self.params.theme))
     }
 
+    /// What a removed-since marker's lines were removed since: `HEAD` for uncommitted
+    /// changes, else the comparison's baseline.
+    const fn removal_since(
+        &self,
+        item: &bcode_code_review::document::RemovedSinceItem,
+    ) -> compare::Since {
+        if item.uncommitted {
+            compare::Since::Head
+        } else {
+            self.params.since
+        }
+    }
+
     fn build(&self, index: usize, item: &ReviewItem, width: u16) -> ItemRows {
         let styles = &self.params.theme;
         let cells = usize::from(width);
@@ -836,7 +855,7 @@ impl RowContext<'_> {
             ),
             ReviewItem::RemovedSince(item) => compare::removed_rows(
                 item,
-                self.params.since,
+                self.removal_since(item),
                 self.params.marks,
                 self.options(),
                 styles,

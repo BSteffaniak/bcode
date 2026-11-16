@@ -85,6 +85,10 @@ pub struct ReviewViewConfig {
     /// Source groups in a flat file list: `keep` (the default) or `merge`.
     #[serde(default)]
     pub flat_groups: FlatGroups,
+    /// Reviews of files, folders, and the repository as they are now (the plugin table's
+    /// `files` table, not `review_v2`).
+    #[serde(skip)]
+    pub files: FilesConfig,
     /// What makes a viewed file stale (`viewed_reset` in the plugin table, not `review_v2`).
     #[serde(skip)]
     pub viewed_reset: bcode_code_review::viewed::ViewedReset,
@@ -92,6 +96,31 @@ pub struct ReviewViewConfig {
     /// and the environment; `None` (tests, previews) means full color.
     #[serde(skip)]
     pub color_depth: Option<bmux_tui::capabilities::TerminalColorDepth>,
+}
+
+/// Reviews of files, folders, and the repository as they are now
+/// (`[plugins.config."bcode.code_review".files]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesConfig {
+    /// Whether whole working-tree files mark their lines changed since `HEAD` (default true);
+    /// `w` toggles it per review.
+    pub uncommitted_marks: bool,
+    /// Whether folder, glob, and repository sources and the path picker list ignored files
+    /// (default false); `alt+i` toggles it per review.
+    pub show_ignored: bool,
+    /// Files one browse source lists at most (default 5,000, at most 100,000).
+    pub max_files: Option<u32>,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            uncommitted_marks: true,
+            show_ignored: false,
+            max_files: None,
+        }
+    }
 }
 
 /// How much a file's header shows.
@@ -195,6 +224,10 @@ impl ReviewViewConfig {
             .get("viewed_reset")
             .and_then(|value| value.clone().try_into().ok())
             .unwrap_or_default();
+        config.files = table
+            .get("files")
+            .and_then(|value| value.clone().try_into().ok())
+            .unwrap_or_default();
         config
     }
 
@@ -241,6 +274,8 @@ impl ReviewViewConfig {
             hide_viewed: false,
             layout: self.file_layout(None),
             flat_choice: None,
+            uncommitted_marks: None,
+            show_ignored: None,
         }
     }
 

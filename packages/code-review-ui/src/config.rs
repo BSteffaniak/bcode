@@ -247,6 +247,14 @@ fn read_plugin_table(table: &toml::Table, loaded: &mut LoadedConfig) {
             )),
         }
     }
+    if let Some(files) = table.get("files")
+        && let Err(error) = files.clone().try_into::<view::FilesConfig>()
+    {
+        loaded.diagnostics.push(format!(
+            "plugins.config.\"{PLUGIN_ID}\".files: {}",
+            first_line(&error.to_string())
+        ));
+    }
     if let Some(reset) = table.get("viewed_reset")
         && reset
             .clone()

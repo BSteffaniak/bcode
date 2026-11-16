@@ -212,6 +212,10 @@ fn serve(service: &ReviewData, doc: &mut ReviewDocument) {
                     let response = service.compare_marks(request).expect("marks");
                     doc.accept_marks(ticket, response);
                 }
+                DocumentNeed::WorktreeMarks { request, .. } => {
+                    let response = service.worktree_marks(request).expect("marks");
+                    doc.accept_worktree_marks(ticket, response);
+                }
             }
         }
     }

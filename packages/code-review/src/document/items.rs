@@ -87,6 +87,17 @@ pub struct RemovedSinceItem {
     pub lines: Arc<[String]>,
     /// Whether the removed text shows.
     pub expanded: bool,
+    /// The lines were removed since `HEAD` (uncommitted), not since a comparison's baseline.
+    pub uncommitted: bool,
+}
+
+/// Lines of a working-tree file added and removed since `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Uncommitted {
+    /// Lines added or changed.
+    pub additions: u32,
+    /// Lines removed.
+    pub deletions: u32,
 }
 
 /// Kind of one displayed line.
@@ -234,6 +245,8 @@ pub struct FileHeaderItem {
     pub count: u32,
     /// The file's content is collapsed (only its header shows).
     pub collapsed: bool,
+    /// Lines changed since `HEAD`, when uncommitted changes are marked and the file has some.
+    pub uncommitted: Option<Uncommitted>,
 }
 
 /// The end of a file: the break before the next one (see [`super::FileChrome::ends`]).

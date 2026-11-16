@@ -147,6 +147,8 @@ pub enum NeedResult {
     Attribution(Box<ReviewStackAttributionResponse>),
     /// `review.compare.marks` answer.
     Marks(Box<bcode_code_review_models::ReviewCompareMarksResponse>),
+    /// `review.worktree.marks` answer.
+    WorktreeMarks(Box<bcode_code_review_models::ReviewWorktreeMarksResponse>),
     /// The call failed.
     Failed(String),
 }
@@ -245,6 +247,8 @@ pub struct OpenOptions {
     pub stream: bool,
     /// Set when the review no longer wants the open.
     pub cancel: bcode_code_review::provider::Cancel,
+    /// How browse sources list: ignored files, and the file limit.
+    pub browse: bcode_code_review_models::BrowseOptions,
 }
 
 /// Open a review progressively ([`bcode_code_review::session::open`]).
@@ -290,6 +294,7 @@ pub async fn open(
         first: options.first,
         max_layers: services.stack_limit().resolve_limit(),
         cancel: options.cancel,
+        browse: options.browse,
     };
     let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (data, registry) = (services.data(), services.providers());
@@ -850,6 +855,10 @@ pub async fn serve_need(services: ReviewServices, need: DocumentNeed) -> (Ticket
             .call(request)
             .await
             .map(|response| NeedResult::Marks(Box::new(response))),
+        DocumentNeed::WorktreeMarks { request, .. } => services
+            .call(request)
+            .await
+            .map(|response| NeedResult::WorktreeMarks(Box::new(response))),
     };
     (
         ticket,

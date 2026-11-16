@@ -48,6 +48,8 @@ pub enum Since {
     Version(u32),
     /// Another time, pushes, or versions picked.
     Then,
+    /// The last commit (`HEAD`): uncommitted changes of a working-tree file.
+    Head,
 }
 
 impl Since {
@@ -66,6 +68,7 @@ impl Since {
             Self::Push(push) => format!("push {push}"),
             Self::Version(version) => format!("v{version}"),
             Self::Then => "then".to_owned(),
+            Self::Head => "HEAD".to_owned(),
         }
     }
 
@@ -79,6 +82,7 @@ impl Since {
             Self::Ago(ms) => 3 | ms << 3,
             Self::Push(push) => 4 | (push as u64) << 3,
             Self::Version(version) => 5 | (version as u64) << 3,
+            Self::Head => 6,
         }
     }
 }
@@ -135,7 +139,9 @@ fn note_variants(note: &CompareNoteItem, since: Since, theme: &ReviewTheme) -> V
                 match since {
                     Since::LastLooked => "what you last looked at".to_owned(),
                     Since::PreviousPush => "the previous push".to_owned(),
-                    Since::Ago(_) | Since::Push(_) | Since::Version(_) => since.phrase(),
+                    Since::Ago(_) | Since::Push(_) | Since::Version(_) | Since::Head => {
+                        since.phrase()
+                    }
                     Since::Then => "the versions picked".to_owned(),
                 }
             ))],
@@ -741,6 +747,7 @@ mod tests {
             before_new_line: 3,
             lines: vec!["漢字かな交じり文 👩‍👩‍👧 e\u{301}".to_owned(), String::new()].into(),
             expanded: true,
+            uncommitted: false,
         };
         for width in [0_u16, 1, 2, 5, 12, 40] {
             let rows = removed_rows(
@@ -1187,6 +1194,7 @@ mod tests {
             before_new_line: 3,
             lines: vec![MIXED.to_owned(), "let old = 1;".to_owned()].into(),
             expanded: false,
+            uncommitted: false,
         };
         let inline = MarkOptions {
             removed_inline: true,

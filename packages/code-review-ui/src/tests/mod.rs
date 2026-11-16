@@ -18,6 +18,7 @@ mod interaction;
 mod parity;
 mod publish;
 mod screen;
+mod uncommitted;
 mod wizard;
 
 use super::ReviewSurface;

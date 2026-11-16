@@ -476,6 +476,10 @@ impl Fake {
                 let response = self.marks.get(&request.path).cloned().unwrap_or_default();
                 doc.accept_marks(*ticket, response)
             }
+            DocumentNeed::WorktreeMarks { ticket, .. } => doc.accept_worktree_marks(
+                *ticket,
+                bcode_code_review_models::ReviewWorktreeMarksResponse::default(),
+            ),
         }
     }
 

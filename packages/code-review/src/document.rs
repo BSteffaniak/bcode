@@ -42,7 +42,7 @@ pub use items::{
     FileEndItem, FileHeaderItem, FileLoad, FileNoticeItem, FileVersionsItem, GapItem, GapState,
     HunkHeaderItem, LayerNumber, LayoutMode, LineContent, LineItem, LineKind, LinePairItem,
     OutdatedReason, PairSide, PlaceholderItem, RemovedSinceItem, ReviewItem, SourceHeaderItem,
-    SourceIntroItem, StackLayerLabel, ThreadItem,
+    SourceIntroItem, StackLayerLabel, ThreadItem, Uncommitted,
 };
 pub use keys::{FileKey, FileNoticeKind, FileRef, ItemKey};
 pub use navigation::{

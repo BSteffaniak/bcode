@@ -47,6 +47,9 @@ pub struct DocumentConfig {
     pub viewed_reset: ViewedReset,
     /// Whether a viewed file folds by itself (see [`FileFold::Auto`]).
     pub fold_viewed: bool,
+    /// Whether whole files of the working tree mark their lines changed since `HEAD`
+    /// (uncommitted changes).
+    pub uncommitted_marks: bool,
 }
 
 impl Default for DocumentConfig {
@@ -61,6 +64,7 @@ impl Default for DocumentConfig {
             blob_chunk_lines: REVIEW_BLOB_LINES_MAX_COUNT,
             viewed_reset: ViewedReset::Diff,
             fold_viewed: false,
+            uncommitted_marks: false,
         }
     }
 }
@@ -158,6 +162,16 @@ pub enum DocumentNeed {
         /// Request.
         request: ReviewCompareMarksRequest,
     },
+    /// Load which lines of a working-tree file changed since `HEAD`
+    /// (`review.worktree.marks`).
+    WorktreeMarks {
+        /// Ticket to pass back with the result.
+        ticket: Ticket,
+        /// File.
+        file: FileRef,
+        /// Request.
+        request: bcode_code_review_models::ReviewWorktreeMarksRequest,
+    },
 }
 
 impl DocumentNeed {
@@ -168,7 +182,8 @@ impl DocumentNeed {
             Self::Hunks { ticket, .. }
             | Self::BlobLines { ticket, .. }
             | Self::Attribution { ticket, .. }
-            | Self::Marks { ticket, .. } => *ticket,
+            | Self::Marks { ticket, .. }
+            | Self::WorktreeMarks { ticket, .. } => *ticket,
         }
     }
 
@@ -179,7 +194,8 @@ impl DocumentNeed {
             Self::Hunks { file, .. }
             | Self::BlobLines { file, .. }
             | Self::Attribution { file, .. }
-            | Self::Marks { file, .. } => file,
+            | Self::Marks { file, .. }
+            | Self::WorktreeMarks { file, .. } => file,
         }
     }
 }
@@ -317,8 +333,11 @@ pub(super) struct FileState {
     pub attribution: AttributionState,
     pub last_used: u64,
     pub resident_bytes: usize,
-    /// Lines new since the comparison's baseline.
+    /// Lines new since the comparison's baseline, or (a working-tree file of a browse source)
+    /// changed since `HEAD`.
     pub marks: MarksState,
+    /// Lines added and removed since `HEAD`, once a working-tree file's marks are loaded.
+    pub uncommitted: Option<super::items::Uncommitted>,
     /// The commit the resident content was diffed from, when it is not the source's base (the
     /// "only what changed" view of a comparison).
     pub content_base: Option<String>,
@@ -774,6 +793,7 @@ impl ReviewDocument {
                 last_used: 0,
                 resident_bytes: 0,
                 marks: MarksState::Missing,
+                uncommitted: None,
                 content_base: None,
                 content_head: None,
                 fold: FileFold::Auto,
@@ -1269,6 +1289,33 @@ impl ReviewDocument {
         ticket
     }
 
+    /// The marks file `file` needs now, ticketed: a comparison's, or a working-tree file's
+    /// uncommitted changes.
+    fn marks_need(&mut self, file: usize) -> Option<DocumentNeed> {
+        let compare = self.marks_request(file);
+        let worktree = if compare.is_none() {
+            Some(self.worktree_marks_request(file)?)
+        } else {
+            None
+        };
+        let ticket = self.ticket(Pending::Marks(file));
+        self.files[file].marks = MarksState::Pending(ticket);
+        let key = self.files[file].key.clone();
+        Some(match (compare, worktree) {
+            (Some(request), _) => DocumentNeed::Marks {
+                ticket,
+                file: key,
+                request,
+            },
+            (None, Some(request)) => DocumentNeed::WorktreeMarks {
+                ticket,
+                file: key,
+                request,
+            },
+            (None, None) => return None,
+        })
+    }
+
     fn needs_for_file(&mut self, file: usize, needs: &mut Vec<DocumentNeed>) {
         if matches!(self.files[file].content, Content::Unloaded) {
             let group = &self.groups[self.files[file].group];
@@ -1337,15 +1384,9 @@ impl ReviewDocument {
             });
         }
         if self.inflight(false) < self.config.max_inflight_blobs
-            && let Some(request) = self.marks_request(file)
+            && let Some(need) = self.marks_need(file)
         {
-            let ticket = self.ticket(Pending::Marks(file));
-            self.files[file].marks = MarksState::Pending(ticket);
-            needs.push(DocumentNeed::Marks {
-                ticket,
-                file: self.files[file].key.clone(),
-                request,
-            });
+            needs.push(need);
         }
         for (start, count) in self.missing_blob_ranges(file) {
             if self.inflight(false) >= self.config.max_inflight_blobs {

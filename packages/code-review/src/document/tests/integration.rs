@@ -41,6 +41,12 @@ fn serve(service: &ReviewData, doc: &mut ReviewDocument) {
                     Ok(response) => doc.accept_marks(ticket, response),
                     Err(error) => doc.fail(ticket, &error.to_string()),
                 },
+                DocumentNeed::WorktreeMarks { request, .. } => {
+                    match service.worktree_marks(request) {
+                        Ok(response) => doc.accept_worktree_marks(ticket, response),
+                        Err(error) => doc.fail(ticket, &error.to_string()),
+                    }
+                }
             };
             assert!(applied, "{need:?}");
         }

@@ -87,6 +87,12 @@ pub struct FilePanelView {
     /// The reviewer's flat (`Some(true)`) or tree choice for this review, saved with it; unset
     /// follows the configuration.
     pub flat_choice: Option<bool>,
+    /// The reviewer's choice for this review of whether whole working-tree files mark their
+    /// uncommitted changes, saved with it; unset follows `files.uncommitted_marks`.
+    pub uncommitted_marks: Option<bool>,
+    /// The reviewer's choice for this review of whether folder, glob, and repository sources
+    /// list ignored files, saved with it; unset follows `files.show_ignored`.
+    pub show_ignored: Option<bool>,
 }
 
 /// What a file row shows besides its index data.

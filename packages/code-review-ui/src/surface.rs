@@ -982,6 +982,8 @@ impl ReviewSurface {
             self.hide_resolved = state.hide_resolved_threads;
             self.file_view.hide_viewed = state.hide_viewed_files;
             self.file_view.flat_choice = state.flat_files;
+            self.file_view.uncommitted_marks = state.uncommitted_marks;
+            self.file_view.show_ignored = state.show_ignored;
             self.file_view.layout = self.config.file_layout(state.flat_files);
             self.stack_view = if state.all_stack_layers {
                 stack::StackView::AllLayers
@@ -1464,6 +1466,7 @@ impl ReviewSurface {
         };
         let first = self.first_source();
         let cancel = self.opening.start();
+        let browse = self.browse_options();
         host.spawn(Box::pin(async move {
             // Streamed: the first frame, then each source as it arrives.
             let options = loader::OpenOptions {
@@ -1471,6 +1474,7 @@ impl ReviewSurface {
                 first,
                 stream: true,
                 cancel,
+                browse,
             };
             let message = match loader::open(services, repo, sources, inbox.clone(), options).await
             {
@@ -2201,6 +2205,9 @@ impl ReviewSurface {
             NeedResult::Marks(response) => {
                 review.doc.accept_marks(ticket, *response);
             }
+            NeedResult::WorktreeMarks(response) => {
+                review.doc.accept_worktree_marks(ticket, *response);
+            }
             NeedResult::Failed(error) => {
                 review.doc.fail(ticket, &error);
             }
@@ -2262,7 +2269,10 @@ impl ReviewSurface {
         let mut review = Review::new(
             self.repo_path.clone(),
             opened,
-            self.document_config,
+            DocumentConfig {
+                uncommitted_marks: self.uncommitted_marks(),
+                ..self.document_config
+            },
             &self.theme,
             self.file_view,
         );
@@ -2532,6 +2542,7 @@ impl ReviewSurface {
         let first = self.first_source();
         // A refresh keeps showing the review until every source is listed again: early,
         // incomplete answers go to a throwaway inbox.
+        let browse = self.browse_options();
         let cancel = self.opening.start();
         host.spawn(Box::pin(async move {
             let message = match loader::open(
@@ -2544,6 +2555,7 @@ impl ReviewSurface {
                     first,
                     stream: false,
                     cancel,
+                    browse,
                 },
             )
             .await
@@ -3193,6 +3205,70 @@ impl ReviewSurface {
             Some(_) => Some(Action::None),
             None => None,
         }
+    }
+
+    /// Whether whole working-tree files mark their uncommitted changes: this review's choice,
+    /// else `files.uncommitted_marks`.
+    #[must_use]
+    pub fn uncommitted_marks(&self) -> bool {
+        self.file_view
+            .uncommitted_marks
+            .unwrap_or(self.config.files.uncommitted_marks)
+    }
+
+    /// Whether folder, glob, and repository sources list ignored files: this review's choice,
+    /// else `files.show_ignored`.
+    #[must_use]
+    pub fn show_ignored(&self) -> bool {
+        self.file_view
+            .show_ignored
+            .unwrap_or(self.config.files.show_ignored)
+    }
+
+    /// How the review's browse sources list.
+    fn browse_options(&self) -> bcode_code_review_models::BrowseOptions {
+        bcode_code_review_models::BrowseOptions {
+            include_ignored: self.show_ignored(),
+            max_files: self.config.files.max_files,
+        }
+    }
+
+    /// `uncommitted_marks` (`w`): show or hide the marks of uncommitted changes in this review.
+    fn toggle_uncommitted_marks(&mut self) -> Action {
+        let marks = !self.uncommitted_marks();
+        self.file_view.uncommitted_marks = Some(marks);
+        if let Some(review) = self.review.as_mut() {
+            review.doc.set_uncommitted_marks(marks);
+            review.note_splices();
+        }
+        self.set_status(
+            if marks {
+                "marking uncommitted changes (lines changed since HEAD)"
+            } else {
+                "uncommitted changes not marked"
+            },
+            StatusSeverity::Info,
+        );
+        self.persist_presentation(true);
+        Action::Redraw
+    }
+
+    /// `show_ignored` (`alt+i`): list ignored files in this review's folder, glob, and
+    /// repository sources, or stop; the review opens again with the new listing.
+    fn toggle_show_ignored(&mut self, host: &UiContext) -> Action {
+        let show = !self.show_ignored();
+        self.file_view.show_ignored = Some(show);
+        self.set_status(
+            if show {
+                "showing ignored files"
+            } else {
+                "ignored files hidden"
+            },
+            StatusSeverity::Info,
+        );
+        self.persist_presentation(true);
+        self.reopen(host);
+        Action::Redraw
     }
 
     /// `files_review_folder`: review the folder (or file) selected in the file panel, or the
@@ -4294,8 +4370,11 @@ impl ReviewSurface {
                 .push(crate::assistant::LinkRequest::Action(action.to_owned()));
             return Action::Redraw;
         }
-        if action == "files_review_folder" {
-            return self.review_folder_as_it_is_now();
+        match action {
+            "files_review_folder" => return self.review_folder_as_it_is_now(),
+            "uncommitted_marks" => return self.toggle_uncommitted_marks(),
+            "show_ignored" => return self.toggle_show_ignored(host),
+            _ => {}
         }
         if let Some(result) = self.surface_action(action, count, host) {
             return result;

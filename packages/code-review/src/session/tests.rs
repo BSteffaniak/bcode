@@ -109,6 +109,7 @@ fn the_first_source_is_ready_before_the_rest_with_the_stack_pending() {
             first: Some("layer-102".into()),
             max_layers: None,
             cancel: crate::provider::Cancel::default(),
+            browse: bcode_code_review_models::BrowseOptions::default(),
         },
     );
     // The stack, every other layer pending, then the asked-for layer listed.
@@ -173,6 +174,7 @@ fn a_recently_resolved_stack_is_not_resolved_again_and_one_source_is_ready_at_on
         first: None,
         max_layers: None,
         cancel: crate::provider::Cancel::default(),
+        browse: bcode_code_review_models::BrowseOptions::default(),
     };
     let resolves = |fake: &FakeProvider| {
         fake.calls()
@@ -212,6 +214,7 @@ fn a_remembered_stack_is_confirmed_in_one_request_and_resolved_again_when_it_cha
         first: Some("layer-101".into()),
         max_layers: None,
         cancel: crate::provider::Cancel::default(),
+        browse: bcode_code_review_models::BrowseOptions::default(),
     };
     let count = |operation: &str| {
         fake.calls()
@@ -266,6 +269,7 @@ fn a_layer_opened_on_top_of_a_remembered_stack_is_found_when_confirming() {
         first: Some("layer-100".into()),
         max_layers: None,
         cancel: crate::provider::Cancel::default(),
+        browse: bcode_code_review_models::BrowseOptions::default(),
     };
     let events = open_all(&data, &registry, &request);
     assert_eq!(layer_count(&events), [3]);
@@ -294,6 +298,7 @@ fn a_stopped_open_reports_nothing_more_and_asks_providers_nothing_more() {
         first: Some("layer-102".into()),
         max_layers: None,
         cancel: crate::provider::Cancel::default(),
+        browse: bcode_code_review_models::BrowseOptions::default(),
     };
     // The review closes as soon as its first source is ready.
     let mut events = Vec::new();
@@ -332,6 +337,7 @@ fn a_cancelled_open_stops_and_its_provider_sees_it() {
         first: Some("layer-102".into()),
         max_layers: None,
         cancel: crate::provider::Cancel::default(),
+        browse: bcode_code_review_models::BrowseOptions::default(),
     };
     // Cancelled before it starts: the provider is told, and nothing is listed.
     request.cancel.cancel();
@@ -354,6 +360,7 @@ fn a_cancelled_open_stops_and_its_provider_sees_it() {
         &registry,
         &OpenRequest {
             cancel: crate::provider::Cancel::default(),
+            browse: bcode_code_review_models::BrowseOptions::default(),
             ..request.clone()
         },
     );
@@ -367,6 +374,7 @@ fn a_cancelled_open_stops_and_its_provider_sees_it() {
     let cancel = crate::provider::Cancel::default();
     let request = OpenRequest {
         cancel: cancel.clone(),
+        browse: bcode_code_review_models::BrowseOptions::default(),
         ..request
     };
     let mut events = Vec::new();

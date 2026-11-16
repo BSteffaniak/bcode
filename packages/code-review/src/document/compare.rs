@@ -708,3 +708,97 @@ impl ReviewDocument {
         self.expanded_removals.contains(&(file.clone(), before))
     }
 }
+
+/// Uncommitted-change marks: a browse source's working-tree files mark their lines changed since
+/// `HEAD`, through the same per-file marks as a comparison.
+impl ReviewDocument {
+    /// The worktree marks request file `file` needs now: a resident working-tree file of a
+    /// browse source, while uncommitted changes are marked.
+    pub(super) fn worktree_marks_request(
+        &self,
+        file: usize,
+    ) -> Option<bcode_code_review_models::ReviewWorktreeMarksRequest> {
+        let state = &self.files[file];
+        let source = &self.groups[state.group].source;
+        (self.config.uncommitted_marks
+            && matches!(state.marks, MarksState::Missing)
+            && state.loaded().is_some()
+            && state.expandable()
+            && source.mode == bcode_code_review_models::ResolvedSourceMode::Browse
+            && matches!(
+                source.head,
+                bcode_code_review_models::RevisionRef::WorkingTree
+            ))
+        .then(|| bcode_code_review_models::ReviewWorktreeMarksRequest {
+            repo_path: self.repo_path.clone(),
+            paths: vec![state.entry.path.clone()],
+        })
+    }
+
+    /// Accept a working-tree file's marks. Returns whether the result was applied.
+    pub fn accept_worktree_marks(
+        &mut self,
+        ticket: Ticket,
+        response: bcode_code_review_models::ReviewWorktreeMarksResponse,
+    ) -> bool {
+        let Some(Pending::Marks(file)) = self.pending.get(&ticket).copied() else {
+            return false;
+        };
+        self.pending.remove(&ticket);
+        let path = self.files[file].entry.path.clone();
+        let found = response.files.into_iter().find(|marks| marks.path == path);
+        let (marks, counts) = match found {
+            Some(found) if !found.too_large && !found.untracked && !found.missing => (
+                Marks {
+                    new_lines: found.added,
+                    newly_removed: Vec::new(),
+                    removed_since: found.removed,
+                    was: found
+                        .was
+                        .into_iter()
+                        .map(|(line, text)| (line, Arc::from(text)))
+                        .collect(),
+                },
+                Some(super::items::Uncommitted {
+                    additions: found.additions,
+                    deletions: found.deletions,
+                }),
+            ),
+            _ => (Marks::default(), None),
+        };
+        self.files[file].marks = MarksState::Loaded(Arc::new(marks));
+        self.files[file].uncommitted = counts;
+        self.rebuild_file(file);
+        true
+    }
+
+    /// Mark (or stop marking) the lines working-tree files changed since `HEAD`. Returns
+    /// whether anything changed.
+    pub fn set_uncommitted_marks(&mut self, marks: bool) -> bool {
+        if self.config.uncommitted_marks == marks {
+            return false;
+        }
+        self.config.uncommitted_marks = marks;
+        let browse: Vec<usize> = (0..self.files.len())
+            .filter(|file| {
+                self.groups[self.files[*file].group].source.mode
+                    == bcode_code_review_models::ResolvedSourceMode::Browse
+            })
+            .collect();
+        for file in browse {
+            if let MarksState::Pending(ticket) = self.files[file].marks {
+                self.pending.remove(&ticket);
+            }
+            self.files[file].marks = MarksState::Missing;
+            self.files[file].uncommitted = None;
+            self.rebuild_file(file);
+        }
+        true
+    }
+
+    /// Whether working-tree files mark their lines changed since `HEAD`.
+    #[must_use]
+    pub const fn uncommitted_marks(&self) -> bool {
+        self.config.uncommitted_marks
+    }
+}

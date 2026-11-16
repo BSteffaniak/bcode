@@ -11,7 +11,7 @@ use super::items::{
     AgentThreadItem, AnchorPlacement, CompareNoteItem, ComposerItem, FileDetailsItem, FileEndItem,
     FileHeaderItem, FileNoticeItem, GapItem, GapState, HunkHeaderItem, LayoutMode, LineContent,
     LineItem, LineKind, LinePairItem, OutdatedReason, PairSide, PlaceholderItem, RemovedSinceItem,
-    ReviewItem, SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem,
+    ReviewItem, SourceHeaderItem, SourceIntroItem, StackLayerLabel, ThreadItem, Uncommitted,
 };
 use super::keys::{FileNoticeKind, FileRef};
 use super::review::{
@@ -420,6 +420,9 @@ impl ReviewDocument {
             position: u32::try_from(file - group.files.start + 1).unwrap_or(u32::MAX),
             count: u32::try_from(group.files.len()).unwrap_or(u32::MAX),
             collapsed: self.folded(file),
+            uncommitted: state.uncommitted.filter(|counts| {
+                self.config.uncommitted_marks && *counts != Uncommitted::default()
+            }),
         })];
         if self.chrome.details && !self.folded(file) {
             items.push(ReviewItem::FileDetails(FileDetailsItem {
@@ -781,6 +784,8 @@ impl FileBuilder<'_> {
                 expanded: self
                     .doc
                     .removal_expanded(&self.key, removal.before_new_line),
+                uncommitted: self.doc.groups[self.state.group].source.mode
+                    == bcode_code_review_models::ResolvedSourceMode::Browse,
             });
             self.push(item, parent);
         }
