@@ -204,8 +204,10 @@ fn renamed_binary_and_spaced_files_show_their_uncommitted_change() {
             .text()
             .lines()
             .find(|line| line.contains(name) && line.contains("uncommitted"))
-            .map(str::to_owned)
-            .unwrap_or_else(|| panic!("no uncommitted header for {name}:\n{}", screen.text()))
+            .map_or_else(
+                || panic!("no uncommitted header for {name}:\n{}", screen.text()),
+                str::to_owned,
+            )
     };
     assert!(line("my plan.md").contains("uncommitted +2"));
     assert!(line("logo.png").contains("uncommitted binary"));

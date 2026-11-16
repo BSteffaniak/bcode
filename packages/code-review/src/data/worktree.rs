@@ -244,9 +244,11 @@ fn staged_renames(
     let records = git::split_nul(&output);
     let wanted: BTreeSet<&str> = paths.iter().copied().collect();
     Ok(records
-        .chunks_exact(3)
-        .filter(|record| record[0].starts_with('R') && wanted.contains(record[2].as_str()))
-        .map(|record| (record[2].clone(), record[1].clone()))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .filter(|[status, _, new]| status.starts_with('R') && wanted.contains(new.as_str()))
+        .map(|[_, old, new]| (new.clone(), old.clone()))
         .collect())
 }
 

@@ -88,31 +88,10 @@ pub(super) fn listing(
     }
     // A conflicted file is staged more than once and deleted once per stage: close enough for
     // a count.
-    let mut total = tracked.total.saturating_sub(deleted.total) + untracked.total + ignored.total;
-    // A file named directly is reviewed whether or not git ignores it.
-    for path in selection
-        .include
-        .iter()
-        .filter(|selector| selector.is_explicit_file())
-        .filter_map(PathSelector::path)
-    {
-        let excluded = selection
-            .exclude
-            .iter()
-            .any(|excluded| covers(excluded, path));
-        if entries.contains_key(path)
-            || excluded
-            || crate::data::paths::working_tree_file(root, path).is_none()
-        {
-            continue;
-        }
-        let mode = working_tree_mode(root, path);
-        entries.insert(
-            path.to_owned(),
-            browse_entry(source_id, path, mode, Some(ReviewIndexFlag::Ignored)),
-        );
-        total += 1;
-    }
+    let total = tracked.total.saturating_sub(deleted.total)
+        + untracked.total
+        + ignored.total
+        + add_named_files(root, source_id, selection, &mut entries);
     let total = u32::try_from(total).unwrap_or(u32::MAX);
     let mut entries: Vec<ReviewIndexEntry> = entries.into_values().collect();
     let cut = [&tracked, &untracked, &ignored, &deleted]
@@ -137,6 +116,41 @@ pub(super) fn listing(
         deletions,
         untruncated,
     }))
+}
+
+/// Add every file a selector of `selection` names directly that `entries` lacks (an ignored
+/// file: a file named directly is reviewed whether or not git ignores it). Returns how many.
+fn add_named_files(
+    root: &Path,
+    source_id: &str,
+    selection: &BrowseSelection,
+    entries: &mut BTreeMap<String, ReviewIndexEntry>,
+) -> u64 {
+    let mut added = 0;
+    for path in selection
+        .include
+        .iter()
+        .filter(|selector| selector.is_explicit_file())
+        .filter_map(PathSelector::path)
+    {
+        let excluded = selection
+            .exclude
+            .iter()
+            .any(|excluded| covers(excluded, path));
+        if entries.contains_key(path)
+            || excluded
+            || crate::data::paths::working_tree_file(root, path).is_none()
+        {
+            continue;
+        }
+        let mode = working_tree_mode(root, path);
+        entries.insert(
+            path.to_owned(),
+            browse_entry(source_id, path, mode, Some(ReviewIndexFlag::Ignored)),
+        );
+        added += 1;
+    }
+    added
 }
 
 /// Whether the exclusion `excluded` (a file or folder) covers `path`.

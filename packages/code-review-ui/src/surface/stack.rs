@@ -233,7 +233,7 @@ impl ReviewSurface {
                     .last()
                     .map_or_else(String::new, |layer| format!("#{}", layer.number))
             };
-            let failed = self.failed_sources.contains(&source_id);
+            let failed = self.source_notes.failed.contains(&source_id);
             let (viewed, viewed_style, cells) =
                 tab_progress(failed, group.loading, group.viewed, group.file_count, theme);
             let mut full = vec![
@@ -441,7 +441,7 @@ impl ReviewSurface {
             ));
         }
         spans.push(Span::styled(separator, theme.muted));
-        if self.failed_sources.contains(&group.source.source_id) {
+        if self.source_notes.failed.contains(&group.source.source_id) {
             spans.push(Span::styled("could not be opened", theme.error));
         } else if group.loading {
             spans.push(Span::styled(

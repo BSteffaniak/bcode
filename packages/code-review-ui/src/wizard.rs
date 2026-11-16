@@ -183,6 +183,18 @@ pub enum WizardOutcome {
     },
 }
 
+/// Whether path pickers show ignored files, and what the review keeps.
+#[derive(Debug, Clone, Copy, Default)]
+struct IgnoredChoice {
+    /// Whether path pickers open showing ignored files: the review's choice when editing, else
+    /// `files.show_ignored`, then the last picker's.
+    shown: bool,
+    /// What path pickers opened with (see [`Wizard::set_show_ignored`]).
+    opened: bool,
+    /// The choice of the last path picker, when one was used: the new or edited review keeps it.
+    chosen: Option<bool>,
+}
+
 /// A source chosen so far: its kind and label, and (when editing) its id and inclusion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Chosen {
@@ -355,14 +367,7 @@ pub struct Wizard {
     provisional: Option<(u64, Vec<ProvisionalLayer>)>,
     /// The assistant panel request and the header cells left for the Ask AI button.
     link: crate::assistant::ScreenLink,
-    /// Whether path pickers open showing ignored files: the review's choice when editing, else
-    /// `files.show_ignored`, then the last picker's.
-    show_ignored: bool,
-    /// The ignored-files choice of the last path picker, when one was used: the new or edited
-    /// review keeps it.
-    chose_ignored: Option<bool>,
-    /// What path pickers opened with (see [`Self::set_show_ignored`]).
-    opened_ignored: bool,
+    ignored: IgnoredChoice,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -423,9 +428,7 @@ impl Wizard {
             stack_limit_dismissed: None,
             provisional: None,
             link: crate::assistant::ScreenLink::default(),
-            show_ignored: false,
-            chose_ignored: None,
-            opened_ignored: false,
+            ignored: IgnoredChoice::default(),
         }
     }
 
@@ -438,8 +441,8 @@ impl Wizard {
             .and_then(|workspace| workspace.presentation.as_ref())
             .and_then(|presentation| presentation.show_ignored)
             .unwrap_or(show);
-        self.show_ignored = show;
-        self.opened_ignored = show;
+        self.ignored.shown = show;
+        self.ignored.opened = show;
         if let Some(paths) = self.paths.as_mut() {
             paths.set_show_ignored(show);
         }
@@ -448,8 +451,9 @@ impl Wizard {
     /// The ignored-files choice the review keeps: the last path picker's, when it differs from
     /// what pickers opened with.
     fn ignored_choice(&self) -> Option<bool> {
-        self.chose_ignored
-            .filter(|chosen| *chosen != self.opened_ignored)
+        self.ignored
+            .chosen
+            .filter(|chosen| *chosen != self.ignored.opened)
     }
 
     /// A wizard that opens on the files and folders picker (a review of files, folders, or the
@@ -1146,7 +1150,7 @@ impl Wizard {
         exclude: Vec<PathSelector>,
     ) {
         let picker = PathPicker::new(self.services.clone(), self.repo.clone(), purpose)
-            .with_selection(include, exclude, self.show_ignored);
+            .with_selection(include, exclude, self.ignored.shown);
         self.paths = Some(picker);
         self.step = Step::Details(Details::Paths { purpose, replace });
         self.pending_items = true;
@@ -1154,8 +1158,8 @@ impl Wizard {
 
     /// The tree picker finished with `choice`.
     fn paths_done(&mut self, purpose: PathPurpose, replace: Option<usize>, choice: PathChoice) {
-        self.show_ignored = choice.show_ignored;
-        self.chose_ignored = Some(choice.show_ignored);
+        self.ignored.shown = choice.show_ignored;
+        self.ignored.chosen = Some(choice.show_ignored);
         let files = self.paths.as_ref().and_then(PathPicker::total);
         let kind = match purpose {
             PathPurpose::Files => {
@@ -1203,20 +1207,17 @@ impl Wizard {
         };
         self.paths = None;
         let label = kind.label();
-        match replace.and_then(|index| self.sources.get_mut(index)) {
-            Some(source) => {
-                source.kind = kind;
-                source.label = label;
+        if let Some(source) = replace.and_then(|index| self.sources.get_mut(index)) {
+            source.kind = kind;
+            source.label = label;
+            source.files = files;
+            self.enter_confirm();
+        } else {
+            self.add_sources(vec![(kind.clone(), label)]);
+            if let Some(source) = self.sources.iter_mut().find(|source| source.kind == kind) {
                 source.files = files;
-                self.enter_confirm();
             }
-            None => {
-                self.add_sources(vec![(kind.clone(), label)]);
-                if let Some(source) = self.sources.iter_mut().find(|source| source.kind == kind) {
-                    source.files = files;
-                }
-                self.pending_items = true;
-            }
+            self.pending_items = true;
         }
     }
 

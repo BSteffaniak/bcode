@@ -159,24 +159,7 @@ impl PathIndex {
                 );
             }
         }
-        // git prints a folder that is not ignored itself but holds only ignored files both as
-        // the folder and as its files: its files are kept, so it is not an ignored folder.
-        let ignored_folders: Vec<String> = ignored
-            .records
-            .iter()
-            .filter_map(|path| path.strip_suffix('/'))
-            .filter(|folder| {
-                let prefix = format!("{folder}/");
-                files
-                    .range::<str, _>((
-                        std::ops::Bound::Included(prefix.as_str()),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                    .is_none_or(|(path, _)| !path.starts_with(&prefix))
-            })
-            .map(str::to_owned)
-            .collect();
+        let ignored_folders = ignored_folders(&ignored.records, &files);
         let mut folders: BTreeMap<String, FolderCount> = BTreeMap::new();
         folders.insert(String::new(), FolderCount::default());
         for file in files.values() {
@@ -327,6 +310,28 @@ impl PathIndex {
                 .collect()
         })
     }
+}
+
+/// The ignored folders of an ignored `--directory` listing (`records`), without a trailing `/`.
+///
+/// git prints a folder that is not ignored itself but holds only ignored files both as the
+/// folder and as its files: its `files` are kept, so it is not an ignored folder.
+fn ignored_folders(records: &[String], files: &BTreeMap<String, IndexedFile>) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|path| path.strip_suffix('/'))
+        .filter(|folder| {
+            let prefix = format!("{folder}/");
+            files
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .is_none_or(|(path, _)| !path.starts_with(&prefix))
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `path`'s folders, nearest first, ending with the root `""`.
@@ -744,15 +749,16 @@ pub fn resolve(
             changed = changed.saturating_add(u32::from(indexed_changed == Some(true)));
         }
     }
-    let mut capped = false;
-    if request.include_ignored {
+    let capped = if request.include_ignored {
         let ignored = ignored_folder_counts(&index, root, request, &unindexed)?;
         for (count, files) in include.iter_mut().zip(&ignored.per_selector) {
             count.files = count.files.saturating_add(*files);
         }
         total = total.saturating_add(ignored.total);
-        capped = ignored.capped;
-    }
+        ignored.capped
+    } else {
+        false
+    };
     for count in include.iter_mut().chain(exclude.iter_mut()) {
         if count.files == 0 {
             count.error = selector_error(&index, root, &count.selector);

@@ -627,7 +627,9 @@ pub struct ReviewWorktreeMarksRequest {
 }
 
 /// One file's lines changed since `HEAD`.
+// Independent wire flags, each `#[serde(default)]` so older payloads still decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ReviewWorktreeFileMarks {
     /// Repository-relative path.
     pub path: String,

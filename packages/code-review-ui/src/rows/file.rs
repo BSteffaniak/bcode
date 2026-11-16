@@ -242,6 +242,7 @@ fn version_spans(
 /// What a header says about a file's changes since `HEAD`: renamed, binary, and line counts
 /// (left out when a renamed or binary file has none).
 fn uncommitted_text(uncommitted: bcode_code_review::document::Uncommitted, minus: &str) -> String {
+    use std::fmt::Write as _;
     let mut text = "uncommitted".to_owned();
     if uncommitted.renamed {
         text.push_str(" renamed");
@@ -251,10 +252,11 @@ fn uncommitted_text(uncommitted: bcode_code_review::document::Uncommitted, minus
     }
     let lines = uncommitted.additions > 0 || uncommitted.deletions > 0;
     if lines || !(uncommitted.renamed || uncommitted.binary) {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             " +{} {minus}{}",
             uncommitted.additions, uncommitted.deletions
-        ));
+        );
     }
     text
 }

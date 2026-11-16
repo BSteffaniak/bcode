@@ -720,14 +720,14 @@ fn uncommitted_marks_read_names_with_spaces_binary_changes_and_renames() {
     assert_eq!((found[0].additions, found[0].deletions), (1, 1));
     assert_eq!(found[1].added, [(2, 2)], "a C-quoted name");
     assert!(found[2].binary && found[2].is_changed(), "{:?}", found[2]);
-    assert!(found[2].added.is_empty());
+    assert_eq!(found[2].added, []);
     assert_eq!(
         found[3].renamed_from.as_deref(),
         Some("docs/moved.rs"),
         "{:?}",
         found[3]
     );
-    assert!(found[3].added.is_empty(), "a pure rename marks no lines");
+    assert_eq!(found[3].added, [], "a pure rename marks no lines");
     assert!(found[3].is_changed());
     assert_eq!(found[4].renamed_from.as_deref(), Some("docs/edited.rs"));
     assert_eq!(

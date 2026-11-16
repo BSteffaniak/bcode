@@ -655,6 +655,15 @@ struct Leaving {
     start: Option<crate::entry::Entry>,
 }
 
+/// What the review noted about its sources across opens.
+#[derive(Debug, Default)]
+struct SourceNotes {
+    /// Sources that failed after the first frame.
+    failed: BTreeSet<String>,
+    /// Listing-cut warnings already shown, so a refresh does not repeat them.
+    truncated: BTreeSet<String>,
+}
+
 /// The review screen.
 // The flags are independent pieces of surface state (refresh, tree reveal, restore, and
 // annotation loading), not a mode that an enum would describe.
@@ -777,10 +786,8 @@ pub struct ReviewSurface {
     filling_note: Option<String>,
     /// When the review's stack was last resolved or confirmed by its provider.
     stack_confirmed_at: Option<std::time::SystemTime>,
-    /// Sources that failed after the first frame.
-    failed_sources: BTreeSet<String>,
-    /// Listing-cut warnings already shown, so a refresh does not repeat them.
-    truncation_noted: BTreeSet<String>,
+    /// Sources that failed after the first frame, and listing-cut warnings already shown.
+    source_notes: SourceNotes,
     /// The stack this review last saw (and its provider), for its history.
     stack_news: Option<bcode_code_review::session::StackNews>,
     /// Stack layers whose pull requests left the stack, held until the stack is known (see
@@ -916,8 +923,7 @@ impl ReviewSurface {
             filling: false,
             filling_note: None,
             stack_confirmed_at: None,
-            failed_sources: BTreeSet::new(),
-            truncation_noted: BTreeSet::new(),
+            source_notes: SourceNotes::default(),
             stack_news: None,
             gone_layers: std::collections::BTreeSet::new(),
             reopen_pending: false,
@@ -2360,7 +2366,7 @@ impl ReviewSurface {
             return;
         };
         let id = arrived.input.source.source_id.clone();
-        self.failed_sources.remove(&id);
+        self.source_notes.failed.remove(&id);
         // Its place among the groups shown: after every group earlier in the workspace.
         let at = review
             .doc
@@ -2466,7 +2472,7 @@ impl ReviewSurface {
     fn note_truncated(&mut self, messages: Vec<String>) {
         let fresh: Vec<String> = messages
             .into_iter()
-            .filter(|message| self.truncation_noted.insert(message.clone()))
+            .filter(|message| self.source_notes.truncated.insert(message.clone()))
             .collect();
         if !fresh.is_empty() {
             self.toasts.push(
@@ -2498,7 +2504,9 @@ impl ReviewSurface {
                 Some(diagnostic.message.clone()),
             );
         }
-        self.failed_sources.insert(diagnostic.source_id.clone());
+        self.source_notes
+            .failed
+            .insert(diagnostic.source_id.clone());
         let Some(review) = self.review.as_mut() else {
             return;
         };
@@ -3321,7 +3329,7 @@ impl ReviewSurface {
     ) -> bool {
         self.review
             .as_ref()
-            .is_some_and(|review| review.doc.groups().any(|group| wanted(&group.source)))
+            .is_some_and(|review| review.doc.groups().any(|group| wanted(group.source)))
     }
 
     /// `files_review_folder`: review the folder (or file) selected in the file panel, or the

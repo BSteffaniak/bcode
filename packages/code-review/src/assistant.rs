@@ -269,6 +269,9 @@ pub struct FileView {
     pub source: Option<String>,
 }
 
+/// A review's entries (with their source's index) and its cut-listing messages.
+type Listed = (Vec<(usize, ReviewIndexEntry)>, Vec<String>);
+
 /// Files of a review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesView {
@@ -590,10 +593,7 @@ impl<'a> ReviewTools<'a> {
     }
 
     /// [`Self::entries`], and what each source cut to its file limit says.
-    fn listed(
-        &self,
-        review: &OpenReview,
-    ) -> Result<(Vec<(usize, ReviewIndexEntry)>, Vec<String>), AssistantError> {
+    fn listed(&self, review: &OpenReview) -> Result<Listed, AssistantError> {
         let mut entries = Vec::new();
         let mut truncated = Vec::new();
         for (index, source) in review.resolved.iter().enumerate() {
