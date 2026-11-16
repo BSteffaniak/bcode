@@ -860,9 +860,9 @@ fn native_metadata() -> SourceMetadata {
 /// Resolve the state locations that participate in aggregated native discovery.
 ///
 /// The primary location always participates. Additional readable locations come from
-/// `[state] readable_profiles`. Resolution failures are skipped rather than propagated: a
-/// location that cannot be resolved must not prevent the rest of the catalog from loading
-/// (`Domain-local durable failures remain isolated`).
+/// `[state] readable_profiles` in the daemon's startup configuration. Resolution failures are
+/// skipped rather than propagated: a location that cannot be resolved must not prevent the rest
+/// of the catalog from loading (`Domain-local durable failures remain isolated`).
 fn native_locations(state: &ServerState) -> Vec<NativeLocation> {
     let Some(primary_sessions_root) = state.sessions.session_store_root() else {
         return Vec::new();
@@ -877,17 +877,17 @@ fn native_locations(state: &ServerState) -> Vec<NativeLocation> {
         primary: true,
     }];
 
+    // Resolved from the daemon's startup configuration, like its primary location, never
+    // reacquired per call: session authorization consults these claims on every request.
     let resolved = if let Some(locations) = &state.locations {
         locations.clone()
     } else {
-        let Ok(config) = bcode_config::load_config() else {
-            return locations;
-        };
-        if config.state.readable_profiles.is_empty() {
+        let config = &state.startup_config.state;
+        if config.readable_profiles.is_empty() {
             return locations;
         }
         let Ok(resolved) = bcode_config::resolve_state_location_set(
-            &config.state,
+            config,
             &bcode_config::StateLocationSelection::default(),
         ) else {
             return locations;
@@ -3075,6 +3075,40 @@ mod tests {
         assert_eq!(
             super::native_locations(&state),
             [] as [super::NativeLocation; 0]
+        );
+        drop(state);
+    }
+
+    #[test]
+    fn native_readable_locations_come_from_the_daemon_startup_configuration() {
+        let primary = tempfile::tempdir().expect("primary root");
+        let foreign = tempfile::tempdir().expect("foreign root");
+        let mut state = crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(primary.path()),
+        );
+        state.daemon_status.state_location_id = Some("retained-location".to_owned());
+        state.startup_config.state = bcode_config::StateConfig {
+            profile: std::collections::BTreeMap::from([(
+                "foreign".into(),
+                bcode_config::StateProfileConfig {
+                    root: Some(foreign.path().to_path_buf()),
+                    sessions_root: Some(foreign.path().to_path_buf()),
+                },
+            )]),
+            readable_profiles: vec!["foreign".into()],
+            ..Default::default()
+        };
+        let locations = super::native_locations(&state);
+        assert!(
+            locations
+                .iter()
+                .any(|location| location.primary && location.sessions_root == primary.path())
+        );
+        assert!(
+            locations
+                .iter()
+                .any(|location| !location.primary && location.sessions_root == foreign.path()),
+            "readable profiles resolve from the configuration the daemon started with"
         );
         drop(state);
     }

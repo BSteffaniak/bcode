@@ -144,6 +144,9 @@ be restarted explicitly; its cursor is not a durable snapshot or authority token
 Discovery never changes a session's canonical cwd or owning state location.
 
 `[state] readable_profiles` lists locations whose sessions participate in aggregated discovery.
+A daemon resolves them once from its startup configuration, as it does its primary location;
+restart the daemon to change them. Session authorization consults these locations on every
+request, so they are never reacquired from configuration files per call.
 Aggregation is read-only: per `Aggregated session discovery does not confer authority`, a session's
 mutations, ownership, and repair apply only to the location that owns its canonical storage. When more
 than one location claims the same session ID, the conflict is surfaced and no location is opened as
