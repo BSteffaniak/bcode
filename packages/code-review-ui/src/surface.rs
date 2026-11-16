@@ -3256,6 +3256,20 @@ impl ReviewSurface {
 
     /// `uncommitted_marks` (`w`): show or hide the marks of uncommitted changes in this review.
     fn toggle_uncommitted_marks(&mut self) -> Action {
+        if !self.has_source(|source| {
+            source.mode == bcode_code_review_models::ResolvedSourceMode::Browse
+                && matches!(
+                    source.head,
+                    bcode_code_review_models::RevisionRef::WorkingTree
+                )
+        }) {
+            self.set_status(
+                "no whole working-tree files here: uncommitted changes are marked in files, \
+                 folder and repository reviews",
+                StatusSeverity::Info,
+            );
+            return Action::Redraw;
+        }
         let marks = !self.uncommitted_marks();
         self.file_view.uncommitted_marks = Some(marks);
         if let Some(review) = self.review.as_mut() {
@@ -3277,6 +3291,14 @@ impl ReviewSurface {
     /// `show_ignored` (`alt+i`): list ignored files in this review's folder, glob, and
     /// repository sources, or stop; the review opens again with the new listing.
     fn toggle_show_ignored(&mut self, host: &UiContext) -> Action {
+        if !self.has_source(|source| source.selection.is_some()) {
+            self.set_status(
+                "no folder, glob or repository sources here: ignored files are listed only for \
+                 those",
+                StatusSeverity::Info,
+            );
+            return Action::Redraw;
+        }
         let show = !self.show_ignored();
         self.file_view.show_ignored = Some(show);
         self.set_status(
@@ -3290,6 +3312,16 @@ impl ReviewSurface {
         self.persist_presentation(true);
         self.reopen(host);
         Action::Redraw
+    }
+
+    /// Whether a source the review shows matches `wanted`.
+    fn has_source(
+        &self,
+        wanted: impl Fn(&bcode_code_review_models::ResolvedSource) -> bool,
+    ) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.doc.groups().any(|group| wanted(&group.source)))
     }
 
     /// `files_review_folder`: review the folder (or file) selected in the file panel, or the

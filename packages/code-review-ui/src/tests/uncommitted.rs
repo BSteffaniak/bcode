@@ -265,3 +265,41 @@ fn a_listing_cut_at_the_file_limit_says_so_once() {
     settled(&mut scenario);
     assert_eq!(warnings(scenario.surface().review().expect("review")), 1);
 }
+
+#[test]
+fn the_toggles_say_when_a_review_has_nothing_they_change() {
+    let fixture = changed_fixture();
+    let backend = Arc::new(TestBackend::default());
+    let (mut scenario, _) = open_with(
+        &fixture,
+        &backend,
+        ReviewViewConfig::default(),
+        Entry::Sources {
+            title: None,
+            sources: vec![ReviewSourceKind::LastCommit],
+        },
+    );
+    let status = |scenario: &Scenario<ReviewApp>| {
+        scenario
+            .surface()
+            .review()
+            .and_then(|review| review.status().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    scenario.key("w");
+    settled(&mut scenario);
+    assert!(
+        status(&scenario).contains("no whole working-tree files"),
+        "{}",
+        status(&scenario)
+    );
+    assert!(scenario.surface().review().unwrap().uncommitted_marks());
+    scenario.key("alt+i");
+    settled(&mut scenario);
+    assert!(
+        status(&scenario).contains("no folder, glob or repository sources"),
+        "{}",
+        status(&scenario)
+    );
+    assert!(!scenario.surface().review().unwrap().show_ignored());
+}
