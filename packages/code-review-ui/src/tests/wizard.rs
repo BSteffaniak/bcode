@@ -1253,6 +1253,55 @@ fn every_wizard_mode_can_be_created_through_create_review() {
             ));
         }
     }
+    // Each run creates sources of its mode's kinds (a stack's layers are several), and the
+    // runs of a mode differ: every detail is exercised, not one repeated.
+    let mut seen: Vec<(SourceType, Vec<ReviewSourceKind>)> = Vec::new();
+    for (source_type, kinds) in &created {
+        assert!(!kinds.is_empty(), "{source_type:?} created nothing");
+        for kind in kinds {
+            let fits = match source_type {
+                SourceType::WorkingTree => matches!(
+                    kind,
+                    ReviewSourceKind::WorkingTreeAndIndex
+                        | ReviewSourceKind::IndexStaged
+                        | ReviewSourceKind::WorkingTreeUnstaged
+                        | ReviewSourceKind::WorkingTreePaths { .. }
+                ),
+                SourceType::CurrentBranch => matches!(kind, ReviewSourceKind::CurrentBranch { .. }),
+                SourceType::PullRequest => matches!(kind, ReviewSourceKind::PullRequest { .. }),
+                SourceType::CompareBranches => {
+                    matches!(kind, ReviewSourceKind::BranchCompare { .. })
+                }
+                SourceType::Commits => matches!(
+                    kind,
+                    ReviewSourceKind::Commit { .. }
+                        | ReviewSourceKind::Commits { .. }
+                        | ReviewSourceKind::CommitRange { .. }
+                        | ReviewSourceKind::LastCommit
+                ),
+                SourceType::Stack => matches!(
+                    kind,
+                    ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+                ),
+                SourceType::Files => matches!(
+                    kind,
+                    ReviewSourceKind::File { .. }
+                        | ReviewSourceKind::FileRange { .. }
+                        | ReviewSourceKind::FileSet { .. }
+                ),
+                SourceType::Repository => matches!(
+                    kind,
+                    ReviewSourceKind::Repository | ReviewSourceKind::FileSet { .. }
+                ),
+            };
+            assert!(fits, "{source_type:?} created {kind:?}");
+        }
+        assert!(
+            !seen.contains(&(*source_type, kinds.clone())),
+            "{source_type:?} created {kinds:?} twice"
+        );
+        seen.push((*source_type, kinds.clone()));
+    }
     for (source_type, kinds) in created {
         for kind in kinds {
             let argument = create::source_argument(&kind, None).unwrap_or_else(|| {
