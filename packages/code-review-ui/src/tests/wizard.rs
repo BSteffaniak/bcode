@@ -459,6 +459,60 @@ fn the_tree_shows_ignored_files_on_request_and_removes_selected_items() {
 }
 
 #[test]
+fn the_ignored_files_choice_follows_configuration_and_reaches_the_created_review() {
+    use crate::config::ReviewViewConfig;
+    use crate::config::view::FilesConfig;
+    let fixture = paths_fixture();
+    let backend = Arc::new(TestBackend::default());
+    // Configured to show ignored files: the picker opens showing them, and a review created
+    // with them shown needs no stored choice.
+    let config = ReviewViewConfig {
+        files: FilesConfig {
+            show_ignored: true,
+            ..FilesConfig::default()
+        },
+        ..ReviewViewConfig::default()
+    };
+    let app = ReviewApp::new(
+        backend.services(),
+        fixture.root().to_path_buf(),
+        config,
+        Entry::Home,
+    );
+    let mut scenario = Scenario::with_shared_host(app, backend.host(), 140, 40);
+    settled(&mut scenario);
+    scenario.key("n");
+    settled(&mut scenario);
+    let screen = pick_type(&mut scenario, 6);
+    assert!(paths(&scenario).shows_ignored());
+    assert!(screen.contains("ignored-dir/"), "{}", screen.text());
+
+    // By default they are hidden; shown in the picker, the review keeps them shown.
+    let mut scenario = wizard(&fixture, &backend);
+    let screen = pick_type(&mut scenario, 6);
+    assert!(!screen.contains("ignored-dir/"), "{}", screen.text());
+    scenario.key("alt+i");
+    settled(&mut scenario);
+    focus_path(&mut scenario, "ignored-dir/");
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("1 item · 1 file"), "{}", screen.text());
+    scenario.key("enter");
+    settled(&mut scenario);
+    let created = create(&mut scenario, &backend, &fixture);
+    assert_eq!(
+        created
+            .presentation
+            .as_ref()
+            .and_then(|presentation| presentation.show_ignored),
+        Some(true)
+    );
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("secret.txt"), "{}", screen.text());
+    assert!(scenario.surface().review().unwrap().show_ignored());
+}
+
+#[test]
 fn clicks_on_tree_rows_expand_folders_and_select_files_at_every_width() {
     let fixture = paths_fixture();
     let backend = Arc::new(TestBackend::default());

@@ -279,6 +279,21 @@ impl ReviewTools<'_> {
         title: Option<String>,
         sources: Vec<(ReviewSourceKind, Option<String>)>,
     ) -> Result<ReviewEntry, AssistantError> {
+        self.create_review_with(repo_path, title, sources, None)
+    }
+
+    /// [`Self::create_review`] with initial display settings, such as listing ignored files.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_review`].
+    pub fn create_review_with(
+        &self,
+        repo_path: &Path,
+        title: Option<String>,
+        sources: Vec<(ReviewSourceKind, Option<String>)>,
+        presentation: Option<bcode_code_review_models::ReviewPresentationState>,
+    ) -> Result<ReviewEntry, AssistantError> {
         if sources.is_empty() {
             return Err(AssistantError::Invalid(
                 "name at least one source to review".to_owned(),
@@ -311,6 +326,7 @@ impl ReviewTools<'_> {
             repo_path: repo_path.to_path_buf(),
             title: Some(draft.title),
             sources: draft.sources,
+            presentation,
         })?;
         Ok(ReviewEntry::of(&response.workspace))
     }

@@ -1597,3 +1597,47 @@ fn list_files_says_when_a_folder_is_cut_at_the_file_limit() {
         "{head}"
     );
 }
+
+#[test]
+fn create_review_can_list_ignored_files_and_find_paths_flags_weak_matches() {
+    let mut harness = Harness::new();
+    let root = harness.fixture.root().to_path_buf();
+    for (path, text) in [
+        ("oauth-client/src/lib.rs", "//! OAuth.\n"),
+        ("generated/out.rs", "// generated\n"),
+        (".gitignore", "generated/\n"),
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, text).expect("write");
+    }
+    let weak = harness.json(
+        "code_review.find_paths",
+        &json!({"query": "the auth module"}),
+        SESSION,
+    );
+    assert_eq!(weak["matches"][0]["path"], "oauth-client/", "{weak}");
+    assert_eq!(weak["weak"], true, "{weak}");
+    let found = harness.json(
+        "code_review.find_paths",
+        &json!({"query": "generated", "include_ignored": true}),
+        SESSION,
+    );
+    assert_eq!(found["matches"][0]["path"], "generated/", "{found}");
+    let review = created(
+        &mut harness,
+        &json!({"sources": [{"kind": "files", "paths": ["generated/"]}], "show_ignored": true}),
+    );
+    let id = review["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        stored(&harness, &root, &id)
+            .presentation
+            .and_then(|presentation| presentation.show_ignored),
+        Some(true)
+    );
+    let files = harness.json("code_review.list_files", &json!({"review": id}), SESSION);
+    assert!(
+        files.to_string().contains("generated/out.rs"),
+        "the assistant reads the review as the app lists it: {files}"
+    );
+}

@@ -12,12 +12,13 @@
 
 use super::{DataError, decode_cursor, fingerprint, git, page, page_size, search::fuzzy_score};
 use bcode_code_review_models::{
-    PathSelector, REVIEW_PATH_INDEX_MAX_PATHS, REVIEW_PATHS_FIND_DEFAULT_LIMIT,
-    REVIEW_PATHS_FIND_MAX_LIMIT, REVIEW_SEARCH_DEFAULT_PAGE_SIZE, REVIEW_SEARCH_MAX_PAGE_SIZE,
-    ReviewPathEntry, ReviewPathKind, ReviewPathMatch, ReviewPathMatchKind, ReviewPathStatus,
-    ReviewPathsFindRequest, ReviewPathsFindResponse, ReviewPathsListRequest,
-    ReviewPathsListResponse, ReviewPathsResolveRequest, ReviewPathsResolveResponse,
-    ReviewPathsSearchRequest, ReviewPathsSearchResponse, ReviewSelectorCount,
+    PathSelector, REVIEW_FILES_MAX_FILES_LIMIT, REVIEW_PATH_INDEX_MAX_PATHS,
+    REVIEW_PATHS_FIND_DEFAULT_LIMIT, REVIEW_PATHS_FIND_MAX_LIMIT, REVIEW_SEARCH_DEFAULT_PAGE_SIZE,
+    REVIEW_SEARCH_MAX_PAGE_SIZE, ReviewPathEntry, ReviewPathKind, ReviewPathMatch,
+    ReviewPathMatchKind, ReviewPathStatus, ReviewPathsFindRequest, ReviewPathsFindResponse,
+    ReviewPathsListRequest, ReviewPathsListResponse, ReviewPathsResolveRequest,
+    ReviewPathsResolveResponse, ReviewPathsSearchRequest, ReviewPathsSearchResponse,
+    ReviewSelectorCount,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -158,10 +159,22 @@ impl PathIndex {
                 );
             }
         }
+        // git prints a folder that is not ignored itself but holds only ignored files both as
+        // the folder and as its files: its files are kept, so it is not an ignored folder.
         let ignored_folders: Vec<String> = ignored
             .records
             .iter()
             .filter_map(|path| path.strip_suffix('/'))
+            .filter(|folder| {
+                let prefix = format!("{folder}/");
+                files
+                    .range::<str, _>((
+                        std::ops::Bound::Included(prefix.as_str()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .is_none_or(|(path, _)| !path.starts_with(&prefix))
+            })
             .map(str::to_owned)
             .collect();
         let mut folders: BTreeMap<String, FolderCount> = BTreeMap::new();
@@ -731,6 +744,15 @@ pub fn resolve(
             changed = changed.saturating_add(u32::from(indexed_changed == Some(true)));
         }
     }
+    let mut capped = false;
+    if request.include_ignored {
+        let ignored = ignored_folder_counts(&index, root, request, &unindexed)?;
+        for (count, files) in include.iter_mut().zip(&ignored.per_selector) {
+            count.files = count.files.saturating_add(*files);
+        }
+        total = total.saturating_add(ignored.total);
+        capped = ignored.capped;
+    }
     for count in include.iter_mut().chain(exclude.iter_mut()) {
         if count.files == 0 {
             count.error = selector_error(&index, root, &count.selector);
@@ -741,7 +763,105 @@ pub fn resolve(
         exclude,
         total,
         changed,
-        truncated: index.truncated,
+        truncated: index.truncated || capped,
+    })
+}
+
+/// Files inside ignored folders that folder selectors select, which the path index holds as
+/// one entry per ignored folder.
+struct IgnoredCounts {
+    /// Per include selector, in request order.
+    per_selector: Vec<u32>,
+    /// Distinct files in all, less the files named directly (already counted).
+    total: u32,
+    /// A folder held more than [`REVIEW_FILES_MAX_FILES_LIMIT`] files: counts are lower bounds.
+    capped: bool,
+}
+
+/// Count, with git, the ignored files under the include folders of `request`: each folder
+/// that is (or is inside) an ignored folder, and each ignored folder inside an include folder,
+/// unless an exclude folder covers it. Each such folder is listed once, at most
+/// [`REVIEW_FILES_MAX_FILES_LIMIT`] files.
+fn ignored_folder_counts(
+    index: &PathIndex,
+    root: &Path,
+    request: &ReviewPathsResolveRequest,
+    unindexed: &BTreeSet<&str>,
+) -> Result<IgnoredCounts, DataError> {
+    use crate::selectors::is_under;
+    let covered = |folder: &str| {
+        request.exclude.iter().any(|excluded| match excluded {
+            PathSelector::Folder { path } => path == folder || is_under(folder, path),
+            _ => false,
+        })
+    };
+    // Each include selector's ignored folders.
+    let units: Vec<Vec<String>> = request
+        .include
+        .iter()
+        .map(|selector| match selector {
+            PathSelector::Folder { path } if index.in_ignored_folder(path) => vec![path.clone()],
+            PathSelector::Folder { path } => index
+                .ignored_folders
+                .iter()
+                .filter(|ignored| is_under(ignored, path))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        })
+        .map(|units: Vec<String>| units.into_iter().filter(|unit| !covered(unit)).collect())
+        .collect();
+    let distinct: BTreeSet<&str> = units.iter().flatten().map(String::as_str).collect();
+    // A folder inside another counted folder is counted with it.
+    let outer: Vec<&str> = distinct
+        .iter()
+        .copied()
+        .filter(|unit| !distinct.iter().any(|other| is_under(unit, other)))
+        .collect();
+    let cap = u64::from(REVIEW_FILES_MAX_FILES_LIMIT);
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut capped = false;
+    for unit in &distinct {
+        let (files, cut) = git::count_file_records(
+            git::command(
+                root,
+                &[
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--",
+                    unit,
+                ],
+            ),
+            cap,
+        )?;
+        capped |= cut;
+        counts.insert(unit, u32::try_from(files).unwrap_or(u32::MAX));
+    }
+    let per_selector = units
+        .iter()
+        .map(|units| {
+            units
+                .iter()
+                .filter_map(|unit| counts.get(unit.as_str()))
+                .fold(0_u32, |sum, files| sum.saturating_add(*files))
+        })
+        .collect();
+    let named_inside = unindexed
+        .iter()
+        .filter(|path| outer.iter().any(|unit| is_under(path, unit)))
+        .count();
+    let total = outer
+        .iter()
+        .filter_map(|unit| counts.get(unit))
+        .fold(0_u32, |sum, files| sum.saturating_add(*files))
+        .saturating_sub(u32::try_from(named_inside).unwrap_or(u32::MAX));
+    Ok(IgnoredCounts {
+        per_selector,
+        total,
+        capped,
     })
 }
 

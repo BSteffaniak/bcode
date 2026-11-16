@@ -841,6 +841,7 @@ pub async fn save_as(
             repo_path: transient.repo_root.clone(),
             title: Some(transient.title.clone()),
             sources: transient.sources.clone(),
+            presentation: None,
         })
         .await
         .map_err(|error| error.message)?;

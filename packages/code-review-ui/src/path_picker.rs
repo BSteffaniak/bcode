@@ -1113,6 +1113,13 @@ impl PathPicker {
         self.relist(false);
     }
 
+    /// Show (or hide) ignored files.
+    pub fn set_show_ignored(&mut self, show: bool) {
+        if self.show_ignored != show {
+            self.toggle_ignored();
+        }
+    }
+
     /// Drop every listing (asking the service to rebuild its index when `refresh`).
     fn relist(&mut self, refresh: bool) {
         self.generation += 1;

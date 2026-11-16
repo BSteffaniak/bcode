@@ -346,6 +346,7 @@ const SPECS: &[Spec] = &[
                     "sources": {"type": "array", "minItems": 1, "items": create::source_schema(), "description": "What to review, in order."},
                     "title": {"type": "string", "description": "Title (defaults from the sources)."},
                     "directory": {"type": "string", "description": "A directory (absolute, or relative to the session's working directory): the review belongs to its repository, and uncommitted changes, files and repository sources without `paths` are limited to it."},
+                    "show_ignored": {"type": "boolean", "description": "Files, folder and repository sources also list files git ignores (default: the user's configuration, normally false). Use it when the user asks for ignored files, or for a folder find_paths found only with include_ignored."},
                 })),
                 &["sources"],
             )
@@ -698,6 +699,7 @@ struct Arguments {
     archived: Option<bool>,
     kinds: Vec<ReviewPathMatchKind>,
     include_ignored: Option<bool>,
+    show_ignored: Option<bool>,
     reviews: Vec<String>,
     comments: Vec<CommentArgument>,
     thread_ids: Vec<String>,
@@ -1105,8 +1107,18 @@ fn review_level(
                 arguments.directory.as_deref(),
                 std::mem::take(&mut arguments.sources),
             )?;
-            let created =
-                tools.create_review(&plan.repo_root, arguments.title.clone(), plan.sources)?;
+            let presentation = arguments.show_ignored.map(|show| {
+                bcode_code_review_models::ReviewPresentationState {
+                    show_ignored: Some(show),
+                    ..bcode_code_review_models::ReviewPresentationState::default()
+                }
+            });
+            let created = tools.create_review_with(
+                &plan.repo_root,
+                arguments.title.clone(),
+                plan.sources,
+                presentation,
+            )?;
             encode(&json!({
                 "message": format!("created the review {:?} ({})", created.title, created.id),
                 "review": created,

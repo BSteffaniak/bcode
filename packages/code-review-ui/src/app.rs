@@ -652,12 +652,23 @@ impl ReviewApp {
     }
 
     /// Create a durable workspace of `sources` and open it.
-    fn create(&mut self, title: String, sources: Vec<ReviewSourceKind>, host: &UiContext) {
+    fn create(
+        &mut self,
+        title: String,
+        sources: Vec<ReviewSourceKind>,
+        show_ignored: Option<bool>,
+        host: &UiContext,
+    ) {
         let draft = transient_workspace(self.repo.clone(), Some(title), sources);
         let (services, repo) = (self.services.clone(), self.repo.clone());
         let label = format!("Creating “{}”…", draft.title);
+        let presentation =
+            show_ignored.map(|show| bcode_code_review_models::ReviewPresentationState {
+                show_ignored: Some(show),
+                ..bcode_code_review_models::ReviewPresentationState::default()
+            });
         self.run_opening(label, host, async move {
-            create_workspace(services, repo, draft.title, draft.sources).await
+            create_workspace(services, repo, draft.title, draft.sources, presentation).await
         });
     }
 
@@ -682,6 +693,7 @@ impl ReviewApp {
                     Wizard::new(self.services.clone(), self.repo.clone())
                 };
                 wizard.prepare_keymap(host);
+                wizard.set_show_ignored(self.config.files.show_ignored);
                 self.route = Route::Wizard(Box::new(wizard));
                 self.keymap_stale = true;
                 Action::Redraw
@@ -706,8 +718,12 @@ impl ReviewApp {
                 self.update_sources(*workspace, base, host);
                 Action::Redraw
             }
-            WizardOutcome::Create { title, sources } => {
-                self.create(title, sources, host);
+            WizardOutcome::Create {
+                title,
+                sources,
+                show_ignored,
+            } => {
+                self.create(title, sources, show_ignored, host);
                 Action::Redraw
             }
         }
@@ -728,6 +744,7 @@ impl ReviewApp {
             let mut wizard =
                 Wizard::editing(self.services.clone(), self.repo.clone(), workspace.clone());
             wizard.prepare_keymap(host);
+            wizard.set_show_ignored(self.config.files.show_ignored);
             self.editing = Some(Box::new(workspace));
             self.route = Route::Wizard(Box::new(wizard));
             self.keymap_stale = true;
@@ -1288,6 +1305,7 @@ impl ReviewApp {
                     Wizard::new(self.services.clone(), self.repo.clone())
                 };
                 wizard.prepare_keymap(host);
+                wizard.set_show_ignored(self.config.files.show_ignored);
                 self.route = Route::Wizard(Box::new(wizard));
                 self.keymap_stale = true;
                 let _ = reply.send(self.screen_answer(if filled {
@@ -1508,12 +1526,14 @@ async fn create_workspace(
     repo: PathBuf,
     title: String,
     sources: Vec<ReviewSource>,
+    presentation: Option<bcode_code_review_models::ReviewPresentationState>,
 ) -> Result<ReviewWorkspace, String> {
     let response: CreateReviewWorkspaceResponse = services
         .call(CreateReviewWorkspaceRequest {
             repo_path: repo,
             title: Some(title),
             sources,
+            presentation,
         })
         .await
         .map_err(|error| error.message)?;

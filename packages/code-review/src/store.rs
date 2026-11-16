@@ -1366,7 +1366,7 @@ fn create_review_workspace_for_request(
         viewed_marks: Vec::new(),
         viewed_threads: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
-        presentation: None,
+        presentation: request.presentation,
         stack_snapshots: Vec::new(),
     };
     let saved = workspace.clone();

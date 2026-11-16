@@ -755,3 +755,84 @@ fn a_file_deleted_from_the_working_tree_leaves_folder_reviews_and_counts() {
         u32::try_from(entries.len()).expect("count")
     );
 }
+
+#[test]
+fn ignored_folders_are_counted_when_ignored_files_are_shown() {
+    let fixture = repository();
+    let repo = fixture.root();
+    write(repo, "build/deep/more.bin", "more\n");
+    let service = ReviewData::default();
+    assert_eq!(counted(&service, repo, vec![folder("build")], false), 0);
+    assert_eq!(counted(&service, repo, vec![folder("build")], true), 2);
+    assert_eq!(counted(&service, repo, vec![folder("build/deep")], true), 1);
+    // Nested selectors count each file once.
+    assert_eq!(
+        counted(
+            &service,
+            repo,
+            vec![folder("build"), folder("build/deep")],
+            true
+        ),
+        2
+    );
+    // A folder holding an ignored folder counts its files too, as the review lists them.
+    write(repo, "examples/hello-plugin/build/gen.rs", "// gen\n");
+    let shown = BrowseOptions {
+        include_ignored: true,
+        max_files: None,
+    };
+    let response = resolve(
+        &service,
+        repo,
+        file_set(vec![folder(HELLO)], Vec::new()),
+        shown,
+    );
+    let listed = full_index(&service, repo, &response.sources[0]).len();
+    assert_eq!(
+        counted(&service, repo, vec![folder(HELLO)], true),
+        u32::try_from(listed).expect("count")
+    );
+    let response = resolve(
+        &service,
+        repo,
+        file_set(vec![folder("build")], Vec::new()),
+        shown,
+    );
+    assert_eq!(
+        paths(&full_index(&service, repo, &response.sources[0])),
+        ["build/deep/more.bin", "build/out.bin"]
+    );
+}
+
+#[test]
+fn nested_gitignore_files_and_re_included_files_are_respected() {
+    let fixture = repository();
+    let repo = fixture.root();
+    write(repo, "sub/.gitignore", "*.tmp\n!keep.tmp\n");
+    write(repo, "sub/drop.tmp", "drop\n");
+    write(repo, "sub/keep.tmp", "keep\n");
+    write(repo, "sub/inner/also.tmp", "also\n");
+    write(repo, "sub/code.rs", "// code\n");
+    let service = ReviewData::default();
+    let source = resolved(&service, repo, file_set(vec![folder("sub")], Vec::new()));
+    let entries = full_index(&service, repo, &source);
+    assert_eq!(
+        paths(&entries),
+        ["sub/.gitignore", "sub/code.rs", "sub/keep.tmp"]
+    );
+    assert_eq!(counted(&service, repo, vec![folder("sub")], false), 3);
+    let shown = resolve(
+        &service,
+        repo,
+        file_set(vec![folder("sub")], Vec::new()),
+        BrowseOptions {
+            include_ignored: true,
+            max_files: None,
+        },
+    );
+    let entries = full_index(&service, repo, &shown.sources[0]);
+    assert_eq!(entries.len(), 5, "{:?}", paths(&entries));
+    assert!(flagged(&entries, "sub/drop.tmp").has(ReviewIndexFlag::Ignored));
+    assert!(flagged(&entries, "sub/inner/also.tmp").has(ReviewIndexFlag::Ignored));
+    assert_eq!(counted(&service, repo, vec![folder("sub")], true), 5);
+}

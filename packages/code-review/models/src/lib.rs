@@ -978,6 +978,9 @@ pub struct CreateReviewWorkspaceRequest {
     /// Initial workspace sources.
     #[serde(default)]
     pub sources: Vec<ReviewSource>,
+    /// Initial display settings (such as listing ignored files), when chosen at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ReviewPresentationState>,
 }
 
 /// Response payload for `review.workspace.create`.

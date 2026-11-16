@@ -177,6 +177,42 @@ pub fn limited_file_records(command: Command, keep: usize) -> Result<LimitedReco
     limited_records_where(command, keep, |record| !record.ends_with(b"/"))
 }
 
+/// Count the file records (not ending in `/`) `command` prints, up to `cap`: past it git is
+/// stopped and the answer is `(cap, true)`, so counting a huge ignored folder costs at most
+/// `cap` records.
+///
+/// # Errors
+///
+/// * [`DataError::Io`] when git cannot be started or read.
+/// * [`DataError::Git`] when git exits unsuccessfully before the cap.
+pub fn count_file_records(mut command: Command, cap: u64) -> Result<(u64, bool), DataError> {
+    use std::io::BufRead as _;
+    let _slot = Slot::acquire();
+    command.stderr(std::process::Stdio::null());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| DataError::Git("git stdout unavailable".to_owned()))?;
+    let mut count = 0_u64;
+    for record in std::io::BufReader::new(stdout).split(0) {
+        if record?.ends_with(b"/") {
+            continue;
+        }
+        count += 1;
+        if count > cap {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok((cap, true));
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(DataError::Git(format!("git exited with {status}")));
+    }
+    Ok((count, false))
+}
+
 fn limited_records_where(
     mut command: Command,
     keep: usize,

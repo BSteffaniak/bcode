@@ -172,6 +172,9 @@ pub enum WizardOutcome {
         title: String,
         /// Sources, in order.
         sources: Vec<ReviewSourceKind>,
+        /// Whether its folder, glob and repository sources list ignored files, when a path
+        /// picker chose differently from the configured default.
+        show_ignored: Option<bool>,
     },
     /// Save the edited sources of the review being edited.
     Update {
@@ -349,6 +352,14 @@ pub struct Wizard {
     provisional: Option<(u64, Vec<ProvisionalLayer>)>,
     /// The assistant panel request and the header cells left for the Ask AI button.
     link: crate::assistant::ScreenLink,
+    /// Whether path pickers open showing ignored files: the review's choice when editing, else
+    /// `files.show_ignored`, then the last picker's.
+    show_ignored: bool,
+    /// The ignored-files choice of the last path picker, when one was used: the new or edited
+    /// review keeps it.
+    chose_ignored: Option<bool>,
+    /// What path pickers opened with (see [`Self::set_show_ignored`]).
+    opened_ignored: bool,
 }
 
 impl std::fmt::Debug for Wizard {
@@ -409,7 +420,33 @@ impl Wizard {
             stack_limit_dismissed: None,
             provisional: None,
             link: crate::assistant::ScreenLink::default(),
+            show_ignored: false,
+            chose_ignored: None,
+            opened_ignored: false,
         }
+    }
+
+    /// Open path pickers showing ignored files when `show` (`files.show_ignored`), unless the
+    /// review being edited chose otherwise.
+    pub fn set_show_ignored(&mut self, show: bool) {
+        let show = self
+            .editing
+            .as_ref()
+            .and_then(|workspace| workspace.presentation.as_ref())
+            .and_then(|presentation| presentation.show_ignored)
+            .unwrap_or(show);
+        self.show_ignored = show;
+        self.opened_ignored = show;
+        if let Some(paths) = self.paths.as_mut() {
+            paths.set_show_ignored(show);
+        }
+    }
+
+    /// The ignored-files choice the review keeps: the last path picker's, when it differs from
+    /// what pickers opened with.
+    fn ignored_choice(&self) -> Option<bool> {
+        self.chose_ignored
+            .filter(|chosen| *chosen != self.opened_ignored)
     }
 
     /// A wizard that opens on the files and folders picker (a review of files, folders, or the
@@ -1104,7 +1141,7 @@ impl Wizard {
         exclude: Vec<PathSelector>,
     ) {
         let picker = PathPicker::new(self.services.clone(), self.repo.clone(), purpose)
-            .with_selection(include, exclude, false);
+            .with_selection(include, exclude, self.show_ignored);
         self.paths = Some(picker);
         self.step = Step::Details(Details::Paths { purpose, replace });
         self.pending_items = true;
@@ -1112,6 +1149,8 @@ impl Wizard {
 
     /// The tree picker finished with `choice`.
     fn paths_done(&mut self, purpose: PathPurpose, replace: Option<usize>, choice: PathChoice) {
+        self.show_ignored = choice.show_ignored;
+        self.chose_ignored = Some(choice.show_ignored);
         let kind = match purpose {
             PathPurpose::Files => {
                 bcode_code_review::selectors::files_source(choice.include, choice.exclude)
@@ -2247,6 +2286,12 @@ impl Wizard {
                         let mut workspace = editing.clone();
                         workspace.title = title;
                         workspace.sources = self.edited_sources(&workspace.sources);
+                        if let Some(show) = self.ignored_choice() {
+                            workspace
+                                .presentation
+                                .get_or_insert_with(Default::default)
+                                .show_ignored = Some(show);
+                        }
                         return WizardOutcome::Update { workspace };
                     }
                     return WizardOutcome::Create {
@@ -2256,6 +2301,7 @@ impl Wizard {
                             .iter()
                             .map(|source| source.kind.clone())
                             .collect(),
+                        show_ignored: self.ignored_choice(),
                     };
                 }
                 "add" => {

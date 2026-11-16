@@ -1765,6 +1765,7 @@ fn store_with_review(temp: &Path) -> (ReviewStore, PathBuf, ReviewWorkspace) {
             repo_path: repo.clone(),
             title: Some("Original".to_owned()),
             sources: vec![test_source("last", ReviewSourceKind::LastCommit)],
+            presentation: None,
         })
         .expect("create")
         .workspace;

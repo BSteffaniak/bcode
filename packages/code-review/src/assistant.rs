@@ -542,8 +542,17 @@ impl<'a> ReviewTools<'a> {
         } else {
             Vec::new()
         };
+        // Ignored files are listed as the review lists them in the app.
+        let include_ignored = workspace
+            .presentation
+            .as_ref()
+            .and_then(|presentation| presentation.show_ignored)
+            .unwrap_or(false);
         let response = self.data.resolve_sources(&ResolveReviewSourcesRequest {
-            browse: bcode_code_review_models::BrowseOptions::default(),
+            browse: bcode_code_review_models::BrowseOptions {
+                include_ignored,
+                ..bcode_code_review_models::BrowseOptions::default()
+            },
             repo_path: workspace.repo_root.clone(),
             sources: workspace.sources.clone(),
             provider_resolutions,

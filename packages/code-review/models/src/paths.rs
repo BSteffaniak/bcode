@@ -542,7 +542,8 @@ pub struct ReviewPathsResolveResponse {
     /// Of `total`, files changed since `HEAD` (untracked files included).
     #[serde(default)]
     pub changed: u32,
-    /// The path index stopped at [`REVIEW_PATH_INDEX_MAX_PATHS`]; counts are lower bounds.
+    /// Counts are lower bounds: the path index stopped at [`REVIEW_PATH_INDEX_MAX_PATHS`], or
+    /// an ignored folder held more than [`REVIEW_FILES_MAX_FILES_LIMIT`] files.
     #[serde(default)]
     pub truncated: bool,
 }
