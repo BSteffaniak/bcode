@@ -9,6 +9,7 @@ This document defines package ownership and dependency direction for Bcode's neu
 Owns serializable, transport-free tool protocol models:
 
 * invocation identity and arguments
+* opt-in argument normalization for tools that treat blank values as omitted
 * opaque preparation host context
 * prepared invocation descriptors
 * provider-batch execution options
@@ -26,6 +27,8 @@ Owns orchestration behavior:
 * turn and invocation scopes
 * final scope acceptance checks
 * cancellation registration and fan-out
+* canonical tool-call arguments: optional arguments a strict provider dialect reported as `null` are
+  removed against the tool's input schema before preparation, authorization and invocation
 * complete-batch preparation and authorization
 * provider-batch bounded scheduling
 * ordered result collection

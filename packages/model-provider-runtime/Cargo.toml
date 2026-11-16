@@ -13,6 +13,7 @@ version     = { workspace = true }
 [dependencies]
 base64               = { workspace = true, optional = true }
 bcode_model          = { workspace = true }
+bcode_model_schema   = { workspace = true }
 bcode_plugin_sdk     = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_xray           = { workspace = true }

@@ -4,6 +4,8 @@
 
 //! Serializable leaf-model types for neutral tool runtime contracts.
 
+/// Tool-argument normalization a tool may opt into.
+pub mod arguments;
 /// Tools implemented by connected client applications.
 pub mod client_tool;
 pub mod interaction;

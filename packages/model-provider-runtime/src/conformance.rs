@@ -13,7 +13,7 @@ use bcode_model::{
     PromptCacheHints, PromptCacheMode, PromptCachePoint, ProviderCapabilities, ProviderCapability,
     ProviderErrorCategory, ProviderRequestContext, ProviderRequestProjection, ProviderTurnEvent,
     StartTurnResponse, StopReason, StructuredOutputRequest, ToolCallRequestPolicy, ToolChoice,
-    ToolDefinition, ToolResult, ValidateConfigRequest, ValidateConfigResponse,
+    ToolDefinition, ToolResult, ToolSchemaMode, ValidateConfigRequest, ValidateConfigResponse,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 const BASE_TURN: &str = "baseline turn";
 const CANCELLATION: &str = "cancellation";
 const NATIVE_WEB_SEARCH: &str = "native web search";
+const OPTIONAL_TOOL_ARGUMENTS: &str = "optional tool arguments";
+const OPTIONAL_STRUCTURED_FIELDS: &str = "structured output optional fields";
 const PARALLEL_TOOL_CALLING: &str = "parallel tool calling";
 const PROMPT_CACHING: &str = "prompt caching";
 const STRUCTURED_OUTPUT: &str = "structured output";
@@ -710,10 +712,16 @@ where
     ];
 
     cases.push(run_tool_case(invoker, options, &provider, &model)?);
+    cases.push(run_optional_tool_arguments_case(
+        invoker, options, &provider, &model,
+    )?);
     cases.push(run_parallel_tool_case(invoker, options, &provider, &model)?);
     cases.push(run_prompt_cache_case(invoker, options, &provider, &model)?);
     cases.push(run_native_web_search_case(invoker, options, &provider)?);
     cases.push(run_structured_output_case(
+        invoker, options, &provider, &model,
+    )?);
+    cases.push(run_optional_structured_fields_case(
         invoker, options, &provider, &model,
     )?);
     cases.push(run_cancellation_case(invoker, options, &provider, &model)?);
@@ -867,6 +875,98 @@ where
     }
     continue_after_tools(invoker, options, TOOL_CALLING, request, &summary.tool_calls)?;
     Ok(passed(TOOL_CALLING))
+}
+
+/// Tool arguments the model leaves out must reach the host as omitted.
+///
+/// Strict tool dialects require every property, so the provider may send `null` for an omitted
+/// optional argument; after the host's removal of such `null`s
+/// ([`bcode_model_schema::omit_null_optional_properties`]) the arguments must satisfy the
+/// canonical schema. Strict mode is requested whenever the provider and model guarantee it.
+fn run_optional_tool_arguments_case<I>(
+    invoker: &mut I,
+    options: &ProviderConformanceOptions,
+    provider: &ProviderCapabilities,
+    model: &ModelInfo,
+) -> Result<ProviderConformanceCase, ProviderConformanceError>
+where
+    I: BlockingModelProviderInvoker,
+{
+    if !supports(
+        provider,
+        model,
+        ProviderCapability::Tools,
+        ModelCapability::ToolCalls,
+    ) {
+        return Ok(skipped(
+            OPTIONAL_TOOL_ARGUMENTS,
+            "provider/model do not advertise tool calls",
+        ));
+    }
+    let mut request = turn_request(
+        options,
+        &model.model_id,
+        "Call the filesystem.read tool exactly once with path /tmp/bcode-provider-conformance. Leave out the optional note argument.",
+    );
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "note": {"type": "string", "description": "Optional note; leave it out."}
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    });
+    request.tools.push(ToolDefinition {
+        name: "filesystem.read".to_string(),
+        description: "Read the requested test path.".to_string(),
+        input_schema: schema.clone(),
+    });
+    request.tool_call_policy = ToolCallRequestPolicy {
+        parallel: Some(false),
+        choice: ToolChoice::Required,
+    };
+    if provider
+        .feature_support
+        .tool_schema(ToolSchemaMode::Strict)
+        .is_guaranteed()
+        && model
+            .feature_support
+            .tool_schema(ToolSchemaMode::Strict)
+            .is_guaranteed()
+    {
+        request.tool_schema_mode = Some(ToolSchemaMode::Strict);
+    }
+    let summary = run_turn(invoker, options, OPTIONAL_TOOL_ARGUMENTS, &request, false)?;
+    let [call] = summary.tool_calls.as_slice() else {
+        return violation(
+            OPTIONAL_TOOL_ARGUMENTS,
+            "required tool call did not produce exactly one completed call",
+        );
+    };
+    let arguments =
+        bcode_model_schema::omit_null_optional_properties(&schema, call.arguments.clone());
+    let canonical = arguments.as_object().is_some_and(|object| {
+        object.get("path").is_some_and(serde_json::Value::is_string)
+            && object.get("note").is_none_or(serde_json::Value::is_string)
+            && object.keys().all(|key| key == "path" || key == "note")
+    });
+    if !canonical {
+        return violation(
+            OPTIONAL_TOOL_ARGUMENTS,
+            format!(
+                "tool arguments do not satisfy the canonical schema after omitting optional nulls: {arguments}"
+            ),
+        );
+    }
+    continue_after_tools(
+        invoker,
+        options,
+        OPTIONAL_TOOL_ARGUMENTS,
+        request,
+        &summary.tool_calls,
+    )?;
+    Ok(passed(OPTIONAL_TOOL_ARGUMENTS))
 }
 
 fn run_parallel_tool_case<I>(
@@ -1168,6 +1268,68 @@ where
         );
     }
     Ok(passed(STRUCTURED_OUTPUT))
+}
+
+/// Structured output must reach the host in its canonical representation.
+///
+/// An optional field the model leaves out must be absent, not `null` or a placeholder, even when
+/// the provider's strict dialect required it on the wire.
+fn run_optional_structured_fields_case<I>(
+    invoker: &mut I,
+    options: &ProviderConformanceOptions,
+    provider: &ProviderCapabilities,
+    model: &ModelInfo,
+) -> Result<ProviderConformanceCase, ProviderConformanceError>
+where
+    I: BlockingModelProviderInvoker,
+{
+    if !supports(
+        provider,
+        model,
+        ProviderCapability::JsonMode,
+        ModelCapability::JsonMode,
+    ) {
+        return Ok(skipped(
+            OPTIONAL_STRUCTURED_FIELDS,
+            "provider/model do not advertise JSON mode",
+        ));
+    }
+    let mut request = turn_request(
+        options,
+        &model.model_id,
+        "Return only a JSON object whose ok property is true. Leave out the optional note property.",
+    );
+    request.structured_output = Some(StructuredOutputRequest {
+        name: "ConformanceOptionalResult".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ok": {"const": true},
+                "note": {"type": "string", "description": "Optional note; leave it out."}
+            },
+            "required": ["ok"],
+            "additionalProperties": false
+        }),
+        strict: true,
+    });
+    let text = run_text_turn(invoker, options, OPTIONAL_STRUCTURED_FIELDS, &request)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| ProviderConformanceError::Violation {
+            case: OPTIONAL_STRUCTURED_FIELDS,
+            message: format!("structured output was not JSON: {error}"),
+        })?;
+    let canonical = value.as_object().is_some_and(|object| {
+        object.get("ok") == Some(&serde_json::Value::Bool(true))
+            && object.get("note").is_none_or(serde_json::Value::is_string)
+            && object.keys().all(|key| key == "ok" || key == "note")
+    });
+    if !canonical {
+        return violation(
+            OPTIONAL_STRUCTURED_FIELDS,
+            format!("structured output is not in its canonical representation: {value}"),
+        );
+    }
+    Ok(passed(OPTIONAL_STRUCTURED_FIELDS))
 }
 
 fn run_cancellation_case<I>(

@@ -907,32 +907,17 @@ impl ReviewApp {
     }
 }
 
-/// An app tool's arguments with blank optional values taken as not given: a field whose value
-/// is an empty or whitespace-only string, or `null`, is dropped from every object, including
-/// objects inside arrays (array items themselves are kept). Arguments that are not a JSON
-/// object are returned unchanged, to be refused by the tool's own parsing.
+/// An app tool's arguments with blank optional values taken as not given (see
+/// [`bcode_tool_models::arguments::without_blank_values`]). Empty arguments are an empty object;
+/// arguments that are not a JSON object are returned unchanged, to be refused by the tool's own
+/// parsing.
 pub(crate) fn without_blank_arguments(arguments: &str) -> String {
-    fn strip(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                map.retain(|_, value| match value {
-                    serde_json::Value::String(text) => !text.trim().is_empty(),
-                    serde_json::Value::Null => false,
-                    _ => true,
-                });
-                map.values_mut().for_each(strip);
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
-            _ => {}
-        }
-    }
     if arguments.trim().is_empty() {
         return "{}".to_owned();
     }
     match serde_json::from_str::<serde_json::Value>(arguments) {
-        Ok(mut value @ serde_json::Value::Object(_)) => {
-            strip(&mut value);
-            value.to_string()
+        Ok(value @ serde_json::Value::Object(_)) => {
+            bcode_tool_models::arguments::without_blank_values(value, &[]).to_string()
         }
         _ => arguments.to_owned(),
     }

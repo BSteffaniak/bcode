@@ -13,6 +13,7 @@ mod compaction_control;
 mod compaction_fixture;
 mod judgement;
 pub mod prompt_cache;
+mod tool_arguments;
 mod vision;
 
 use bcode_model::{
@@ -2441,15 +2442,13 @@ fn finish_configured_fake_tool_conformance(
         return false;
     }
     for index in 0..tool_call_count {
+        let tool = request.tools.get(index % request.tools.len().max(1));
         finish_fake_tool_call(
             turn,
             ToolCall {
                 id: format!("fake-call-{index}"),
-                name: request
-                    .tools
-                    .get(index % request.tools.len().max(1))
-                    .map_or_else(|| "fake.tool".to_owned(), |tool| tool.name.clone()),
-                arguments: serde_json::json!({"index": index}),
+                name: tool.map_or_else(|| "fake.tool".to_owned(), |tool| tool.name.clone()),
+                arguments: indexed_fake_tool_arguments(request, tool, index),
             },
         );
     }
@@ -2934,26 +2933,39 @@ fn repeated_fake_tool_call(
 }
 
 fn required_fake_tool_call(request: &ModelTurnRequest, next_turn: u64) -> Option<ToolCall> {
-    let name = match &request.tool_call_policy.choice {
-        ToolChoice::Required => request.tools.first()?.name.clone(),
-        ToolChoice::Tool { name } => request
-            .tools
-            .iter()
-            .find(|tool| tool.name == *name)?
-            .name
-            .clone(),
+    let tool = match &request.tool_call_policy.choice {
+        ToolChoice::Required => request.tools.first()?,
+        ToolChoice::Tool { name } => request.tools.iter().find(|tool| tool.name == *name)?,
         ToolChoice::Auto | ToolChoice::None => return None,
-    };
-    let arguments = if name == "filesystem.read" {
-        serde_json::json!({"path": "/tmp/bcode-provider-conformance"})
-    } else {
-        serde_json::json!({})
     };
     Some(ToolCall {
         id: format!("fake-required-tool-{next_turn}"),
-        name,
-        arguments,
+        name: tool.name.clone(),
+        arguments: tool_arguments::fake_tool_arguments(
+            tool,
+            strict_tool_schema(request),
+            &serde_json::Map::new(),
+        ),
     })
+}
+
+/// Whether the request asks for strict tool schemas, under which omitted optional arguments are
+/// sent as `null`.
+fn strict_tool_schema(request: &ModelTurnRequest) -> bool {
+    request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict)
+}
+
+/// Arguments for the fake call `index` to `tool`, or the bare index for an unknown tool.
+fn indexed_fake_tool_arguments(
+    request: &ModelTurnRequest,
+    tool: Option<&bcode_model::ToolDefinition>,
+    index: usize,
+) -> serde_json::Value {
+    let correlation = serde_json::Map::from_iter([("index".to_owned(), serde_json::json!(index))]);
+    tool.map_or_else(
+        || serde_json::Value::Object(correlation.clone()),
+        |tool| tool_arguments::fake_tool_arguments(tool, strict_tool_schema(request), &correlation),
+    )
 }
 
 // Opt-in acceptance fixture: inspect lines of the latest user prompt, which may

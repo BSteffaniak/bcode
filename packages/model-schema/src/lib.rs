@@ -24,18 +24,13 @@ pub enum ObjectPropertyPolicy {
     /// Preserve the source schema's object-property declarations.
     #[default]
     Preserve,
-    /// Require every declared property and reject undeclared properties.
-    ///
-    /// An optional source property becomes mandatory, so a provider must always produce a value
-    /// for it.
-    RequireAllAndClose,
     /// Require every declared property and reject undeclared properties, letting each optional
     /// source property that does not already accept `null` also accept `null`.
     ///
-    /// `null` then stands for an omitted property; [`omit_null_optional_properties`] restores
-    /// the canonical value. Annotations (`description`, `title`, `$comment`) stay on the
-    /// property so models still see them.
-    RequireAllNullableOptionalAndClose,
+    /// Dialects with this policy cannot express an omitted property, so `null` stands for one;
+    /// [`omit_null_optional_properties`] restores the canonical value. Annotations
+    /// (`description`, `title`, `$comment`) stay on the property so models still see them.
+    RequireAllAndClose,
 }
 
 /// Policy for a JSON Schema keyword unsupported by a provider dialect.
@@ -127,7 +122,9 @@ pub struct SchemaPortabilityError {
 }
 
 impl SchemaPortabilityError {
-    fn new(path: &str, message: impl Into<String>) -> Self {
+    /// Create a portability failure at the JSON pointer `path`.
+    #[must_use]
+    pub fn new(path: &str, message: impl Into<String>) -> Self {
         Self {
             path: path.to_string(),
             message: message.into(),
@@ -250,7 +247,6 @@ fn normalize_object(
     if matches!(
         dialect.object_properties,
         ObjectPropertyPolicy::RequireAllAndClose
-            | ObjectPropertyPolicy::RequireAllNullableOptionalAndClose
     ) && is_object_schema(object)
     {
         if object
@@ -270,9 +266,7 @@ fn normalize_object(
         let properties = object
             .entry("properties".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
-        if dialect.object_properties == ObjectPropertyPolicy::RequireAllNullableOptionalAndClose
-            && let Some(properties) = properties.as_object_mut()
-        {
+        if let Some(properties) = properties.as_object_mut() {
             for (key, property) in properties.iter_mut() {
                 if !source_required.contains(key)
                     && !optional_properties::schema_allows_null(property)
@@ -568,7 +562,7 @@ mod tests {
     fn property_names_and_literal_objects_are_not_schemas() {
         let literal = serde_json::json!({"properties": {"type": "object"}});
         let schema = serde_json::json!({
-            "type": "object", "properties": {
+            "type": "object", "required": ["properties", "type", "example"], "properties": {
                 "properties": {"type": "array", "description": "attributes", "items": {"type": "string"}},
                 "type": {"type": "string"},
                 "example": {"type": "object", "const": literal}
@@ -605,9 +599,17 @@ mod tests {
             normalized["required"],
             serde_json::json!(["child", "count"])
         );
-        assert!(normalized.pointer("/properties/count/minimum").is_none());
+        assert!(
+            normalized
+                .pointer("/properties/count/anyOf/0/minimum")
+                .is_none()
+        );
         assert_eq!(
-            normalized.pointer("/properties/child/required"),
+            normalized.pointer("/properties/child/anyOf/1"),
+            Some(&serde_json::json!({"type": "null"}))
+        );
+        assert_eq!(
+            normalized.pointer("/properties/child/anyOf/0/required"),
             Some(&serde_json::json!(["name"]))
         );
     }
@@ -734,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_optional_policy_requires_every_property_and_lets_optionals_be_null() {
+    fn closed_objects_require_every_property_and_let_optionals_be_null() {
         let schema = serde_json::json!({
             "type": "object",
             "required": ["name"],
@@ -747,7 +749,7 @@ mod tests {
             "$defs": {"Target": {"type": "object", "properties": {"path": {"type": "string"}}}}
         });
         let dialect = SchemaDialect {
-            object_properties: ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
+            object_properties: ObjectPropertyPolicy::RequireAllAndClose,
             ..SchemaDialect::default()
         };
 
@@ -777,17 +779,6 @@ mod tests {
         assert_eq!(
             wire["$defs"]["Target"]["properties"]["path"],
             serde_json::json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
-        );
-        assert_eq!(
-            normalize(
-                &schema,
-                &SchemaDialect {
-                    object_properties: ObjectPropertyPolicy::RequireAllAndClose,
-                    ..SchemaDialect::default()
-                }
-            )
-            .expect("value-required wire schema")["properties"]["branch"],
-            schema["properties"]["branch"]
         );
     }
 }

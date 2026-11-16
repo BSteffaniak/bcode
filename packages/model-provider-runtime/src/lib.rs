@@ -79,10 +79,15 @@ pub mod image_verification;
 pub mod image_fixtures;
 
 mod conformance;
+mod structured_output;
 pub use conformance::{
     ProviderConformanceCase, ProviderConformanceError, ProviderConformanceOptions,
     ProviderConformanceOutcome, ProviderConformanceReport, ProviderEventSummary,
     ProviderEventValidator, run_provider_conformance_suite,
+};
+pub use structured_output::{
+    MAX_STRUCTURED_OUTPUT_WIRE_BYTES, STRUCTURED_OUTPUT_WIRE_INSTRUCTION, StructuredOutputCapture,
+    StructuredOutputWireEncoding,
 };
 
 use bcode_model::{
@@ -151,6 +156,9 @@ impl SyntheticStructuredOutput {
 
     /// Convert the intercepted synthetic call into portable assistant JSON text.
     ///
+    /// `null`s standing for omitted optional properties (as strict tool dialects produce) are
+    /// removed against the constraint schema.
+    ///
     /// # Errors
     ///
     /// Returns an error when the call targets another tool or its arguments cannot be serialized.
@@ -165,7 +173,9 @@ impl SyntheticStructuredOutput {
                 ),
             ));
         }
-        serde_json::to_string(&call.arguments).map_err(|error| {
+        let value =
+            bcode_model_schema::omit_null_optional_properties(&self.schema, call.arguments.clone());
+        serde_json::to_string(&value).map_err(|error| {
             simple_provider_error(
                 "invalid_structured_output_arguments",
                 ProviderErrorCategory::InvalidRequest,
@@ -674,9 +684,38 @@ pub struct TurnState {
     terminal: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
     diagnostics: ProviderDiagnostics,
+    structured_output: Arc<Mutex<Option<StructuredOutputCapture>>>,
 }
 
 impl TurnState {
+    /// Hold text deltas until the turn ends and publish them decoded through `encoding`.
+    ///
+    /// Install this before the provider streams output for a request whose structured-output
+    /// schema was replaced by `encoding`'s wire schema. See [`StructuredOutputCapture::finish`]
+    /// for what is published at each kind of turn end.
+    pub fn capture_structured_output(&self, encoding: StructuredOutputWireEncoding) {
+        if let Ok(mut capture) = self.structured_output.lock() {
+            *capture = Some(StructuredOutputCapture::new(encoding));
+        }
+    }
+
+    /// Route `event` through an installed structured-output capture.
+    ///
+    /// Returns the events to publish instead, or `None` when the event is unaffected.
+    fn captured(&self, event: &ProviderTurnEvent) -> Option<Vec<ProviderTurnEvent>> {
+        let mut capture = self.structured_output.lock().ok()?;
+        match event {
+            ProviderTurnEvent::TextDelta { text } => {
+                capture.as_mut()?.absorb(text);
+                Some(Vec::new())
+            }
+            event if StructuredOutputCapture::ends_with(event) => {
+                Some(capture.take()?.finish(event.clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// Bind the originating observer context before publishing any turn events.
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
@@ -694,6 +733,12 @@ impl TurnState {
     /// Events published after `TurnFinished` are ignored, even after the terminal
     /// event has been drained. Terminal publication does not acknowledge worker release.
     pub fn push(&self, event: ProviderTurnEvent) {
+        if let Some(events) = self.captured(&event) {
+            for event in events {
+                self.push(event);
+            }
+            return;
+        }
         if matches!(event, ProviderTurnEvent::AttemptTiming { .. })
             && !self.attempt_timing_enabled.load(Ordering::Acquire)
         {

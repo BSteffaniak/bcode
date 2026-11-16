@@ -162,20 +162,10 @@ fn worktree_workspace_root(
     Ok(Some(root))
 }
 
-/// Tool arguments with blank optional values taken as not given: a top-level field whose value
-/// is an empty or whitespace-only string, or `null`, is dropped. Models commonly fill every
-/// schema property and send `""` for the ones they do not mean to use; none of the worktree
-/// tool fields has a meaningful empty value. Required fields dropped this way are refused as
-/// missing.
-fn without_blank_arguments(mut arguments: serde_json::Value) -> serde_json::Value {
-    if let serde_json::Value::Object(map) = &mut arguments {
-        map.retain(|_, value| match value {
-            serde_json::Value::String(text) => !text.trim().is_empty(),
-            serde_json::Value::Null => false,
-            _ => true,
-        });
-    }
-    arguments
+/// Tool arguments with blank optional values taken as not given. None of the worktree tool
+/// fields has a meaningful empty value; required fields dropped this way are refused as missing.
+fn without_blank_arguments(arguments: serde_json::Value) -> serde_json::Value {
+    bcode_tool::arguments::without_blank_values(arguments, &[])
 }
 
 /// Parse a tool request from invocation arguments with blank optional values taken as not given.

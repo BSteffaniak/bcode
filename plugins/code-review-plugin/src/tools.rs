@@ -807,28 +807,10 @@ impl Arguments {
 /// the lines.
 const BLANK_IS_A_VALUE: &[&str] = &["replacement"];
 
-/// Tool arguments with blank optional values taken as not given: a field whose value is an
-/// empty or whitespace-only string, or `null`, is dropped from every object, including objects
-/// inside arrays (array items themselves are kept), except the fields in [`BLANK_IS_A_VALUE`],
-/// whose strings are kept as given. Required fields dropped this way are refused as missing.
-fn without_blanks(mut value: Value) -> Value {
-    fn strip(value: &mut Value) {
-        match value {
-            Value::Object(map) => {
-                map.retain(|key, value| match value {
-                    Value::String(_) if BLANK_IS_A_VALUE.contains(&key.as_str()) => true,
-                    Value::String(text) => !text.trim().is_empty(),
-                    Value::Null => false,
-                    _ => true,
-                });
-                map.values_mut().for_each(strip);
-            }
-            Value::Array(items) => items.iter_mut().for_each(strip),
-            _ => {}
-        }
-    }
-    strip(&mut value);
-    value
+/// Tool arguments with blank optional values taken as not given, except the fields in
+/// [`BLANK_IS_A_VALUE`]. Required fields dropped this way are refused as missing.
+fn without_blanks(value: Value) -> Value {
+    bcode_tool::arguments::without_blank_values(value, BLANK_IS_A_VALUE)
 }
 
 /// Run one invocation.

@@ -45,6 +45,8 @@ pub use decode::{
 };
 mod decode;
 mod projection;
+mod strict_schema;
+pub use strict_schema::{strict_schema, strict_schema_dialect};
 
 pub use projection::{
     INTERRUPTED_TOOL_OUTPUT, append_missing_responses_tool_outputs, image_data_url, image_ref_text,

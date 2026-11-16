@@ -233,7 +233,7 @@ struct TurnState {
     semantic_output_started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
-    structured_text: Arc<Mutex<Option<Result<String, String>>>>,
+    structured_output: Arc<Mutex<Option<bcode_model_provider_runtime::StructuredOutputCapture>>>,
 }
 
 #[derive(Debug)]
@@ -281,7 +281,45 @@ struct OpenAiAuthTokenResponse {
 }
 
 impl TurnState {
+    /// Hold text deltas until the turn ends and publish them decoded through `encoding`.
+    fn capture_structured_output(
+        &self,
+        encoding: bcode_model_provider_runtime::StructuredOutputWireEncoding,
+    ) {
+        *self
+            .structured_output
+            .lock()
+            .expect("structured output lock") = Some(
+            bcode_model_provider_runtime::StructuredOutputCapture::new(encoding),
+        );
+    }
+
+    /// Route `event` through an installed structured-output capture, returning the events to
+    /// publish instead.
+    fn captured(&self, event: &ProviderTurnEvent) -> Option<Vec<ProviderTurnEvent>> {
+        let mut capture = self
+            .structured_output
+            .lock()
+            .expect("structured output lock");
+        match event {
+            ProviderTurnEvent::TextDelta { text } => {
+                capture.as_mut()?.absorb(text);
+                Some(Vec::new())
+            }
+            event if bcode_model_provider_runtime::StructuredOutputCapture::ends_with(event) => {
+                Some(capture.take()?.finish(event.clone()))
+            }
+            _ => None,
+        }
+    }
+
     fn push(&self, event: ProviderTurnEvent) {
+        if let Some(events) = self.captured(&event) {
+            for event in events {
+                self.push(event);
+            }
+            return;
+        }
         diagnostics::event(&event);
         if matches!(
             &event,
@@ -296,19 +334,6 @@ impl TurnState {
             self.semantic_output_started.store(true, Ordering::Release);
         }
         self.timing.lock().expect("timing lock").observe(&event);
-        if let ProviderTurnEvent::TextDelta { text } = &event {
-            let mut buffered = self.structured_text.lock().expect("structured text lock");
-            if let Some(result) = buffered.as_mut() {
-                if let Ok(output) = result {
-                    if output.len().saturating_add(text.len()) > 1024 * 1024 {
-                        *result = Err("encoded structured output exceeds 1 MiB".into());
-                    } else {
-                        output.push_str(text);
-                    }
-                }
-                return;
-            }
-        }
         if matches!(
             event,
             ProviderTurnEvent::TurnFinished { .. } | ProviderTurnEvent::Cancelled
@@ -3436,73 +3461,11 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
     }
 }
 
-/// `OpenAI` requires an object root even when the canonical result is a scalar or array.
+/// Strict structured output whose wire representation differs from the canonical schema is
+/// requested with the wire schema and decoded before the host sees it.
 ///
-/// Strict schemas also require every property, so optional properties accept `null` on the
-/// wire and decoding removes those `null`s again.
-struct StructuredWireEncoding {
-    maps: bcode_model_schema::ObjectMapEncoding,
-    enveloped: bool,
-    optionals: bool,
-}
-
-impl StructuredWireEncoding {
-    fn compile(schema: &serde_json::Value) -> Result<Self, ProviderError> {
-        let enveloped = schema.get("type").and_then(serde_json::Value::as_str) != Some("object");
-        let mut wire = schema.clone();
-        if enveloped {
-            let mut envelope = serde_json::json!({
-                "type": "object", "properties": {"result": wire},
-                "required": ["result"], "additionalProperties": false
-            });
-            // Local references still resolve from the document root, not the result property.
-            for key in ["$schema", "$defs", "definitions"] {
-                if let Some(value) = envelope["properties"]["result"]
-                    .as_object_mut()
-                    .and_then(|object| object.remove(key))
-                {
-                    envelope[key] = value;
-                }
-            }
-            wire = envelope;
-        }
-        let maps = bcode_model_schema::ObjectMapEncoding::compile(&wire).map_err(|error| {
-            provider_error(
-                "invalid_structured_output_schema",
-                ProviderErrorCategory::InvalidRequest,
-                error.to_string(),
-            )
-        })?;
-        let optionals = bcode_model_schema::has_optional_properties(maps.schema());
-        Ok(Self {
-            maps,
-            enveloped,
-            optionals,
-        })
-    }
-
-    const fn is_adapted(&self) -> bool {
-        self.enveloped || self.optionals || self.maps.is_adapted()
-    }
-
-    fn decode(&self, value: serde_json::Value) -> Result<serde_json::Value, String> {
-        let value = bcode_model_schema::omit_null_optional_properties(self.maps.schema(), value);
-        let value = self.maps.decode(value).map_err(|error| error.to_string())?;
-        if !self.enveloped {
-            return Ok(value);
-        }
-        let serde_json::Value::Object(mut object) = value else {
-            return Err("structured result envelope must be an object".into());
-        };
-        if object.len() != 1 {
-            return Err("structured result envelope must contain only result".into());
-        }
-        object
-            .remove("result")
-            .ok_or_else(|| "structured result envelope is missing result".into())
-    }
-}
-
+/// `OpenAI` requires an object root even when the canonical result is a scalar or array, cannot
+/// express dynamic maps in strict objects, and lets optional properties be `null`.
 async fn stream_encoded_completion(
     request: &ModelTurnRequest,
     turn: &TurnState,
@@ -3511,46 +3474,32 @@ async fn stream_encoded_completion(
         .structured_output
         .as_ref()
         .filter(|output| output.strict)
-        .map(|output| StructuredWireEncoding::compile(&output.schema))
+        .map(|output| {
+            bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(
+                &output.schema,
+                true,
+            )
+        })
         .transpose()?;
-    let Some(encoding) = encoding.filter(StructuredWireEncoding::is_adapted) else {
+    let Some(encoding) =
+        encoding.filter(bcode_model_provider_runtime::StructuredOutputWireEncoding::is_adapted)
+    else {
         return stream_chat_completion_with_failover(request, turn).await;
     };
-    strict_openai_schema(encoding.maps.schema())?;
+    strict_openai_schema(encoding.schema())?;
     let mut wire = request.clone();
     wire.structured_output
         .as_mut()
         .expect("structured request")
-        .schema = encoding.maps.schema().clone();
+        .schema = encoding.schema().clone();
     wire.messages.push(bcode_model::ModelMessage {
         role: bcode_model::MessageRole::System,
-        content: vec![bcode_model::ContentBlock::Text { text: "For this structured response, follow the wire response schema: when a result envelope is present, put the requested result in its result field. Dynamic JSON maps are represented on the wire as arrays of {\"key\": string, \"value\": value} records. Use unique keys. Use null for an optional field you leave out. The provider adapter restores the original result representation.".into() }],
+        content: vec![bcode_model::ContentBlock::Text {
+            text: bcode_model_provider_runtime::STRUCTURED_OUTPUT_WIRE_INSTRUCTION.into(),
+        }],
     });
-    *turn.structured_text.lock().expect("structured text lock") = Some(Ok(String::new()));
-    let outcome = stream_chat_completion_with_failover(&wire, turn).await;
-    let text = turn
-        .structured_text
-        .lock()
-        .expect("structured text lock")
-        .take()
-        .expect("buffer installed");
-    if matches!(outcome, Ok(StreamOutcome::Finished)) {
-        let decoded = text
-            .and_then(|text| {
-                serde_json::from_str(&text).map_err(|_| "invalid encoded structured JSON".into())
-            })
-            .and_then(|value| encoding.decode(value))
-            .and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
-            .map_err(|message| {
-                provider_error(
-                    "invalid_structured_output",
-                    ProviderErrorCategory::InvalidRequest,
-                    message,
-                )
-            })?;
-        turn.push(ProviderTurnEvent::TextDelta { text: decoded });
-    }
-    outcome
+    turn.capture_structured_output(encoding);
+    stream_chat_completion_with_failover(&wire, turn).await
 }
 
 async fn stream_chat_completion_with_failover(
@@ -6394,37 +6343,7 @@ fn openai_tool_choice(
 }
 
 fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value, ProviderError> {
-    if !schema.is_object() {
-        return Err(provider_error(
-            "invalid_structured_output_schema",
-            ProviderErrorCategory::InvalidRequest,
-            "strict structured-output schema must be a JSON object",
-        ));
-    }
-    bcode_model_schema::normalize(
-        schema,
-        &bcode_model_schema::SchemaDialect {
-            unsupported_keywords: std::collections::BTreeMap::from([(
-                "default".to_owned(),
-                bcode_model_schema::UnsupportedKeywordPolicy::Remove,
-            )]),
-            unsupported_formats: [
-                "uint8", "uint16", "uint32", "uint64", "uint128", "int8", "int16", "int32",
-                "int64", "int128", "float", "double",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            object_properties:
-                bcode_model_schema::ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
-            one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
-            reference_siblings:
-                bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
-            ..bcode_model_schema::SchemaDialect::default()
-        },
-    )
-    .and_then(|schema| bcode_model_schema::inline_local_references(&schema, 1024 * 1024))
-    .map_err(|error| {
+    bcode_openai_responses::strict_schema(schema).map_err(|error| {
         provider_error(
             "invalid_structured_output_schema",
             ProviderErrorCategory::InvalidRequest,
@@ -12178,12 +12097,18 @@ mod tests {
             return;
         }
         let mut events = Vec::new();
-        if body
-            .get("text")
-            .and_then(|text| text.get("format"))
-            .is_some()
-            || body.get("response_format").is_some()
-        {
+        if let Some(format) = body.get("text").and_then(|text| text.get("format")) {
+            // A strict provider sends `null` for an optional field it leaves out.
+            let delta = if format.pointer("/schema/properties/note").is_some() {
+                "{\"ok\":true,\"note\":null}"
+            } else {
+                "{\"ok\":true}"
+            };
+            events.push(serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": delta
+            }));
+        } else if body.get("response_format").is_some() {
             events.push(serde_json::json!({
                 "type": "response.output_text.delta",
                 "delta": "{\"ok\":true}"
@@ -12210,7 +12135,11 @@ mod tests {
                                 "type": "function_call",
                                 "call_id": call_id,
                                 "name": name,
-                                "arguments": "{}"
+                                "arguments": if name == "filesystem_read" {
+                                    "{\"path\":\"/tmp/bcode-provider-conformance\",\"note\":null}"
+                                } else {
+                                    "{}"
+                                }
                             }
                         })
                     }),
@@ -12415,7 +12344,9 @@ mod tests {
             "parallel tool calling",
             "prompt caching",
             "native web search",
+            "optional tool arguments",
             "structured output",
+            "structured output optional fields",
             "cancellation",
         ] {
             assert!(report.cases.iter().any(|case| {
@@ -12469,7 +12400,10 @@ mod tests {
             serde_json::to_value(responses_text_options(&settings, &request).unwrap()).unwrap();
         assert_eq!(responses["format"]["schema"], chat["json_schema"]["schema"]);
         let turn = TurnState::default();
-        *turn.structured_text.lock().unwrap() = Some(Ok(String::new()));
+        turn.capture_structured_output(
+            bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(&schema, true)
+                .unwrap(),
+        );
         turn.push(ProviderTurnEvent::TextDelta {
             text: "{\"files\":[{\"key\":\"src/main.rs\",".into(),
         });
@@ -12480,27 +12414,21 @@ mod tests {
         turn.push(ProviderTurnEvent::TextDelta {
             text: "\"value\":\"fn main() {}\"}]}".into(),
         });
-        let text = turn
-            .structured_text
-            .lock()
-            .unwrap()
-            .take()
-            .unwrap()
-            .unwrap();
-        let value = encoding
-            .decode(serde_json::from_str(&text).unwrap())
-            .unwrap();
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+        let events = turn.drain();
+        let [
+            ProviderTurnEvent::TextDelta { text },
+            ProviderTurnEvent::TurnFinished { .. },
+        ] = events.as_slice()
+        else {
+            panic!("expected decoded text then end of turn, got {events:?}");
+        };
         assert_eq!(
-            value,
+            serde_json::from_str::<serde_json::Value>(text).unwrap(),
             serde_json::json!({"files":{"src/main.rs":"fn main() {}"}})
         );
-        turn.push(ProviderTurnEvent::TextDelta {
-            text: value.to_string(),
-        });
-        assert!(matches!(
-            turn.drain().as_slice(),
-            [ProviderTurnEvent::TextDelta { .. }]
-        ));
         assert!(
             strict_openai_schema(&schema).is_err(),
             "unencoded maps must never be silently closed"
@@ -12509,19 +12437,32 @@ mod tests {
 
     #[test]
     fn encoded_output_buffer_is_bounded_and_cancellation_remains_visible() {
+        let encoding = bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(
+            &serde_json::json!({"type": "string"}),
+            true,
+        )
+        .unwrap();
+        let oversized =
+            "x".repeat(bcode_model_provider_runtime::MAX_STRUCTURED_OUTPUT_WIRE_BYTES + 1);
         let turn = TurnState::default();
-        *turn.structured_text.lock().unwrap() = Some(Ok(String::new()));
+        turn.capture_structured_output(encoding.clone());
         turn.push(ProviderTurnEvent::TextDelta {
-            text: "x".repeat(1024 * 1024 + 1),
+            text: oversized.clone(),
         });
-        assert!(
-            turn.structured_text
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .is_err()
-        );
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+        assert!(matches!(
+            turn.drain().as_slice(),
+            [
+                ProviderTurnEvent::Error { error },
+                ProviderTurnEvent::TurnFinished { stop_reason: StopReason::Error }
+            ] if error.code == "invalid_structured_output"
+        ));
+
+        let turn = TurnState::default();
+        turn.capture_structured_output(encoding);
+        turn.push(ProviderTurnEvent::TextDelta { text: oversized });
         turn.push(ProviderTurnEvent::Cancelled);
         assert!(matches!(
             turn.drain().as_slice(),
@@ -12666,14 +12607,15 @@ mod tests {
             strict: true,
         });
         let turn = TurnState::default();
+        stream_chat_completion(&request, &turn).await;
+        let events = turn.events.lock().unwrap().clone();
         assert!(matches!(
-            stream_encoded_completion(&request, &turn).await.unwrap(),
-            StreamOutcome::Finished
+            events.back(),
+            Some(ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn
+            })
         ));
-        let text: String = turn
-            .events
-            .lock()
-            .unwrap()
+        let text: String = events
             .iter()
             .filter_map(|event| match event {
                 ProviderTurnEvent::TextDelta { text } => Some(text.as_str()),
@@ -12707,9 +12649,11 @@ mod tests {
                 serde_json::Value::Null,
             ),
         ] {
-            let encoding = StructuredWireEncoding::compile(&schema).unwrap();
+            let encoding =
+                bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(&schema, true)
+                    .unwrap();
             assert!(encoding.is_adapted());
-            let wire = strict_openai_schema(encoding.maps.schema()).unwrap();
+            let wire = strict_openai_schema(encoding.schema()).unwrap();
             assert_eq!(wire["type"], "object");
             assert_eq!(
                 encoding
@@ -12725,8 +12669,10 @@ mod tests {
             );
         }
         let schema = serde_json::json!({"type":"array","items":{"$ref":"#/$defs/Map"},"$defs":{"Map":{"type":"object","additionalProperties":{"type":"string"}}}});
-        let encoding = StructuredWireEncoding::compile(&schema).unwrap();
-        assert!(strict_openai_schema(encoding.maps.schema()).is_ok());
+        let encoding =
+            bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(&schema, true)
+                .unwrap();
+        assert!(strict_openai_schema(encoding.schema()).is_ok());
         assert_eq!(
             encoding
                 .decode(serde_json::json!({"result":[[{"key":"a","value":"b"}]]}))
@@ -12736,9 +12682,11 @@ mod tests {
         let object = serde_json::json!({
             "type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}
         });
-        let encoding = StructuredWireEncoding::compile(&object).unwrap();
+        let encoding =
+            bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(&object, true)
+                .unwrap();
         assert!(!encoding.is_adapted());
-        assert_eq!(encoding.maps.schema(), &object);
+        assert_eq!(encoding.schema(), &object);
     }
 
     #[test]
@@ -12752,9 +12700,11 @@ mod tests {
                 "details":{"type":"object","properties":{"line":{"type":"integer"}}}
             }
         });
-        let encoding = StructuredWireEncoding::compile(&schema).unwrap();
+        let encoding =
+            bcode_model_provider_runtime::StructuredOutputWireEncoding::compile(&schema, true)
+                .unwrap();
         assert!(encoding.is_adapted());
-        let wire = strict_openai_schema(encoding.maps.schema()).unwrap();
+        let wire = strict_openai_schema(encoding.schema()).unwrap();
         assert_eq!(
             wire["properties"]["reason"],
             serde_json::json!({"anyOf":[{"type":"string"},{"type":"null"}]})

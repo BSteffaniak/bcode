@@ -72,6 +72,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 
 * **Provider details remain provider-owned.** Authentication, wire formats, provider-specific metadata, retry interpretation, and request conversion belong in provider integrations or the provider runtime.
 * **Application contracts use normalized model semantics.** The rest of Bcode consumes normalized messages, events, usage, errors, stop reasons, and capabilities rather than provider-native payloads.
+* **Schema adaptations are reversible.** Provider dialect adaptations of structured-output and tool schemas must not change which values the canonical schema accepts, and structured output and tool-call arguments reach tools and application consumers in their canonical representation.
 * **Model resolution is centralized.** Aliases, provider selection, capability checks, and fallback resolution use the model catalog and resolution path rather than local ad hoc matching.
 * **Context accounting has one semantic source.** Request estimation, provider-reported usage, occupancy, and context display must not invent contradictory accounting rules in individual frontends or providers.
 * **Retry and fallback preserve safety.** Retries and provider fallback must not duplicate committed side effects, weaken permission requirements, or misrepresent the final provider or outcome.

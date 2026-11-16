@@ -1,7 +1,7 @@
 //! Reversible representation of optional object properties for closed-object dialects.
 //!
 //! Dialects that require every declared property cannot express "leave this property out".
-//! [`crate::ObjectPropertyPolicy::RequireAllNullableOptionalAndClose`] lets such a property
+//! [`crate::ObjectPropertyPolicy::RequireAllAndClose`] lets such a property
 //! accept `null` on the provider wire instead, and [`omit_null_optional_properties`] restores
 //! the canonical value by removing those `null`s again.
 use serde_json::{Map, Value};
@@ -27,7 +27,7 @@ pub fn omit_null_optional_properties(schema: &Value, value: Value) -> Value {
 
 /// Whether `schema` declares an object property that is optional and does not accept `null`.
 ///
-/// Values produced against a [`crate::ObjectPropertyPolicy::RequireAllNullableOptionalAndClose`]
+/// Values produced against a [`crate::ObjectPropertyPolicy::RequireAllAndClose`]
 /// normalization of such a schema may contain `null`s that [`omit_null_optional_properties`]
 /// must remove before they are valid canonical values.
 #[must_use]
@@ -195,7 +195,7 @@ mod tests {
 
     fn nullable_dialect() -> SchemaDialect {
         SchemaDialect {
-            object_properties: ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
+            object_properties: ObjectPropertyPolicy::RequireAllAndClose,
             ..SchemaDialect::default()
         }
     }

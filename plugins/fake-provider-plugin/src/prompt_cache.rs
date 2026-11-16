@@ -402,13 +402,19 @@ pub fn serve_turn(
                 ToolChoice::Required | ToolChoice::Tool { .. } => true,
                 ToolChoice::Auto => user_text.contains("probe"),
             };
-        wants_tool_call.then(|| ToolCall {
-            id: format!("fake-cache-probe-{completed_calls}"),
-            name: match &request.tool_call_policy.choice {
-                ToolChoice::Tool { name } => name.clone(),
-                _ => request.tools[0].name.clone(),
-            },
-            arguments: serde_json::json!({"index": completed_calls}),
+        wants_tool_call.then(|| {
+            let tool = match &request.tool_call_policy.choice {
+                ToolChoice::Tool { name } => request.tools.iter().find(|tool| tool.name == *name),
+                _ => request.tools.first(),
+            };
+            ToolCall {
+                id: format!("fake-cache-probe-{completed_calls}"),
+                name: match &request.tool_call_policy.choice {
+                    ToolChoice::Tool { name } => name.clone(),
+                    _ => request.tools[0].name.clone(),
+                },
+                arguments: super::indexed_fake_tool_arguments(request, tool, completed_calls),
+            }
         })
     };
     let text = if tool_call.is_some() {

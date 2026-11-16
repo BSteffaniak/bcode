@@ -46,8 +46,9 @@ use bcode_model::{
     ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
-    ProviderRuntime, StreamOutcome, SyntheticStructuredOutput, TurnState, TurnStore,
-    provider_error, retry_hint_from_body, sanitize_provider_diagnostic,
+    ProviderRuntime, STRUCTURED_OUTPUT_WIRE_INSTRUCTION, StreamOutcome,
+    StructuredOutputWireEncoding, SyntheticStructuredOutput, TurnState, TurnStore, provider_error,
+    retry_hint_from_body, sanitize_provider_diagnostic,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,36 @@ impl Drop for PushTurnCleanup<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .finish(&self.id);
+    }
+}
+
+impl BedrockProviderPlugin {
+    /// Start `request` on the turn executor.
+    ///
+    /// Structured output that needs a wire representation is requested in that representation
+    /// and `turn` decodes it, so every executor and Bedrock surface publishes canonical output.
+    fn start_turn_executor(&self, request: ModelTurnRequest, turn: &TurnState) {
+        let request = match structured_output_wire_request(&request, turn) {
+            Ok(wire) => wire.unwrap_or(request),
+            Err(error) => {
+                turn.push(ProviderTurnEvent::Error { error });
+                turn.push(ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::Error,
+                });
+                return;
+            }
+        };
+        match &self.runtime {
+            Ok(runtime) => {
+                self.turn_executor.start(
+                    runtime,
+                    request,
+                    turn.clone(),
+                    Arc::clone(&self.discovery),
+                );
+            }
+            Err(error) => push_runtime_error(turn, error),
+        }
     }
 }
 
@@ -311,13 +342,7 @@ impl BedrockProviderPlugin {
                 projection: bedrock_request_projection(&request, route),
             });
         }
-        match &self.runtime {
-            Ok(runtime) => {
-                self.turn_executor
-                    .start(runtime, request, turn, Arc::clone(&self.discovery));
-            }
-            Err(error) => push_runtime_error(&turn, error),
-        }
+        self.start_turn_executor(request, &turn);
         let response = json_response(&StartTurnResponse { provider_turn_id });
         cleanup.transferred = response.error.is_none();
         drop(cleanup);
@@ -359,17 +384,7 @@ impl BedrockProviderPlugin {
                 projection: bedrock_request_projection(&request, route),
             });
         }
-        match &self.runtime {
-            Ok(runtime) => {
-                self.turn_executor.start(
-                    runtime,
-                    request,
-                    turn.clone(),
-                    Arc::clone(&self.discovery),
-                );
-            }
-            Err(error) => push_runtime_error(&turn, error),
-        }
+        self.start_turn_executor(request, &turn);
 
         let outcome = stream_turn_events(&turn, context);
 
@@ -528,6 +543,48 @@ async fn stream_bedrock_turn(
             });
         }
     }
+}
+
+/// The request to send when structured output needs a wire representation, with `turn` set to
+/// decode the output back into the canonical representation.
+///
+/// Every Bedrock surface (Converse, Anthropic Messages, Mantle `OpenAI` Responses and the
+/// synthetic-tool fallback) then sees the same wire schema, so one decoder covers all of them.
+///
+/// # Errors
+///
+/// Returns an error when the structured-output schema has no lossless wire representation.
+fn structured_output_wire_request(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<Option<ModelTurnRequest>, ProviderError> {
+    let Some(structured) = &request.structured_output else {
+        return Ok(None);
+    };
+    let encoding = StructuredOutputWireEncoding::compile(&structured.schema, true)?;
+    if !encoding.is_adapted() {
+        return Ok(None);
+    }
+    let mut wire = request.clone();
+    if let Some(structured) = wire.structured_output.as_mut() {
+        structured.schema = encoding.schema().clone();
+    }
+    wire.messages.push(ModelMessage {
+        role: MessageRole::System,
+        content: vec![ContentBlock::Text {
+            text: STRUCTURED_OUTPUT_WIRE_INSTRUCTION.to_owned(),
+        }],
+    });
+    turn.capture_structured_output(encoding);
+    Ok(Some(wire))
+}
+
+fn invalid_structured_output_schema(error: &impl std::fmt::Display) -> ProviderError {
+    provider_error(
+        "invalid_structured_output_schema",
+        ProviderErrorCategory::InvalidRequest,
+        error.to_string(),
+    )
 }
 
 /// Validate a turn request against the capabilities of the selected Bedrock surface.
@@ -1037,6 +1094,31 @@ fn mantle_anthropic_support_hint() -> bcode_model::ModelCatalogSupportHint {
 /// content mapping behave identically to every other Responses deployment. Bedrock-specific
 /// concerns stay here: tool naming, and the fact that Mantle rejects `store` and
 /// `previous_response_id` because this adapter does not use server-side conversation reuse.
+/// Structured-output text options for the Mantle `OpenAI` Responses surface; strict schemas use
+/// the `OpenAI` strict dialect.
+fn mantle_openai_text_options(
+    request: &ModelTurnRequest,
+) -> Result<Option<bcode_openai_responses::ResponsesTextOptions>, ProviderError> {
+    let Some(structured) = &request.structured_output else {
+        return Ok(None);
+    };
+    let schema = if structured.strict {
+        bcode_openai_responses::strict_schema(&structured.schema)
+            .map_err(|error| invalid_structured_output_schema(&error))?
+    } else {
+        structured.schema.clone()
+    };
+    Ok(Some(bcode_openai_responses::ResponsesTextOptions {
+        format: Some(bcode_openai_responses::ResponsesTextFormat {
+            r#type: "json_schema",
+            name: structured.name.clone(),
+            schema,
+            strict: structured.strict,
+        }),
+        verbosity: "low",
+    }))
+}
+
 fn build_mantle_openai_request(
     request: &ModelTurnRequest,
     model_id: &str,
@@ -1094,17 +1176,7 @@ fn build_mantle_openai_request(
         parallel_tool_calls: (!request.tools.is_empty())
             .then_some(request.tool_call_policy.parallel)
             .flatten(),
-        text: request.structured_output.as_ref().map(|structured| {
-            bcode_openai_responses::ResponsesTextOptions {
-                format: Some(bcode_openai_responses::ResponsesTextFormat {
-                    r#type: "json_schema",
-                    name: structured.name.clone(),
-                    schema: structured.schema.clone(),
-                    strict: structured.strict,
-                }),
-                verbosity: "low",
-            }
-        }),
+        text: mantle_openai_text_options(request)?,
         reasoning: mantle_openai_reasoning(request),
         include: Vec::new(),
         prompt_cache_key: mantle_openai_explicit_prompt_cache_enabled(request).then(|| {
@@ -3172,8 +3244,7 @@ fn bedrock_tool_input_schema(tool: &ToolDefinition) -> Result<&serde_json::Value
 /// `null`, which the host removes again before dispatching the call.
 fn bedrock_strict_tool_schema_dialect() -> bcode_model_schema::SchemaDialect {
     bcode_model_schema::SchemaDialect {
-        object_properties:
-            bcode_model_schema::ObjectPropertyPolicy::RequireAllNullableOptionalAndClose,
+        object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
         reject_recursive_references: false,
         ..bcode_model_schema::SchemaDialect::default()
     }
@@ -7552,6 +7623,112 @@ mod tests {
     };
     use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
 
+    fn optional_reason_structured_request() -> ModelTurnRequest {
+        let mut request = test_model_turn_request();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "Verdict".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["verdict"],
+                "properties": {"verdict": {"type": "string"}, "reason": {"type": "string"}}
+            }),
+            strict: true,
+        });
+        request
+    }
+
+    #[test]
+    fn structured_output_with_optional_fields_is_decoded_before_the_host_sees_it() {
+        let request = optional_reason_structured_request();
+        let turn = TurnState::default();
+
+        let wire = structured_output_wire_request(&request, &turn)
+            .expect("wire request")
+            .expect("optional properties need decoding");
+
+        assert_eq!(
+            wire.structured_output.as_ref().unwrap().schema,
+            request.structured_output.as_ref().unwrap().schema
+        );
+        assert!(matches!(
+            wire.messages.last(),
+            Some(ModelMessage {
+                role: MessageRole::System,
+                ..
+            })
+        ));
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "{\"verdict\":\"ok\",".to_owned(),
+        });
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "\"reason\":null}".to_owned(),
+        });
+        assert_eq!(turn.drain(), [] as [ProviderTurnEvent; 0]);
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+        assert_eq!(
+            turn.drain(),
+            vec![
+                ProviderTurnEvent::TextDelta {
+                    text: "{\"verdict\":\"ok\"}".to_owned()
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn
+                }
+            ]
+        );
+
+        let exact = {
+            let mut request = request;
+            request.structured_output.as_mut().unwrap().schema = serde_json::json!({
+                "type": "object", "required": ["verdict"],
+                "properties": {"verdict": {"type": "string"}}
+            });
+            request
+        };
+        assert!(
+            structured_output_wire_request(&exact, &TurnState::default())
+                .expect("wire request")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn synthetic_structured_output_drops_nulls_for_omitted_optionals() {
+        let request = optional_reason_structured_request();
+        let synthetic =
+            SyntheticStructuredOutput::new(request.structured_output.as_ref().unwrap(), false)
+                .expect("synthetic constraint");
+        let tool = synthetic.tool();
+
+        let text = synthetic
+            .completed_text(&ToolCall {
+                id: "synthetic".to_owned(),
+                name: tool.name,
+                arguments: serde_json::json!({"verdict": "ok", "reason": null}),
+            })
+            .expect("synthetic text");
+
+        assert_eq!(text, "{\"verdict\":\"ok\"}");
+    }
+
+    #[test]
+    fn mantle_openai_strict_structured_output_uses_the_openai_strict_dialect() {
+        let request = optional_reason_structured_request();
+
+        let body = build_mantle_openai_request(&request, "openai.test-model").expect("request");
+
+        let schema = &body["text"]["format"]["schema"];
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], serde_json::json!(["reason", "verdict"]));
+        assert_eq!(
+            schema["properties"]["reason"],
+            serde_json::json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
+        );
+    }
+
     #[test]
     fn converse_structured_output_normalizes_schema_and_builds_output_config() {
         let mut request = test_model_turn_request();
@@ -7580,7 +7757,15 @@ mod tests {
         assert_eq!(definition.name(), Some("LoopWorkflowIteration"));
         let schema: serde_json::Value =
             serde_json::from_str(definition.schema()).expect("normalized schema JSON");
-        assert!(schema.pointer("/properties/iteration/minimum").is_none());
+        assert!(
+            schema
+                .pointer("/properties/iteration/anyOf/0/minimum")
+                .is_none()
+        );
+        assert_eq!(
+            schema.pointer("/properties/summary/anyOf/1"),
+            Some(&serde_json::json!({"type": "null"}))
+        );
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["required"],
@@ -10077,10 +10262,16 @@ mod tests {
                     1
                 };
                 for (index, tool) in request.tools.iter().take(tool_count).enumerate() {
+                    // A strict provider sends `null` for an optional argument it leaves out.
+                    let arguments = if tool.name == "filesystem.read" {
+                        serde_json::json!({"path": "/tmp/bcode-provider-conformance", "note": null})
+                    } else {
+                        serde_json::json!({})
+                    };
                     let call = ToolCall {
                         id: format!("bedrock-conformance-call-{index}"),
                         name: tool.name.clone(),
-                        arguments: serde_json::json!({}),
+                        arguments,
                     };
                     turn.push(ProviderTurnEvent::ToolCallStarted {
                         call_id: call.id.clone(),
@@ -10096,8 +10287,15 @@ mod tests {
                 });
                 return;
             }
+            let text = match &request.structured_output {
+                Some(structured) if structured.schema.pointer("/properties/note").is_some() => {
+                    "{\"ok\":true,\"note\":null}"
+                }
+                Some(_) => "{\"ok\":true}",
+                None => "bedrock conformance",
+            };
             turn.push(ProviderTurnEvent::TextDelta {
-                text: "bedrock conformance".to_string(),
+                text: text.to_string(),
             });
             turn.push(ProviderTurnEvent::Usage {
                 usage: TokenUsage {
@@ -10163,6 +10361,33 @@ mod tests {
     }
 
     #[test]
+    fn every_turn_executor_publishes_canonical_structured_output() {
+        let plugin = BedrockProviderPlugin {
+            turn_executor: Arc::new(DeterministicBedrockTurnExecutor),
+            ..BedrockProviderPlugin::default()
+        };
+        let mut request = optional_reason_structured_request();
+        request.structured_output.as_mut().unwrap().schema = serde_json::json!({
+            "type": "object",
+            "required": ["ok"],
+            "properties": {"ok": {"const": true}, "note": {"type": "string"}}
+        });
+        let turn = TurnState::default();
+
+        plugin.start_turn_executor(request, &turn);
+
+        let text: String = turn
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::TextDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "{\"ok\":true}");
+    }
+
+    #[test]
     fn bedrock_adapter_passes_public_deterministic_conformance_suite() {
         let options = ProviderConformanceOptions {
             provider_context: ProviderRequestContext {
@@ -10188,6 +10413,7 @@ mod tests {
         for required_case in [
             "baseline turn",
             "tool calling",
+            "optional tool arguments",
             "prompt caching",
             "cancellation",
         ] {

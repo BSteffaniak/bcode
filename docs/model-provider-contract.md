@@ -280,7 +280,9 @@ carries the active provider context and selected model; unknown claims fail clos
 
 Strict tool-schema enforcement is request-level policy (`ModelTurnRequest.tool_schema_mode`), not
 metadata on portable tool definitions. Provider adapters may normalize schemas to their declared
-JSON Schema dialect. An adapter may emulate structured output only on a tool-free provider round;
+JSON Schema dialect, but a dialect adaptation must be reversible: it must not change which values
+the canonical schema accepts, and output produced against the adapted schema reaches the host in
+its canonical representation. An adapter may emulate structured output only on a tool-free provider round;
 its synthetic tool must be intercepted inside the adapter and must never enter host dispatch,
 authorization, or canonical tool history. Negotiated fidelity is persisted as a versioned canonical
 session event.
@@ -292,6 +294,39 @@ structured-output request, disable every host tool, carry only bounded validatio
 must not replay completed tool work. Providers receive ordinary normalized requests and must not
 infer authorization or workflow semantics from correction metadata. Exhaustion terminates with one
 normalized error; an invalid candidate is never reported as successful structured output.
+
+## Canonical schema representation
+
+Strict dialects such as `OpenAI` strict mode and Bedrock's structured output close every object and
+require every declared property. They cannot express "leave this property out", so
+`bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose` lets each optional property that does
+not already accept `null` also accept `null`, keeping its annotations visible to the model. A `null`
+for such a property means the property was omitted, and
+`bcode_model_schema::omit_null_optional_properties` restores the canonical value. Values the
+canonical schema accepts are never changed by this restoration.
+
+* **Structured output** is restored by the provider adapter. Adapters compile
+  `bcode_model_provider_runtime::StructuredOutputWireEncoding` from the canonical schema (optional
+  object-root envelope, dynamic maps as key/value records, nullable optional properties), request
+  the wire schema when the encoding is adapted, and install it on the turn with
+  `TurnState::capture_structured_output`. The turn state then holds streamed wire text and
+  publishes only the decoded canonical text when the turn ends; a value that cannot be decoded ends
+  the turn with an `invalid_structured_output` error. Synthetic-tool emulation removes optional
+  `null`s in `SyntheticStructuredOutput::completed_text`.
+* **Tool-call arguments** are restored by the host. The agent runtime removes optional `null`s
+  against the tool's input schema before preparation, so permission checks, presentation and
+  invocation see canonical arguments. Providers may report either form; the conversation history
+  keeps the arguments as the model produced them.
+
+Empty strings are not normalized: `""` can be a real value. A tool that treats blank optional
+strings as omitted opts in with `bcode_tool::arguments::without_blank_values`, naming any fields
+whose blank string is meaningful.
+
+The provider conformance suite (`run_provider_conformance_suite`) checks both directions:
+`optional tool arguments` requires tool-call arguments that satisfy the canonical schema after
+optional `null`s are removed, requesting strict tool schemas when they are guaranteed, and
+`structured output optional fields` requires an omitted optional field to be absent rather than
+`null` or a placeholder.
 
 ## Tool calls and continuation
 
