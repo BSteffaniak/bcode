@@ -91,6 +91,26 @@ fn managed_input_available(
     true
 }
 
+/// A managed composer placement overrides the requested one; steering also names the native
+/// turn it expects to steer.
+fn managed_placement(
+    chat: &ActiveChat,
+    requested: bcode_ipc::PromptPlacement,
+) -> (bcode_ipc::PromptPlacement, Option<String>) {
+    match &chat.app.managed_composer.placement {
+        Some(bcode_harness_models::HarnessPlacement::NextTurn) => {
+            (bcode_ipc::PromptPlacement::FollowUp, None)
+        }
+        Some(bcode_harness_models::HarnessPlacement::Steer {
+            expected_native_turn_id,
+        }) => (
+            bcode_ipc::PromptPlacement::Steering,
+            Some(expected_native_turn_id.clone()),
+        ),
+        None => (requested, None),
+    }
+}
+
 pub fn stage_session_message(
     launch_working_directory: &std::path::Path,
     launch_options: super::TuiLaunchOptions,
@@ -138,21 +158,7 @@ pub fn stage_session_message(
         .is_none()
         .then(|| chat.app.selected_account_reference().map(ToOwned::to_owned))
         .flatten();
-    let expected_native_turn_id = match &chat.app.managed_composer.placement {
-        Some(bcode_harness_models::HarnessPlacement::Steer {
-            expected_native_turn_id,
-        }) => Some(expected_native_turn_id.clone()),
-        _ => None,
-    };
-    let placement = match &chat.app.managed_composer.placement {
-        Some(bcode_harness_models::HarnessPlacement::NextTurn) => {
-            bcode_ipc::PromptPlacement::FollowUp
-        }
-        Some(bcode_harness_models::HarnessPlacement::Steer { .. }) => {
-            bcode_ipc::PromptPlacement::Steering
-        }
-        None => placement,
-    };
+    let (placement, expected_native_turn_id) = managed_placement(chat, placement);
     // A native agent learns the conversation's Bcode agent with the next message after it
     // changes, and again after it summarized away the earlier announcement.
     let native_agent_change = if chat.app.managed_execution_session().is_some() {
