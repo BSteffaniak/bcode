@@ -12,6 +12,7 @@ use crate::testing::harness::{Scenario, Screen};
 use bcode_code_review_models::{
     PathSelector, REVIEW_SOURCE_ERROR_UNAUTHENTICATED, ReviewSourceKind, ReviewWorkspace,
 };
+use bmux_tui::event::{MouseButton, MouseEventKind};
 use std::sync::Arc;
 
 /// Open home and start the wizard.
@@ -504,6 +505,22 @@ fn clicks_on_tree_rows_expand_folders_and_select_files_at_every_width() {
         scenario.click(point.x, point.y);
         let screen = settled(&mut scenario);
         assert!(!screen.contains("説明書.txt"), "{}", screen.text());
+        // A right click selects the folder itself, and again unselects it.
+        let point = screen.find("名前/").expect("folder row");
+        scenario.mouse(MouseEventKind::Down(MouseButton::Right), point.x, point.y);
+        let screen = settled(&mut scenario);
+        assert_eq!(
+            paths(&scenario).include(),
+            [PathSelector::Folder {
+                path: "名前".to_owned()
+            }],
+            "{width}x{height}:\n{}",
+            screen.text()
+        );
+        assert!(screen.contains("[x] 名前/"), "{}", screen.text());
+        scenario.mouse(MouseEventKind::Down(MouseButton::Right), point.x, point.y);
+        settled(&mut scenario);
+        assert_eq!(paths(&scenario).include(), []);
     }
     // At a tiny width the keyboard still selects, and emoji names stay inside the frame.
     scenario.resize(20, 12);
@@ -523,6 +540,56 @@ fn clicks_on_tree_rows_expand_folders_and_select_files_at_every_width() {
             path: "名前".to_owned()
         }]
     );
+}
+
+#[test]
+fn a_filter_with_more_matches_than_shown_says_how_many() {
+    let fixture = fixture();
+    let many = fixture.root().join("many");
+    std::fs::create_dir_all(&many).expect("mkdir");
+    for index in 0..520 {
+        std::fs::write(many.join(format!("item-{index:03}.txt")), "x\n").expect("write");
+    }
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 6);
+    scenario.paste("item-");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("500 of 520 matches"), "{}", screen.text());
+    // Narrowed so every match is listed, the frame no longer says so.
+    scenario.paste("51");
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("item-519.txt"), "{}", screen.text());
+    assert!(!screen.contains(" matches"), "{}", screen.text());
+}
+
+#[test]
+fn uncommitted_paths_count_the_changed_files_of_the_selection() {
+    let fixture = fixture();
+    std::fs::write(fixture.root().join("docs/zz-new.txt"), "new\n").expect("write");
+    let changed = fixture
+        .git(&["status", "--porcelain", "-uall", "--", "docs"])
+        .lines()
+        .count();
+    let files = fixture.git(&["ls-files", "--", "docs"]).lines().count() + 1;
+    assert!(changed < files, "the fixture has unchanged files in docs/");
+    let backend = Arc::new(TestBackend::default());
+    let mut scenario = wizard(&fixture, &backend);
+    pick_type(&mut scenario, 0);
+    scenario.keys(&["down", "down", "down", "enter"]);
+    settled(&mut scenario);
+    focus_path(&mut scenario, "docs/");
+    scenario.key("space");
+    let screen = settled(&mut scenario);
+    assert_eq!(
+        paths(&scenario).total(),
+        Some(u32::try_from(changed).expect("count"))
+    );
+    let summary = format!(
+        "1 item · {changed} changed file{}",
+        if changed == 1 { "" } else { "s" }
+    );
+    assert!(screen.contains(&summary), "{summary}:\n{}", screen.text());
 }
 
 #[test]

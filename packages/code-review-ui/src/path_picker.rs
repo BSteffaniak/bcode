@@ -65,7 +65,8 @@ pub enum PathPurpose {
     Files,
     /// A repository review limited to folders: folders only.
     Folders,
-    /// Uncommitted changes in some paths: files and folders, counted by changed files.
+    /// Uncommitted changes in some paths: files and folders, counted by changed files (rows and
+    /// the selection summary).
     Uncommitted,
 }
 
@@ -180,6 +181,8 @@ enum Message {
     },
     Counted {
         seq: u64,
+        /// The selection revision the count was asked for.
+        revision: u64,
         result: Result<ReviewPathsResolveResponse, String>,
     },
 }
@@ -393,13 +396,20 @@ impl PathPicker {
         })
     }
 
-    /// The selection's file count now, once counted.
+    /// The selection's file count now, once counted: for uncommitted changes, the files that
+    /// changed since `HEAD`.
     #[must_use]
     pub fn total(&self) -> Option<u32> {
         self.counts
             .as_ref()
             .filter(|_| self.counted == self.selection_revision)
-            .map(|counts| counts.total)
+            .map(|counts| {
+                if self.purpose == PathPurpose::Uncommitted {
+                    counts.changed
+                } else {
+                    counts.total
+                }
+            })
     }
 
     /// The status line text (why a row could not be selected, for example).
@@ -502,11 +512,17 @@ impl PathPicker {
                     }
                 }
             }
-            Message::Counted { seq, result } => {
+            Message::Counted {
+                seq,
+                revision,
+                result,
+            } => {
                 if seq != self.counts_seq {
                     return;
                 }
-                self.counted = self.selection_revision;
+                // The count answers the selection it was asked about: when the selection
+                // changed since, it is not current and a new count is asked for.
+                self.counted = revision;
                 self.counts = result.ok();
             }
         }
@@ -576,10 +592,15 @@ impl PathPicker {
                 include_ignored: self.show_ignored,
                 refresh: false,
             };
-            let (services, seq) = (self.services.clone(), self.counts_seq);
+            let (services, seq, revision) = (
+                self.services.clone(),
+                self.counts_seq,
+                self.selection_revision,
+            );
             self.spawn(host, async move {
                 Message::Counted {
                     seq,
+                    revision,
                     result: services.call(request).await.map_err(|error| error.message),
                 }
             });
@@ -653,10 +674,27 @@ impl PathPicker {
             Mode::Tree | Mode::Filter => self.tree_rows("", 0, &mut rows),
         }
         self.rows = rows;
+        self.title = self.frame_title();
         self.focus = focused
             .and_then(|id| self.rows.iter().position(|row| row.id == id))
             .unwrap_or_else(|| self.focus.min(self.rows.len().saturating_sub(1)));
         self.keep_focus_visible();
+    }
+
+    /// The frame's title, padded with a space on each side: the purpose, and how many of a
+    /// filter's matches are shown when it found more than the picker lists.
+    fn frame_title(&self) -> String {
+        let shown = u32::try_from(self.search.entries.len()).unwrap_or(u32::MAX);
+        let filtering = self.mode != Mode::Selection && !self.search_query().is_empty();
+        if filtering && self.search.total > shown && self.search.requested == self.search.answered {
+            format!(
+                " {} · {shown} of {} matches, type more to narrow ",
+                self.purpose.title(),
+                self.search.total
+            )
+        } else {
+            format!(" {} ", self.purpose.title())
+        }
     }
 
     fn tree_rows(&self, dir: &str, depth: u16, rows: &mut Vec<Row>) {
@@ -754,6 +792,7 @@ impl PathPicker {
                 kind: RowKind::Entry(entry.clone()),
             });
         }
+
         if rows.is_empty() {
             rows.push(Row {
                 id: "note:none".to_owned(),
@@ -1304,6 +1343,15 @@ impl PathPicker {
                 self.move_focus(0);
                 PathPickerOutcome::Redraw
             }
+            // A right click selects or unselects any row, a folder of the tree included (a
+            // left click on one expands it).
+            MouseEventKind::Down(MouseButton::Right) => {
+                let Some(tree) = on_tree else {
+                    return PathPickerOutcome::Ignored;
+                };
+                let row = Self::hit_row(layout, items, &self.tree_state, tree, point);
+                row.map_or(PathPickerOutcome::Ignored, |row| self.select_row(row))
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(tree) = on_tree {
                     let row = Self::hit_row(layout, items, &self.tree_state, tree, point);
@@ -1350,6 +1398,17 @@ impl PathPicker {
                     && (rect.x..rect.x + rect.width).contains(&local_x)
             })
         })
+    }
+
+    /// A right click on visible row `row`: focus it and select or unselect it.
+    fn select_row(&mut self, row: usize) -> PathPickerOutcome {
+        let index = self.scroll + row;
+        if !self.rows.get(index).is_some_and(Self::selectable) {
+            return PathPickerOutcome::Ignored;
+        }
+        self.focus = index;
+        self.toggle_focused();
+        PathPickerOutcome::Redraw
     }
 
     /// A click on visible row `row`: focus it; a folder of the tree expands or collapses, any
@@ -1584,9 +1643,16 @@ impl PathPicker {
             )]);
         }
         let items = self.include.len() + self.exclude.len();
-        let files = self
-            .total()
-            .map_or_else(|| "counting…".to_owned(), Self::files_text);
+        let files = self.total().map_or_else(
+            || "counting…".to_owned(),
+            |count| {
+                if self.purpose == PathPurpose::Uncommitted {
+                    format!("{count} changed file{}", if count == 1 { "" } else { "s" })
+                } else {
+                    Self::files_text(count)
+                }
+            },
+        );
         Line::from_spans(vec![
             Span::styled(
                 format!(
@@ -1732,5 +1798,66 @@ impl PathPicker {
             });
         }
         self.painted = Some((area, layout, items));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::backend::TestBackend;
+
+    fn counted(total: u32) -> ReviewPathsResolveResponse {
+        ReviewPathsResolveResponse {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            total,
+            changed: 0,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_count_for_an_earlier_selection_is_not_shown_as_current() {
+        let backend = TestBackend::default();
+        let picker = PathPicker::new(
+            backend.services(),
+            PathBuf::from("/repo"),
+            PathPurpose::Files,
+        );
+        let mut picker = picker.with_selection(
+            vec![PathSelector::Folder {
+                path: "docs".to_owned(),
+            }],
+            Vec::new(),
+            false,
+        );
+        // A count is asked for the folder alone…
+        let asked = picker.selection_revision;
+        picker.counts_seq += 1;
+        picker.counts_requested = asked;
+        // …the selection grows before it answers…
+        picker.include.push(PathSelector::File {
+            path: "README.md".to_owned(),
+        });
+        picker.selection_changed();
+        picker.apply(Message::Counted {
+            seq: picker.counts_seq,
+            revision: asked,
+            result: Ok(counted(3)),
+        });
+        // …so the answer is not the selection's count, and another is due.
+        assert_eq!(picker.total(), None);
+        assert!(picker.loading());
+        assert_ne!(picker.counts_requested, picker.selection_revision);
+        // The answer for the selection now is current.
+        picker.counts_seq += 1;
+        picker.counts_requested = picker.selection_revision;
+        picker.apply(Message::Counted {
+            seq: picker.counts_seq,
+            revision: picker.selection_revision,
+            result: Ok(counted(4)),
+        });
+        assert_eq!(picker.total(), Some(4));
+        assert!(!picker.loading());
     }
 }

@@ -694,12 +694,14 @@ pub fn resolve(
         })
         .collect();
     let mut total = 0_u32;
+    let mut changed = 0_u32;
     let paths = index
         .files
         .iter()
-        .map(|file| (file.path.as_str(), true))
-        .chain(unindexed.iter().map(|path| (*path, false)));
-    for (path, indexed) in paths {
+        .map(|file| (file.path.as_str(), Some(file.changed)))
+        .chain(unindexed.iter().map(|path| (*path, None)));
+    for (path, indexed_changed) in paths {
+        let indexed = indexed_changed.is_some();
         let mut chosen = false;
         for ((selector, glob), count) in
             request.include.iter().zip(&include_globs).zip(&mut include)
@@ -726,6 +728,7 @@ pub fn resolve(
         }
         if !removed {
             total = total.saturating_add(1);
+            changed = changed.saturating_add(u32::from(indexed_changed == Some(true)));
         }
     }
     for count in include.iter_mut().chain(exclude.iter_mut()) {
@@ -737,6 +740,7 @@ pub fn resolve(
         include,
         exclude,
         total,
+        changed,
         truncated: index.truncated,
     })
 }

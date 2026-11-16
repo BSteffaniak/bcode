@@ -539,6 +539,9 @@ pub struct ReviewPathsResolveResponse {
     pub exclude: Vec<ReviewSelectorCount>,
     /// Files selected after exclusions.
     pub total: u32,
+    /// Of `total`, files changed since `HEAD` (untracked files included).
+    #[serde(default)]
+    pub changed: u32,
     /// The path index stopped at [`REVIEW_PATH_INDEX_MAX_PATHS`]; counts are lower bounds.
     #[serde(default)]
     pub truncated: bool,
