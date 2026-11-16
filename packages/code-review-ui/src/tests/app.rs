@@ -333,7 +333,12 @@ fn suggestions_follow_repository_state_and_the_provider() {
     let (scenario, screen) = open(&fixture, &backend, Entry::Home, 160, 40);
     assert_eq!(
         scenario.surface().home().unwrap().suggestion_titles(),
-        ["Uncommitted changes", "Branch main", "New review…"]
+        [
+            "Uncommitted changes",
+            "Branch main",
+            "New review…",
+            "Review files or folders…"
+        ]
     );
     assert!(screen.contains("1 commit ahead of origin/main"));
     assert!(screen.contains("Start a review"));
@@ -367,6 +372,7 @@ fn suggestions_follow_repository_state_and_the_provider() {
             &format!("Review requested: #{FAKE_REQUESTED}"),
             "New commits: Old pass",
             "New review…",
+            "Review files or folders…",
         ]
     );
     assert!(home.stats(&moved.id).is_some_and(|stats| stats.new_commits));
@@ -406,7 +412,12 @@ fn suggestions_follow_repository_state_and_the_provider() {
     let (scenario, screen) = open(&fixture, &backend, Entry::Home, 160, 40);
     assert_eq!(
         scenario.surface().home().unwrap().suggestion_titles(),
-        ["Uncommitted changes", "Branch main", "New review…"]
+        [
+            "Uncommitted changes",
+            "Branch main",
+            "New review…",
+            "Review files or folders…"
+        ]
     );
     assert!(screen.contains("not signed in"), "{}", screen.text());
 }

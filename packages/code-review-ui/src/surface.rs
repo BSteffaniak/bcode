@@ -646,6 +646,15 @@ const fn digit_count(value: u32) -> u32 {
     }
 }
 
+/// What the app shows instead of the review when it leaves.
+#[derive(Debug, Default)]
+struct Leaving {
+    /// Closing asks the app to edit the review's sources.
+    edit_sources: bool,
+    /// A review to open in place of this one (`files_review_folder`).
+    start: Option<crate::entry::Entry>,
+}
+
 /// The review screen.
 // The flags are independent pieces of surface state (refresh, tree reveal, restore, and
 // annotation loading), not a mode that an enum would describe.
@@ -787,8 +796,8 @@ pub struct ReviewSurface {
     clipboard: Option<(String, &'static str)>,
     /// Exiting an unsaved review with annotations was asked once (the next exit leaves).
     exit_armed: bool,
-    /// Closing asks the app to edit the review's sources.
-    edit_requested: bool,
+    /// What replaces the review when it closes or is replaced.
+    leaving: Leaving,
     /// Permission answers and stops waiting to be sent.
     feed_requests: VecDeque<feed::FeedRequest>,
     /// When the next spinner frame was asked for.
@@ -914,7 +923,7 @@ impl ReviewSurface {
             opening: OpenInFlight::default(),
             clipboard: None,
             exit_armed: false,
-            edit_requested: false,
+            leaving: Leaving::default(),
             feed_requests: VecDeque::new(),
             feed_wake: None,
         }
@@ -1608,14 +1617,14 @@ impl ReviewSurface {
                 "the review on screen is not saved and has comments, AI answers or suggestions that leaving would drop; ask the user to save it ({save}) or to leave it themselves"
             ));
         }
-        self.edit_requested = false;
+        self.leaving.edit_sources = false;
         Ok(self.begin_close(host))
     }
 
     /// The close action: plain, or asking the app to edit the review's sources.
     const fn close_action(&self) -> Action {
         Action::Close {
-            edit_sources: self.edit_requested,
+            edit_sources: self.leaving.edit_sources,
         }
     }
 
@@ -1628,7 +1637,7 @@ impl ReviewSurface {
             );
             return Action::Redraw;
         }
-        self.edit_requested = true;
+        self.leaving.edit_sources = true;
         self.begin_close(host)
     }
 
@@ -3186,6 +3195,62 @@ impl ReviewSurface {
         }
     }
 
+    /// `files_review_folder`: review the folder (or file) selected in the file panel, or the
+    /// folder of the file at the cursor, as it is now, in a new transient review.
+    fn review_folder_as_it_is_now(&mut self) -> Action {
+        let Some(review) = &self.review else {
+            return Action::None;
+        };
+        let selected = (matches!(self.focus, Focus::Files | Focus::Filter))
+            .then(|| review.tree.borrow().selected_id().map(str::to_owned))
+            .flatten();
+        let folder = |path: &str| {
+            (
+                bcode_code_review_models::ReviewSourceKind::FileSet {
+                    include: vec![bcode_code_review_models::PathSelector::Folder {
+                        path: path.to_owned(),
+                    }],
+                    exclude: Vec::new(),
+                },
+                format!("{path}/ as it is now"),
+            )
+        };
+        let target = selected.as_deref().map_or_else(
+            || {
+                review
+                    .cursor_file()
+                    .map(|file| match file.path.rsplit_once('/') {
+                        Some((parent, _)) => folder(parent),
+                        None => (
+                            bcode_code_review_models::ReviewSourceKind::Repository,
+                            "Repository as it is now".to_owned(),
+                        ),
+                    })
+            },
+            |id| {
+                review.files.folder_path(id).map(folder).or_else(|| {
+                    review.files.file_of(id).map(|file| {
+                        (
+                            bcode_code_review_models::ReviewSourceKind::File {
+                                path: file.path.clone(),
+                            },
+                            format!("{} as it is now", file.path),
+                        )
+                    })
+                })
+            },
+        );
+        let Some((kind, title)) = target else {
+            self.set_status("select a folder or file to review", StatusSeverity::Info);
+            return Action::Redraw;
+        };
+        self.leaving.start = Some(crate::entry::Entry::Sources {
+            title: Some(title),
+            sources: vec![kind],
+        });
+        Action::Redraw
+    }
+
     /// Move the tree selection by `delta` visible rows; a file row moves the document cursor.
     fn move_tree(&mut self, delta: i64) {
         let Some(review) = &self.review else {
@@ -4228,6 +4293,9 @@ impl ReviewSurface {
                 .requests
                 .push(crate::assistant::LinkRequest::Action(action.to_owned()));
             return Action::Redraw;
+        }
+        if action == "files_review_folder" {
+            return self.review_folder_as_it_is_now();
         }
         if let Some(result) = self.surface_action(action, count, host) {
             return result;

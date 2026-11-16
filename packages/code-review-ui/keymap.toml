@@ -325,6 +325,9 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.edit_sources", scope = "code-review", description = "Edit the review's sources…", defaults = [
     ] },
+    { id = "bcode.code_review.files_review_folder", scope = "code-review", description = "Review this folder as it is now (the file panel's folder or file, else the cursor file's folder)", defaults = [
+        "alt+r",
+    ] },
     { id = "bcode.code_review.files_open", scope = "code-review-files", description = "Open the file (fold a directory) and go to the review", defaults = [
         "enter",
     ] },
@@ -382,6 +385,9 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.home_new", scope = "code-review-home", description = "New review", defaults = [
         "n",
+    ] },
+    { id = "bcode.code_review.home_new_files", scope = "code-review-home", description = "New review: files or folders as they are now…", defaults = [
+        "shift+n",
     ] },
     { id = "bcode.code_review.home_continue", scope = "code-review-home", description = "Continue the latest review", defaults = [
         "c",

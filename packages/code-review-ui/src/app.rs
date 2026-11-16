@@ -662,6 +662,7 @@ impl ReviewApp {
     }
 
     fn home_outcome(&mut self, outcome: HomeOutcome, host: &UiContext) -> Action {
+        let outcome_files = outcome == HomeOutcome::NewFiles;
         match outcome {
             HomeOutcome::Ignored => Action::None,
             HomeOutcome::Redraw => Action::Redraw,
@@ -674,8 +675,12 @@ impl ReviewApp {
                 self.start(entry, host);
                 Action::Redraw
             }
-            HomeOutcome::New => {
-                let mut wizard = Wizard::new(self.services.clone(), self.repo.clone());
+            HomeOutcome::New | HomeOutcome::NewFiles => {
+                let mut wizard = if outcome_files {
+                    Wizard::files(self.services.clone(), self.repo.clone())
+                } else {
+                    Wizard::new(self.services.clone(), self.repo.clone())
+                };
                 wizard.prepare_keymap(host);
                 self.route = Route::Wizard(Box::new(wizard));
                 self.keymap_stale = true;
@@ -775,6 +780,10 @@ impl ReviewApp {
                 let result = review.handle_event(event, host);
                 if matches!(result.action, Action::Close { .. }) {
                     return EventResult::from_action(self.review_action(result.action, host));
+                }
+                if let Some(entry) = review.take_start_request() {
+                    self.start(entry, host);
+                    return EventResult::from_action(Action::Redraw);
                 }
                 return result;
             }

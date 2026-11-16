@@ -1143,3 +1143,85 @@ fn every_wizard_mode_can_be_created_through_create_review() {
         }
     }
 }
+
+#[test]
+fn home_offers_files_reviews_and_the_file_panel_reviews_folders_as_they_are_now() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default());
+    let (mut scenario, screen) = open(&fixture, &backend, Entry::Home, 140, 40);
+    assert!(
+        screen.contains("Review files or folders…"),
+        "{}",
+        screen.text()
+    );
+    scenario.key("shift+n");
+    settled(&mut scenario);
+    assert_eq!(scenario.surface().route_name(), RouteName::NewReview);
+    assert_eq!(paths(&scenario).include(), []);
+    scenario.key("esc");
+    settled(&mut scenario);
+    assert_eq!(step(&scenario), 1);
+
+    // The cursor file's folder, from a review of one file.
+    let (mut scenario, _) = open(
+        &fixture,
+        &backend,
+        Entry::Sources {
+            title: None,
+            sources: vec![ReviewSourceKind::File {
+                path: UNICODE_FILE.to_owned(),
+            }],
+        },
+        140,
+        40,
+    );
+    scenario.key("alt+r");
+    settled(&mut scenario);
+    let review = scenario.surface().review().expect("review");
+    assert_eq!(
+        kinds(review.workspace().expect("workspace")),
+        [ReviewSourceKind::FileSet {
+            include: vec![PathSelector::Folder {
+                path: "docs".to_owned()
+            }],
+            exclude: Vec::new(),
+        }]
+    );
+    let screen = settled(&mut scenario);
+    assert!(screen.contains("docs/ as it is now"), "{}", screen.text());
+
+    // A folder row of the file panel (the first one, below the file rows above it).
+    for downs in 0..40 {
+        let (mut scenario, _) = open(
+            &fixture,
+            &backend,
+            Entry::Sources {
+                title: None,
+                sources: vec![ReviewSourceKind::Repository],
+            },
+            140,
+            40,
+        );
+        scenario.key("tab");
+        for _ in 0..downs {
+            scenario.key("down");
+        }
+        settled(&mut scenario);
+        scenario.key("alt+r");
+        settled(&mut scenario);
+        let review = scenario.surface().review().expect("review");
+        match kinds(review.workspace().expect("workspace")).as_slice() {
+            [ReviewSourceKind::FileSet { include, .. }] => {
+                let [PathSelector::Folder { path }] = include.as_slice() else {
+                    panic!("{include:?}");
+                };
+                assert!(fixture.root().join(path).is_dir(), "{path}");
+                return;
+            }
+            // A file row reviews that file.
+            [ReviewSourceKind::File { path }] => assert!(fixture.root().join(path).exists()),
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("no folder row in the file panel");
+}

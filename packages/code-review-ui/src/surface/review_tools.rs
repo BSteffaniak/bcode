@@ -91,6 +91,12 @@ impl ReviewSurface {
         self.link.take_requests()
     }
 
+    /// The review another review should replace on screen (a folder of the file panel
+    /// reviewed as it is now), asked for since the last call.
+    pub const fn take_start_request(&mut self) -> Option<crate::entry::Entry> {
+        self.leaving.start.take()
+    }
+
     /// The review's `assistant_toggle` action ran since the last call.
     pub const fn take_assistant_request(&mut self) -> bool {
         self.link.take_request()

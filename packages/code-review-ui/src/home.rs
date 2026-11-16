@@ -97,6 +97,8 @@ pub enum HomeOutcome {
     Start(Entry),
     /// Open the new-review wizard.
     New,
+    /// Open the new-review wizard on its files and folders picker.
+    NewFiles,
 }
 
 /// Keyboard focus on home.
@@ -1024,6 +1026,7 @@ impl Home {
                 }
             }
             "home_new" => return HomeOutcome::New,
+            "home_new_files" => return HomeOutcome::NewFiles,
             "home_continue" => return self.continue_latest(),
             "home_filter" => self.focus = HomeFocus::Filter,
             "home_rename" => self.start_rename(),
@@ -1149,6 +1152,7 @@ impl Home {
             SuggestionAction::Start(entry) => HomeOutcome::Start(entry.clone()),
             SuggestionAction::Open(workspace) => HomeOutcome::Open(workspace.clone()),
             SuggestionAction::New => HomeOutcome::New,
+            SuggestionAction::NewFiles => HomeOutcome::NewFiles,
         }
     }
 

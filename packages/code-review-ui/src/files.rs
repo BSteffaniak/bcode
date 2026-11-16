@@ -146,6 +146,8 @@ enum NodeKind {
     },
     Dir {
         name: String,
+        /// Repository-relative path of the directory.
+        path: String,
         totals: Totals,
     },
     File(FileRow),
@@ -401,6 +403,7 @@ impl FileTree {
                         parent,
                         NodeKind::Dir {
                             name,
+                            path: full.clone(),
                             totals: Totals::default(),
                         },
                     );
@@ -521,6 +524,15 @@ impl FileTree {
     pub fn file_of(&self, id: &str) -> Option<&FileRef> {
         match &self.nodes[*self.ids.get(id)?].kind {
             NodeKind::File(row) => Some(&row.file),
+            _ => None,
+        }
+    }
+
+    /// The repository-relative path of a directory row id.
+    #[must_use]
+    pub fn folder_path(&self, id: &str) -> Option<&str> {
+        match &self.nodes[*self.ids.get(id)?].kind {
+            NodeKind::Dir { path, .. } => Some(path),
             _ => None,
         }
     }
@@ -819,7 +831,7 @@ impl FileTree {
                 theme.muted,
             )])])
             .disabled(true),
-            NodeKind::Dir { name, totals }
+            NodeKind::Dir { name, totals, .. }
             | NodeKind::Group {
                 label: name,
                 totals,

@@ -197,6 +197,8 @@ pub enum SuggestionAction {
     Open(Box<ReviewWorkspace>),
     /// Open the new-review wizard.
     New,
+    /// Open the new-review wizard on its files and folders picker.
+    NewFiles,
 }
 
 /// Kind of a suggestion (its icon and color).
@@ -354,6 +356,13 @@ pub fn suggestions(inputs: &SuggestionInputs<'_>, minus: &str) -> Vec<Suggestion
         title: "New review…".to_owned(),
         detail: "branches, commits, pull requests, stacks, files".to_owned(),
         action: SuggestionAction::New,
+    });
+    out.push(Suggestion {
+        id: "files".to_owned(),
+        kind: SuggestionKind::New,
+        title: "Review files or folders…".to_owned(),
+        detail: "whole files, folders, or the repository as it is now".to_owned(),
+        action: SuggestionAction::NewFiles,
     });
     out
 }
@@ -725,6 +734,7 @@ mod tests {
                 "Review requested: #7",
                 "New commits: Review w",
                 "New review…",
+                "Review files or folders…",
             ]
         );
         assert_eq!(out[0].detail, "2 files unstaged · +5 -1");
@@ -749,8 +759,9 @@ mod tests {
             },
             "-",
         );
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert_eq!(out[0].action, SuggestionAction::New);
+        assert_eq!(out[1].action, SuggestionAction::NewFiles);
     }
 
     #[test]

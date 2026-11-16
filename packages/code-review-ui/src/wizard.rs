@@ -412,6 +412,16 @@ impl Wizard {
         }
     }
 
+    /// A wizard that opens on the files and folders picker (a review of files, folders, or the
+    /// repository as it is now); `esc` there goes to step 1.
+    #[must_use]
+    pub fn files(services: ReviewServices, repo: PathBuf) -> Self {
+        let mut wizard = Self::new(services, repo);
+        wizard.chosen_type = Some(SourceType::Files);
+        wizard.enter_paths(PathPurpose::Files, None, Vec::new(), Vec::new());
+        wizard
+    }
+
     /// Leave `cells` free at the end of the header row (where the app paints its Ask AI
     /// button).
     pub const fn set_header_reserve(&mut self, cells: u16) {
