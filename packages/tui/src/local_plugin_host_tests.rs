@@ -66,8 +66,7 @@ fn setup_flows_activate_selected_bundled_plugins() {
 #[test]
 fn plugin_tui_default_host_activates_bundled_plugins() {
     assert_host_echo(
-        plugin_tui::load_default_host_with_static_bundled(&hello_selection(), &[hello()], &[])
-            .unwrap(),
+        plugin_tui::load_default_host_with_static_bundled(&hello_selection(), &[hello()]).unwrap(),
     );
 }
 
