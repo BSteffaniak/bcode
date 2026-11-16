@@ -31,7 +31,10 @@ use bcode_code_review::assistant::{
 };
 use bcode_code_review::viewed::ViewedReset;
 use bcode_code_review::{CodeReviewConfig, ReviewData, ReviewStore};
-use bcode_code_review_models::{ReviewSourceKind, ReviewThreadKind, ReviewThreadSeverity};
+use bcode_code_review_models::{
+    ReviewPathMatchKind, ReviewPathsFindRequest, ReviewSourceKind, ReviewThreadKind,
+    ReviewThreadSeverity,
+};
 use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::{ToolPolicyIdentity, ToolPolicyOperation, ToolPolicyPreparation};
 use bcode_tool::{
@@ -336,15 +339,32 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.create_review",
         access: Access::Write,
-        description: "Create a saved review and return its id, title, kind and sources. Kinds: a pull request (number or url), a stack stepped through one pull request at a time (stack_layers, bottom first) or as one diff (stack), a branch against a base, the current branch, a commit range, commits, one commit, and uncommitted changes (working_tree, staged, unstaged) optionally limited to `paths` or to `directory`. With `directory`, the review is created in that directory's repository and uncommitted changes are limited to it. To find the user's pull requests and stacks, call bcode.code-review.find_pull_requests first; to show the new review, call bcode.code-review.open_review.",
+        description: "Create a saved review and return its id, title, kind and sources. Kinds: a pull request (number or url), a stack stepped through one pull request at a time (stack_layers, bottom first) or as one diff (stack), a branch against a base, the current branch, a commit range, commits, one commit, uncommitted changes (working_tree, staged, unstaged) optionally limited to `paths` or to `directory`, code as it is now (files: files, folders, globs or line ranges; a folder is listed again whenever the review opens), and the whole repository or some of its folders as it is now (repository). With `directory`, the review is created in that directory's repository, and uncommitted changes, files and repository reviews without `paths` are limited to it. To find a folder, package or file the user names, call code_review.find_paths first; to find the user's pull requests and stacks, call bcode.code-review.find_pull_requests first; to show the new review, call bcode.code-review.open_review. Every kind of review the app's wizard creates can be created here; never run the bcode command line instead.",
         schema: || {
             object(
                 json_map(json!({
                     "sources": {"type": "array", "minItems": 1, "items": create::source_schema(), "description": "What to review, in order."},
                     "title": {"type": "string", "description": "Title (defaults from the sources)."},
-                    "directory": {"type": "string", "description": "A directory (absolute, or relative to the session's working directory): the review belongs to its repository, and uncommitted changes are limited to it."},
+                    "directory": {"type": "string", "description": "A directory (absolute, or relative to the session's working directory): the review belongs to its repository, and uncommitted changes, files and repository sources without `paths` are limited to it."},
                 })),
                 &["sources"],
+            )
+        },
+    },
+    Spec {
+        name: "code_review.find_paths",
+        access: Access::Read,
+        description: "Find repository paths by what the user calls them: a folder name, a package or crate name (Cargo.toml, package.json, pyproject.toml), a file name, or a path ending (\"the hello plugin\", \"bcode-git\", \"Cargo.toml\", \"plugin/src\"). Files git ignores are left out unless `include_ignored`. Returns matches best first with their kind, files under each folder now, and how they matched; folders and packages end with `/` and can be passed as they are in the `paths` of a code_review.create_review files or repository source. `ambiguous` is true when the two best matches are equally likely: ask the user which one only then, or when nothing matched. Read-only.",
+        schema: || {
+            object(
+                json_map(json!({
+                    "query": {"type": "string", "description": "What the user called it: \"the hello plugin\", \"bcode-git\", \"the review wizard\", \"Cargo.toml\"."},
+                    "kinds": {"type": "array", "items": {"type": "string", "enum": ["folder", "package", "file"]}, "description": "What to look for (default all)."},
+                    "directory": {"type": "string", "description": "Search the repository of this directory (default the session's)."},
+                    "include_ignored": {"type": "boolean", "description": "Also search files git ignores (default false)."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Matches returned (default 10)."},
+                })),
+                &["query"],
             )
         },
     },
@@ -676,6 +696,8 @@ struct Arguments {
     title: Option<String>,
     directory: Option<String>,
     archived: Option<bool>,
+    kinds: Vec<ReviewPathMatchKind>,
+    include_ignored: Option<bool>,
     reviews: Vec<String>,
     comments: Vec<CommentArgument>,
     thread_ids: Vec<String>,
@@ -860,7 +882,7 @@ fn run(
 ) -> Result<String, AssistantError> {
     let repo = descriptor.working_directory.as_path();
     let mut tools = ReviewTools::new(data, store).with_providers(remembered_providers());
-    if let Some(result) = run_reviews(&tools, repo, name, arguments) {
+    if let Some(result) = run_reviews(data, &tools, repo, name, arguments) {
         return result;
     }
     let reference = review_ref(arguments, descriptor)?;
@@ -1031,6 +1053,7 @@ fn run_batch(
 /// Tools that act on saved reviews as a whole rather than on one open review.
 const REVIEW_LEVEL_TOOLS: &[&str] = &[
     "code_review.list_reviews",
+    "code_review.find_paths",
     "code_review.create_review",
     "code_review.update_review",
     "code_review.delete_review",
@@ -1038,6 +1061,7 @@ const REVIEW_LEVEL_TOOLS: &[&str] = &[
 
 /// Run the tools that act on saved reviews as a whole; `None` for any other tool.
 fn run_reviews(
+    data: &ReviewData,
     tools: &ReviewTools<'_>,
     repo: &std::path::Path,
     name: &str,
@@ -1045,10 +1069,11 @@ fn run_reviews(
 ) -> Option<Result<String, AssistantError>> {
     REVIEW_LEVEL_TOOLS
         .contains(&name)
-        .then(|| review_level(tools, repo, name, arguments))
+        .then(|| review_level(data, tools, repo, name, arguments))
 }
 
 fn review_level(
+    data: &ReviewData,
     tools: &ReviewTools<'_>,
     repo: &std::path::Path,
     name: &str,
@@ -1060,6 +1085,20 @@ fn review_level(
             arguments.include_archived.unwrap_or(false),
             arguments.query.as_deref(),
         )?),
+        "code_review.find_paths" => {
+            let query = Arguments::required(arguments.query.as_ref(), "query")?;
+            let (root, _) = create::repository_of(repo, arguments.directory.as_deref())?;
+            let found = data.paths_find(&ReviewPathsFindRequest {
+                repo_path: root,
+                query: query.to_owned(),
+                kinds: std::mem::take(&mut arguments.kinds),
+                include_ignored: arguments.include_ignored.unwrap_or(false),
+                limit: arguments
+                    .limit
+                    .map(|limit| u32::try_from(limit).unwrap_or(u32::MAX)),
+            })?;
+            encode(&found)
+        }
         "code_review.create_review" => {
             let plan = create::plan(
                 repo,

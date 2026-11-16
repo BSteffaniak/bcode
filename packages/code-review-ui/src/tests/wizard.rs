@@ -729,3 +729,81 @@ fn working_tree_counts_outside_a_repository_are_unavailable() {
     assert!(screen.contains("counts unavailable"), "{}", screen.text());
     assert!(!screen.contains("counting"), "{}", screen.text());
 }
+
+/// One input to the wizard.
+enum Input {
+    Key(&'static str),
+    Paste(String),
+}
+
+#[test]
+fn every_wizard_mode_can_be_created_through_create_review() {
+    use crate::wizard::SourceType;
+    use Input::{Key, Paste};
+    use bcode_code_review::assistant::create;
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let mut created = Vec::new();
+    for (index, source_type) in SourceType::ALL.into_iter().enumerate() {
+        // Every detail of every mode. Exhaustive: a new mode does not compile until it is here.
+        let runs: Vec<Vec<Input>> = match source_type {
+            SourceType::WorkingTree => vec![
+                vec![Key("enter")],
+                vec![Key("down"), Key("enter")],
+                vec![Key("down"), Key("down"), Key("enter")],
+            ],
+            // The detected base, and the provider's first pull request.
+            SourceType::CurrentBranch | SourceType::PullRequest => vec![vec![Key("enter")]],
+            SourceType::CompareBranches => vec![vec![
+                Paste(BASE_BRANCH.to_owned()),
+                Key("enter"),
+                Paste(HEAD_BRANCH.to_owned()),
+                Key("enter"),
+            ]],
+            SourceType::Commits => vec![
+                vec![Key("enter")],
+                vec![Key("tab"), Key("down"), Key("shift+tab"), Key("enter")],
+            ],
+            SourceType::Stack => vec![
+                vec![Key("enter"), Key("enter")],
+                vec![Key("enter"), Key("down"), Key("enter")],
+                vec![Key("enter"), Key("end"), Key("enter")],
+            ],
+            SourceType::Files => vec![
+                vec![Key("enter")],
+                vec![Paste(format!("{UNICODE_FILE}:2-4")), Key("enter")],
+            ],
+        };
+        for run in runs {
+            let mut scenario = wizard(&fixture, &backend);
+            pick_type(&mut scenario, index);
+            for input in run {
+                match input {
+                    Key(key) => {
+                        scenario.key(key);
+                    }
+                    Paste(text) => {
+                        scenario.paste(&text);
+                    }
+                }
+                settled(&mut scenario);
+            }
+            created.push((
+                source_type,
+                kinds(&create(&mut scenario, &backend, &fixture)),
+            ));
+        }
+    }
+    for (source_type, kinds) in created {
+        for kind in kinds {
+            let argument = create::source_argument(&kind, None).unwrap_or_else(|| {
+                panic!("{source_type:?} creates {kind:?}, which create_review cannot")
+            });
+            let plan = create::plan(fixture.root(), None, vec![argument])
+                .unwrap_or_else(|error| panic!("{source_type:?} {kind:?}: {error}"));
+            let planned: Vec<ReviewSourceKind> =
+                plan.sources.into_iter().map(|(kind, _)| kind).collect();
+            assert_eq!(planned, std::slice::from_ref(&kind), "{source_type:?}");
+        }
+    }
+}

@@ -23,6 +23,7 @@ mod stack;
 mod worktree;
 
 pub use blob::{BlobService, CatFileRegistry};
+pub use resolve::validate_selectors;
 pub use stack::MAX_ATTRIBUTION_LINES;
 
 use bcode_code_review_models::{

@@ -34,6 +34,7 @@ pub mod history;
 pub mod provider;
 pub mod publish_plan;
 pub mod scope;
+pub mod selectors;
 pub mod session;
 pub mod store;
 #[cfg(any(test, feature = "testing"))]

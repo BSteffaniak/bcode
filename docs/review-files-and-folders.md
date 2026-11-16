@@ -8,7 +8,16 @@ file panel, CLI, review assistant), and the order in which it is built.
 
 ## Status
 
-Design. Nothing here is built yet; the build plan at the end orders the work. Today:
+Steps 1 and 2 of the build plan are built: the source model, resolution, uncommitted marks and
+path services in the data layer, the `files` and `repository` kinds of `create_review`,
+`code_review.find_paths`, the profile recipes, `bcode review files` and `bcode review repo
+--path`, and the parity test for the wizard's current modes. Steps 3 to 5 (the BMUX check
+column, the wizard tree picker and entry points, marks and toggles in the review) are not built
+yet; until step 5, the review UI resolves with the default browse options (ignored files hidden,
+5,000 files) and shows no uncommitted marks. Deviations from the design found while building are
+written into the sections below.
+
+Before this work:
 
 * `ReviewSourceKind::File`, `FileRange` and `Repository` exist and resolve to browse mode
   (`ResolvedSourceMode::Browse`), listed with `git ls-files --stage` (tracked files only, no
@@ -439,12 +448,16 @@ Stack, Files, Repository.
 
 ## Entry points
 
-* **CLI.** `bcode review files <SELECTOR>... [--repo PATH] [--show-ignored]` opens a transient
-  review of the selectors (the syntax above). Relative selectors are relative to the process's
-  working directory and must stay inside the repository; one plain file becomes `File`, anything
-  else `FileSet`. `bcode review repo [--path FOLDER]... [--show-ignored]` opens the whole
-  repository, or a `FileSet` of the folders. A selector that names nothing fails before the app
-  opens: "examples/helo-plugin: no such file or folder".
+* **CLI.** `bcode review files <SELECTOR>... [--repo PATH]` opens a transient review of the
+  selectors (the syntax above). Relative selectors are relative to the process's working
+  directory when it is inside the repository, else to the repository root, and must stay inside
+  the repository; one plain file becomes `File`, anything else `FileSet`. `bcode review repo
+  [--path FOLDER]...` opens the whole repository, or a `FileSet` of the folders. A selector that
+  names nothing fails before the app opens: "examples/helo-plugin: no such file or folder".
+  `--show-ignored` on both comes with the ignored toggle in step 5, which owns the review's
+  presentation state it sets.
+* **Submodules.** A submodule's folder is a file to the selector syntax (git lists it as one
+  entry, its commit), so `vendor/sub` is `File`, never `Folder`.
 * **Home.** A suggestion row, after **New review…**: **Review files or folders…** (`whole files,
   folders, or the repository as it is now`), opening the wizard on the Files picker; the palette
   has it as "New review: files or folders…".
@@ -474,8 +487,11 @@ The source schema gains two kinds:
   `directory` and no `paths`, the directory itself is the folder.
 * `repository`: without `paths`, the whole repository; with `paths` (folders), a `FileSet` of
   them. With `directory` below the root and no `paths`, that folder.
-* Paths are repository-relative; a path that is absolute, escapes the repository, or names
-  nothing is an `invalid` error naming it.
+* Paths are repository-relative; an absolute path inside the repository is taken as its
+  relative path. A path that escapes the repository or names nothing is an `invalid` error
+  naming it ("examples/helo-plugin: no such file or folder").
+* Pull request, stack and stack layer sources take `provider` (default `github`), so a stack of
+  any review-source provider the wizard offers can be created too.
 * The kind descriptions say: "files: whole files, folders, globs or line ranges as they are now
   (not a change); repository: the whole repository or some folders as they are now".
 * `ReviewSourceKind -> SourceArgument` (`create::source_argument`) is an exhaustive match over
@@ -561,13 +577,13 @@ and the tool output limit.
 
 ### Parity test
 
-`every_wizard_mode_can_be_created_through_create_review` (code-review-ui tests): for every
-`SourceType` (an exhaustive match, so a new mode must be added to the test to compile) and each
-of its details (working tree: unstaged, staged, both, paths; files: a file, a range, a folder, a
+`every_wizard_mode_can_be_created_through_create_review` (code-review-ui `tests/wizard.rs`,
+built in step 2 for the current modes): for every `SourceType` (an exhaustive match, so a new
+mode must be added to the test to compile) and each of its details (working tree: unstaged, staged, both, paths; files: a file, a range, a folder, a
 glob, a mix with an exclusion; repository: whole, folders; commits; ranges; branches; pull
-request, stack and stack layers against the fake provider), drive the wizard to its
-`WizardOutcome::Create` sources, convert each with `create::source_argument`, run
-`create::plan`, and assert the same `ReviewSourceKind`s.
+request, stack and stack layers against the fake provider), drive the wizard until it creates the review, convert each created source with
+`create::source_argument`, run `create::plan`, and assert the same `ReviewSourceKind`s. Step 4
+adds the Repository mode, the folder and glob details and **Limit to paths…**.
 
 ## Build plan
 

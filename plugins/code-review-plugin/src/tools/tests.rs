@@ -198,6 +198,7 @@ fn reads_are_read_only_and_changes_ask_for_permission() {
     let names: Vec<&str> = list.tools.iter().map(|tool| tool.name.as_str()).collect();
     for name in [
         "code_review.list_reviews",
+        "code_review.find_paths",
         "code_review.summary",
         "code_review.list_files",
         "code_review.file_diff",
@@ -1494,4 +1495,79 @@ fn an_empty_replacement_suggests_deleting_the_lines() {
         .as_str()
         .expect("suggestion");
     assert!(suggestion.contains("```suggestion\n\n```"), "{suggestion}");
+}
+
+#[test]
+fn find_paths_names_a_folder_that_create_review_reviews_as_it_is_now() {
+    let mut harness = Harness::new();
+    let root = harness.fixture.root().to_path_buf();
+    for (path, text) in [
+        (
+            "examples/hello-plugin/Cargo.toml",
+            "[package]\nname = \"hello-plugin\"\n",
+        ),
+        ("examples/hello-plugin/src/lib.rs", "pub fn hello() {}\n"),
+        ("examples/hello-plugin/target.log", "ignored\n"),
+        (".gitignore", "*.log\n"),
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(full, text).expect("write");
+    }
+    let found = harness.json(
+        "code_review.find_paths",
+        &json!({"query": "the hello plugin"}),
+        SESSION,
+    );
+    assert_eq!(found["ambiguous"], false, "{found}");
+    let best = &found["matches"][0];
+    assert_eq!(
+        (
+            best["path"].as_str(),
+            best["kind"].as_str(),
+            best["files"].as_u64()
+        ),
+        (Some("examples/hello-plugin/"), Some("package"), Some(2)),
+        "{found}"
+    );
+    let review = created(
+        &mut harness,
+        &json!({"sources": [{"kind": "files", "paths": [best["path"]]}]}),
+    );
+    assert_eq!(review["kind"], "files", "{review}");
+    let id = review["id"].as_str().expect("id").to_owned();
+    assert_eq!(
+        stored(&harness, &root, &id).sources[0].kind,
+        bcode_code_review_models::ReviewSourceKind::FileSet {
+            include: vec![bcode_code_review_models::PathSelector::Folder {
+                path: "examples/hello-plugin".to_owned()
+            }],
+            exclude: Vec::new(),
+        }
+    );
+    // A file added to the folder later is part of the review when it is read again.
+    std::fs::write(root.join("examples/hello-plugin/src/more.rs"), "// more\n").expect("write");
+    let files = harness.json("code_review.list_files", &json!({"review": id}), SESSION);
+    let listed = files.to_string();
+    for path in [
+        "examples/hello-plugin/Cargo.toml",
+        "examples/hello-plugin/src/lib.rs",
+        "examples/hello-plugin/src/more.rs",
+    ] {
+        assert!(listed.contains(path), "{path} in {listed}");
+    }
+    assert!(!listed.contains("target.log"), "{listed}");
+    let missing = harness.call(
+        "code_review.create_review",
+        &json!({"sources": [{"kind": "files", "paths": ["examples/helo-plugin"]}]}),
+        SESSION,
+    );
+    assert!(missing.is_error);
+    assert!(
+        missing
+            .output
+            .contains("examples/helo-plugin: no such file or folder"),
+        "{}",
+        missing.output
+    );
 }

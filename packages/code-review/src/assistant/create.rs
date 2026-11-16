@@ -4,8 +4,9 @@
 //! [`plan`] turns them into review source kinds and the repository the review belongs to.
 
 use super::AssistantError;
-use bcode_code_review_models::ReviewSourceKind;
-use serde::Deserialize;
+use crate::selectors;
+use bcode_code_review_models::{PathSelector, ReviewSourceKind};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -27,13 +28,15 @@ pub fn source_schema() -> Value {
                 "type": "string",
                 "enum": [
                     "pull_request", "stack", "stack_layers", "branch", "current_branch", "range",
-                    "commits", "commit", "last_commit", "working_tree", "staged", "unstaged"
+                    "commits", "commit", "last_commit", "working_tree", "staged", "unstaged",
+                    "files", "repository"
                 ],
-                "description": "pull_request: one pull request (number or url). stack: a whole stack as one diff (top = its top pull request). stack_layers: a stack stepped through one pull request at a time (layers, bottom first; prefer this for a stack). branch: head against base. current_branch: the checked-out branch against its base. range: base..head commits. commits: several commits (revs). commit / last_commit: one commit. working_tree / staged / unstaged: uncommitted changes (all, staged only, unstaged only), optionally limited to `paths`."
+                "description": "pull_request: one pull request (number or url). stack: a whole stack as one diff (top = its top pull request). stack_layers: a stack stepped through one pull request at a time (layers, bottom first; prefer this for a stack). branch: head against base. current_branch: the checked-out branch against its base. range: base..head commits. commits: several commits (revs). commit / last_commit: one commit. working_tree / staged / unstaged: uncommitted changes (all, staged only, unstaged only), optionally limited to `paths`. files: whole files, folders, globs or line ranges as they are now, not a change (`paths`, optional `exclude`); a folder is listed again whenever the review opens. repository: the whole repository, or some folders (`paths`), as it is now."
             },
             "number": {"type": "integer", "minimum": 1, "description": "pull_request: its number."},
             "url": {"type": "string", "description": "pull_request: its web address, instead of number."},
             "repository": {"type": "string", "description": "pull_request, stack, stack_layers: owner/name on the forge; the origin remote's when omitted."},
+            "provider": {"type": "string", "description": "pull_request, stack, stack_layers: the review-source provider id, as find_pull_requests reports it (default github)."},
             "top": {"type": "integer", "minimum": 1, "description": "stack: number of its top pull request."},
             "layers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "description": "stack_layers: pull request numbers from the bottom layer up."},
             "titles": {"type": "array", "items": {"type": "string"}, "description": "stack_layers: titles of the layers' pull requests, in the same order (labels only)."},
@@ -42,7 +45,8 @@ pub fn source_schema() -> Value {
             "merge_base": {"type": "boolean", "description": "branch, range: compare from their merge base (default: true for branch, false for range)."},
             "rev": {"type": "string", "description": "commit: the revision."},
             "revs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "commits: revisions."},
-            "paths": {"type": "array", "items": {"type": "string"}, "description": "working_tree, staged, unstaged: repository-relative directories or files to limit it to."},
+            "paths": {"type": "array", "items": {"type": "string"}, "description": "working_tree, staged, unstaged: repository-relative directories or files to limit it to. files: what to review, repository-relative: `path` (a file or a folder), `folder/`, a glob such as `src/**/*.rs`, or `path:START-END` for lines of a file. repository: folders to limit it to."},
+            "exclude": {"type": "array", "items": {"type": "string"}, "description": "files: files and folders to leave out of its folders and globs."},
             "label": {"type": "string", "description": "How the source is labelled (defaults from its kind)."}
         },
         "required": ["kind"],
@@ -51,22 +55,39 @@ pub fn source_schema() -> Value {
 }
 
 /// One source as the tool receives it.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SourceArgument {
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     top: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     layers: Vec<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     titles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     merge_base: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     rev: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     revs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     paths: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exclude: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
 }
 
@@ -104,36 +125,7 @@ pub fn plan(
             "a review has at most {MAX_SOURCES} sources"
         )));
     }
-    let (repo_root, scope) = match directory.map(str::trim).filter(|dir| !dir.is_empty()) {
-        Some(directory) => {
-            let path = working_directory.join(directory);
-            let path = path.canonicalize().map_err(|error| {
-                AssistantError::Invalid(format!("directory {directory}: {error}"))
-            })?;
-            if !path.is_dir() {
-                return Err(AssistantError::Invalid(format!(
-                    "{directory} is not a directory"
-                )));
-            }
-            let root = git(&path, &["rev-parse", "--show-toplevel"])
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    AssistantError::Invalid(format!("{directory} is not inside a git repository"))
-                })?;
-            let root = root.canonicalize().unwrap_or(root);
-            let scope = path
-                .strip_prefix(&root)
-                .ok()
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-                .filter(|relative| !relative.is_empty());
-            (root, scope)
-        }
-        None => (
-            git(working_directory, &["rev-parse", "--show-toplevel"])
-                .map_or_else(|| working_directory.to_path_buf(), PathBuf::from),
-            None,
-        ),
-    };
+    let (repo_root, scope) = repository_of(working_directory, directory)?;
     let mut planned = Vec::new();
     for source in sources {
         planned.extend(kinds(&repo_root, scope.as_deref(), source)?);
@@ -142,6 +134,55 @@ pub fn plan(
         repo_root,
         sources: planned,
     })
+}
+
+/// The repository a tool call acts on, and the folder below its root that `directory` names.
+///
+/// The repository is that of `directory` (relative to `working_directory` when relative), else
+/// of the working directory.
+///
+/// # Errors
+///
+/// * [`AssistantError::Invalid`] for a directory that does not exist or is outside every
+///   repository.
+pub fn repository_of(
+    working_directory: &Path,
+    directory: Option<&str>,
+) -> Result<(PathBuf, Option<String>), AssistantError> {
+    Ok(
+        match directory.map(str::trim).filter(|dir| !dir.is_empty()) {
+            Some(directory) => {
+                let path = working_directory.join(directory);
+                let path = path.canonicalize().map_err(|error| {
+                    AssistantError::Invalid(format!("directory {directory}: {error}"))
+                })?;
+                if !path.is_dir() {
+                    return Err(AssistantError::Invalid(format!(
+                        "{directory} is not a directory"
+                    )));
+                }
+                let root = git(&path, &["rev-parse", "--show-toplevel"])
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        AssistantError::Invalid(format!(
+                            "{directory} is not inside a git repository"
+                        ))
+                    })?;
+                let root = root.canonicalize().unwrap_or(root);
+                let scope = path
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .filter(|relative| !relative.is_empty());
+                (root, scope)
+            }
+            None => (
+                git(working_directory, &["rev-parse", "--show-toplevel"])
+                    .map_or_else(|| working_directory.to_path_buf(), PathBuf::from),
+                None,
+            ),
+        },
+    )
 }
 
 /// Run git in `repo`; its trimmed output when it succeeded with some.
@@ -169,6 +210,11 @@ fn kinds(
     source: SourceArgument,
 ) -> Result<Vec<(ReviewSourceKind, Option<String>)>, AssistantError> {
     let label = source.label.clone();
+    let provider = source
+        .provider
+        .clone()
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or_else(|| GITHUB_PROVIDER.to_owned());
     let one = |kind: ReviewSourceKind| Ok(vec![(kind, label.clone())]);
     let kind = source.kind.as_str();
     match kind {
@@ -183,13 +229,13 @@ fn kinds(
                 }
             };
             one(ReviewSourceKind::PullRequest {
-                provider: GITHUB_PROVIDER.to_owned(),
+                provider,
                 repository,
                 number,
             })
         }
         "stack" => one(ReviewSourceKind::Stack {
-            provider: GITHUB_PROVIDER.to_owned(),
+            provider,
             repository: repository(repo, source.repository.as_deref())?,
             top: required(source.top.or(source.number), kind, "top")?,
         }),
@@ -206,13 +252,15 @@ fn kinds(
                 .iter()
                 .enumerate()
                 .map(|(index, number)| {
+                    // One layer without a title keeps the source's label.
                     let title = source
                         .titles
                         .get(index)
-                        .map(|title| format!("#{number} {}", title.trim()));
+                        .map(|title| format!("#{number} {}", title.trim()))
+                        .or_else(|| label.clone().filter(|_| source.layers.len() == 1));
                     (
                         ReviewSourceKind::StackLayer {
-                            provider: GITHUB_PROVIDER.to_owned(),
+                            provider: provider.clone(),
                             repository: repository.clone(),
                             number: *number,
                         },
@@ -247,10 +295,185 @@ fn kinds(
         "working_tree" | "staged" | "unstaged" => {
             Ok(vec![(uncommitted(kind, scope, &source.paths), label)])
         }
+        "files" => one(files_kind(repo, scope, &source)?),
+        "repository" => one(repository_kind(repo, scope, &source)?),
         other => Err(AssistantError::Invalid(format!(
             "unknown source kind {other:?}"
         ))),
     }
+}
+
+/// A `files` source: its `paths` (else the folder `scope`) minus its `exclude`.
+fn files_kind(
+    repo: &Path,
+    scope: Option<&str>,
+    source: &SourceArgument,
+) -> Result<ReviewSourceKind, AssistantError> {
+    let mut include = selectors(repo, &source.paths)?;
+    if include.is_empty()
+        && let Some(scope) = scope
+    {
+        include.push(PathSelector::Folder {
+            path: scope.to_owned(),
+        });
+    }
+    if include.is_empty() {
+        return Err(AssistantError::Invalid(
+            "a files source needs `paths` (files, folders, globs or ranges)".to_owned(),
+        ));
+    }
+    let exclude = selectors(repo, &source.exclude)?;
+    crate::data::validate_selectors(&include, &exclude)
+        .map_err(|error| AssistantError::Invalid(error.to_string()))?;
+    Ok(selectors::files_source(include, exclude))
+}
+
+/// A `repository` source: the whole repository, else its `paths` folders (else `scope`).
+fn repository_kind(
+    repo: &Path,
+    scope: Option<&str>,
+    source: &SourceArgument,
+) -> Result<ReviewSourceKind, AssistantError> {
+    let mut folders = selectors(repo, &source.paths)?;
+    if folders.is_empty()
+        && let Some(scope) = scope
+    {
+        folders.push(PathSelector::Folder {
+            path: scope.to_owned(),
+        });
+    }
+    selectors::repository_source(folders).map_err(AssistantError::Invalid)
+}
+
+/// `texts` in the selector syntax, relative to the repository root `repo` (an absolute path
+/// inside it is taken as it is).
+fn selectors(repo: &Path, texts: &[String]) -> Result<Vec<PathSelector>, AssistantError> {
+    let root = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    texts
+        .iter()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| selectors::parse_selector(&root, &root, text).map_err(AssistantError::Invalid))
+        .collect()
+}
+
+/// The `create_review` source that creates `kind`, labelled `label`.
+///
+/// Every kind a review can have can be created by the assistant. `None` for a kind no source
+/// can name: an unsupported kind, or uncommitted changes without staged or unstaged ones.
+#[must_use]
+// One arm per source kind: a conversion table.
+#[allow(clippy::too_many_lines)]
+pub fn source_argument(kind: &ReviewSourceKind, label: Option<&str>) -> Option<SourceArgument> {
+    let of = |kind: &str| SourceArgument {
+        kind: kind.to_owned(),
+        label: label.map(str::to_owned),
+        ..SourceArgument::default()
+    };
+    let provider = |provider: &str| (provider != GITHUB_PROVIDER).then(|| provider.to_owned());
+    // Exhaustive on purpose: a new kind does not compile until the tool can create it.
+    Some(match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => of("unstaged"),
+        ReviewSourceKind::IndexStaged => of("staged"),
+        ReviewSourceKind::WorkingTreeAndIndex => of("working_tree"),
+        ReviewSourceKind::WorkingTreePaths {
+            paths,
+            staged,
+            unstaged,
+        } => SourceArgument {
+            paths: paths.clone(),
+            ..of(match (staged, unstaged) {
+                (true, true) => "working_tree",
+                (true, false) => "staged",
+                (false, true) => "unstaged",
+                (false, false) => return None,
+            })
+        },
+        ReviewSourceKind::LastCommit => of("last_commit"),
+        ReviewSourceKind::Commit { rev } => SourceArgument {
+            rev: Some(rev.clone()),
+            ..of("commit")
+        },
+        ReviewSourceKind::CommitRange {
+            base,
+            head,
+            merge_base,
+        } => SourceArgument {
+            base: Some(base.clone()),
+            head: Some(head.clone()),
+            merge_base: Some(*merge_base),
+            ..of("range")
+        },
+        ReviewSourceKind::BranchCompare {
+            base_branch,
+            head_branch,
+            merge_base,
+        } => SourceArgument {
+            base: Some(base_branch.clone()),
+            head: Some(head_branch.clone()),
+            merge_base: Some(*merge_base),
+            ..of("branch")
+        },
+        ReviewSourceKind::File { path } => SourceArgument {
+            paths: vec![PathSelector::File { path: path.clone() }.to_string()],
+            ..of("files")
+        },
+        ReviewSourceKind::FileRange { path, start, end } => SourceArgument {
+            paths: vec![
+                PathSelector::FileRange {
+                    path: path.clone(),
+                    start: *start,
+                    end: *end,
+                }
+                .to_string(),
+            ],
+            ..of("files")
+        },
+        ReviewSourceKind::FileSet { include, exclude } => SourceArgument {
+            paths: include.iter().map(ToString::to_string).collect(),
+            exclude: exclude.iter().map(ToString::to_string).collect(),
+            ..of("files")
+        },
+        ReviewSourceKind::Repository => of("repository"),
+        ReviewSourceKind::Commits { revs } => SourceArgument {
+            revs: revs.clone(),
+            ..of("commits")
+        },
+        ReviewSourceKind::PullRequest {
+            provider: id,
+            repository,
+            number,
+        } => SourceArgument {
+            number: Some(*number),
+            repository: Some(repository.clone()),
+            provider: provider(id),
+            ..of("pull_request")
+        },
+        ReviewSourceKind::StackLayer {
+            provider: id,
+            repository,
+            number,
+        } => SourceArgument {
+            layers: vec![*number],
+            repository: Some(repository.clone()),
+            provider: provider(id),
+            ..of("stack_layers")
+        },
+        ReviewSourceKind::Stack {
+            provider: id,
+            repository,
+            top,
+        } => SourceArgument {
+            top: Some(*top),
+            repository: Some(repository.clone()),
+            provider: provider(id),
+            ..of("stack")
+        },
+        ReviewSourceKind::CurrentBranch { base } => SourceArgument {
+            base: base.clone(),
+            ..of("current_branch")
+        },
+        ReviewSourceKind::Unsupported { .. } => return None,
+    })
 }
 
 /// An uncommitted-changes source of `kind` (`working_tree`, `staged`, `unstaged`) limited to
@@ -345,6 +568,208 @@ fn parse_pull_url(url: &str) -> Result<(String, u64), AssistantError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::fixture::GitFixture;
+
+    fn repository() -> GitFixture {
+        let fixture = GitFixture::empty();
+        for path in [
+            "examples/hello-plugin/src/lib.rs",
+            "examples/hello-plugin/README.md",
+            "docs/guide.md",
+        ] {
+            let full = fixture.root().join(path);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, "x\n").expect("write");
+        }
+        fixture
+    }
+
+    fn argument(value: serde_json::Value) -> SourceArgument {
+        serde_json::from_value(value).expect("argument")
+    }
+
+    fn kinds_of(
+        root: &Path,
+        directory: Option<&str>,
+        value: serde_json::Value,
+    ) -> Result<Vec<ReviewSourceKind>, AssistantError> {
+        plan(root, directory, vec![argument(value)])
+            .map(|plan| plan.sources.into_iter().map(|(kind, _)| kind).collect())
+    }
+
+    fn folder(path: &str) -> PathSelector {
+        PathSelector::Folder { path: path.into() }
+    }
+
+    #[test]
+    fn files_and_repository_sources_take_the_selector_syntax() {
+        let fixture = repository();
+        let root = fixture.root();
+        let kinds = |value| kinds_of(root, None, value).expect("plan");
+        assert_eq!(
+            kinds(json!({"kind": "files", "paths": ["examples/hello-plugin"]})),
+            [ReviewSourceKind::FileSet {
+                include: vec![folder("examples/hello-plugin")],
+                exclude: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            kinds(json!({"kind": "files", "paths": ["examples/hello-plugin/src/lib.rs:3-1"]})),
+            [ReviewSourceKind::FileRange {
+                path: "examples/hello-plugin/src/lib.rs".into(),
+                start: 1,
+                end: 3,
+            }]
+        );
+        assert_eq!(
+            kinds(json!({
+                "kind": "files",
+                "paths": ["examples/", "docs/**/*.md", "examples/hello-plugin/README.md"],
+                "exclude": ["examples/hello-plugin/src"],
+            })),
+            [ReviewSourceKind::FileSet {
+                include: vec![
+                    folder("examples"),
+                    PathSelector::Glob {
+                        pattern: "docs/**/*.md".into()
+                    },
+                    PathSelector::File {
+                        path: "examples/hello-plugin/README.md".into()
+                    },
+                ],
+                exclude: vec![folder("examples/hello-plugin/src")],
+            }]
+        );
+        assert_eq!(
+            kinds(json!({"kind": "repository"})),
+            [ReviewSourceKind::Repository]
+        );
+        assert_eq!(
+            kinds(json!({"kind": "repository", "paths": ["examples", "docs/"]})),
+            [ReviewSourceKind::FileSet {
+                include: vec![folder("examples"), folder("docs")],
+                exclude: Vec::new(),
+            }]
+        );
+        // A directory below the root is the folder when no paths are named.
+        for kind in ["files", "repository"] {
+            assert_eq!(
+                kinds_of(root, Some("examples/hello-plugin"), json!({"kind": kind})).expect("plan"),
+                [ReviewSourceKind::FileSet {
+                    include: vec![folder("examples/hello-plugin")],
+                    exclude: Vec::new(),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn files_and_repository_sources_refuse_what_names_nothing_or_leaves_the_repository() {
+        let fixture = repository();
+        let root = fixture.root();
+        let error = |value| match kinds_of(root, None, value) {
+            Err(AssistantError::Invalid(message)) => message,
+            other => panic!("expected an invalid argument, got {other:?}"),
+        };
+        assert_eq!(
+            error(json!({"kind": "files", "paths": ["examples/helo-plugin"]})),
+            "examples/helo-plugin: no such file or folder"
+        );
+        assert!(error(json!({"kind": "files"})).contains("needs `paths`"));
+        assert!(error(json!({"kind": "files", "paths": ["../outside"]})).contains("outside"));
+        assert!(error(json!({"kind": "files", "paths": ["/etc/hosts"]})).contains("outside"));
+        assert!(
+            error(json!({"kind": "files", "paths": ["examples/"], "exclude": ["*.md"]}))
+                .contains("only files and folders can be excluded")
+        );
+        assert!(
+            error(json!({"kind": "repository", "paths": ["docs/guide.md"]}))
+                .contains("limited to folders")
+        );
+    }
+
+    #[test]
+    fn every_source_kind_but_unsupported_ones_has_a_create_review_source() {
+        let fixture = repository();
+        let root = fixture.root();
+        let pull = |number| ReviewSourceKind::PullRequest {
+            provider: GITHUB_PROVIDER.into(),
+            repository: "o/r".into(),
+            number,
+        };
+        let kinds = vec![
+            ReviewSourceKind::WorkingTreeUnstaged,
+            ReviewSourceKind::IndexStaged,
+            ReviewSourceKind::WorkingTreeAndIndex,
+            ReviewSourceKind::WorkingTreePaths {
+                paths: vec!["docs".into()],
+                staged: true,
+                unstaged: false,
+            },
+            ReviewSourceKind::LastCommit,
+            ReviewSourceKind::Commit { rev: "abc".into() },
+            ReviewSourceKind::CommitRange {
+                base: "a".into(),
+                head: "b".into(),
+                merge_base: true,
+            },
+            ReviewSourceKind::BranchCompare {
+                base_branch: "main".into(),
+                head_branch: "topic".into(),
+                merge_base: false,
+            },
+            ReviewSourceKind::File {
+                path: "docs/guide.md".into(),
+            },
+            ReviewSourceKind::FileRange {
+                path: "docs/guide.md".into(),
+                start: 2,
+                end: 4,
+            },
+            ReviewSourceKind::FileSet {
+                include: vec![folder("examples"), folder("docs")],
+                exclude: vec![PathSelector::File {
+                    path: "examples/hello-plugin/README.md".into(),
+                }],
+            },
+            ReviewSourceKind::Repository,
+            ReviewSourceKind::Commits {
+                revs: vec!["a".into(), "b".into()],
+            },
+            pull(7),
+            ReviewSourceKind::StackLayer {
+                provider: GITHUB_PROVIDER.into(),
+                repository: "o/r".into(),
+                number: 8,
+            },
+            ReviewSourceKind::Stack {
+                provider: GITHUB_PROVIDER.into(),
+                repository: "o/r".into(),
+                top: 9,
+            },
+            ReviewSourceKind::CurrentBranch {
+                base: Some("main".into()),
+            },
+            ReviewSourceKind::Stack {
+                provider: "graphite".into(),
+                repository: "o/r".into(),
+                top: 3,
+            },
+        ];
+        for kind in kinds {
+            let argument = source_argument(&kind, Some("label"))
+                .unwrap_or_else(|| panic!("{kind:?} has no create_review source"));
+            let planned = plan(root, None, vec![argument]).expect("plan");
+            assert_eq!(
+                planned.sources,
+                [(kind.clone(), Some("label".into()))],
+                "{kind:?}"
+            );
+        }
+        let unsupported: ReviewSourceKind =
+            serde_json::from_str(r#"{"kind":"future_kind"}"#).expect("kind");
+        assert!(source_argument(&unsupported, None).is_none());
+    }
 
     #[test]
     fn pull_request_addresses_parse_on_github_and_enterprise_hosts() {

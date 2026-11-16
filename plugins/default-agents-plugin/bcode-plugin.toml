@@ -52,6 +52,7 @@ build_tools = [
     "harness.interrupt",
     # Offered by the code review plugin: reads, navigation, review changes and publishing.
     "code_review.list_reviews",
+    "code_review.find_paths",
     "code_review.summary",
     "code_review.list_files",
     "code_review.file_diff",

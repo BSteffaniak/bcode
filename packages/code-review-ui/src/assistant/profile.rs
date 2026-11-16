@@ -76,6 +76,7 @@ impl Category {
         match self {
             Self::ReviewReads => &[
                 "code_review.list_reviews",
+                "code_review.find_paths",
                 "code_review.summary",
                 "code_review.list_files",
                 "code_review.file_diff",
@@ -293,6 +294,14 @@ sources [{kind: working_tree}] and directory <dir>, then open_review. When the r
 other_repository, tell the user to run `bcode review` in that repository to see it.
 * \"Review PR #N\" / a URL / a branch / a range / commits: code_review.create_review with that \
 kind (find_pull_requests first when you need the stack of a pull request), then open_review.
+* \"Create a review of X\", \"a review of X as it is now\", \"all of X\", \"review the X folder\" \
+(X a folder, package, crate, plugin or file): code_review.find_paths with X, then \
+code_review.create_review with sources [{kind: files, paths: [<the best match's path>]}], then \
+open_review. Ask which one only when find_paths says ambiguous or finds nothing; never ask about \
+commits or ranges for such a review.
+* \"X's changes\", \"what changed in X\": a diff review (working_tree with paths, or the branch, \
+range or pull request the user names), not a files review.
+* \"The whole repository\": code_review.create_review with sources [{kind: repository}].
 * \"Mark these files viewed\": one code_review.mark_viewed call with paths, a glob, layers, all, \
 or unchanged_since_look; never one call per file.
 * Comparisons (\"what changed since I looked\", \"since the last push\", \"v2 to v3 of #12\", \
@@ -302,6 +311,10 @@ or unchanged_since_look; never one call per file.
 screen new_review, a title and sources (the wizard opens filled in for the user to confirm).
 * Archive, rename, delete reviews: code_review.update_review / code_review.delete_review \
 (delete only when asked; prefer archiving).
+
+Never run the bcode command line through the shell to create or open reviews: the tools above \
+create every kind of review the app can. When a tool cannot do what was asked, say what is \
+missing instead.
 
 Do only what the user asked; ask before acting on anything else. Changes to reviews, files, \
 publishing, commands and moving the user to another screen may ask the user for permission; \
@@ -383,6 +396,27 @@ mod tests {
         assert_eq!(profile.id, PROFILE_ID);
         assert_eq!(profile.base_agent, BASE_AGENT);
         assert_eq!(profile.tools, tools);
+    }
+
+    #[test]
+    fn the_profile_finds_paths_and_creates_reviews_of_them_as_they_are_now() {
+        let (config, _) = parse("");
+        let profile = config.profile();
+        for tool in ["code_review.find_paths", "code_review.create_review"] {
+            assert!(profile.tools.iter().any(|name| name == tool), "{tool}");
+        }
+        assert!(
+            Category::ReviewReads
+                .tools()
+                .contains(&"code_review.find_paths")
+        );
+        let (config, _) = parse("[assistant.tools]\nreview_reads = false\n");
+        assert!(
+            !config
+                .tools()
+                .iter()
+                .any(|tool| tool == "code_review.find_paths")
+        );
     }
 
     #[test]
