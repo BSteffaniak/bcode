@@ -176,6 +176,8 @@ pub struct AskContext {
     pub repo: PathBuf,
     /// Labels of the review's included sources.
     pub sources: Vec<String>,
+    /// The source owning the anchored file; absent for a whole-review question.
+    pub selected_source: Option<AskSource>,
     /// Other threads on the same file (or the review): one line each, bounded by
     /// [`MAX_PROMPT_THREADS`].
     pub threads: Vec<String>,
@@ -195,6 +197,15 @@ pub struct AskContext {
     pub thread: Option<AskThread>,
     /// The question.
     pub question: String,
+}
+
+/// The source owning the file a question is anchored to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskSource {
+    /// Stable source id used by source-scoped review tools.
+    pub id: String,
+    /// Human-readable source or stack-layer label.
+    pub label: String,
 }
 
 /// The thread a question was asked from.
@@ -481,6 +492,14 @@ pub fn prompt(context: &AskContext) -> String {
         context.repo.display(),
         cut(&context.sources.join(", "), MAX_HEAD_FIELD_BYTES, "…"),
     );
+    if let Some(source) = &context.selected_source {
+        let _ = write!(
+            text,
+            "\nSelected source/layer: {}\nSource id: {}\nThe selected file and diff belong to this source, not necessarily the first PR in the review title. Use this source id for source-scoped code_review tool calls.\n",
+            cut(&source.label, MAX_HEAD_FIELD_BYTES, "…"),
+            cut(&source.id, MAX_HEAD_FIELD_BYTES, "…"),
+        );
+    }
     if let Some(thread) = &context.thread {
         text.push('\n');
         text.push_str(&thread_section(thread));
@@ -1319,6 +1338,7 @@ mod tests {
             title: "Review".to_owned(),
             repo: PathBuf::from("/repo"),
             sources: vec!["Last commit".to_owned()],
+            selected_source: None,
             threads: (0..40)
                 .map(|index| format!("src/lib.rs:{index}: {}", "y".repeat(400)))
                 .collect(),
@@ -1357,6 +1377,7 @@ mod tests {
             title: "#7 Retry sends".to_owned(),
             repo: PathBuf::from("/repo"),
             sources: vec!["Pull request o/r#7".to_owned()],
+            selected_source: None,
             threads: Vec::new(),
             threads_omitted: 0,
             threads_on: path.to_owned(),
@@ -1367,6 +1388,39 @@ mod tests {
             thread,
             question: "Still a problem?".to_owned(),
         }
+    }
+
+    #[test]
+    fn selected_source_survives_a_long_stack_listing() {
+        let mut context = context(None, "src/lib.rs");
+        context.title = "#101 First layer +86".to_owned();
+        context.sources = (0..87)
+            .map(|index| format!("Stack layer owner/repo#{}", 101 + index))
+            .collect();
+        context.selected_source = Some(AskSource {
+            id: "source-87".to_owned(),
+            label: "Stack layer owner/repo#187".to_owned(),
+        });
+        let text = prompt(&context);
+        assert!(text.len() <= MAX_PROMPT_BYTES);
+        assert!(text.contains("Review: #101 First layer +86"));
+        assert!(
+            text.contains(
+                "Selected source/layer: Stack layer owner/repo#187\nSource id: source-87\n"
+            )
+        );
+        assert!(text.contains("Use this source id for source-scoped code_review tool calls."));
+    }
+
+    #[test]
+    fn whole_review_questions_do_not_claim_a_selected_source() {
+        let text = prompt(&context(
+            None,
+            bcode_code_review::document::REVIEW_LEVEL_PATH,
+        ));
+        assert!(text.contains("Asked about: the whole review"));
+        assert!(!text.contains("Selected source/layer:"));
+        assert!(!text.contains("Source id:"));
     }
 
     fn thread(comments: Vec<AskComment>) -> AskThread {

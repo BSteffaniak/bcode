@@ -103,6 +103,44 @@ fn publish_step(scenario: &Scenario<ReviewApp>) -> Option<Step> {
 }
 
 #[test]
+fn questions_on_the_second_stack_layer_keep_its_source_identity() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let workspace = create(
+        &backend,
+        &fixture,
+        "#101 Layer 101 +2",
+        vec![layer(101), layer(102), layer(103)],
+    );
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    scenario.key(".");
+    settled(&mut scenario);
+    let screen = scenario.frame();
+    let at = screen
+        .find(" Ask Bcode ")
+        .unwrap_or_else(|| panic!("no file Ask:\n{}", screen.text()));
+    scenario.click(at.x + 1, at.y);
+    settled(&mut scenario);
+    scenario.paste("Summarize this PR and file");
+    scenario.key("enter");
+    settled(&mut scenario);
+
+    let messages = backend.messages();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    let prompt = &messages[0].1;
+    assert!(prompt.contains("Review: #101 Layer 101 +2"), "{prompt}");
+    assert!(
+        prompt.contains("Selected source/layer: Stack layer"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("#102\nSource id: source-2\n"), "{prompt}");
+    assert!(
+        prompt.contains(&format!("File: {}", GitFixture::stack_layer_path(2))),
+        "{prompt}"
+    );
+}
+
+#[test]
 fn stack_rail_steps_between_layers_keeping_each_layers_position() {
     let fixture = fixture();
     let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));

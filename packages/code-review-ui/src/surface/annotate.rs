@@ -12,7 +12,7 @@
 
 use super::{Focus, Review, ReviewSurface, TRANSIENT_WORKSPACE_ID, ThreadRows};
 use crate::action::Action;
-use crate::agent::{self, AskContext};
+use crate::agent::{self, AskContext, AskSource};
 use crate::composer::{Composer, ComposerButton, ComposerInput, ComposerMode};
 use crate::context::UiContext;
 use crate::loader::Message;
@@ -880,6 +880,10 @@ impl ReviewSurface {
                 .filter(|source| source.included)
                 .map(|source| source.label.clone())
                 .collect(),
+            selected_source: exchange.anchor.source_id.as_ref().map(|id| AskSource {
+                id: id.clone(),
+                label: self.source_label(id),
+            }),
             threads,
             threads_omitted,
             threads_on: path,
