@@ -454,14 +454,14 @@ fn load_launcher_runtime(
 ) -> Result<bcode_plugin::PluginRuntimeHost, TuiError> {
     bcode_plugin_config::load_plugin_runtime_host(
         &bcode_plugin::PluginSelection::all_enabled(),
-        bcode_plugin::discover_plugins().map_err(launcher_load_error)?,
+        bcode_plugin::discover_plugins().map_err(|error| launcher_load_error(&error))?,
         static_plugins,
         std::collections::BTreeMap::new(),
     )
-    .map_err(launcher_load_error)
+    .map_err(|error| launcher_load_error(&error))
 }
 
-fn launcher_load_error(error: bcode_plugin::PluginLoadError) -> TuiError {
+fn launcher_load_error(error: &bcode_plugin::PluginLoadError) -> TuiError {
     TuiError::PluginService {
         code: "plugin_runtime_load_failed".to_owned(),
         message: error.to_string(),

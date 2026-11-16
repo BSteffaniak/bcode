@@ -49,11 +49,13 @@ async fn assert_runtime_echo(runtime: bcode_plugin::PluginRuntimeHost) {
 
 #[tokio::test]
 async fn eval_metrics_ralph_and_surface_launchers_activate_bundled_plugins() {
-    let runtime = tokio::task::spawn_blocking(|| load_launcher_runtime(&[hello()]))
-        .await
-        .unwrap()
-        .expect("launcher runtime loads with explicit activation");
-    assert_runtime_echo(runtime).await;
+    assert_runtime_echo(
+        tokio::task::spawn_blocking(|| load_launcher_runtime(&[hello()]))
+            .await
+            .unwrap()
+            .expect("launcher runtime loads with explicit activation"),
+    )
+    .await;
 }
 
 #[test]
@@ -71,11 +73,13 @@ fn plugin_tui_default_host_activates_bundled_plugins() {
 
 #[tokio::test]
 async fn plugin_tui_default_runtime_activates_bundled_plugins() {
-    let runtime = tokio::task::spawn_blocking(|| {
-        plugin_tui::load_default_runtime_with_static_bundled(&[hello()])
-    })
-    .await
-    .unwrap()
-    .expect("client runtime loads with explicit activation");
-    assert_runtime_echo(runtime).await;
+    assert_runtime_echo(
+        tokio::task::spawn_blocking(|| {
+            plugin_tui::load_default_runtime_with_static_bundled(&[hello()])
+        })
+        .await
+        .unwrap()
+        .expect("client runtime loads with explicit activation"),
+    )
+    .await;
 }

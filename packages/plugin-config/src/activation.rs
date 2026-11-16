@@ -153,9 +153,10 @@ impl Runtime {
     }
 }
 
-/// Grant every selected plugin in `plugin_ids` explicit activation authority from
-/// one new shared plugin runtime scope. Supplied activation contexts are preserved;
-/// unselected plugins receive no configuration entry from this call.
+/// Grant selected plugins activation authority from one new shared runtime scope.
+///
+/// Every selected plugin in `plugin_ids` is bound. Supplied activation contexts are
+/// preserved; unselected plugins receive no configuration entry from this call.
 #[must_use]
 pub fn bind_shared_plugin_activations(
     selection: &bcode_plugin::PluginSelection,
@@ -184,10 +185,12 @@ pub fn bind_shared_plugin_activations(
     configs
 }
 
-/// Load a plugin host for exactly the supplied discovered plugins and static
-/// registrations, granting every selected one activation authority from one owned
-/// shared runtime scope (see [`bind_shared_plugin_activations`]). Default plugin
-/// roots are not consulted; pass [`bcode_plugin::discover_plugins`] to include them.
+/// Load a plugin host whose selected plugins share one owned activation scope.
+///
+/// Exactly the supplied discovered plugins and static registrations are loaded, each
+/// selected one with activation authority from one owned shared runtime scope (see
+/// [`bind_shared_plugin_activations`]). Default plugin roots are not consulted; pass
+/// [`bcode_plugin::discover_plugins`] to include them.
 ///
 /// # Errors
 /// Returns manifest, selection, activation or load failures.

@@ -142,7 +142,3 @@ static-bundled-shell-plugin = [
 static-bundled-workflow-plugin = [
     "bcode_bundled_plugins/static-bundled-workflow-plugin",
 ]
-
-[package.metadata.cargo-machete]
-# Tests discover and load this dev-dependency as a dynamic library, not a Rust import.
-ignored = ["bcode_hello_plugin"]

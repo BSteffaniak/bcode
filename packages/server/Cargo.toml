@@ -95,8 +95,6 @@ wait-timeout = { workspace = true }
 
 zeroize = { workspace = true }
 
-bmux_plugin_runtime = { workspace = true }
-bmux_plugin_sdk     = { workspace = true }
 [dev-dependencies]
 bcode_bundled_plugins = { workspace = true, features = [
     "static-bundled-default-agents-plugin",
