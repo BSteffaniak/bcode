@@ -8,6 +8,10 @@
 //! 4. every file a selector names directly that none of these found (an ignored file), when it
 //!    is a regular file or link inside the repository.
 //!
+//! A nested repository that is not a submodule (an untracked clone, a vendored checkout) is
+//! printed by `--others` as its folder with a trailing `/`: it is not a file and is left out, as
+//! the path index leaves it out.
+//!
 //! Each git listing is sorted, so the first `max_files` paths of the merge come from the first
 //! `max_files` of each: the rest is counted, never held.
 
@@ -39,7 +43,7 @@ pub(super) fn listing(
         args.extend(options);
         args.push("--");
         args.extend(pathspecs.iter().map(String::as_str));
-        git::limited_records(git::magic_command(root, &args), keep)
+        git::limited_file_records(git::magic_command(root, &args), keep)
     };
     let tracked = run(&["--stage"])?;
     let untracked = if selection.untracked == BrowseUntracked::Tracked {

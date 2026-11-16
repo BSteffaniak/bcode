@@ -162,7 +162,26 @@ pub struct LimitedRecords {
 ///
 /// * [`DataError::Io`] when git cannot be started or read.
 /// * [`DataError::Git`] when git exits unsuccessfully.
-pub fn limited_records(mut command: Command, keep: usize) -> Result<LimitedRecords, DataError> {
+pub fn limited_records(command: Command, keep: usize) -> Result<LimitedRecords, DataError> {
+    limited_records_where(command, keep, |_| true)
+}
+
+/// [`limited_records`] of the records that name files: `git ls-files --others` prints a nested
+/// repository (an untracked clone, say) as one record ending in `/`, which is digested but
+/// neither kept nor counted.
+///
+/// # Errors
+///
+/// As [`limited_records`].
+pub fn limited_file_records(command: Command, keep: usize) -> Result<LimitedRecords, DataError> {
+    limited_records_where(command, keep, |record| !record.ends_with(b"/"))
+}
+
+fn limited_records_where(
+    mut command: Command,
+    keep: usize,
+    accept: impl Fn(&[u8]) -> bool,
+) -> Result<LimitedRecords, DataError> {
     use sha2::Digest as _;
     use std::io::{BufRead as _, Read as _};
     let _slot = Slot::acquire();
@@ -187,6 +206,9 @@ pub fn limited_records(mut command: Command, keep: usize) -> Result<LimitedRecor
         let record = record?;
         hasher.update(&record);
         hasher.update([0]);
+        if !accept(&record) {
+            continue;
+        }
         result.total += 1;
         if result.records.len() < keep {
             result

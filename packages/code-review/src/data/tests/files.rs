@@ -277,6 +277,93 @@ fn the_repository_lists_untracked_files_and_a_long_listing_is_cut_with_its_count
     );
 }
 
+/// Files `include` selects now by the path index (what the picker and `find_paths` count).
+fn counted(service: &ReviewData, repo: &Path, include: Vec<PathSelector>, ignored: bool) -> u32 {
+    service
+        .paths_resolve(&ReviewPathsResolveRequest {
+            repo_path: repo.to_path_buf(),
+            include,
+            exclude: Vec::new(),
+            include_ignored: ignored,
+            refresh: true,
+        })
+        .expect("resolve")
+        .total
+}
+
+#[test]
+fn nested_repositories_are_not_files_and_submodules_are_listed_once() {
+    let fixture = repository();
+    let repo = fixture.root();
+    write(repo, "sub/a.txt", "a\n");
+    fixture.run(&["add", "sub/a.txt"]);
+    // A submodule: a gitlink in the index.
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.run(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{},sub/module", head.trim()),
+    ]);
+    fixture.run(&["commit", "-q", "-m", "sub"]);
+    // A nested repository that is not a submodule (an untracked clone), with a file inside.
+    write(repo, "sub/nested/inner.txt", "inner\n");
+    fixture.run(&["-C", "sub/nested", "init", "-q"]);
+    let service = ReviewData::default();
+    for ignored in [false, true] {
+        for kind in [
+            file_set(vec![folder("sub")], Vec::new()),
+            file_set(
+                vec![PathSelector::Glob {
+                    pattern: "sub/**".into(),
+                }],
+                Vec::new(),
+            ),
+        ] {
+            let response = resolve(
+                &service,
+                repo,
+                kind.clone(),
+                BrowseOptions {
+                    include_ignored: ignored,
+                    max_files: None,
+                },
+            );
+            let entries = full_index(&service, repo, &response.sources[0]);
+            assert_eq!(
+                paths(&entries),
+                ["sub/a.txt", "sub/module"],
+                "{kind:?} ignored={ignored}"
+            );
+            assert!(entries[1].has(ReviewIndexFlag::Submodule));
+            let ReviewSourceKind::FileSet { include, .. } = kind else {
+                unreachable!()
+            };
+            assert_eq!(
+                counted(&service, repo, include, ignored),
+                2,
+                "the picker counts what the review lists"
+            );
+        }
+        let whole = resolve(
+            &service,
+            repo,
+            ReviewSourceKind::Repository,
+            BrowseOptions {
+                include_ignored: ignored,
+                max_files: None,
+            },
+        );
+        let entries = full_index(&service, repo, &whole.sources[0]);
+        assert!(
+            !paths(&entries).iter().any(|path| path.ends_with('/')),
+            "{:?}",
+            paths(&entries)
+        );
+        assert!(paths(&entries).contains(&"sub/module"));
+    }
+}
+
 #[test]
 fn malformed_file_sets_are_per_source_diagnostics_and_older_listings_stay_tracked_only() {
     let fixture = repository();
