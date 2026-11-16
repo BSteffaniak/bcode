@@ -24,11 +24,13 @@ tempfile = { workspace = true }
 [features]
 bundled-tesseract = ["bundled-tesseract-default"]
 bundled-tesseract-all = [
+    "bundled-tesseract-dynamic",
     "bundled-tesseract-v5-3-4",
     "bundled-tesseract-v5-5-1",
     "bundled-tesseract-v5-5-2",
 ]
 bundled-tesseract-default = ["bundled-tesseract-v5-5-2"]
+bundled-tesseract-dynamic = ["bcode_tesseract_sys/bundled-tesseract-dynamic"]
 bundled-tesseract-latest = ["bundled-tesseract-v5-5-2"]
 bundled-tesseract-v5-3-4 = ["bcode_tesseract_sys/bundled-tesseract-v5-3-4"]
 bundled-tesseract-v5-5-1 = ["bcode_tesseract_sys/bundled-tesseract-v5-5-1"]

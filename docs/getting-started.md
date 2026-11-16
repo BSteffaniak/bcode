@@ -91,7 +91,7 @@ Bcode asks before sensitive operations according to the active agent's policy. P
 
 ## Full distribution build
 
-The complete release feature composition adds bundled OCR runtimes, Mermaid rendering, and the optional web renderer:
+The complete release feature composition adds statically bundled OCR, Mermaid rendering, and the optional web renderer:
 
 ```sh
 cargo build --locked --release -p bcode --features distribution --bin bcode

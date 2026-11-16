@@ -31,6 +31,21 @@ unsafe extern "C" {
         oem: c_int,
     ) -> c_int;
 
+    /// Initializes the Tesseract API from an in-memory traineddata buffer.
+    pub fn TessBaseAPIInit5(
+        handle: *mut c_void,
+        data: *const c_char,
+        data_size: c_int,
+        language: *const c_char,
+        oem: c_int,
+        configs: *mut *mut c_char,
+        configs_size: c_int,
+        vars_vec: *mut *mut c_char,
+        vars_values: *mut *mut c_char,
+        vars_vec_size: usize,
+        set_only_non_debug_params: c_int,
+    ) -> c_int;
+
     /// Sets raw image data for recognition.
     pub fn TessBaseAPISetImage(
         handle: *mut c_void,
@@ -61,6 +76,35 @@ unsafe extern "C" {
     pub fn TessDeleteText(text: *mut c_char);
 }
 
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/embedded_tessdata.rs"));
+}
+
+/// How the build script provided Tesseract to this crate.
+///
+/// * `none`: no Tesseract symbols are linked.
+/// * `system`: linked against system libraries.
+/// * `vendored`: statically linked from caller-provided sources or libraries.
+/// * `bundled-static`: statically linked from catalog sources, with embedded tessdata.
+/// * `bundled-dynamic`: catalog runtimes are loaded at runtime; no symbols are linked.
+#[must_use]
+pub const fn linkage() -> &'static str {
+    env!("BCODE_TESSERACT_LINKAGE")
+}
+
+/// Returns traineddata files embedded by static bundled builds as
+/// `(language, bytes)` pairs. Other link modes embed nothing.
+#[must_use]
+pub const fn embedded_tessdata() -> &'static [(&'static str, &'static [u8])] {
+    embedded::EMBEDDED_TESSDATA
+}
+
+/// Returns the build-time `BCODE_TESSDATA_PREFIX` override, when one was set.
+#[must_use]
+pub const fn compiled_tessdata_prefix() -> Option<&'static str> {
+    option_env!("BCODE_TESSDATA_PREFIX")
+}
+
 /// Returns the bundled runtime root emitted by the build script, when bundled
 /// dynamic runtimes were built.
 #[must_use]
@@ -69,7 +113,7 @@ pub const fn compiled_bundled_runtime_root() -> Option<&'static str> {
 }
 
 /// Returns the bundled versions emitted by the build script, when bundled
-/// dynamic runtimes were built.
+/// runtimes were built or statically linked.
 #[must_use]
 pub const fn compiled_bundled_versions() -> Option<&'static str> {
     option_env!("BCODE_TESSERACT_BUNDLED_VERSIONS")

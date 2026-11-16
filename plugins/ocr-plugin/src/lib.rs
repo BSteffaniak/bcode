@@ -888,18 +888,26 @@ fn ocr_engine_statuses() -> Vec<EngineStatus> {
 
 #[cfg(feature = "_bundled-tesseract-runtime")]
 fn bundled_tesseract_status() -> EngineStatus {
-    let tessdata = bcode_tesseract_ocr::resolve_tessdata_dir();
     let runtime = bcode_tesseract_ocr::TesseractRuntime::load_default();
+    let version = match &runtime {
+        Ok(runtime) => format!(
+            "{} ({} bundled runtime {})",
+            runtime.backend_version(),
+            if runtime.is_static() {
+                "static"
+            } else {
+                "dynamic"
+            },
+            runtime.version()
+        ),
+        Err(error) => format!("bundled runtime unavailable: {error}"),
+    };
     EngineStatus {
         name: "tesseract".to_string(),
-        available: tessdata.is_dir() && runtime.is_ok(),
-        version: Some(format!(
-            "{} (bundled runtime {})",
-            bcode_tesseract_ocr::TesseractEngine::version(),
-            runtime
-                .as_ref()
-                .map_or("unavailable", |runtime| runtime.version())
-        )),
+        available: runtime
+            .as_ref()
+            .is_ok_and(|runtime| runtime.has_language(DEFAULT_LANGUAGE)),
+        version: Some(version),
         quality: "bundled".to_string(),
         available_bundled_versions: bcode_tesseract_ocr::available_bundled_versions()
             .into_iter()

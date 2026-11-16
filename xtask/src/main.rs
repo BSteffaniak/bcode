@@ -803,7 +803,47 @@ fn sync_tesseract_feature_blocks(
         options,
     )?;
     sync_ocr_plugin_features(&root.join("plugins/ocr-plugin/Cargo.toml"), policy, options)?;
+    sync_bundled_plugins_features(
+        &root.join("packages/bundled-plugins/Cargo.toml"),
+        policy,
+        options,
+    )?;
     sync_bcode_features(&root.join("packages/bcode/Cargo.toml"), policy, options)
+}
+
+/// Writes the alias features shared by every crate in the Tesseract feature
+/// chain. `-all` selects several versions, which only dynamic bundling supports.
+fn set_tesseract_alias_features(
+    features: &mut toml_edit::Table,
+    prefix: &str,
+    policy: &TesseractSyncPolicy,
+    dynamic_dependency: &str,
+) {
+    set_feature(features, prefix, &[format!("{prefix}-default")]);
+    set_feature(
+        features,
+        &format!("{prefix}-default"),
+        &[feature_name(prefix, &policy.default)],
+    );
+    set_feature(
+        features,
+        &format!("{prefix}-latest"),
+        &[feature_name(prefix, &policy.latest)],
+    );
+    let mut all = vec![format!("{prefix}-dynamic")];
+    all.extend(
+        policy
+            .versions
+            .iter()
+            .map(|version| feature_name(prefix, version)),
+    );
+    set_feature(features, &format!("{prefix}-all"), &all);
+    let dynamic: Vec<String> = if dynamic_dependency.is_empty() {
+        Vec::new()
+    } else {
+        vec![dynamic_dependency.to_owned()]
+    };
+    set_feature(features, &format!("{prefix}-dynamic"), &dynamic);
 }
 
 fn feature_name(prefix: &str, version: &str) -> String {
@@ -851,30 +891,7 @@ fn sync_tesseract_sys_features(
 ) -> Result<()> {
     let mut document = load_cargo_toml(path)?;
     let features = features_table(&mut document)?;
-    set_feature(
-        features,
-        "bundled-tesseract",
-        &["bundled-tesseract-default".to_owned()],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-default",
-        &[feature_name("bundled-tesseract", &policy.default)],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-latest",
-        &[feature_name("bundled-tesseract", &policy.latest)],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-all",
-        &policy
-            .versions
-            .iter()
-            .map(|version| feature_name("bundled-tesseract", version))
-            .collect::<Vec<_>>(),
-    );
+    set_tesseract_alias_features(features, "bundled-tesseract", policy, "");
     set_feature(
         features,
         "bundled-tesseract-build",
@@ -901,29 +918,11 @@ fn sync_tesseract_ocr_features(
 ) -> Result<()> {
     let mut document = load_cargo_toml(path)?;
     let features = features_table(&mut document)?;
-    set_feature(
+    set_tesseract_alias_features(
         features,
         "bundled-tesseract",
-        &["bundled-tesseract-default".to_owned()],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-default",
-        &[feature_name("bundled-tesseract", &policy.default)],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-latest",
-        &[feature_name("bundled-tesseract", &policy.latest)],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-all",
-        &policy
-            .versions
-            .iter()
-            .map(|version| feature_name("bundled-tesseract", version))
-            .collect::<Vec<_>>(),
+        policy,
+        "bcode_tesseract_sys/bundled-tesseract-dynamic",
     );
     for version in &policy.versions {
         let feature = feature_name("bundled-tesseract", version);
@@ -943,29 +942,11 @@ fn sync_ocr_plugin_features(
 ) -> Result<()> {
     let mut document = load_cargo_toml(path)?;
     let features = features_table(&mut document)?;
-    set_feature(
+    set_tesseract_alias_features(
         features,
         "bundled-tesseract",
-        &["bundled-tesseract-default".to_owned()],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-default",
-        &[feature_name("bundled-tesseract", &policy.default)],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-latest",
-        &[feature_name("bundled-tesseract", &policy.latest)],
-    );
-    set_feature(
-        features,
-        "bundled-tesseract-all",
-        &policy
-            .versions
-            .iter()
-            .map(|version| feature_name("bundled-tesseract", version))
-            .collect::<Vec<_>>(),
+        policy,
+        "bcode_tesseract_ocr?/bundled-tesseract-dynamic",
     );
     for version in &policy.versions {
         let feature = feature_name("bundled-tesseract", version);
@@ -981,42 +962,52 @@ fn sync_ocr_plugin_features(
     write_cargo_toml(path, &document, options)
 }
 
+fn sync_bundled_plugins_features(
+    path: &Path,
+    policy: &TesseractSyncPolicy,
+    options: &Options,
+) -> Result<()> {
+    let mut document = load_cargo_toml(path)?;
+    let features = features_table(&mut document)?;
+    set_tesseract_alias_features(
+        features,
+        "bundled-ocr-tesseract",
+        policy,
+        "bcode_ocr_plugin?/bundled-tesseract-dynamic",
+    );
+    for version in &policy.versions {
+        set_feature(
+            features,
+            &feature_name("bundled-ocr-tesseract", version),
+            &[
+                "static-bundled-ocr-plugin".to_owned(),
+                format!(
+                    "bcode_ocr_plugin/{}",
+                    feature_name("bundled-tesseract", version)
+                ),
+            ],
+        );
+    }
+    write_cargo_toml(path, &document, options)
+}
+
 fn sync_bcode_features(path: &Path, policy: &TesseractSyncPolicy, options: &Options) -> Result<()> {
     let mut document = load_cargo_toml(path)?;
     let features = features_table(&mut document)?;
-    set_feature(
+    set_tesseract_alias_features(
         features,
         "bundled-ocr-tesseract",
-        &["bundled-ocr-tesseract-default".to_owned()],
-    );
-    set_feature(
-        features,
-        "bundled-ocr-tesseract-default",
-        &[feature_name("bundled-ocr-tesseract", &policy.default)],
-    );
-    set_feature(
-        features,
-        "bundled-ocr-tesseract-latest",
-        &[feature_name("bundled-ocr-tesseract", &policy.latest)],
-    );
-    set_feature(
-        features,
-        "bundled-ocr-tesseract-all",
-        &policy
-            .versions
-            .iter()
-            .map(|version| feature_name("bundled-ocr-tesseract", version))
-            .collect::<Vec<_>>(),
+        policy,
+        "bcode_bundled_plugins?/bundled-ocr-tesseract-dynamic",
     );
     for version in &policy.versions {
-        let app_feature = feature_name("bundled-ocr-tesseract", version);
-        let plugin_feature = feature_name("bundled-tesseract", version);
+        let feature = feature_name("bundled-ocr-tesseract", version);
         set_feature(
             features,
-            &app_feature,
+            &feature,
             &[
                 "static-bundled-ocr-plugin".to_owned(),
-                format!("bcode_ocr_plugin/{plugin_feature}"),
+                format!("bcode_bundled_plugins/{feature}"),
             ],
         );
     }
@@ -1070,6 +1061,18 @@ fn smoke_test_tesseract(options: &Options) -> Result<()> {
         options.out_dir.clone()
     };
     ensure_file(&binary)?;
+    if options.out_dir == Path::new(DIST_DIR) && !runtime_root.exists() {
+        // Static bundled builds carry Tesseract and tessdata in the executable.
+        let binary_dir = binary
+            .parent()
+            .ok_or_else(|| format_error("failed to determine binary directory"))?;
+        smoke_test_packaged_ocr(&binary, binary_dir, target_kind, None)?;
+        println!(
+            "smoke-tested statically bundled Tesseract in {}",
+            binary.display()
+        );
+        return Ok(());
+    }
     ensure_dir(&runtime_root)?;
     let expected_runtime = latest_bundled_runtime_root(&options.target)?;
     if runtime_tree_manifest(&runtime_root)? != runtime_tree_manifest(&expected_runtime)? {
@@ -1084,18 +1087,7 @@ fn smoke_test_tesseract(options: &Options) -> Result<()> {
             .arg("--version")
             .env("BCODE_TESSERACT_RUNTIME_ROOT", &runtime_root),
     )?;
-    run_command(
-        Command::new("cargo")
-            .arg("run")
-            .arg("--package")
-            .arg("bcode_tesseract_ocr")
-            .arg("--bin")
-            .arg("tesseract-smoke")
-            .arg("--no-default-features")
-            .arg("--features")
-            .arg("bundled-tesseract-default")
-            .env("BCODE_TESSERACT_RUNTIME_ROOT", &runtime_root),
-    )?;
+    run_dynamic_tesseract_smoke(&runtime_root)?;
     println!(
         "smoke-tested bcode binary with bundled Tesseract runtime root {}",
         runtime_root.display()
@@ -1127,7 +1119,11 @@ fn latest_bundled_runtime_root(target: &str) -> Result<PathBuf> {
                 .and_then(|metadata| metadata.modified())
                 .ok()
         })
-        .ok_or_else(|| format_error("failed to find built bundled Tesseract runtimes"))
+        .ok_or_else(|| {
+            format_error(
+                "failed to find built bundled Tesseract runtimes; runtime trees exist only for builds with the bundled-ocr-tesseract-dynamic feature",
+            )
+        })
 }
 
 fn bundled_runtime_roots(build_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1289,12 +1285,37 @@ fn selected_features(options: &Options, default_distribution: bool) -> Vec<Strin
         .collect()
 }
 
-fn features_enable_bundled_tesseract(features: &[String]) -> bool {
-    features.iter().any(|feature| {
-        feature == "distribution"
-            || feature == "bundled-ocr-tesseract"
-            || feature.starts_with("bundled-ocr-tesseract-")
-    })
+/// How a release build ships bundled Tesseract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TesseractPackaging {
+    /// No bundled Tesseract.
+    None,
+    /// Tesseract and tessdata are linked into the executable.
+    Static,
+    /// Runtime trees ship in `bcode-runtimes/tesseract` beside the executable.
+    Dynamic,
+}
+
+impl TesseractPackaging {
+    fn from_features(features: &[String]) -> Self {
+        let bundled = features.iter().any(|feature| {
+            feature == "distribution"
+                || feature == "bundled-ocr-tesseract"
+                || feature.starts_with("bundled-ocr-tesseract-")
+        });
+        let dynamic = features.iter().any(|feature| {
+            feature == "bundled-ocr-tesseract-dynamic" || feature == "bundled-ocr-tesseract-all"
+        });
+        match (bundled, dynamic) {
+            (false, _) => Self::None,
+            (true, false) => Self::Static,
+            (true, true) => Self::Dynamic,
+        }
+    }
+
+    const fn ships_runtime_tree(self) -> bool {
+        matches!(self, Self::Dynamic)
+    }
 }
 
 fn generated_artifact_id() -> String {
@@ -1477,7 +1498,7 @@ fn verified_browser_bundle(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
 fn release(options: &Options) -> Result<()> {
     ensure_windows_release_runs_natively(&options.target, "release")?;
     let features = selected_features(options, true);
-    let include_tesseract = features_enable_bundled_tesseract(&features);
+    let tesseract = TesseractPackaging::from_features(&features);
     let target_kind = TargetKind::parse(&options.target)?;
     if target_kind == TargetKind::Windows {
         windows_signing_configuration()?;
@@ -1540,7 +1561,7 @@ fn release(options: &Options) -> Result<()> {
             )));
         }
     }
-    if include_tesseract {
+    if tesseract.ships_runtime_tree() {
         let runtime_source = latest_bundled_runtime_root(&options.target)?;
         let runtime_destination = staging_dir.join("bcode-runtimes").join("tesseract");
         recreate_dir(&runtime_destination)?;
@@ -1565,13 +1586,13 @@ fn release(options: &Options) -> Result<()> {
 
 fn verify_release(options: &Options) -> Result<()> {
     let features = selected_features(options, true);
-    let include_tesseract = features_enable_bundled_tesseract(&features);
+    let tesseract = TesseractPackaging::from_features(&features);
     let target_kind = TargetKind::parse(&options.target)?;
     let archive = archive_path(options, target_kind);
     ensure_file(&archive)?;
     ensure_file(&checksum_path(&archive))?;
     verify_checksum(&archive)?;
-    verify_archive_contents(&archive, target_kind, include_tesseract)?;
+    verify_archive_contents(&archive, target_kind, tesseract)?;
     if features
         .iter()
         .any(|feature| matches!(feature.as_str(), "distribution" | "web-renderer"))
@@ -1609,7 +1630,7 @@ fn verify_release(options: &Options) -> Result<()> {
         smoke_test_release_archive(
             &archive,
             target_kind,
-            include_tesseract,
+            tesseract,
             normalize_release_version(&options.version)?,
         )?;
     } else {
@@ -2520,10 +2541,10 @@ fn verify_checksum(archive: &Path) -> Result<()> {
 fn verify_archive_contents(
     archive: &Path,
     target_kind: TargetKind,
-    include_tesseract: bool,
+    tesseract: TesseractPackaging,
 ) -> Result<()> {
     if target_kind == TargetKind::Linux {
-        return verify_tar_archive_contents(archive, target_kind, include_tesseract);
+        return verify_tar_archive_contents(archive, target_kind, tesseract);
     }
     let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
     let mut entries = std::collections::BTreeSet::new();
@@ -2533,20 +2554,20 @@ fn verify_archive_contents(
             entries.insert(entry.name().to_owned());
         }
     }
-    verify_required_archive_entries(&entries, archive, target_kind, include_tesseract)
+    verify_required_archive_entries(&entries, archive, target_kind, tesseract)
 }
 
 fn verify_tar_archive_contents(
     archive: &Path,
     target_kind: TargetKind,
-    include_tesseract: bool,
+    tesseract: TesseractPackaging,
 ) -> Result<()> {
     let listing = command_output(Command::new("tar").arg("-tzf").arg(archive))?;
     let entries = listing
         .lines()
         .map(|entry| entry.trim_start_matches("./").to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    verify_required_archive_entries(&entries, archive, target_kind, include_tesseract)
+    verify_required_archive_entries(&entries, archive, target_kind, tesseract)
 }
 
 fn verification_extraction_path(archive: &Path) -> PathBuf {
@@ -2574,7 +2595,7 @@ fn next_verification_temp_id() -> u64 {
 fn smoke_test_release_archive(
     archive: &Path,
     target_kind: TargetKind,
-    include_tesseract: bool,
+    tesseract: TesseractPackaging,
     expected_version: &str,
 ) -> Result<()> {
     let extraction = verification_extraction_path(archive);
@@ -2584,7 +2605,7 @@ fn smoke_test_release_archive(
         archive,
         target_kind,
         &extraction,
-        include_tesseract,
+        tesseract,
         expected_version,
     );
     let cleanup = fs::remove_dir_all(&extraction);
@@ -2645,7 +2666,7 @@ fn smoke_test_release_archive_in(
     archive: &Path,
     target_kind: TargetKind,
     extraction: &Path,
-    include_tesseract: bool,
+    tesseract: TesseractPackaging,
     expected_version: &str,
 ) -> Result<()> {
     if target_kind == TargetKind::Linux {
@@ -2681,8 +2702,12 @@ fn smoke_test_release_archive_in(
         // must fail before startup and must not downgrade to the HTML frontend.
         smoke_test_packaged_browser_rejection(&binary, &browser_bundle, extraction)?;
     }
-    if include_tesseract {
-        smoke_test_extracted_tesseract(extraction, target_kind)?;
+    match tesseract {
+        TesseractPackaging::None => {}
+        TesseractPackaging::Static => {
+            smoke_test_packaged_ocr(&binary, extraction, target_kind, None)?;
+        }
+        TesseractPackaging::Dynamic => smoke_test_extracted_tesseract(extraction, target_kind)?,
     }
     if target_kind == TargetKind::Windows {
         smoke_test_windows_shell_tool(&binary, extraction)?;
@@ -2780,10 +2805,13 @@ fn smoke_test_packaged_browser_rejection(
 fn smoke_test_extracted_tesseract(extraction: &Path, target_kind: TargetKind) -> Result<()> {
     let runtime_root = extraction.join("bcode-runtimes").join("tesseract");
     ensure_dir(&runtime_root)?;
-    if target_kind == TargetKind::Windows {
-        let binary = extraction.join(binary_file_name(target_kind));
-        smoke_test_windows_bundled_ocr(&binary, extraction, &runtime_root)?;
-    }
+    let binary = extraction.join(binary_file_name(target_kind));
+    smoke_test_packaged_ocr(&binary, extraction, target_kind, Some(&runtime_root))?;
+    run_dynamic_tesseract_smoke(&runtime_root)
+}
+
+/// Runs the library smoke test against a dynamic runtime tree.
+fn run_dynamic_tesseract_smoke(runtime_root: &Path) -> Result<()> {
     run_command(
         Command::new("cargo")
             .arg("run")
@@ -2793,7 +2821,7 @@ fn smoke_test_extracted_tesseract(extraction: &Path, target_kind: TargetKind) ->
             .arg("tesseract-smoke")
             .arg("--no-default-features")
             .arg("--features")
-            .arg("bundled-tesseract-default")
+            .arg("bundled-tesseract-default,bundled-tesseract-dynamic")
             .env("BCODE_TESSERACT_RUNTIME_ROOT", runtime_root),
     )
 }
@@ -2872,18 +2900,21 @@ fn tool_preparation_payload(
     }
 }
 
-fn smoke_test_windows_bundled_ocr(
+/// Recognizes a fixture through the packaged binary's OCR plugin, with an
+/// isolated environment so only the packaged Tesseract can satisfy it.
+fn smoke_test_packaged_ocr(
     binary: &Path,
     extraction: &Path,
-    runtime_root: &Path,
+    target_kind: TargetKind,
+    runtime_root: Option<&Path>,
 ) -> Result<()> {
-    let smoke_root = extraction.join("windows OCR smoke 状态");
+    let smoke_root = extraction.join("OCR smoke 状态");
     fs::create_dir_all(smoke_root.join("temp"))?;
     let fixture = smoke_root.join("fixture test.png");
     write_windows_ocr_fixture(&fixture)?;
     let working_directory = extraction.canonicalize()?;
     let prepare = tool_preparation_payload(
-        "windows-ocr-smoke",
+        "packaged-ocr-smoke",
         "ocr.extract",
         serde_json::json!({
             "path": fixture,
@@ -2904,12 +2935,18 @@ fn smoke_test_windows_bundled_ocr(
         &serde_json::to_string(&prepare)
             .map_err(|error| format_error(format!("failed to encode OCR preparation: {error}")))?,
     ]);
-    windows_ocr_smoke_environment(&mut prepare_command, extraction, &smoke_root, runtime_root);
+    packaged_ocr_smoke_environment(
+        &mut prepare_command,
+        extraction,
+        &smoke_root,
+        target_kind,
+        runtime_root,
+    );
     let prepared_output = command_output(&mut prepare_command)?;
     let prepared = decode_tool_preparation_response(&prepared_output)?;
     verify_ocr_preparation(&prepared)?;
     let invocation = bcode_tool::ToolInvocationRequest {
-        tool_call_id: "windows-ocr-smoke".to_owned(),
+        tool_call_id: "packaged-ocr-smoke".to_owned(),
         name: "ocr.extract".to_owned(),
         arguments: prepare.invocation.arguments,
         preparation_descriptor: prepared.descriptor,
@@ -2924,7 +2961,13 @@ fn smoke_test_windows_bundled_ocr(
         &serde_json::to_string(&invocation)
             .map_err(|error| format_error(format!("failed to encode OCR invocation: {error}")))?,
     ]);
-    windows_ocr_smoke_environment(&mut invoke_command, extraction, &smoke_root, runtime_root);
+    packaged_ocr_smoke_environment(
+        &mut invoke_command,
+        extraction,
+        &smoke_root,
+        target_kind,
+        runtime_root,
+    );
     let invocation_output = command_output(&mut invoke_command)?;
     let response = decode_tool_invocation_response(&invocation_output)?;
     if response.is_error || !response.output.to_ascii_lowercase().contains("test") {
@@ -2933,16 +2976,34 @@ fn smoke_test_windows_bundled_ocr(
             response.output
         )));
     }
+    fs::remove_dir_all(smoke_root)?;
     Ok(())
 }
 
-fn windows_ocr_smoke_environment(
+fn packaged_ocr_smoke_environment(
     command: &mut Command,
     extraction: &Path,
     smoke_root: &Path,
-    runtime_root: &Path,
+    target_kind: TargetKind,
+    runtime_root: Option<&Path>,
 ) {
-    windows_product_smoke_environment(command, extraction, smoke_root, Some(runtime_root));
+    if target_kind == TargetKind::Windows {
+        windows_product_smoke_environment(command, extraction, smoke_root, runtime_root);
+        return;
+    }
+    // `PATH` holds only the extraction so an installed `tesseract` CLI cannot
+    // stand in for the packaged engine.
+    command
+        .env_clear()
+        .current_dir(extraction)
+        .env("PATH", extraction)
+        .env("HOME", smoke_root)
+        .env("TMPDIR", smoke_root.join("temp"))
+        .env("BCODE_CONFIG_TOML", "")
+        .env("BCODE_STATE_DIR", smoke_root.join("state"));
+    if let Some(runtime_root) = runtime_root {
+        command.env("BCODE_TESSERACT_RUNTIME_ROOT", runtime_root);
+    }
 }
 
 fn response_json(output: &str) -> Result<&str> {
@@ -3749,10 +3810,10 @@ fn verify_required_archive_entries(
     entries: &BTreeSet<String>,
     archive: &Path,
     target_kind: TargetKind,
-    include_tesseract: bool,
+    tesseract: TesseractPackaging,
 ) -> Result<()> {
     let mut required = vec![binary_file_name(target_kind)];
-    if include_tesseract {
+    if tesseract.ships_runtime_tree() {
         required.push("bcode-runtimes/tesseract/manifest.json");
     }
     for name in required {
@@ -3773,7 +3834,7 @@ fn verify_required_archive_entries(
             }
         }
     }
-    if !include_tesseract {
+    if !tesseract.ships_runtime_tree() {
         return Ok(());
     }
     let runtime_prefix = "bcode-runtimes/tesseract/";
@@ -4049,6 +4110,101 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    const TESSERACT_FEATURE_MANIFESTS: [&str; 5] = [
+        "packages/tesseract-sys/Cargo.toml",
+        "packages/tesseract-ocr/Cargo.toml",
+        "plugins/ocr-plugin/Cargo.toml",
+        "packages/bundled-plugins/Cargo.toml",
+        "packages/bcode/Cargo.toml",
+    ];
+
+    fn manifest_features(path: &Path) -> BTreeMap<String, Vec<String>> {
+        let mut manifest = load_cargo_toml(path).expect("manifest");
+        features_table(&mut manifest)
+            .expect("features table")
+            .iter()
+            .map(|(name, value)| {
+                let dependencies = value
+                    .as_array()
+                    .expect("feature array")
+                    .iter()
+                    .map(|dependency| dependency.as_str().expect("feature string").to_owned())
+                    .collect();
+                (name.to_owned(), dependencies)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tesseract_feature_sync_reproduces_checked_in_feature_blocks() {
+        let root = workspace_root();
+        let temp = tempfile::tempdir().expect("temp dir");
+        for manifest in TESSERACT_FEATURE_MANIFESTS {
+            let destination = temp.path().join(manifest);
+            fs::create_dir_all(destination.parent().expect("manifest parent"))
+                .expect("manifest directory");
+            fs::copy(root.join(manifest), destination).expect("copy manifest");
+        }
+        let policy = read_tesseract_sync_policy(
+            &root.join("packages/tesseract-sys/bundled/sync-policy.toml"),
+        )
+        .expect("sync policy");
+        sync_tesseract_feature_blocks(temp.path(), &policy, &Options::help())
+            .expect("sync feature blocks");
+        for manifest in TESSERACT_FEATURE_MANIFESTS {
+            assert_eq!(
+                manifest_features(&temp.path().join(manifest)),
+                manifest_features(&root.join(manifest)),
+                "{manifest} feature block drifted from the Tesseract feature generator"
+            );
+        }
+    }
+
+    #[test]
+    fn tesseract_packaging_ships_runtime_trees_only_for_dynamic_bundles() {
+        let packaging = |features: &[&str]| {
+            TesseractPackaging::from_features(
+                &features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(packaging(&["app"]), TesseractPackaging::None);
+        assert_eq!(packaging(&["distribution"]), TesseractPackaging::Static);
+        assert_eq!(
+            packaging(&["app", "bundled-ocr-tesseract"]),
+            TesseractPackaging::Static
+        );
+        assert_eq!(
+            packaging(&["distribution", "bundled-ocr-tesseract-dynamic"]),
+            TesseractPackaging::Dynamic
+        );
+        assert_eq!(
+            packaging(&["app", "bundled-ocr-tesseract-all"]),
+            TesseractPackaging::Dynamic
+        );
+        let entries = std::collections::BTreeSet::from(["bcode".to_owned()]);
+        assert!(
+            verify_required_archive_entries(
+                &entries,
+                Path::new("release.tar.gz"),
+                TargetKind::Linux,
+                TesseractPackaging::Static,
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_required_archive_entries(
+                &entries,
+                Path::new("release.tar.gz"),
+                TargetKind::Linux,
+                TesseractPackaging::Dynamic,
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn explicit_release_features_replace_distribution_and_imply_app() {
         let mut options = Options::help();
@@ -4078,12 +4234,14 @@ mod tests {
 
     #[test]
     fn optional_release_assets_follow_selected_features() {
-        assert!(!features_enable_bundled_tesseract(&[
-            "static-bundled-plugins".to_owned()
-        ]));
-        assert!(features_enable_bundled_tesseract(&[
-            "bundled-ocr-tesseract-v5-5-2".to_owned()
-        ]));
+        assert_eq!(
+            TesseractPackaging::from_features(&["static-bundled-plugins".to_owned()]),
+            TesseractPackaging::None
+        );
+        assert_eq!(
+            TesseractPackaging::from_features(&["bundled-ocr-tesseract-v5-5-2".to_owned()]),
+            TesseractPackaging::Static
+        );
     }
 
     #[test]
@@ -4472,12 +4630,20 @@ mod tests {
         fs::write(runtime.join("tessdata/eng.traineddata"), b"language").expect("language data");
         let archive = temp.path().join("release.zip");
         create_zip_archive(&archive, &staging).expect("create archive");
-        verify_archive_contents(&archive, TargetKind::Windows, true).expect("complete archive");
+        verify_archive_contents(&archive, TargetKind::Windows, TesseractPackaging::Dynamic)
+            .expect("complete archive");
 
         fs::remove_file(staging.join("bcode.exe")).expect("remove product binary");
         let incomplete = temp.path().join("incomplete.zip");
         create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
-        assert!(verify_archive_contents(&incomplete, TargetKind::Windows, true).is_err());
+        assert!(
+            verify_archive_contents(
+                &incomplete,
+                TargetKind::Windows,
+                TesseractPackaging::Dynamic
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4508,7 +4674,7 @@ mod tests {
                 &entries,
                 Path::new("release.zip"),
                 TargetKind::Windows,
-                true,
+                TesseractPackaging::Dynamic,
             )
             .is_err()
         );
@@ -4544,8 +4710,13 @@ mod tests {
         let second_extraction = verification_extraction_path(&archive);
         assert_ne!(first_extraction, second_extraction);
         assert!(
-            smoke_test_release_archive(&archive, TargetKind::Windows, true, "0.0.1-alpha.0",)
-                .is_err()
+            smoke_test_release_archive(
+                &archive,
+                TargetKind::Windows,
+                TesseractPackaging::Dynamic,
+                "0.0.1-alpha.0",
+            )
+            .is_err()
         );
         let leaked = fs::read_dir(temp.path())
             .expect("temp entries")

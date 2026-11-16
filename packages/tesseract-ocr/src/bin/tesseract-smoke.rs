@@ -5,7 +5,7 @@
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_tesseract_ocr::{
     ImageView, PageSegMode, RuntimeSelection, TesseractEngine, TesseractRuntime,
-    available_bundled_versions,
+    available_bundled_versions, embedded_languages,
 };
 
 fn main() -> bcode_tesseract_ocr::Result<()> {
@@ -16,10 +16,15 @@ fn main() -> bcode_tesseract_ocr::Result<()> {
     );
 
     let default_runtime = TesseractRuntime::load_default()?;
+    let tessdata = default_runtime.tessdata_dir().map_or_else(
+        || format!("embedded tessdata: {}", embedded_languages().join(", ")),
+        |path| display_from_current_dir(path).to_string(),
+    );
     println!(
-        "default bundled runtime: {} ({})",
+        "default bundled runtime: {} ({}; library {})",
         default_runtime.version(),
-        display_from_current_dir(default_runtime.tessdata_dir())
+        tessdata,
+        default_runtime.backend_version()
     );
     let latest_runtime = TesseractRuntime::load_latest()?;
     println!("latest bundled runtime: {}", latest_runtime.version());

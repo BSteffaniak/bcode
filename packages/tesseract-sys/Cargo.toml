@@ -23,19 +23,23 @@ zip        = { workspace = true, optional = true }
 [features]
 bundled-tesseract = ["bundled-tesseract-default"]
 bundled-tesseract-all = [
+    "bundled-tesseract-dynamic",
     "bundled-tesseract-v5-3-4",
     "bundled-tesseract-v5-5-1",
     "bundled-tesseract-v5-5-2",
 ]
 bundled-tesseract-build = ["dep:reqwest", "dep:sha2", "dep:zip"]
 bundled-tesseract-default = ["bundled-tesseract-v5-5-2"]
-bundled-tesseract-latest = ["bundled-tesseract-v5-5-2"]
-bundled-tesseract-v5-3-4 = ["bundled-tesseract-build"]
-bundled-tesseract-v5-5-1 = ["bundled-tesseract-build"]
-bundled-tesseract-v5-5-2 = ["bundled-tesseract-build"]
-default = []
-fail-on-warnings = []
-system-tesseract = []
+# Bundle selected versions as separately loaded runtime trees instead of
+# statically linking a single version with embedded tessdata.
+bundled-tesseract-dynamic = []
+bundled-tesseract-latest  = ["bundled-tesseract-v5-5-2"]
+bundled-tesseract-v5-3-4  = ["bundled-tesseract-build"]
+bundled-tesseract-v5-5-1  = ["bundled-tesseract-build"]
+bundled-tesseract-v5-5-2  = ["bundled-tesseract-build"]
+default                   = []
+fail-on-warnings          = []
+system-tesseract          = []
 
 [package.metadata.cargo-machete]
 # The build script uses these dependencies; cargo-machete does not trace this build script.

@@ -186,7 +186,7 @@ jobs:
             throw "Windows release verification did not execute extracted-product acceptance"
           }
 
-      - name: Smoke-test packaged Tesseract runtime
+      - name: Smoke-test packaged Tesseract
         run: cargo xtask smoke-test-tesseract --target x86_64-pc-windows-msvc
 
       - name: Upload Windows CI diagnostics
@@ -226,7 +226,8 @@ jobs:
           $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $archive))
           try {
             $entries = $zip.Entries.FullName
-            foreach ($required in 'bcode.exe', 'bcode-runtimes/tesseract/manifest.json') {
+            # The distribution statically links Tesseract, so no runtime tree ships beside it.
+            foreach ($required in @('bcode.exe')) {
               if ($entries -notcontains $required) {
                 throw "Windows CI archive is missing $required"
               }

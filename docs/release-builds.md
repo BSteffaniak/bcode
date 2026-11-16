@@ -84,8 +84,11 @@ verification remains enabled on both paths.
 macOS and Windows artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP
 is the complete initial Windows distribution format; an installer, Store package, package-manager
 publication, and auto-updater are outside the v1 Windows milestone. Every archive contains
-`bcode` (with an `.exe` suffix on Windows), plus
-the bundled Tesseract runtime tree selected by the `distribution` feature. Windows source
+`bcode` (with an `.exe` suffix on Windows). The `distribution` feature statically links the
+catalog default Tesseract version and embeds its tessdata in the executable, so OCR needs no files
+beside the binary. Builds that add `bundled-ocr-tesseract-dynamic` (or select several versions with
+`bundled-ocr-tesseract-all`) instead ship loadable runtime trees under `bcode-runtimes/tesseract`;
+release packaging stages and verifies that tree only for those builds. Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
 CI verifies `cmake`, `cl.exe`, and `link.exe` explicitly and initializes the Visual Studio amd64
 developer shell when those tools are not already in the runner environment.
@@ -115,7 +118,7 @@ cargo xtask verify-release --target x86_64-pc-windows-msvc --version v0.1.0
 ```
 
 Extract the ZIP as a directory and preserve its relative layout: `bcode.exe`
-remains at the root, while the versioned OCR DLLs and language data stay
+remains at the root, and dynamic OCR builds keep their versioned DLLs and language data
 under `bcode-runtimes\\tesseract`. Run `bcode.exe --version` from the extracted directory as a basic
 installation check. Mermaid WASM and AOT artifacts are embedded at compile time;
 no external renderer worker is shipped. Release verification additionally exercises bundled OCR,

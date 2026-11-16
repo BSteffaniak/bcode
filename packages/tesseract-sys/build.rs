@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=bundled/catalog.generated.toml");
@@ -15,13 +17,134 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BCODE_TESSERACT_OFFLINE");
     emit_tessdata_prefix_override();
 
-    match link_mode().as_str() {
-        "none" => emit_no_link_metadata(),
-        "system" => system::link(),
-        "vendored" => vendored::link(),
-        "bundled" | "download" => bundled::link(),
+    let mut embedded_tessdata = Vec::new();
+    let linkage = match link_mode().as_str() {
+        "none" => {
+            emit_no_link_metadata();
+            Linkage::None
+        }
+        "system" => {
+            system::link();
+            Linkage::System
+        }
+        "vendored" => {
+            vendored::link();
+            Linkage::Vendored
+        }
+        "bundled" | "download" => link_bundled(bundled_linkage(), &mut embedded_tessdata),
+        "bundled-static" => link_bundled(BundledLinkage::Static, &mut embedded_tessdata),
+        "bundled-dynamic" => link_bundled(BundledLinkage::Dynamic, &mut embedded_tessdata),
         other => panic!("unsupported BCODE_TESSERACT_LINK_MODE: {other}"),
+    };
+    write_embedded_tessdata_module(&embedded_tessdata);
+    // Dependents read this as `DEP_TESSERACT_LINKAGE` to learn which symbols are linked.
+    println!("cargo:linkage={}", linkage.as_str());
+    println!(
+        "cargo:rustc-env=BCODE_TESSERACT_LINKAGE={}",
+        linkage.as_str()
+    );
+}
+
+#[derive(Clone, Copy)]
+enum Linkage {
+    None,
+    System,
+    Vendored,
+    BundledStatic,
+    BundledDynamic,
+}
+
+impl Linkage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::System => "system",
+            Self::Vendored => "vendored",
+            Self::BundledStatic => "bundled-static",
+            Self::BundledDynamic => "bundled-dynamic",
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum BundledLinkage {
+    Static,
+    Dynamic,
+}
+
+fn bundled_linkage() -> BundledLinkage {
+    if cfg!(feature = "bundled-tesseract-dynamic") {
+        BundledLinkage::Dynamic
+    } else {
+        BundledLinkage::Static
+    }
+}
+
+fn link_bundled(
+    linkage: BundledLinkage,
+    embedded_tessdata: &mut Vec<(String, PathBuf)>,
+) -> Linkage {
+    validate_bundled_selection();
+    match linkage {
+        BundledLinkage::Static => {
+            let versions = selected_bundled_versions();
+            assert!(
+                versions.len() == 1,
+                "static bundled Tesseract links exactly one version, but {} were selected ({}); enable bundled-tesseract-dynamic to bundle several versions as loadable runtimes",
+                versions.len(),
+                versions.join(", ")
+            );
+            *embedded_tessdata = bundled::link_static(&versions[0]);
+            Linkage::BundledStatic
+        }
+        BundledLinkage::Dynamic => {
+            bundled::link_dynamic();
+            Linkage::BundledDynamic
+        }
+    }
+}
+
+/// Writes the Rust module that embeds traineddata files into the crate.
+///
+/// Every link mode writes the module so the crate always compiles; only static
+/// bundled builds populate it.
+fn write_embedded_tessdata_module(entries: &[(String, PathBuf)]) {
+    let mut module = String::from("pub static EMBEDDED_TESSDATA: &[(&str, &[u8])] = &[\n");
+    for (language, path) in entries {
+        let path = path.to_str().unwrap_or_else(|| {
+            panic!(
+                "embedded tessdata path is not valid UTF-8: {}",
+                path.display()
+            )
+        });
+        module.push_str(&format!(
+            "    ({language:?}, include_bytes!({path:?}).as_slice()),\n"
+        ));
+    }
+    module.push_str("];\n");
+    let destination = out_dir().join("embedded_tessdata.rs");
+    if fs::read_to_string(&destination).ok().as_deref() != Some(module.as_str()) {
+        fs::write(&destination, module).unwrap_or_else(|error| {
+            panic!(
+                "failed to write embedded tessdata module {}: {error}",
+                destination.display()
+            )
+        });
+    }
+}
+
+fn out_dir() -> PathBuf {
+    PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"))
+}
+
+/// Build scripts run on the host, so target properties come from Cargo's
+/// `CARGO_CFG_*` variables rather than `cfg!`.
+fn target_os_is(os: &str) -> bool {
+    env::var("CARGO_CFG_TARGET_OS").is_ok_and(|value| value == os)
+}
+
+fn target_env_is(target_env: &str) -> bool {
+    env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|value| value == target_env)
 }
 
 fn emit_tessdata_prefix_override() {
@@ -39,10 +162,7 @@ fn default_link_mode() -> String {
     let system = cfg!(feature = "system-tesseract");
 
     match (bundled, system) {
-        (true, false) => {
-            validate_bundled_selection();
-            "bundled".to_string()
-        }
+        (true, false) => "bundled".to_string(),
         (false, true) => "system".to_string(),
         (false, false) => "none".to_string(),
         (true, true) => panic!(
@@ -102,6 +222,7 @@ mod system {
 
 mod vendored {
     use std::env;
+    use std::fs;
     use std::path::{Path, PathBuf};
 
     pub(super) fn link() {
@@ -119,11 +240,29 @@ mod vendored {
 
         let leptonica_source = env_path("BCODE_LEPTONICA_SOURCE_DIR");
         let tesseract_source = env_path("BCODE_TESSERACT_SOURCE_DIR");
-        build_and_link(&leptonica_source, &tesseract_source);
+        build_and_link_static(
+            &leptonica_source,
+            &tesseract_source,
+            &super::out_dir().join("vendored"),
+        );
     }
 
-    fn build_and_link(leptonica_source: &Path, tesseract_source: &Path) {
+    /// Builds Leptonica and Tesseract as static libraries under `build_root`
+    /// and links both into the current crate.
+    ///
+    /// Optional codec, network, archive, and graphics integrations are
+    /// disabled so the static archives need no further system libraries.
+    pub(super) fn build_and_link_static(
+        leptonica_source: &Path,
+        tesseract_source: &Path,
+        build_root: &Path,
+    ) {
         let leptonica_install = cmake::Config::new(leptonica_source)
+            .out_dir(build_root.join("leptonica"))
+            .profile("Release")
+            // Leptonica reads this as a preprocessor define (there is no CMake
+            // option); it silences diagnostics such as missing optional codecs.
+            .cflag("-DNO_CONSOLE_IO")
             .define("leptonica_INSTALL_CMAKE_DIR", "lib/cmake/leptonica")
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
             .define("CMAKE_INSTALL_LIBDIR", "lib")
@@ -137,15 +276,17 @@ mod vendored {
             .define("ENABLE_WEBP", "OFF")
             .define("ENABLE_OPENJPEG", "OFF")
             .define("ENABLE_GIF", "OFF")
-            .define("NO_CONSOLE_IO", "ON")
             .define("SW_BUILD", "OFF")
             .define("HAVE_LIBZ", "0")
             .build();
 
         let leptonica_include = leptonica_install.join("include");
-        let leptonica_lib = leptonica_install.join("lib");
+        let leptonica_lib_dir = leptonica_install.join("lib");
+        let leptonica_library = find_static_library(&leptonica_lib_dir, "leptonica");
 
         let tesseract_install = cmake::Config::new(tesseract_source)
+            .out_dir(build_root.join("tesseract"))
+            .profile("Release")
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
             .define("CMAKE_INSTALL_LIBDIR", "lib")
             .define("CMAKE_BUILD_TYPE", "Release")
@@ -154,24 +295,32 @@ mod vendored {
             .define("BUILD_TESTS", "OFF")
             .define("BUILD_PROG", "OFF")
             .define("DISABLED_LEGACY_ENGINE", "OFF")
+            .define("GRAPHICS_DISABLED", "ON")
+            .define("DISABLE_ARCHIVE", "ON")
+            .define("DISABLE_CURL", "ON")
+            .define("DISABLE_TIFF", "ON")
+            .define("INSTALL_CONFIGS", "OFF")
             .define("USE_OPENCL", "OFF")
             .define("OPENMP_BUILD", "OFF")
             .define("SW_BUILD", "OFF")
-            .define("Leptonica_INCLUDE_DIRS", &leptonica_include)
+            .define("ENABLE_CCACHE", "OFF")
             .define(
-                "Leptonica_LIBRARIES",
-                leptonica_lib.join(static_library_name("leptonica")),
+                "Leptonica_DIR",
+                leptonica_install.join("lib/cmake/leptonica"),
             )
+            // Clear a cached pkg-config failure when reconfiguring after discovery.
+            .configure_arg("-ULeptonica_FOUND")
+            .define("Leptonica_INCLUDE_DIRS", &leptonica_include)
+            .define("Leptonica_LIBRARIES", &leptonica_library)
             .build();
 
-        println!(
-            "cargo:rustc-link-search=native={}",
-            tesseract_install.join("lib").display()
-        );
-        println!("cargo:rustc-link-search=native={}", leptonica_lib.display());
-        println!("cargo:rustc-link-lib=static=tesseract");
-        println!("cargo:rustc-link-lib=static=leptonica");
+        let tesseract_library = find_static_library(&tesseract_install.join("lib"), "tesseract");
+        link_static_library(&tesseract_library);
+        link_static_library(&leptonica_library);
         link_cpp_runtime();
+        if super::target_os_is("windows") {
+            println!("cargo:rustc-link-lib=ws2_32");
+        }
     }
 
     fn env_path(name: &str) -> PathBuf {
@@ -180,18 +329,64 @@ mod vendored {
             .unwrap_or_else(|| panic!("{name} must be set when BCODE_TESSERACT_LINK_MODE=vendored"))
     }
 
-    fn static_library_name(name: &str) -> String {
-        if cfg!(target_os = "windows") {
-            format!("{name}.lib")
+    fn static_library_extension() -> &'static str {
+        if super::target_env_is("msvc") {
+            ".lib"
         } else {
-            format!("lib{name}.a")
+            ".a"
         }
     }
 
+    /// Finds the installed static archive for `name`, whose file name may carry
+    /// a platform prefix and version suffix (for example `tesseract55.lib`).
+    fn find_static_library(lib_dir: &Path, name: &str) -> PathBuf {
+        let extension = static_library_extension();
+        [lib_dir.to_path_buf(), lib_dir.join("Release")]
+            .into_iter()
+            .filter_map(|dir| fs::read_dir(dir).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|file_name| file_name.to_str())
+                    .is_some_and(|file_name| {
+                        file_name.contains(name) && file_name.ends_with(extension)
+                    })
+            })
+            .min()
+            .unwrap_or_else(|| {
+                panic!(
+                    "failed to find static library {name} under {}",
+                    lib_dir.display()
+                )
+            })
+    }
+
+    fn link_static_library(library: &Path) {
+        let directory = library
+            .parent()
+            .expect("static library path must have a parent directory");
+        let file_name = library
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .expect("static library file name must be UTF-8");
+        let stem = file_name
+            .strip_suffix(static_library_extension())
+            .expect("static library has the platform extension");
+        let link_name = if super::target_env_is("msvc") {
+            stem
+        } else {
+            stem.strip_prefix("lib").unwrap_or(stem)
+        };
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-lib=static={link_name}");
+    }
+
     fn link_cpp_runtime() {
-        if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
+        if super::target_os_is("macos") || super::target_os_is("ios") {
             println!("cargo:rustc-link-lib=c++");
-        } else if cfg!(target_env = "msvc") {
+        } else if super::target_env_is("msvc") {
             // MSVC links the C++ runtime through compiler defaults.
         } else {
             println!("cargo:rustc-link-lib=stdc++");
@@ -303,7 +498,39 @@ mod bundled {
             .unwrap_or_else(|| panic!("catalog field {key} is required"))
     }
 
-    pub(super) fn link() {
+    /// Builds one catalog version as static libraries, links it into the
+    /// crate, and returns the traineddata files to embed.
+    pub(super) fn link_static(version: &str) -> Vec<(String, PathBuf)> {
+        let catalog = BundledCatalog::load();
+        let sources_dir = out_dir().join("sources");
+        fs::create_dir_all(&sources_dir).expect("failed to create bundled source directory");
+        let (leptonica_source, tesseract_source) =
+            download_sources(&catalog, version, &sources_dir);
+        super::vendored::build_and_link_static(
+            &leptonica_source,
+            &tesseract_source,
+            &out_dir().join(format!("static-{version}")),
+        );
+        emit_bundled_version_metadata(&catalog, &[version.to_owned()]);
+        if env::var_os("BCODE_TESSDATA_PREFIX").is_some() {
+            return Vec::new();
+        }
+        let tessdata_dir = out_dir().join("embedded-tessdata");
+        fs::create_dir_all(&tessdata_dir).expect("failed to create embedded tessdata directory");
+        catalog
+            .tessdata_languages()
+            .into_iter()
+            .map(|language| {
+                let path = tessdata_dir.join(format!("{}.traineddata", language.code));
+                download_file_to(language.url, language.sha256, &path);
+                (language.code.to_owned(), path)
+            })
+            .collect()
+    }
+
+    /// Builds every selected catalog version as a loadable runtime tree with
+    /// its own tessdata directory.
+    pub(super) fn link_dynamic() {
         let catalog = BundledCatalog::load();
         let versions = selected_bundled_versions();
         let runtimes_dir = out_dir().join("bundled-runtimes");
@@ -313,19 +540,8 @@ mod bundled {
 
         for version in &versions {
             let tesseract = catalog.tesseract(version);
-            let leptonica = catalog.leptonica(&tesseract.leptonica);
-            let leptonica_source = download_and_extract(
-                leptonica.url,
-                leptonica.sha256,
-                &sources_dir,
-                &format!("leptonica-{}", tesseract.leptonica),
-            );
-            let tesseract_source = download_and_extract(
-                &tesseract.url,
-                &tesseract.sha256,
-                &sources_dir,
-                &format!("tesseract-{}", tesseract.version),
-            );
+            let (leptonica_source, tesseract_source) =
+                download_sources(&catalog, version, &sources_dir);
             build_runtime(
                 &tesseract,
                 &leptonica_source,
@@ -338,6 +554,32 @@ mod bundled {
             "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_RUNTIMES={}",
             runtimes_dir.display()
         );
+        emit_bundled_version_metadata(&catalog, &versions);
+    }
+
+    fn download_sources(
+        catalog: &BundledCatalog,
+        version: &str,
+        sources_dir: &Path,
+    ) -> (PathBuf, PathBuf) {
+        let tesseract = catalog.tesseract(version);
+        let leptonica = catalog.leptonica(&tesseract.leptonica);
+        let leptonica_source = download_and_extract(
+            leptonica.url,
+            leptonica.sha256,
+            sources_dir,
+            &format!("leptonica-{}", tesseract.leptonica),
+        );
+        let tesseract_source = download_and_extract(
+            &tesseract.url,
+            &tesseract.sha256,
+            sources_dir,
+            &format!("tesseract-{}", tesseract.version),
+        );
+        (leptonica_source, tesseract_source)
+    }
+
+    fn emit_bundled_version_metadata(catalog: &BundledCatalog, versions: &[String]) {
         println!(
             "cargo:rustc-env=BCODE_TESSERACT_BUNDLED_VERSIONS={}",
             versions.join(",")
@@ -967,7 +1209,13 @@ mod bundled {
 
 #[cfg(not(feature = "bundled-tesseract-build"))]
 mod bundled {
-    pub(super) fn link() -> ! {
+    use std::path::PathBuf;
+
+    pub(super) fn link_static(_version: &str) -> Vec<(String, PathBuf)> {
+        panic!("BCODE_TESSERACT_LINK_MODE=bundled requires a concrete bundled Tesseract feature")
+    }
+
+    pub(super) fn link_dynamic() {
         panic!("BCODE_TESSERACT_LINK_MODE=bundled requires a concrete bundled Tesseract feature")
     }
 }

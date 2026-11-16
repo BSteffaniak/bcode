@@ -73,14 +73,24 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A bundled Tesseract runtime selected at compile time.
+///
+/// Static bundled builds link one Tesseract version into the binary and embed
+/// its tessdata; dynamic bundled builds load a version's library and tessdata
+/// from a runtime tree.
 #[derive(Clone, Debug)]
 pub struct TesseractRuntime {
-    inner: Arc<TesseractRuntimeInner>,
+    version: &'static str,
+    backend: RuntimeBackend,
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeBackend {
+    Static,
+    Dynamic(Arc<DynamicRuntime>),
 }
 
 #[derive(Debug)]
-struct TesseractRuntimeInner {
-    version: &'static str,
+struct DynamicRuntime {
     tessdata_dir: PathBuf,
     _library: libloading::Library,
     symbols: TesseractSymbols,
@@ -101,8 +111,8 @@ struct TesseractSymbols {
     delete_text: unsafe extern "C" fn(*mut c_char),
 }
 
-unsafe impl Send for TesseractRuntimeInner {}
-unsafe impl Sync for TesseractRuntimeInner {}
+unsafe impl Send for DynamicRuntime {}
+unsafe impl Sync for DynamicRuntime {}
 
 /// Runtime backend selection for the high-level OCR builder.
 #[derive(Clone, Debug, Default)]
@@ -275,7 +285,9 @@ impl TesseractRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error if the version was not selected by Cargo features.
+    /// Returns an error if:
+    /// * the version was not selected by Cargo features
+    /// * a dynamic runtime's directory, library, or tessdata cannot be found or loaded
     pub fn load_version(version: &str) -> Result<Self> {
         let version = available_bundled_versions()
             .iter()
@@ -284,6 +296,12 @@ impl TesseractRuntime {
             .ok_or_else(|| Error::BundledRuntimeUnavailable {
                 version: version.to_string(),
             })?;
+        if is_static_bundle() {
+            return Ok(Self {
+                version,
+                backend: RuntimeBackend::Static,
+            });
+        }
         let runtime_root = bundled_runtime_root()?;
         let (runtime_dir, library_path, tessdata_dir) =
             resolve_confined_runtime_paths(&runtime_root, version).map_err(|message| {
@@ -306,19 +324,36 @@ impl TesseractRuntime {
             }
         })?;
         Ok(Self {
-            inner: Arc::new(TesseractRuntimeInner {
-                version,
+            version,
+            backend: RuntimeBackend::Dynamic(Arc::new(DynamicRuntime {
                 tessdata_dir,
                 _library: library,
                 symbols,
-            }),
+            })),
         })
     }
 
     /// Returns the selected bundled version.
     #[must_use]
-    pub fn version(&self) -> &'static str {
-        self.inner.version
+    pub const fn version(&self) -> &'static str {
+        self.version
+    }
+
+    /// Returns whether this runtime is statically linked into the binary.
+    #[must_use]
+    pub const fn is_static(&self) -> bool {
+        matches!(self.backend, RuntimeBackend::Static)
+    }
+
+    /// Returns the version string reported by the loaded Tesseract library.
+    #[must_use]
+    pub fn backend_version(&self) -> String {
+        match &self.backend {
+            RuntimeBackend::Static => linked_version(),
+            RuntimeBackend::Dynamic(runtime) => {
+                c_string_lossy(unsafe { (runtime.symbols.version)() })
+            }
+        }
     }
 
     /// Creates a Tesseract API handle for this runtime.
@@ -327,14 +362,61 @@ impl TesseractRuntime {
     ///
     /// Returns an error if Tesseract returns a null API handle.
     pub fn create_engine(&self) -> Result<TesseractEngine> {
-        TesseractEngine::new_dynamic(Arc::clone(&self.inner))
+        match &self.backend {
+            RuntimeBackend::Static => TesseractEngine::new(),
+            RuntimeBackend::Dynamic(runtime) => TesseractEngine::new_dynamic(Arc::clone(runtime)),
+        }
     }
 
-    /// Returns the tessdata directory used by this bundled runtime.
+    /// Returns the tessdata directory used by a dynamic runtime. Static
+    /// runtimes embed their tessdata and return `None`.
     #[must_use]
-    pub fn tessdata_dir(&self) -> &Path {
-        &self.inner.tessdata_dir
+    pub fn tessdata_dir(&self) -> Option<&Path> {
+        match &self.backend {
+            RuntimeBackend::Static => None,
+            RuntimeBackend::Dynamic(runtime) => Some(&runtime.tessdata_dir),
+        }
     }
+
+    /// Returns whether this runtime can initialize `language` without an
+    /// explicit datapath.
+    #[must_use]
+    pub fn has_language(&self, language: &str) -> bool {
+        let file_name = format!("{language}.traineddata");
+        match &self.backend {
+            RuntimeBackend::Static => {
+                embedded_traineddata(language).is_some()
+                    || default_linked_tessdata_dir().join(file_name).is_file()
+            }
+            RuntimeBackend::Dynamic(runtime) => runtime.tessdata_dir.join(file_name).is_file(),
+        }
+    }
+}
+
+const fn is_static_bundle() -> bool {
+    cfg!(bcode_tesseract_bundled_static)
+}
+
+/// Returns the languages whose traineddata is embedded in this binary.
+#[must_use]
+pub fn embedded_languages() -> Vec<&'static str> {
+    bcode_tesseract_sys::embedded_tessdata()
+        .iter()
+        .map(|(language, _)| *language)
+        .collect()
+}
+
+fn embedded_traineddata(language: &str) -> Option<&'static [u8]> {
+    bcode_tesseract_sys::embedded_tessdata()
+        .iter()
+        .find(|(embedded, _)| *embedded == language)
+        .map(|(_, data)| *data)
+}
+
+/// Tessdata directory for linked backends when no datapath is given and the
+/// language is not embedded.
+fn default_linked_tessdata_dir() -> PathBuf {
+    bcode_tesseract_sys::compiled_tessdata_prefix().map_or_else(resolve_tessdata_dir, PathBuf::from)
 }
 
 fn resolve_confined_runtime_paths(
@@ -646,10 +728,10 @@ pub struct TesseractEngine {
     backend: Backend,
 }
 
-#[cfg_attr(not(feature = "system-tesseract"), allow(dead_code))]
+#[cfg_attr(not(bcode_tesseract_linked), allow(dead_code))]
 enum Backend {
     Linked,
-    Dynamic(Arc<TesseractRuntimeInner>),
+    Dynamic(Arc<DynamicRuntime>),
 }
 
 unsafe impl Send for TesseractEngine {}
@@ -661,18 +743,20 @@ impl TesseractEngine {
         TesseractEngineBuilder::default()
     }
 
-    /// Creates a new Tesseract API handle.
+    /// Creates a new Tesseract API handle for the directly linked library.
     ///
     /// # Errors
     ///
-    /// Returns an error if Tesseract fails to allocate a handle.
+    /// Returns an error if:
+    /// * this build does not link Tesseract directly
+    /// * Tesseract fails to allocate a handle
     #[allow(clippy::missing_const_for_fn)]
     pub fn new() -> Result<Self> {
-        #[cfg(not(feature = "system-tesseract"))]
+        #[cfg(not(bcode_tesseract_linked))]
         {
             Err(Error::LinkedRuntimeUnavailable)
         }
-        #[cfg(feature = "system-tesseract")]
+        #[cfg(bcode_tesseract_linked)]
         {
             let handle = unsafe { bcode_tesseract_sys::TessBaseAPICreate() };
             if handle.is_null() {
@@ -685,7 +769,7 @@ impl TesseractEngine {
         }
     }
 
-    fn new_dynamic(runtime: Arc<TesseractRuntimeInner>) -> Result<Self> {
+    fn new_dynamic(runtime: Arc<DynamicRuntime>) -> Result<Self> {
         let handle = unsafe { (runtime.symbols.create)() };
         if handle.is_null() {
             return Err(Error::CreateHandle);
@@ -716,21 +800,31 @@ impl TesseractEngine {
 
     /// Initializes this handle for OCR.
     ///
+    /// A linked backend without an explicit datapath initializes from embedded
+    /// traineddata when the requested language is embedded in this binary.
+    /// Otherwise Tesseract reads `<language>.traineddata` from the datapath.
+    ///
     /// # Errors
     ///
     /// Returns an error if input strings contain NUL bytes or Tesseract init fails.
     pub fn init(&self, options: &InitOptions) -> Result<()> {
+        let engine_mode = options.engine_mode.unwrap_or(EngineMode::Default) as i32;
+        if matches!(self.backend, Backend::Linked)
+            && options.datapath.is_none()
+            && let Some(data) = embedded_traineddata(&options.language)
+        {
+            return self.init_embedded(data, &options.language, engine_mode);
+        }
         let datapath = match (&self.backend, &options.datapath) {
             (_, Some(datapath)) => datapath.clone(),
             (Backend::Dynamic(runtime), None) => runtime.tessdata_dir.clone(),
-            (Backend::Linked, None) => resolve_tessdata_dir(),
+            (Backend::Linked, None) => default_linked_tessdata_dir(),
         };
         // Tesseract appends `/<language>.traineddata`, which Win32 does not normalize
         // inside verbatim (`\\?\`) paths produced by canonicalization.
         let datapath_string = dunce::simplified(&datapath).to_string_lossy().into_owned();
         let datapath_c = CString::new(datapath_string.clone())?;
         let language_c = CString::new(options.language.clone())?;
-        let engine_mode = options.engine_mode.unwrap_or(EngineMode::Default) as i32;
         let result = unsafe {
             match &self.backend {
                 Backend::Linked => linked_init2(
@@ -752,6 +846,28 @@ impl TesseractEngine {
                 datapath: datapath_string,
                 language: options.language.clone(),
             });
+        }
+        Ok(())
+    }
+
+    fn init_embedded(&self, data: &'static [u8], language: &str, engine_mode: c_int) -> Result<()> {
+        let init_error = || Error::Init {
+            datapath: "<embedded>".to_string(),
+            language: language.to_string(),
+        };
+        let data_size = c_int::try_from(data.len()).map_err(|_| init_error())?;
+        let language_c = CString::new(language)?;
+        let result = unsafe {
+            linked_init_from_memory(
+                self.handle,
+                data.as_ptr().cast(),
+                data_size,
+                language_c.as_ptr(),
+                engine_mode,
+            )
+        };
+        if result != 0 {
+            return Err(init_error());
         }
         Ok(())
     }
@@ -878,7 +994,7 @@ fn c_string_lossy(value: *const c_char) -> String {
         .into_owned()
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_init2(
     handle: *mut c_void,
     datapath: *const c_char,
@@ -888,7 +1004,7 @@ unsafe fn linked_init2(
     unsafe { bcode_tesseract_sys::TessBaseAPIInit2(handle, datapath, language, engine_mode) }
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_init2(
     _handle: *mut c_void,
     _datapath: *const c_char,
@@ -898,7 +1014,7 @@ unsafe fn linked_init2(
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_set_image(
     handle: *mut c_void,
     bytes: *const u8,
@@ -919,7 +1035,7 @@ unsafe fn linked_set_image(
     }
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_set_image(
     _handle: *mut c_void,
     _bytes: *const u8,
@@ -931,17 +1047,17 @@ unsafe fn linked_set_image(
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_set_page_seg_mode(handle: *mut c_void, mode: c_int) {
     unsafe { bcode_tesseract_sys::TessBaseAPISetPageSegMode(handle, mode) };
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_set_page_seg_mode(_handle: *mut c_void, _mode: c_int) {
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_set_variable(
     handle: *mut c_void,
     name: *const c_char,
@@ -950,7 +1066,7 @@ unsafe fn linked_set_variable(
     unsafe { bcode_tesseract_sys::TessBaseAPISetVariable(handle, name, value) }
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_set_variable(
     _handle: *mut c_void,
     _name: *const c_char,
@@ -959,63 +1075,99 @@ unsafe fn linked_set_variable(
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_recognize(handle: *mut c_void, monitor: *mut c_void) -> c_int {
     unsafe { bcode_tesseract_sys::TessBaseAPIRecognize(handle, monitor) }
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_recognize(_handle: *mut c_void, _monitor: *mut c_void) -> c_int {
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_get_utf8_text(handle: *mut c_void) -> *mut c_char {
     unsafe { bcode_tesseract_sys::TessBaseAPIGetUTF8Text(handle) }
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_get_utf8_text(_handle: *mut c_void) -> *mut c_char {
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_delete_text(text: *mut c_char) {
     unsafe { bcode_tesseract_sys::TessDeleteText(text) };
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_delete_text(_text: *mut c_char) {
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_end(handle: *mut c_void) {
     unsafe { bcode_tesseract_sys::TessBaseAPIEnd(handle) };
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_end(_handle: *mut c_void) {
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
-#[cfg(feature = "system-tesseract")]
+#[cfg(bcode_tesseract_linked)]
 unsafe fn linked_delete(handle: *mut c_void) {
     unsafe { bcode_tesseract_sys::TessBaseAPIDelete(handle) };
 }
 
-#[cfg(not(feature = "system-tesseract"))]
+#[cfg(not(bcode_tesseract_linked))]
 unsafe fn linked_delete(_handle: *mut c_void) {
+    unreachable!("linked Tesseract backend is unavailable in this build")
+}
+
+#[cfg(bcode_tesseract_linked)]
+unsafe fn linked_init_from_memory(
+    handle: *mut c_void,
+    data: *const c_char,
+    data_size: c_int,
+    language: *const c_char,
+    engine_mode: c_int,
+) -> c_int {
+    unsafe {
+        bcode_tesseract_sys::TessBaseAPIInit5(
+            handle,
+            data,
+            data_size,
+            language,
+            engine_mode,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            0,
+        )
+    }
+}
+
+#[cfg(not(bcode_tesseract_linked))]
+unsafe fn linked_init_from_memory(
+    _handle: *mut c_void,
+    _data: *const c_char,
+    _data_size: c_int,
+    _language: *const c_char,
+    _engine_mode: c_int,
+) -> c_int {
     unreachable!("linked Tesseract backend is unavailable in this build")
 }
 
 #[allow(clippy::missing_const_for_fn)]
 fn linked_version() -> String {
-    #[cfg(feature = "system-tesseract")]
+    #[cfg(bcode_tesseract_linked)]
     unsafe {
         c_string_lossy(bcode_tesseract_sys::TessVersion())
     }
-    #[cfg(not(feature = "system-tesseract"))]
+    #[cfg(not(bcode_tesseract_linked))]
     String::new()
 }
 
@@ -1080,6 +1232,53 @@ mod runtime_root_tests {
         let error = resolve_confined_runtime_paths(root.path(), "5.5.2")
             .expect_err("linked runtime library must escape");
         assert!(error.contains("escapes"), "{error}");
+    }
+
+    #[cfg(bcode_tesseract_bundled_static)]
+    #[test]
+    fn static_runtime_initializes_embedded_language_without_runtime_files() {
+        use super::{InitOptions, TesseractRuntime};
+
+        let _lock = environment_lock();
+        let previous = std::env::var_os("BCODE_TESSERACT_RUNTIME_ROOT");
+        let empty_root = tempfile::tempdir().expect("empty runtime root");
+        // SAFETY: this test serializes access to this process environment variable.
+        unsafe {
+            std::env::set_var("BCODE_TESSERACT_RUNTIME_ROOT", empty_root.path());
+        }
+
+        let runtime = TesseractRuntime::load_default().expect("static runtime");
+        assert!(runtime.is_static());
+        assert!(runtime.tessdata_dir().is_none());
+        assert!(runtime.has_language("eng"));
+        assert_eq!(runtime.backend_version(), runtime.version());
+        let engine = runtime.create_engine().expect("engine");
+        engine
+            .init(&InitOptions {
+                datapath: None,
+                language: "eng".to_string(),
+                engine_mode: None,
+            })
+            .expect("embedded eng initializes from memory");
+
+        let missing = runtime.create_engine().expect("engine");
+        let error = missing
+            .init(&InitOptions {
+                datapath: Some(empty_root.path().to_path_buf()),
+                language: "eng".to_string(),
+                engine_mode: None,
+            })
+            .expect_err("an explicit datapath bypasses embedded tessdata");
+        assert!(matches!(error, Error::Init { .. }), "{error}");
+
+        // SAFETY: this test serializes access to this process environment variable.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("BCODE_TESSERACT_RUNTIME_ROOT", previous);
+            } else {
+                std::env::remove_var("BCODE_TESSERACT_RUNTIME_ROOT");
+            }
+        }
     }
 
     #[test]

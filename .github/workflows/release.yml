@@ -315,7 +315,7 @@ jobs:
             throw "Windows release verification did not execute extracted-product acceptance"
           }
 
-      - name: Smoke-test bundled Tesseract runtime
+      - name: Smoke-test bundled Tesseract
         if: runner.os == 'Windows'
         run: cargo xtask smoke-test-tesseract --target ${{ matrix.target }}
 

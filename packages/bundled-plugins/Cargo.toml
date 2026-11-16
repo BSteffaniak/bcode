@@ -67,11 +67,15 @@ tokio         = { workspace = true, features = ["rt"] }
 [features]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
 bundled-ocr-tesseract-all = [
+    "bundled-ocr-tesseract-dynamic",
     "bundled-ocr-tesseract-v5-3-4",
     "bundled-ocr-tesseract-v5-5-1",
     "bundled-ocr-tesseract-v5-5-2",
 ]
 bundled-ocr-tesseract-default = ["bundled-ocr-tesseract-v5-5-2"]
+# Ship Tesseract as loadable runtime trees beside the binary instead of
+# statically linking one version with embedded tessdata.
+bundled-ocr-tesseract-dynamic = ["bcode_ocr_plugin?/bundled-tesseract-dynamic"]
 bundled-ocr-tesseract-latest = ["bundled-ocr-tesseract-v5-5-2"]
 bundled-ocr-tesseract-v5-3-4 = [
     "static-bundled-ocr-plugin",
