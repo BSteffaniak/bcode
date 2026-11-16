@@ -297,8 +297,9 @@ kind (find_pull_requests first when you need the stack of a pull request), then 
 * \"Create a review of X\", \"a review of X as it is now\", \"all of X\", \"review the X folder\" \
 (X a folder, package, crate, plugin or file): code_review.find_paths with X, then \
 code_review.create_review with sources [{kind: files, paths: [<the best match's path>]}], then \
-open_review. Ask which one only when find_paths says ambiguous or finds nothing; never ask about \
-commits or ranges for such a review.
+open_review. Ask only when find_paths says ambiguous (which one), says weak (whether its best \
+match is what the user meant), or finds nothing; never ask about commits or ranges for such a \
+review.
 * \"X's changes\", \"what changed in X\": a diff review (working_tree with paths, or the branch, \
 range or pull request the user names), not a files review.
 * \"The whole repository\": code_review.create_review with sources [{kind: repository}].

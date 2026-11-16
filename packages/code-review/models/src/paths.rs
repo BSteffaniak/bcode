@@ -604,6 +604,10 @@ pub struct ReviewPathsFindResponse {
     pub total: u32,
     /// The two best matches name different paths and score alike: ask the user which.
     pub ambiguous: bool,
+    /// The best match only partly matches what was asked (part of a word, or scattered
+    /// letters, as `auth` in `oauth-client`): confirm it with the user before acting on it.
+    #[serde(default)]
+    pub weak: bool,
     /// The path index stopped at [`REVIEW_PATH_INDEX_MAX_PATHS`].
     #[serde(default)]
     pub truncated: bool,

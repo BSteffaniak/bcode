@@ -354,7 +354,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.find_paths",
         access: Access::Read,
-        description: "Find repository paths by what the user calls them: a folder name, a package or crate name (Cargo.toml, package.json, pyproject.toml), a file name, or a path ending (\"the hello plugin\", \"bcode-git\", \"Cargo.toml\", \"plugin/src\"). Files git ignores are left out unless `include_ignored`. Returns matches best first with their kind, files under each folder now, and how they matched; folders and packages end with `/` and can be passed as they are in the `paths` of a code_review.create_review files or repository source. `ambiguous` is true when the two best matches are equally likely: ask the user which one only then, or when nothing matched. Read-only.",
+        description: "Find repository paths by what the user calls them: a folder name, a package or crate name (Cargo.toml, package.json, pyproject.toml), a file name, or a path ending (\"the hello plugin\", \"bcode-git\", \"Cargo.toml\", \"plugin/src\"). Files git ignores are left out unless `include_ignored`. Returns matches best first with their kind, files under each folder now, and how they matched; folders and packages end with `/` and can be passed as they are in the `paths` of a code_review.create_review files or repository source. `ambiguous` is true when the two best matches are equally likely, and `weak` when the best match only partly matches the name (part of a word or scattered letters, as \"auth\" in \"oauth-client\"): ask the user only then (which one, or whether the weak match is meant), or when nothing matched. Read-only.",
         schema: || {
             object(
                 json_map(json!({

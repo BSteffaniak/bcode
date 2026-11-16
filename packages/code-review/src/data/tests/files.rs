@@ -578,6 +578,28 @@ fn find_paths_resolves_natural_names_to_folders_packages_and_files() {
     );
     let none = find(&service, repo, "zebra crossing", false);
     assert!(none.matches.is_empty() && !none.ambiguous);
+    let strong = find(&service, repo, "the hello plugin", false);
+    assert!(!strong.weak, "{strong:?}");
+}
+
+#[test]
+fn find_paths_flags_a_best_match_that_only_partly_matches_the_name() {
+    let fixture = GitFixture::empty();
+    let repo = fixture.root();
+    write(repo, "oauth-client/src/lib.rs", "//! OAuth.\n");
+    write(repo, "billing/src/lib.rs", "//! Billing.\n");
+    fixture.run(&["add", "-A"]);
+    fixture.run(&["commit", "-q", "-m", "initial"]);
+    let service = ReviewData::default();
+    // Only `oauth-client/` contains "auth", inside a word: a guess to confirm, not a match.
+    let found = find(&service, repo, "the auth module", false);
+    assert_eq!(found.matches[0].path, "oauth-client/", "{found:?}");
+    assert!(found.weak, "{found:?}");
+    assert!(!found.ambiguous);
+    // A whole-word match is not weak.
+    let billing = find(&service, repo, "the billing module", false);
+    assert_eq!(billing.matches[0].path, "billing/");
+    assert!(!billing.weak, "{billing:?}");
 }
 
 fn marks(service: &ReviewData, repo: &Path, paths: &[&str]) -> Vec<ReviewWorktreeFileMarks> {

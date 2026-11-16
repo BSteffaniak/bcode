@@ -529,6 +529,7 @@ Answer:
   ],
   "total": 2,
   "ambiguous": false,
+  "weak": false,
   "truncated": false
 }
 ```
@@ -556,7 +557,10 @@ Matching rules (`review.paths.find`, over the path index, so `.gitignore` is res
    not a candidate: it is the whole repository, not a folder of it.
 4. **Order.** Score, then depth (shallower first), then path length, then path.
 5. **Ambiguity.** `ambiguous` is true when the two best matches name different paths and score
-   within 5 of each other at 80 or more; the assistant asks which one only then.
+   within 5 of each other at 80 or more. `weak` is true when the best match scores below 50:
+   it matched only part of a word or scattered letters ("auth" in `oauth-client/`). The
+   assistant asks only in these cases (which one, or whether the weak match is meant), or when
+   nothing matched.
 
 Counts are files under a folder now (with the ignored rule above). Output is bounded by `limit`
 and the tool output limit.
@@ -568,8 +572,8 @@ and the tool output limit.
 * Recipes added to the profile instructions:
   * "A review of X as it is now", "all of X", "review the X folder": `code_review.find_paths`
     with X, then `code_review.create_review` with `{kind: files, paths: [<folder>]}`, then
-    `bcode.code-review.open_review`. Ask only when `find_paths` says `ambiguous` or finds
-    nothing.
+    `bcode.code-review.open_review`. Ask only when `find_paths` says `ambiguous` or `weak`, or
+    finds nothing.
   * "X's changes", "what changed in X": a diff review (`working_tree` with `paths`, or the
     branch, range or pull request the user names), not a files review.
   * "The whole repository": `{kind: repository}`.

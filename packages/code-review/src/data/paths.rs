@@ -54,6 +54,8 @@ const FOLDER_PENALTY: u32 = 5;
 const AMBIGUOUS_FROM: u32 = 80;
 /// See [`AMBIGUOUS_FROM`].
 const AMBIGUOUS_WITHIN: u32 = 5;
+/// A best match scoring below this matched only part of a word or scattered letters: weak.
+const WEAK_BELOW: u32 = 50;
 
 /// One indexed file.
 #[derive(Debug, Clone)]
@@ -972,6 +974,7 @@ pub fn find(
             if second.score >= AMBIGUOUS_FROM
                 && first.score - second.score <= AMBIGUOUS_WITHIN
     );
+    let weak = matches.first().is_some_and(|best| best.score < WEAK_BELOW);
     let total = u32::try_from(matches.len()).unwrap_or(u32::MAX);
     let limit = request
         .limit
@@ -982,6 +985,7 @@ pub fn find(
         matches,
         total,
         ambiguous,
+        weak,
         truncated: index.truncated,
     })
 }
