@@ -3689,7 +3689,10 @@ pub enum AuthPoolStrategy {
 }
 
 /// Pre-strategy auth pool priming behavior.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+///
+/// An omitted `[priming]` table means the same as an empty one, so effective
+/// configuration round-trips through its TOML transport unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "priming")]
 pub struct AuthPoolPrimingConfig {
     /// Route to unprimed profiles before applying the normal strategy.
@@ -3711,6 +3714,19 @@ pub struct AuthPoolPrimingConfig {
     #[config_doc(skip)]
     #[serde(default)]
     pub required_windows: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for AuthPoolPrimingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_primary: false,
+            reprime_after: None,
+            provider_windows: default_priming_provider_windows(),
+            fallback_reprime_after: default_priming_fallback_reprime_after(),
+            required_windows: BTreeMap::new(),
+        }
+    }
 }
 
 const fn default_priming_provider_windows() -> bool {
@@ -10986,6 +11002,32 @@ enabled = false
                 .system_prompt
                 .sections
                 .config_selection
+        );
+    }
+
+    #[test]
+    fn auth_pool_without_priming_round_trips_through_effective_transport() {
+        let loaded = crate::validate_config_value(
+            toml::from_str("[auth.pools.accounts]\nprofiles = [\"one\"]\n").unwrap(),
+            "test",
+        )
+        .unwrap();
+        let empty_table = crate::validate_config_value(
+            toml::from_str(
+                "[auth.pools.accounts]\nprofiles = [\"one\"]\n[auth.pools.accounts.priming]\n",
+            )
+            .unwrap(),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(loaded, empty_table);
+        let transported =
+            crate::decode_effective_config(&crate::encode_effective_config(&loaded).unwrap())
+                .unwrap();
+        assert_eq!(transported, loaded);
+        assert_eq!(
+            crate::recovery::execution_fingerprint(&transported).unwrap(),
+            crate::recovery::execution_fingerprint(&loaded).unwrap()
         );
     }
 
