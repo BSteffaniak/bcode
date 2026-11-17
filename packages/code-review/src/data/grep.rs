@@ -9,6 +9,9 @@ use std::path::Path;
 
 /// Characters of a matching line kept.
 pub const MAX_HIT_TEXT_CHARS: usize = 300;
+/// Bytes of a matched record kept: its path and line number, and room for
+/// [`MAX_HIT_TEXT_CHARS`] characters of text; the rest of a long line is never held.
+const MAX_HIT_RECORD_BYTES: usize = 8 * 1024 + MAX_HIT_TEXT_CHARS * 4;
 /// Path patterns one search takes at most.
 pub const MAX_PATH_PATTERNS: usize = 20;
 
@@ -138,7 +141,7 @@ pub fn grep(
         return Ok((Vec::new(), false));
     };
     let command = grep_command(repo_root, &revision_args, query, false)?;
-    let (records, more) = git::first_records(command, max, b'\n')?;
+    let (records, more) = git::first_records(command, max, b'\n', MAX_HIT_RECORD_BYTES)?;
     let hits = records
         .iter()
         .filter_map(|record| {
@@ -167,7 +170,7 @@ pub fn grep_files(
         return Ok((Vec::new(), false));
     };
     let command = grep_command(repo_root, &revision_args, query, true)?;
-    let (records, more) = git::first_records(command, max, b'\0')?;
+    let (records, more) = git::first_records(command, max, b'\0', usize::MAX)?;
     Ok((
         records
             .iter()
@@ -312,6 +315,31 @@ mod tests {
         )
         .expect("no matches is not an error");
         assert!(none.is_empty() && !more);
+    }
+
+    #[test]
+    fn a_match_on_a_huge_line_keeps_only_its_start_and_the_lines_after() {
+        let (fixture, _) = repo();
+        let huge = format!(
+            "RetryBudget{}\nRetryBudget after\n",
+            "x".repeat(4 * 1024 * 1024)
+        );
+        std::fs::write(fixture.root().join("src/minified.js"), huge).expect("write");
+        let query = GrepQuery {
+            pattern: "RetryBudget",
+            mode: GrepMode::Fixed,
+            ignore_case: false,
+            paths: &["src/minified.js".to_owned()],
+        };
+        let (hits, more) =
+            grep(fixture.root(), &RevisionRef::WorkingTree, &query, 10).expect("grep");
+        assert!(!more);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.line, hit.text.chars().count()))
+                .collect::<Vec<_>>(),
+            [(1, MAX_HIT_TEXT_CHARS), (2, "RetryBudget after".len())]
+        );
     }
 
     #[test]

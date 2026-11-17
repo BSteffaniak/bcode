@@ -275,10 +275,11 @@ fn limited_records_where(
     Ok(result)
 }
 
-/// The first `keep` records of `command`'s output, split at `separator`, and whether it printed
-/// more: past `keep` git is stopped, so a search with millions of matches costs no more than
-/// `keep` of them. An exit status of 1 with no output (nothing matched, as `git grep` says) is an
-/// empty answer, not an error.
+/// The first `keep` records of `command`'s output, split at `separator`, each cut to its first
+/// `max_record_bytes` bytes, and whether it printed more: past `keep` git is stopped, so a search
+/// with millions of matches costs no more than `keep` of them, and a matched line of a huge
+/// minified file costs no more than `max_record_bytes`. An exit status of 1 with no output
+/// (nothing matched, as `git grep` says) is an empty answer, not an error.
 ///
 /// # Errors
 ///
@@ -288,8 +289,9 @@ pub fn first_records(
     mut command: Command,
     keep: usize,
     separator: u8,
+    max_record_bytes: usize,
 ) -> Result<(Vec<String>, bool), DataError> {
-    use std::io::{BufRead as _, Read as _};
+    use std::io::Read as _;
     let _slot = Slot::acquire();
     let mut child = command.spawn()?;
     let mut stderr = child
@@ -307,8 +309,8 @@ pub fn first_records(
         .ok_or_else(|| DataError::Git("git stdout unavailable".to_owned()))?;
     let mut records = Vec::new();
     let mut more = false;
-    for record in std::io::BufReader::new(stdout).split(separator) {
-        let record = record?;
+    let mut reader = std::io::BufReader::new(stdout);
+    while let Some(record) = capped_record(&mut reader, separator, max_record_bytes)? {
         if records.len() == keep {
             more = true;
             break;
@@ -329,6 +331,42 @@ pub fn first_records(
         return Ok((records, false));
     }
     Err(DataError::Git(errors.trim().to_owned()))
+}
+
+/// The next record of `reader` up to `separator` (or the end), keeping at most `max_bytes` of it
+/// and skipping the rest without holding it; `None` at the end.
+///
+/// # Errors
+///
+/// * The read error.
+fn capped_record(
+    reader: &mut impl std::io::BufRead,
+    separator: u8,
+    max_bytes: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut record = Vec::new();
+    let mut read_any = false;
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if buffer.is_empty() {
+            return Ok(read_any.then_some(record));
+        }
+        read_any = true;
+        let (chunk, found) = buffer
+            .iter()
+            .position(|byte| *byte == separator)
+            .map_or((buffer.len(), false), |at| (at, true));
+        let room = max_bytes.saturating_sub(record.len());
+        record.extend_from_slice(&buffer[..chunk.min(room)]);
+        reader.consume(chunk + usize::from(found));
+        if found {
+            return Ok(Some(record));
+        }
+    }
 }
 
 /// Require a confined glob: non-empty, relative, without `.`/`..` or `.git` segments, and
@@ -590,6 +628,19 @@ pub fn split_nul(bytes: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_are_cut_to_their_bound_and_the_rest_is_skipped() {
+        let input = b"short\0a much longer record\0\0last".to_vec();
+        let mut reader = std::io::BufReader::with_capacity(4, std::io::Cursor::new(input));
+        let mut records = Vec::new();
+        while let Some(record) = capped_record(&mut reader, b'\0', 6).expect("read") {
+            records.push(String::from_utf8(record).expect("utf-8"));
+        }
+        assert_eq!(records, ["short", "a much", "", "last"]);
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert!(capped_record(&mut empty, b'\n', 6).expect("read").is_none());
+    }
 
     #[test]
     fn relative_paths_reject_escapes_and_absolute_forms() {
