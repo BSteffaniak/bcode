@@ -306,7 +306,10 @@ binding (`guide_grant`, set by the app). A grant names a guide and a version (th
 one when absent) and applies only to that version. Without a grant for the guide, a session may
 write, as `Generate`, only the versions whose origin is that session; `guide.start` with
 `resume` makes a session a version's writer. Starting or resuming versions of a guide is refused
-when the session's grant for it is narrower than `Generate`.
+when the session's grant for it is narrower than `Generate`. A session holding a grant writes
+only the granted guide: writing, resuming or starting versions of any other guide, and starting
+a new guide, are refused. The grant applies however the review is reached, including a saved
+review named by `review`.
 
 | Grant | Allowed operations |
 |---|---|

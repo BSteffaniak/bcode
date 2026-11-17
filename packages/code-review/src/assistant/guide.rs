@@ -55,7 +55,6 @@ pub const GUIDE_CONFLICT: &str = "conflict";
 pub const GUIDE_CITATION_PROBLEMS: &str = "citation_problems";
 /// Refusal code: the document the batch would write is over a bound or inconsistent.
 pub const GUIDE_INVALID_DOCUMENT: &str = "invalid_document";
-
 /// What a guide covers, as a writer names it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -509,18 +508,8 @@ impl ReviewTools<'_> {
             }
             (mode, _) => mode,
         };
-        if let (Some(record), Some(grant)) = (&existing, &review.guide_grant)
-            && grant.guide_id == record.guide.guide_id
-            && !matches!(grant.mode, GrantMode::Generate | GrantMode::Restructure)
-        {
-            return Err(AssistantError::Refused {
-                code: OUTSIDE_GRANT,
-                message: format!(
-                    "this conversation may not start or resume versions of guide {} ({}); ask the user",
-                    record.guide.guide_id,
-                    grant_summary(&grant.mode)
-                ),
-            });
+        if let Some(grant) = &review.guide_grant {
+            Self::start_within_grant(grant, existing.as_ref())?;
         }
         let template = Self::template(review, config, start.template.as_deref())?;
         let context = self.context(review, config, declared, &template.name);
@@ -571,6 +560,33 @@ impl ReviewTools<'_> {
             "context": context,
             "next": "write sections with code_review.guide.write (one batch per section or two, citing lines with quotes), then set_status complete",
         }))
+    }
+
+    /// Whether a session holding `grant` may start a version of `existing`: only versions of the
+    /// granted guide, and only with a grant that writes whole versions.
+    fn start_within_grant(
+        grant: &GuideGrant,
+        existing: Option<&GuideRecord>,
+    ) -> Result<(), AssistantError> {
+        let refuse = |message: String| AssistantError::Refused {
+            code: OUTSIDE_GRANT,
+            message,
+        };
+        let Some(record) = existing.filter(|record| record.guide.guide_id == grant.guide_id) else {
+            return Err(refuse(format!(
+                "this conversation may only change guide {} ({}); ask the user",
+                grant.guide_id,
+                grant_summary(&grant.mode)
+            )));
+        };
+        if !matches!(grant.mode, GrantMode::Generate | GrantMode::Restructure) {
+            return Err(refuse(format!(
+                "this conversation may not start or resume versions of guide {} ({}); ask the user",
+                record.guide.guide_id,
+                grant_summary(&grant.mode)
+            )));
+        }
+        Ok(())
     }
 
     /// Mark version `number` of `guide` generating again, written by `session` from now on.
@@ -1453,15 +1469,22 @@ enum Refusal {
 }
 
 /// The mode `session` may write `version` of `guide` with: the binding's grant for the guide
-/// (on its version, or the guide's current one), or without one, everything on versions the
-/// session started.
+/// (on its version, or the guide's current one), or without a grant, everything on versions the
+/// session started. A session holding a grant for another guide writes none of this one.
 fn grant_mode(
     grant: Option<&GuideGrant>,
     session: Option<&str>,
     guide: &ReviewGuide,
     version: &GuideVersion,
 ) -> Result<GrantMode, String> {
-    if let Some(grant) = grant.filter(|grant| grant.guide_id == guide.guide_id) {
+    if let Some(grant) = grant.filter(|grant| grant.guide_id != guide.guide_id) {
+        return Err(format!(
+            "this conversation may only change guide {} ({})",
+            grant.guide_id,
+            grant_summary(&grant.mode)
+        ));
+    }
+    if let Some(grant) = grant {
         let granted = grant.version.unwrap_or(guide.current_version);
         if granted != version.version {
             return Err(format!(

@@ -565,7 +565,10 @@ pub fn run(
             ));
         }
     };
-    let review = tools.open(repo, &reference)?;
+    let mut review = tools.open(repo, &reference)?;
+    if let (ReviewRef::Workspace(_), Some(session)) = (&reference, &descriptor.session_id) {
+        review.guide_grant = tools.session_grant(repo, session)?;
+    }
     let call = Call {
         tools: &tools,
         review: &review,

@@ -728,3 +728,105 @@ fn code_is_searched_and_read_at_the_reviews_revisions() {
         unknown.output
     );
 }
+
+/// Version `number` of `guide`, as stored.
+fn stored_version(
+    harness: &Harness,
+    guide: &str,
+    number: Option<u32>,
+) -> bcode_code_review_models::GuideVersionRecord {
+    harness
+        .store()
+        .guide_version(&GetGuideVersionRequest {
+            repo_path: harness.fixture.root().to_path_buf(),
+            guide_id: guide.to_owned(),
+            version: number,
+        })
+        .expect("read")
+        .version
+        .expect("version")
+}
+
+/// The refusal code of a call that failed.
+fn refusal(harness: &mut Harness, tool: &str, arguments: &Value, session: &str) -> String {
+    let response = harness.call(tool, arguments, session);
+    assert!(response.is_error, "{tool} {arguments}: {}", response.output);
+    response.output
+}
+
+#[test]
+fn a_review_named_by_id_is_written_under_the_sessions_grant() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let review = harness.json(
+        "code_review.create_review",
+        &json!({"sources": [{"kind": "last_commit"}]}),
+        SESSION,
+    )["review"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let started = harness.json(
+        "code_review.guide.start",
+        &json!({"review": review, "outline": [
+            {"id": "s1", "kind": "purpose", "title": "Purpose"},
+            {"id": "s2", "kind": "scope", "title": "Scope"}
+        ]}),
+        SESSION,
+    );
+    let guide = started["guide_id"].as_str().expect("guide").to_owned();
+    harness.json(
+        "code_review.guide.write",
+        &json!({"review": review, "guide_id": guide, "ops": [{"op": "set_status", "status": "complete"}]}),
+        SESSION,
+    );
+    grant(
+        &harness,
+        SESSION,
+        Some(GuideGrant {
+            guide_id: guide.clone(),
+            version: None,
+            mode: GrantMode::Expand {
+                section_id: "s2".to_owned(),
+            },
+        }),
+    );
+    let before = stored_version(&harness, &guide, None);
+    for (tool, arguments) in [
+        (
+            "code_review.guide.start",
+            json!({"review": review, "guide_id": guide, "mode": "resume"}),
+        ),
+        (
+            "code_review.guide.start",
+            json!({"review": review, "guide_id": guide, "mode": "new_version"}),
+        ),
+        (
+            "code_review.guide.write",
+            json!({"review": review, "guide_id": guide, "ops": [{"op": "put_section", "id": "s1", "body": "Rewritten."}]}),
+        ),
+    ] {
+        let output = refusal(&mut harness, tool, &arguments, SESSION);
+        assert!(output.contains("outside_grant"), "{tool}: {output}");
+    }
+    let after = stored_version(&harness, &guide, None);
+    assert_eq!(after.revision, before.revision, "nothing was written");
+    assert_eq!(after.version.status.as_str(), "complete");
+    let expanded = harness.json(
+        "code_review.guide.write",
+        &json!({"review": review, "guide_id": guide, "ops": [{"op": "add_expansion", "under": "s2", "title": "Why"}]}),
+        SESSION,
+    );
+    assert_eq!(expanded["written"], true, "{expanded}");
+
+    let output = refusal(
+        &mut harness,
+        "code_review.guide.start",
+        &json!({"title": "Another"}),
+        SESSION,
+    );
+    assert!(
+        output.contains("outside_grant"),
+        "a granted session starts no other guide: {output}"
+    );
+}

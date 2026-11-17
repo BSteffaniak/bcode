@@ -538,6 +538,29 @@ impl<'a> ReviewTools<'a> {
         })
     }
 
+    /// The guide grant `session_id`'s binding records, whether or not the binding shows a
+    /// review: a review opened by name for a session is still written under its grant.
+    ///
+    /// # Errors
+    ///
+    /// * [`AssistantError::Store`] when the binding cannot be read.
+    pub fn session_grant(
+        &self,
+        repo_path: &Path,
+        session_id: &str,
+    ) -> Result<Option<bcode_code_review_models::GuideGrant>, AssistantError> {
+        Ok(self
+            .store
+            .assistant_binding(&GetReviewAssistantRequest {
+                repo_path: repo_path.to_path_buf(),
+                lookup: ReviewAssistantLookup::Session {
+                    session_id: session_id.to_owned(),
+                },
+            })?
+            .binding
+            .and_then(|binding| binding.guide_grant))
+    }
+
     fn saved(&self, repo_path: &Path, id: &str) -> Result<Option<ReviewWorkspace>, AssistantError> {
         Ok(self
             .store
