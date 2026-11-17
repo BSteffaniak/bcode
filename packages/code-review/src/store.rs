@@ -13,6 +13,7 @@ mod assistant_bindings;
 mod assistant_settings;
 mod conversation;
 mod db;
+mod guides;
 mod history;
 mod looks;
 
@@ -21,6 +22,15 @@ use assistant_settings::{
     save_assistant_panel_size_for_request, save_assistant_settings_for_request,
 };
 use conversation::{conversation_for_request, save_conversation_for_request};
+use guides::{
+    clear_guide_section_mark_for_request, create_guide_for_request, delete_guide_for_request,
+    delete_guide_thread_for_request, fork_guide_version_for_request, get_guide_for_request,
+    get_guide_version_for_request, list_guide_areas_for_request,
+    list_guide_section_marks_for_request, list_guide_threads_for_request,
+    list_guide_versions_for_request, list_guides_for_request, rekey_guides_for_request,
+    save_guide_area_for_request, save_guide_thread_for_request, save_guide_version_for_request,
+    set_guide_section_mark_for_request, update_guide_for_request,
+};
 use history::{list_layer_versions_for_request, record_layer_versions_for_request};
 use looks::{list_layer_looks_for_request, record_layer_looks_for_request};
 
@@ -136,6 +146,10 @@ pub struct CodeReviewConfig {
 /// * [`StoreError::Io`] when the state directory or its lock file cannot be created.
 /// * [`StoreError::Git`] or [`StoreError::Parse`] for operations that read the repository.
 /// * [`StoreError::UnsupportedPublisher`] for an unknown publisher id.
+/// * [`StoreError::RevisionConflict`] when a guided-review write names a revision its record no
+///   longer has.
+/// * [`StoreError::Guide`] for a guided-review document over a bound, inconsistent, or of
+///   another schema version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewStore {
     config: CodeReviewConfig,
@@ -170,6 +184,38 @@ impl ReviewStore {
     #[must_use]
     pub const fn config(&self) -> &CodeReviewConfig {
         &self.config
+    }
+
+    /// Apply `change` to a guide version (`None`: the current one) and write it, in one turn at
+    /// the database.
+    ///
+    /// With `expected_revision`, the version must still be at it. Without, a write that loses a
+    /// race reads the version again and applies `change` again. When `change` fails nothing is
+    /// written and its error is returned in the inner result.
+    ///
+    /// # Errors
+    ///
+    /// * See [`ReviewStore`]; [`StoreError::InvalidRequest`] when the version does not exist.
+    pub fn update_guide_version<T, E>(
+        &self,
+        repo_path: &Path,
+        guide_id: String,
+        version: Option<u32>,
+        expected_revision: Option<u64>,
+        change: impl FnMut(&mut bcode_code_review_models::GuideVersion) -> Result<T, E> + Send + 'static,
+    ) -> Result<Result<(bcode_code_review_models::GuideVersionRecord, T), E>, StoreError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        guides::update_guide_version_for_request(
+            repo_path,
+            guide_id,
+            version,
+            expected_revision,
+            change,
+            &self.config,
+        )
     }
 
     /// File diffs of a review target (no stored state is read).
@@ -302,6 +348,78 @@ store_operations! {
     save_assistant_panel_size(&bcode_code_review_models::SaveReviewAssistantPanelSizeRequest)
         -> bcode_code_review_models::SaveReviewAssistantPanelSizeResponse
         => save_assistant_panel_size_for_request;
+    /// Create a guide with its first version, under the review key of its target and scope.
+    create_guide(bcode_code_review_models::CreateReviewGuideRequest)
+        -> bcode_code_review_models::CreateReviewGuideResponse
+        => create_guide_for_request;
+    /// The guides of a review, most recently changed first.
+    list_guides(&bcode_code_review_models::ListReviewGuidesRequest)
+        -> bcode_code_review_models::ListReviewGuidesResponse
+        => list_guides_for_request;
+    /// One guide.
+    get_guide(&bcode_code_review_models::GetReviewGuideRequest)
+        -> bcode_code_review_models::GetReviewGuideResponse
+        => get_guide_for_request;
+    /// Replace a guide row when it is still at the revision read.
+    update_guide(bcode_code_review_models::UpdateReviewGuideRequest)
+        -> bcode_code_review_models::UpdateReviewGuideResponse
+        => update_guide_for_request;
+    /// Delete a guide with its versions, areas, threads, and marks.
+    delete_guide(&bcode_code_review_models::DeleteReviewGuideRequest)
+        -> bcode_code_review_models::DeleteReviewGuideResponse
+        => delete_guide_for_request;
+    /// Move a review's guides to another review key (an unsaved review was saved).
+    rekey_guides(&bcode_code_review_models::RekeyReviewGuidesRequest)
+        -> bcode_code_review_models::RekeyReviewGuidesResponse
+        => rekey_guides_for_request;
+    /// One version of a guide, or its current version.
+    guide_version(&bcode_code_review_models::GetGuideVersionRequest)
+        -> bcode_code_review_models::GetGuideVersionResponse
+        => get_guide_version_for_request;
+    /// The versions of a guide, oldest first, without their documents.
+    list_guide_versions(&bcode_code_review_models::ListGuideVersionsRequest)
+        -> bcode_code_review_models::ListGuideVersionsResponse
+        => list_guide_versions_for_request;
+    /// Replace a version when it is still at the revision read.
+    save_guide_version(bcode_code_review_models::SaveGuideVersionRequest)
+        -> bcode_code_review_models::SaveGuideVersionResponse
+        => save_guide_version_for_request;
+    /// Add the next version of a guide.
+    fork_guide_version(bcode_code_review_models::ForkGuideVersionRequest)
+        -> bcode_code_review_models::ForkGuideVersionResponse
+        => fork_guide_version_for_request;
+    /// Create a fan-out area, or replace it when it is still at the revision read.
+    save_guide_area(bcode_code_review_models::SaveGuideAreaRequest)
+        -> bcode_code_review_models::SaveGuideAreaResponse
+        => save_guide_area_for_request;
+    /// The fan-out areas of a version.
+    list_guide_areas(&bcode_code_review_models::ListGuideAreasRequest)
+        -> bcode_code_review_models::ListGuideAreasResponse
+        => list_guide_areas_for_request;
+    /// Create or replace an ask thread.
+    save_guide_thread(bcode_code_review_models::SaveGuideThreadRequest)
+        -> bcode_code_review_models::SaveGuideThreadResponse
+        => save_guide_thread_for_request;
+    /// The ask threads of a guide.
+    list_guide_threads(&bcode_code_review_models::ListGuideThreadsRequest)
+        -> bcode_code_review_models::ListGuideThreadsResponse
+        => list_guide_threads_for_request;
+    /// Delete an ask thread.
+    delete_guide_thread(&bcode_code_review_models::DeleteGuideThreadRequest)
+        -> bcode_code_review_models::DeleteGuideThreadResponse
+        => delete_guide_thread_for_request;
+    /// Mark a guide section reviewed.
+    set_guide_section_mark(bcode_code_review_models::SetGuideSectionMarkRequest)
+        -> bcode_code_review_models::SetGuideSectionMarkResponse
+        => set_guide_section_mark_for_request;
+    /// Un-review a guide section.
+    clear_guide_section_mark(&bcode_code_review_models::ClearGuideSectionMarkRequest)
+        -> bcode_code_review_models::ClearGuideSectionMarkResponse
+        => clear_guide_section_mark_for_request;
+    /// The reviewed sections of a guide.
+    list_guide_section_marks(&bcode_code_review_models::ListGuideSectionMarksRequest)
+        -> bcode_code_review_models::ListGuideSectionMarksResponse
+        => list_guide_section_marks_for_request;
     /// Summary of a review target with its draft counts.
     review_context(ReviewContextRequest) -> ReviewContextResponse => review_context_for_request;
     /// Draft threads of a review target.
@@ -519,6 +637,19 @@ pub enum StoreError {
     /// Other writers kept replacing the review's row before this write could.
     #[error("the saved review {0} kept changing; try again")]
     Conflict(String),
+    /// A guided-review record changed since it was read (or was created meanwhile); read it
+    /// again and retry.
+    #[error("{record} changed since it was read{}; read it again", current.map_or_else(String::new, |current| format!(" (now at revision {current})")))]
+    RevisionConflict {
+        /// What changed.
+        record: String,
+        /// Its revision now, when it exists.
+        current: Option<u64>,
+    },
+    /// A guided-review document is over a bound, inconsistent, or of a schema version this build
+    /// does not read or write.
+    #[error("review guide rejected: {0}")]
+    Guide(#[from] crate::guide::document::GuideDocumentError),
 }
 
 fn review_context_for_request(

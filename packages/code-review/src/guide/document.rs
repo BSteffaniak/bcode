@@ -78,6 +78,9 @@ pub enum GuideDocumentError {
     /// An id is empty.
     #[error("{0} has an empty id")]
     EmptyId(&'static str),
+    /// A stored status this build does not know.
+    #[error("unknown stored guide status {0}")]
+    UnknownStatus(String),
 }
 
 /// Check a version: its schema version, bounds, and structure.
