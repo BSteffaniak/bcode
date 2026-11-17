@@ -2,7 +2,8 @@
 //!
 //! * **Header.** Title, source pills (BMUX `badge`), `+/−` totals, viewed progress (text and a
 //!   BMUX `progress_bar`), the draft count (a warning pill while the review is unsaved, since
-//!   leaving would lose them), the layout mode as a pill, and a filled publish `split_button`. Every
+//!   leaving would lose them), the layout mode as a pill, a `Guide 3/9` pill while the guide is
+//!   open but its panel has no room, and a filled publish `split_button`. Every
 //!   part is measured by its own component or text width, and [`plan_header`] places them; when
 //!   the row is too narrow, parts are dropped in [`HEADER_ELISION_ORDER`] while the title would
 //!   get fewer than its width (at most [`TITLE_KEEP`]) cells, then the title is truncated.
@@ -80,12 +81,14 @@ pub enum HeaderPart {
     Mode,
     /// Publish split button.
     Publish,
+    /// `Guide 3/9` chip, while the review's guide is open but its panel has no room.
+    Guide,
 }
 
 /// Header parts in the order they are dropped when the row is too narrow (first dropped
 /// first). Source chips after the first collapse into a `+N` chip before anything else goes;
 /// the title is never dropped.
-pub const HEADER_ELISION_ORDER: [HeaderPart; 9] = [
+pub const HEADER_ELISION_ORDER: [HeaderPart; 10] = [
     HeaderPart::Publish,
     HeaderPart::Chip(1),
     HeaderPart::Drafts,
@@ -94,6 +97,7 @@ pub const HEADER_ELISION_ORDER: [HeaderPart; 9] = [
     HeaderPart::Progress,
     HeaderPart::Threads,
     HeaderPart::Mode,
+    HeaderPart::Guide,
     HeaderPart::Viewed,
 ];
 
@@ -116,6 +120,8 @@ pub struct HeaderModel {
     pub unsaved: bool,
     /// Layout mode label.
     pub mode: String,
+    /// Where the guide stands (`Guide 3/9`), while it is open but its panel has no room.
+    pub guide: Option<String>,
 }
 
 impl HeaderModel {
@@ -244,7 +250,12 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
             left.push((part, component_width(&chip(source), width)));
         }
     }
+    let guide_label = model.guide.clone().unwrap_or_default();
     let right: Vec<(HeaderPart, u16)> = vec![
+        (
+            HeaderPart::Guide,
+            component_width(&chip(&guide_label), width),
+        ),
         (HeaderPart::Totals, text_width(&model.totals_line(theme))),
         (
             HeaderPart::Viewed,
@@ -268,6 +279,7 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
         .chain(&right)
         .map(|(part, _)| *part)
         .filter(|part| *part != HeaderPart::Threads || model.threads.1 > 0)
+        .filter(|part| *part != HeaderPart::Guide || model.guide.is_some())
         .collect();
     let used = |shown: &[HeaderPart]| -> u16 {
         let mut total = 0_u16;
@@ -432,6 +444,11 @@ pub fn paint_header(
             ),
             HeaderPart::Publish => {
                 publish_button(&items, theme).paint(PUBLISH_ID, rect, publish, cx);
+            }
+            HeaderPart::Guide => {
+                if let Some(label) = &model.guide {
+                    cx.paint_component(&chip(label).styles(theme.badges), rect);
+                }
             }
         }
     }
@@ -806,6 +823,7 @@ mod tests {
             drafts: 2,
             unsaved: false,
             mode: "unified".to_owned(),
+            guide: Some("Guide 3/9".to_owned()),
         }
     }
 

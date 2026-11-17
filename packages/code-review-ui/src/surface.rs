@@ -4176,6 +4176,7 @@ impl ReviewSurface {
             drafts: self.notes.draft_count(),
             unsaved: self.is_transient(),
             mode,
+            guide: self.guide_chip(),
         }
     }
 

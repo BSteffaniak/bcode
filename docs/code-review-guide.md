@@ -403,7 +403,9 @@ written through the plugin tools.
 * **Guide panel** (`alt+g`). Beside the document when the body is at least 100 columns (at least
   36 wide; the file panel gives way first and is left out when both would leave the document too
   little); stacked above the threads panel in the right column when that is open too; under the
-  document (at least 8 rows) on narrower bodies with at least 16 rows; otherwise not shown.
+  document (at least 8 rows) on narrower bodies with at least 16 rows; otherwise not shown, and
+  while it is open the header shows a `Guide 3/9` pill instead (dropped from a narrow header
+  just before the viewed count).
   Visibility and the sizes dragged are kept with the review's presentation state
   (`guide_panel_visible`, `guide_right_share`, `guide_bottom_share`).
   * Beside the document, the outline (numbers, titles, citation badges, and a state glyph) sits
@@ -448,8 +450,7 @@ written through the plugin tools.
 * **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
   `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
   review theme's tiers.
-* **Not yet.** The header chip when the panel cannot show, and a draggable split between outline
-  and section.
+* **Not yet.** A draggable split between outline and section.
 
 ### Writing a guide from the assistant
 

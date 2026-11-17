@@ -351,12 +351,18 @@ fn guide_panel_sits_beside_or_under_the_document_and_follows_resizes() {
         screen.text()
     );
 
-    // Too short for it under the document: hidden, and focus goes back to the document.
+    // Too short for it under the document: hidden, and focus goes back to the document; the
+    // header says where the guide stands instead.
     setup.scenario.resize(90, 12);
     let screen = stable(&mut setup.scenario);
     assert!(area(&setup.scenario, GUIDE_PANE_ID).is_none());
     assert!(guide_hits(&screen).is_empty(), "no hits of a hidden panel");
     assert_eq!(setup.scenario.surface().focus(), Focus::Review);
+    assert!(
+        screen.row_text(0).contains("Guide 1/6"),
+        "the header's guide chip: {}",
+        screen.text()
+    );
 
     // Tiny bodies have no panels at all.
     for (width, height) in [(20, 8), (1, 1), (0, 0)] {
@@ -369,10 +375,11 @@ fn guide_panel_sits_beside_or_under_the_document_and_follows_resizes() {
         assert!(guide_hits(&screen).is_empty(), "{width}x{height}");
     }
 
-    // Back to wide: beside again; the open state was kept.
+    // Back to wide: beside again; the open state was kept, and the chip is gone.
     setup.scenario.resize(170, 40);
-    stable(&mut setup.scenario);
+    let screen = stable(&mut setup.scenario);
     assert!(area(&setup.scenario, GUIDE_PANE_ID).is_some());
+    assert!(!screen.row_text(0).contains("Guide 1/6"), "{}", screen.text());
 }
 
 #[test]

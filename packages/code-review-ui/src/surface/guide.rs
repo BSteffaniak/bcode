@@ -298,6 +298,23 @@ impl ReviewSurface {
         }));
     }
 
+    /// The header's guide chip (`Guide 3/9`): while the guide is open but its panel has no room
+    /// in the body and the assistant's Guide tab does not show it either.
+    pub(super) fn guide_chip(&self) -> Option<String> {
+        let active = self.guide.state.active.as_ref()?;
+        if !self.panels.guide_open
+            || self.panels.guide_fits()
+            || self.guide.tab_area.get().is_some()
+        {
+            return None;
+        }
+        let total = active.entries.len();
+        Some(format!(
+            "Guide {}/{total}",
+            if total == 0 { 0 } else { active.selected + 1 }
+        ))
+    }
+
     /// Read the review's guide again (it was written, or the review changed). A reload asked
     /// for while a load runs reads again once that load is in.
     pub fn reload_guide(&mut self) {
