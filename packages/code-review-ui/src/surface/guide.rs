@@ -26,7 +26,7 @@ use bcode_code_review::guide::config::Markers;
 use bcode_code_review_models::{
     CitationRelation, GetGuideVersionRequest, GetGuideVersionResponse, GuideScope,
     ListGuideSectionMarksRequest, ListGuideSectionMarksResponse, ListReviewGuidesRequest,
-    ListReviewGuidesResponse, ResolvedSource, ReviewLineSide,
+    ListReviewGuidesResponse, ResolvedSource, ReviewLineInterval, ReviewLineSide, RevisionRef,
 };
 use bmux_keyboard::KeyStroke;
 use bmux_tui::geometry::Rect;
@@ -586,19 +586,42 @@ impl ReviewSurface {
         }
     }
 
+    /// The revision and lines a peek of `target` shows: where the lines moved to at the source's
+    /// current revision, or the lines as cited at the revision they were cited at (also when the
+    /// source is no longer in the review).
+    fn peek_place(&self, target: &CiteTarget) -> (RevisionRef, ReviewLineInterval) {
+        let current = target
+            .moved()
+            .then(|| self.review.as_ref())
+            .flatten()
+            .and_then(|review| {
+                let mut groups = review.doc.groups();
+                match target.source_id.as_deref() {
+                    Some(id) => groups.find(|group| group.source.source_id == id),
+                    None => groups.next(),
+                }
+                .map(|group| match target.side {
+                    ReviewLineSide::New => group.source.head.clone(),
+                    ReviewLineSide::Old => group.source.base.clone(),
+                })
+            });
+        current.map_or_else(
+            || (target.revision.clone(), target.cited),
+            |revision| (revision, target.lines),
+        )
+    }
+
     /// Show cited code outside the review read-only in the document's place.
     fn open_peek(&mut self, target: &CiteTarget, host: &UiContext) {
         let relation = match target.relation {
             CitationRelation::OutsideReview => "unchanged · outside this review",
             _ => "not shown in this review",
         };
+        let (revision, lines) = self.peek_place(target);
         self.guide.peek = Some(Peek {
             citation: target.citation.clone(),
-            title: format!(
-                "{}:{}-{} · {relation}",
-                target.path, target.lines.start, target.lines.end
-            ),
-            lines: (target.lines.start, target.lines.end),
+            title: format!("{}:{}-{} · {relation}", target.path, lines.start, lines.end),
+            lines: (lines.start, lines.end),
             content: None,
             scroll: 0,
         });
@@ -607,7 +630,6 @@ impl ReviewSurface {
         let repo = self.repo_path.clone();
         let inbox = self.inbox.clone();
         let citation = target.citation.clone();
-        let revision = target.revision.clone();
         let path = target.path.clone();
         host.spawn(Box::pin(async move {
             let result = services

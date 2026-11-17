@@ -818,3 +818,41 @@ fn a_refresh_tells_citation_freshness_against_the_new_head() {
         "freshness is told against the head the refresh resolved"
     );
 }
+
+#[test]
+fn a_peek_of_moved_lines_shows_them_where_they_are_now() {
+    let (mut setup, cited, fixture) = guided(150, 40);
+    quote_citation(&mut setup, &fixture, "c3");
+    let (file, _) = &cited.changed;
+    let path = fixture.root().join(&file.path);
+    let text = std::fs::read_to_string(&path).expect("file");
+    let cited_text: Vec<String> = text.lines().take(3).map(str::to_owned).collect();
+    std::fs::write(&path, format!("{}{text}", "pushed\n".repeat(10))).expect("write");
+    fixture.run(&["commit", "-qam", "push lines above the cited context"]);
+    setup.scenario.key("r");
+    stable(&mut setup.scenario);
+    setup.scenario.key("alt+g");
+    stable(&mut setup.scenario);
+    let outside = entry_of(&setup.scenario, "s2.3");
+    for _ in 0..16 {
+        if setup.scenario.surface().guide().unwrap().selected == outside {
+            break;
+        }
+        setup.scenario.key("j");
+    }
+    setup.scenario.key("enter");
+    stable(&mut setup.scenario);
+    let peek = setup.scenario.surface().guide_peek().expect("peek");
+    assert_eq!(peek.lines, (11, 13), "{}", peek.title);
+    let content = peek
+        .content
+        .as_ref()
+        .expect("read")
+        .as_ref()
+        .expect("content");
+    assert_eq!(
+        content[10..13],
+        cited_text[..],
+        "the moved lines are read where they are now"
+    );
+}

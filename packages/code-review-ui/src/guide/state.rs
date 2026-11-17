@@ -76,12 +76,23 @@ pub struct CiteTarget {
     pub path: String,
     /// Side.
     pub side: ReviewLineSide,
-    /// Lines.
+    /// Lines in the review as it is now: the cited lines, or where they moved to.
     pub lines: ReviewLineInterval,
     /// How the range relates to the review.
     pub relation: CitationRelation,
-    /// The revision it was read at.
+    /// The revision it was cited at.
     pub revision: RevisionRef,
+    /// The lines as cited, at [`Self::revision`].
+    pub cited: ReviewLineInterval,
+}
+
+impl CiteTarget {
+    /// Whether the cited lines have moved since the citation was written (so [`Self::lines`]
+    /// number the source's current revision, not [`Self::revision`]).
+    #[must_use]
+    pub fn moved(&self) -> bool {
+        self.lines != self.cited
+    }
 }
 
 impl CiteTarget {
@@ -100,6 +111,7 @@ impl CiteTarget {
             lines,
             relation: citation.relation,
             revision: citation.revision.clone(),
+            cited: citation.lines,
         }
     }
 }
