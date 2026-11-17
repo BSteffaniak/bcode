@@ -384,21 +384,39 @@ pub struct ReviewScrollAnchor {
     pub row_offset: u32,
 }
 
+/// Parts of the whole a panel share is counted in: a share of `2_500` is a quarter.
+pub const PANEL_SHARE_SCALE: u16 = 10_000;
+
 /// Panel visibility and sizes.
+///
+/// Sizes chosen by resizing are shares of the review body (parts of [`PANEL_SHARE_SCALE`]), so
+/// panels keep their proportions when the terminal is resized. State saved before sizes were
+/// proportional carries cell counts instead (`file_panel_width`, `threads_panel_size`); the
+/// review converts them to shares at the body size it first lays them out at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ReviewPanelState {
     /// Whether the file panel is visible.
     #[serde(default)]
     pub file_panel_visible: Option<bool>,
-    /// File panel width in columns.
-    #[serde(default)]
+    /// File panel width in columns, from state saved before sizes were proportional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_panel_width: Option<u16>,
     /// Whether the threads panel is visible.
     #[serde(default)]
     pub threads_panel_visible: Option<bool>,
-    /// Threads panel size in rows or columns, depending on its placement.
-    #[serde(default)]
+    /// Threads panel size in rows or columns (depending on its placement), from state saved
+    /// before sizes were proportional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads_panel_size: Option<u16>,
+    /// File panel width as a share of the body width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_panel_share: Option<u16>,
+    /// Threads panel width, beside the document, as a share of the body width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads_right_share: Option<u16>,
+    /// Threads panel height, under the document, as a share of the body height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads_bottom_share: Option<u16>,
 }
 
 /// Revealed context of one file.
@@ -3538,6 +3556,34 @@ mod workspace_compat_tests {
     }
 
     #[test]
+    fn panel_state_saved_in_cells_still_reads() {
+        let legacy: ReviewPanelState = serde_json::from_str(
+            r#"{"file_panel_visible":true,"file_panel_width":40,"threads_panel_visible":null,"threads_panel_size":12}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            ReviewPanelState {
+                file_panel_visible: Some(true),
+                file_panel_width: Some(40),
+                threads_panel_size: Some(12),
+                ..ReviewPanelState::default()
+            }
+        );
+        // Proportional state writes no cell counts.
+        let proportional = ReviewPanelState {
+            file_panel_share: Some(2_500),
+            ..ReviewPanelState::default()
+        };
+        let json = serde_json::to_string(&proportional).unwrap();
+        assert!(!json.contains("file_panel_width"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ReviewPanelState>(&json).unwrap(),
+            proportional
+        );
+    }
+
+    #[test]
     fn presentation_state_round_trips() {
         let state = ReviewPresentationState {
             scroll_anchor: Some(ReviewScrollAnchor {
@@ -3553,9 +3599,10 @@ mod workspace_compat_tests {
             layout_mode: Some(ReviewLayoutMode::SideBySide),
             panels: ReviewPanelState {
                 file_panel_visible: Some(true),
-                file_panel_width: Some(40),
                 threads_panel_visible: Some(false),
-                threads_panel_size: None,
+                file_panel_share: Some(2_500),
+                threads_bottom_share: Some(3_000),
+                ..ReviewPanelState::default()
             },
             expansions: vec![ReviewFileExpansion {
                 source_id: "s".into(),

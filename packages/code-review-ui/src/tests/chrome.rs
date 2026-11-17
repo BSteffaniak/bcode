@@ -4,8 +4,10 @@
 
 use super::{open, stable, surface};
 use crate::config::ReviewViewConfig;
-use crate::panels::{FILES_AUTO_BODY, FILES_MIN_BODY};
-use crate::surface::{FILES_PANE_ID, REVIEW_PANE_ID, TREE_ID};
+use crate::panels::{
+    FILES_AUTO_BODY, FILES_MIN_BODY, FILES_MIN_WIDTH, REVIEW_MIN_WIDTH, cells_of, share_of,
+};
+use crate::surface::{FILES_PANE_ID, REVIEW_PANE_ID, THREADS_PANE_ID, TREE_ID};
 use crate::testing::fixture::{FixtureSpec, GitFixture, LARGE_FILE, UNICODE_FILE};
 use crate::testing::fixture_branch_compare;
 use crate::testing::harness::{Scenario, Screen};
@@ -638,14 +640,16 @@ fn panel_sizes_persist_to_presentation_state() {
     stable(&mut scenario);
     let widened = area_of(&scenario, FILES_PANE_ID).unwrap();
     assert_eq!(widened.width, files.width + 4);
+    let body = area_of(&scenario, REVIEW_PANE_ID).unwrap().right() - widened.x;
     let panels = scenario.surface().presentation().panels;
-    assert_eq!(panels.file_panel_width, Some(widened.width));
+    assert_eq!(panels.file_panel_share, Some(share_of(widened.width, body)));
+    assert_eq!(panels.file_panel_width, None, "sizes persist as shares");
     // Keyboard resizing and hiding persist too.
     scenario.key(">");
     stable(&mut scenario);
     assert_eq!(
-        scenario.surface().presentation().panels.file_panel_width,
-        Some(widened.width + 4)
+        scenario.surface().presentation().panels.file_panel_share,
+        Some(share_of(widened.width + 4, body))
     );
     scenario.key("t");
     stable(&mut scenario);
@@ -777,4 +781,231 @@ fn ascii_icons_replace_unicode_glyphs() {
     for glyph in ["✓", "○", "−", "■", "▱", "▍", "┄", "↓", "⌕", "«", "·"] {
         assert!(!text.contains(glyph), "{glyph}\n{text}");
     }
+}
+
+/// Drag from `(x, y)` to `(to_x, to_y)` and settle.
+fn drag(scenario: &mut Scenario<ReviewSurface>, (x, y): (u16, u16), (to_x, to_y): (u16, u16)) {
+    scenario.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+    scenario.mouse(MouseEventKind::Drag(MouseButton::Left), to_x, to_y);
+    scenario.mouse(MouseEventKind::Up(MouseButton::Left), to_x, to_y);
+    stable(scenario);
+}
+
+/// Width of the review body (the panes side by side).
+fn body_width(scenario: &Scenario<ReviewSurface>) -> u16 {
+    let first = area_of(scenario, FILES_PANE_ID)
+        .or_else(|| area_of(scenario, REVIEW_PANE_ID))
+        .unwrap();
+    let last = area_of(scenario, THREADS_PANE_ID)
+        .filter(|threads| threads.y == first.y)
+        .or_else(|| area_of(scenario, REVIEW_PANE_ID))
+        .unwrap();
+    last.right() - first.x
+}
+
+/// Whether `actual` is `share` of `total`, give or take the cell rounding loses.
+fn about(actual: u16, share: u16, total: u16) -> bool {
+    actual.abs_diff(cells_of(share, total)) <= 1
+}
+
+#[test]
+fn dragged_panels_keep_their_proportions_when_the_terminal_resizes() {
+    let fixture = fixture();
+    let mut scenario = Scenario::new(
+        surface(
+            &fixture,
+            fixture_branch_compare(),
+            ReviewViewConfig::default(),
+        )
+        .with_workspace(saved_workspace(&fixture, None)),
+        160,
+        40,
+    );
+    stable(&mut scenario);
+    scenario.key("shift+t");
+    stable(&mut scenario);
+    let threads = area_of(&scenario, THREADS_PANE_ID).expect("threads beside the document");
+    let files = area_of(&scenario, FILES_PANE_ID).unwrap();
+    // Drag the file panel ten columns wider and the threads panel six wider.
+    let divider = area_of(&scenario, REVIEW_PANE_ID).unwrap().x;
+    drag(&mut scenario, (divider, 10), (divider + 10, 10));
+    drag(&mut scenario, (threads.x, 10), (threads.x - 6, 10));
+    let body = body_width(&scenario);
+    let files_share = share_of(files.width + 10, body);
+    let threads_share = share_of(threads.width + 6, body);
+    assert_eq!(
+        area_of(&scenario, FILES_PANE_ID).unwrap().width,
+        files.width + 10
+    );
+    assert_eq!(
+        area_of(&scenario, THREADS_PANE_ID).unwrap().width,
+        threads.width + 6
+    );
+
+    for width in [240_u16, 200, 175, 160] {
+        scenario.resize(width, 40);
+        stable(&mut scenario);
+        let body = body_width(&scenario);
+        let files = area_of(&scenario, FILES_PANE_ID).unwrap().width;
+        let threads = area_of(&scenario, THREADS_PANE_ID).unwrap().width;
+        assert!(
+            about(files, files_share, body),
+            "{width}: files {files} of {body}"
+        );
+        assert!(
+            about(threads, threads_share, body),
+            "{width}: threads {threads} of {body}"
+        );
+        let review = area_of(&scenario, REVIEW_PANE_ID).unwrap().width;
+        assert!(review >= REVIEW_MIN_WIDTH, "{width}: review {review}");
+    }
+
+    threads_under_the_document_keep_their_share(&mut scenario);
+    // Back beside the document: the width it was given there.
+    scenario.resize(200, 40);
+    stable(&mut scenario);
+    let body = body_width(&scenario);
+    let threads = area_of(&scenario, THREADS_PANE_ID).unwrap().width;
+    assert!(
+        about(threads, threads_share, body),
+        "threads {threads} of {body}"
+    );
+
+    narrow_terminals_keep_minimums_and_the_handle_on_the_border(&mut scenario);
+    // And widening again restores the proportion.
+    scenario.resize(240, 40);
+    stable(&mut scenario);
+    let body = body_width(&scenario);
+    let files = area_of(&scenario, FILES_PANE_ID).unwrap().width;
+    assert!(about(files, files_share, body), "files {files} of {body}");
+}
+
+/// Under the document, the threads panel drags and keeps a share of the body's height.
+fn threads_under_the_document_keep_their_share(scenario: &mut Scenario<ReviewSurface>) {
+    scenario.resize(130, 40);
+    stable(scenario);
+    let threads = area_of(scenario, THREADS_PANE_ID).expect("threads under the document");
+    let review = area_of(scenario, REVIEW_PANE_ID).unwrap();
+    assert_eq!(threads.x, review.x, "stacked");
+    let body_height = threads.bottom() - review.y;
+    // The divider is the document pane's bottom border.
+    drag(
+        scenario,
+        (threads.x + 5, review.bottom() - 1),
+        (threads.x + 5, review.bottom() - 5),
+    );
+    let grown = area_of(scenario, THREADS_PANE_ID).unwrap();
+    assert_eq!(grown.height, threads.height + 4);
+    let bottom_share = share_of(grown.height, body_height);
+    for height in [60_u16, 30, 40] {
+        scenario.resize(130, height);
+        stable(scenario);
+        let threads = area_of(scenario, THREADS_PANE_ID).unwrap();
+        let review = area_of(scenario, REVIEW_PANE_ID).unwrap();
+        let body_height = threads.bottom() - review.y;
+        assert!(
+            about(threads.height, bottom_share, body_height),
+            "{height}: threads {} of {body_height}",
+            threads.height
+        );
+    }
+}
+
+/// Narrow terminals: minimums win, and the divider handle stays on the painted border.
+fn narrow_terminals_keep_minimums_and_the_handle_on_the_border(
+    scenario: &mut Scenario<ReviewSurface>,
+) {
+    for width in [100_u16, 61, 60, 59, 30, 24, 23, 5, 1] {
+        scenario.resize(width, 40);
+        let screen = stable(scenario);
+        if let Some(files) = area_of(scenario, FILES_PANE_ID) {
+            assert!(files.width >= FILES_MIN_WIDTH, "{width}: {files:?}");
+            let review = area_of(scenario, REVIEW_PANE_ID).unwrap();
+            assert!(
+                review.width >= REVIEW_MIN_WIDTH.min(width),
+                "{width}: {review:?}"
+            );
+            assert_eq!(files.right(), review.x, "{width}");
+        }
+        let frame = Rect::new(0, 0, width, 40);
+        for hit in screen.hits() {
+            assert_eq!(frame.intersection(hit.area), hit.area, "{width}: {hit:?}");
+            // The file panel's divider (the threads panel sits under the document here).
+            if hit.id.as_str() == "review.panels.divider.0" {
+                let review = area_of(scenario, REVIEW_PANE_ID).unwrap();
+                assert_eq!(hit.area.x, review.x, "{width}: the handle is the border");
+                let symbol = screen
+                    .cell(hit.area.x, hit.area.y + 1)
+                    .unwrap()
+                    .symbol
+                    .clone();
+                assert_eq!(symbol, "│", "{width}: {hit:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn panel_sizes_saved_in_cells_restore_and_then_scale() {
+    let fixture = fixture();
+    let legacy = bcode_code_review_models::ReviewPresentationState {
+        panels: bcode_code_review_models::ReviewPanelState {
+            file_panel_visible: Some(true),
+            file_panel_width: Some(40),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut scenario = Scenario::new(
+        surface(
+            &fixture,
+            fixture_branch_compare(),
+            ReviewViewConfig::default(),
+        )
+        .with_workspace(saved_workspace(&fixture, Some(legacy))),
+        160,
+        40,
+    );
+    stable(&mut scenario);
+    // The saved width at the size it is first shown, then that share of the body.
+    assert_eq!(area_of(&scenario, FILES_PANE_ID).unwrap().width, 40);
+    let body = body_width(&scenario);
+    let panels = scenario.surface().presentation().panels;
+    assert_eq!(panels.file_panel_share, Some(share_of(40, body)));
+    assert_eq!(panels.file_panel_width, None);
+    scenario.resize(240, 40);
+    stable(&mut scenario);
+    let wide = body_width(&scenario);
+    assert!(about(
+        area_of(&scenario, FILES_PANE_ID).unwrap().width,
+        share_of(40, body),
+        wide
+    ));
+
+    // Proportional state restores as a share of whatever size the review opens at.
+    let proportional = bcode_code_review_models::ReviewPresentationState {
+        panels: bcode_code_review_models::ReviewPanelState {
+            file_panel_visible: Some(true),
+            file_panel_share: Some(2_500),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut scenario = Scenario::new(
+        surface(
+            &fixture,
+            fixture_branch_compare(),
+            ReviewViewConfig::default(),
+        )
+        .with_workspace(saved_workspace(&fixture, Some(proportional))),
+        200,
+        40,
+    );
+    stable(&mut scenario);
+    let body = body_width(&scenario);
+    assert!(about(
+        area_of(&scenario, FILES_PANE_ID).unwrap().width,
+        2_500,
+        body
+    ));
 }

@@ -4446,6 +4446,9 @@ impl ReviewSurface {
     /// Lay out, prepare, and paint the body: panels, the file tree, and the document list.
     fn render_body(&mut self, body: Rect, cx: &mut PaintCx<'_, '_>) {
         let plan = self.panels.sync(body.width, body.height);
+        if self.panels.take_converted() {
+            self.persist_panels();
+        }
         // Focus never stays on a pane that is not shown.
         let shown = match self.focus {
             Focus::Files | Focus::Filter => plan.files,

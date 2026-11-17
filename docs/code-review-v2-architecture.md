@@ -775,7 +775,12 @@ them in when the same target opens again; saving the review moves them.
   cursor to it); until annotations load (phase 3c) it shows a BMUX `empty_state`.
 * **Persistence.** File panel visibility and width, and threads panel visibility and size, are
   kept in the workspace's `presentation_v2.panels` (`ReviewPanelState`) and restored when the
-  surface opens a workspace. Durable workspaces are saved with `review.workspace.update` (changes
+  surface opens a workspace. Sizes are shares of the body (`file_panel_share`,
+  `threads_right_share`, `threads_bottom_share`, in parts of 10,000), kept by BMUX flex
+  preservation while dragging, so panels keep their proportions when the terminal resizes;
+  minimums (the document's 40 columns first, then the threads and file panels' own) win when the
+  body shrinks. State saved in cells (`file_panel_width`, `threads_panel_size`) is converted to a
+  share at the body size it is first laid out at, and saved again. Durable workspaces are saved with `review.workspace.update` (changes
   during a save are saved after it); transient workspaces keep the state in memory.
 * **Keys** (scope `code-review`; `code-review-v2` before phase 7): `tab` next pane, `t`
   show/hide the file panel, `f` filter, `>`/`<` widen/narrow the file panel, `T` threads panel.
