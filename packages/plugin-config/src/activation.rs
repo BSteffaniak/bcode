@@ -136,6 +136,7 @@ impl Runtime {
                 plugin_settings_map: std::collections::BTreeMap::default(),
                 host_kernel_bridge: None,
                 host_service_port: None,
+                capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
                 auxiliary_executables: std::collections::BTreeMap::default(),
                 auxiliary_executable_errors: std::collections::BTreeMap::default(),
             },

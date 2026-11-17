@@ -107,6 +107,7 @@ pub fn load_selected(
                 plugin_settings_map: BTreeMap::new(),
                 host_kernel_bridge: None,
                 host_service_port: None,
+                capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
                 auxiliary_executables: BTreeMap::new(),
                 auxiliary_executable_errors: BTreeMap::new(),
             },

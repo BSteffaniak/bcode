@@ -24,8 +24,10 @@ pub mod path_search;
 mod replacement;
 #[cfg(feature = "native")]
 mod write_receipt;
-// Both consumers generate this transport from the contract-only schema owner.
+// Both consumers generate this transport from the contract-only schema owner. Generated
+// dispatch matches on the operation name however few operations the interface has.
 #[cfg(feature = "native")]
+#[allow(clippy::single_match_else)]
 pub mod path_search_transport {
     include!(concat!(env!("OUT_DIR"), "/path_search.rs"));
 }

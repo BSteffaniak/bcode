@@ -19422,7 +19422,13 @@ async fn process_skill_invocation_command(
 
     let skill_model_policy_applied = !is_skill_active(state, permit.session_id(), &skill_id).await;
     let skill_effort = if skill_model_policy_applied {
-        match apply_skill_model_policy(state, permit.session_id(), &skill_id).await {
+        match Box::pin(apply_skill_model_policy(
+            state,
+            permit.session_id(),
+            &skill_id,
+        ))
+        .await
+        {
             Ok(effort) => effort,
             Err(error) => {
                 append_skill_invocation_failed_event(

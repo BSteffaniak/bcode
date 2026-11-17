@@ -309,6 +309,7 @@ fn shared_config(plugin_id: &str) -> bcode_plugin::ResolvedPluginConfig {
                 plugin_settings_map: std::collections::BTreeMap::new(),
                 host_kernel_bridge: None,
                 host_service_port: None,
+                capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
                 auxiliary_executables: std::collections::BTreeMap::new(),
                 auxiliary_executable_errors: std::collections::BTreeMap::new(),
             },
