@@ -856,3 +856,48 @@ fn a_peek_of_moved_lines_shows_them_where_they_are_now() {
         "the moved lines are read where they are now"
     );
 }
+
+#[test]
+fn a_section_body_shows_as_markdown_with_its_badges() {
+    let (setup, _, _fixture) = guided(150, 40);
+    let mut guide = setup.scenario.surface().guide().expect("guide").clone();
+    let current = guide.current().expect("a section").id.clone();
+    let body = "Uses **a token bucket** [[c1]]:\n\n- refills on `success`\n- 変更 drains on failure [[c2]]";
+    fn set_body(sections: &mut [Section], id: &str, body: &str) {
+        for section in sections {
+            if section.id == id {
+                body.clone_into(&mut section.body);
+            }
+            set_body(&mut section.children, id, body);
+        }
+    }
+    set_body(&mut guide.version.outline, &current, body);
+    let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+    let model = panel::build_model(
+        &guide,
+        &std::collections::BTreeSet::new(),
+        &theme,
+        Placement::Under,
+        1,
+    );
+    let screen = panel_screen(&model, false, 60, 20);
+    let text = screen.text();
+    assert!(text.contains("a token bucket"), "{text}");
+    assert!(
+        !text.contains("**") && !text.contains('`') && !text.contains("[[c"),
+        "markdown and tokens are rendered: {text}"
+    );
+    assert!(text.contains("success") && text.contains("変更"), "{text}");
+    let badge = screen.find("[1]").expect("the badge is shown");
+    assert_eq!(screen.style_at(badge.x, badge.y), theme.guide.badge);
+    for width in [1_u16, 2, 5, 12, 23] {
+        let screen = panel_screen(&model, false, width, 20);
+        for y in 0..20 {
+            let row = screen.row_text(y);
+            assert!(
+                bmux_tui::text_width::display_width(row.trim_end()) <= usize::from(width),
+                "{width} row {y}: {row:?}"
+            );
+        }
+    }
+}

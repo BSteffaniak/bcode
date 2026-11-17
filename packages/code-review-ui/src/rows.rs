@@ -2018,7 +2018,7 @@ thread_local! {
 /// Every row of `text` rendered as markdown in `width` cells (as an incomplete document while
 /// `streaming`), reusing a recent rendering of the same text at the same width. For AI answers,
 /// which are shown in full and rebuilt often.
-fn markdown_all_rows(text: &str, width: usize, streaming: bool) -> Vec<Line> {
+pub(crate) fn markdown_all_rows(text: &str, width: usize, streaming: bool) -> Vec<Line> {
     let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
     let cached = RENDERED_MARKDOWN.with_borrow(|entries| {
         entries

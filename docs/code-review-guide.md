@@ -410,7 +410,8 @@ written through the plugin tools.
     above the current section; the outline scrolls to keep the current section in view.
   * Under the document, the current section shows alone; its header says where it is (`3.1/9`).
   * Narrower than 24 columns, only the outline's numbers and titles show.
-  * The current section shows its body (citation tokens as badges), its citations (path, lines,
+  * The current section shows its body as rendered markdown (citation tokens as badges, written
+    as the badges' text so they are measured and wrapped with the prose), its citations (path, lines,
     and how they relate to the review: changed, context, unchanged, or outside the review), and
     its findings. A banner says when the version is being written, failed, was stopped, is not
     the guide's current version, or has sections whose code changed since.
@@ -447,8 +448,8 @@ written through the plugin tools.
 * **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
   `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
   review theme's tiers.
-* **Not yet.** The header chip when the panel cannot show, a draggable split between outline
-  and section, and rendered markdown in section bodies.
+* **Not yet.** The header chip when the panel cannot show, and a draggable split between outline
+  and section.
 
 ### Writing a guide from the assistant
 

@@ -82,6 +82,56 @@ pub struct DetailLine {
     pub wrap: bool,
     /// What clicking it does.
     pub action: Option<PanelClick>,
+    /// Markdown shown in place of `line`, rendered at the panel's width.
+    pub markdown: Option<MarkdownBody>,
+}
+
+/// A section body as markdown, its citation tokens written as their badges' text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownBody {
+    /// Markdown source, each `[[c7]]` token replaced with its badge's text (escaped).
+    pub source: String,
+    /// Each badge's text and the styled spans it is shown with.
+    pub badges: Vec<(String, Vec<Span>)>,
+}
+
+impl MarkdownBody {
+    /// The body rendered in `width` cells, its badges styled.
+    fn rows(&self, width: usize) -> Vec<Line> {
+        crate::rows::markdown_all_rows(&self.source, width, false)
+            .into_iter()
+            .map(|line| with_badges(line, &self.badges))
+            .collect()
+    }
+}
+
+/// `line` with each occurrence of a badge's text shown with the badge's spans.
+fn with_badges(line: Line, badges: &[(String, Vec<Span>)]) -> Line {
+    if badges.is_empty() {
+        return line;
+    }
+    let mut spans = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let mut rest = span.content.as_str();
+        loop {
+            let found = badges
+                .iter()
+                .filter_map(|(text, styled)| rest.find(text.as_str()).map(|at| (at, text, styled)))
+                .min_by_key(|(at, text, _)| (*at, std::cmp::Reverse(text.len())));
+            let Some((at, text, styled)) = found else {
+                if !rest.is_empty() {
+                    spans.push(Span::styled(rest.to_owned(), span.style));
+                }
+                break;
+            };
+            if at > 0 {
+                spans.push(Span::styled(rest[..at].to_owned(), span.style));
+            }
+            spans.extend(styled.iter().cloned());
+            rest = &rest[at + text.len()..];
+        }
+    }
+    Line::from_spans(spans)
 }
 
 /// The current section's header.
@@ -299,7 +349,16 @@ impl<'a> GuidePanelView<'a> {
     fn section_rows(&self, width: usize) -> Vec<(Line, Option<PanelClick>)> {
         let mut rows = Vec::new();
         for detail in &self.model.detail {
-            if detail.wrap && detail.line.width() > width && width > 0 {
+            if let Some(markdown) = &detail.markdown {
+                if width > 0 {
+                    rows.extend(
+                        markdown
+                            .rows(width)
+                            .into_iter()
+                            .map(|row| (row, detail.action.clone())),
+                    );
+                }
+            } else if detail.wrap && detail.line.width() > width && width > 0 {
                 for row in bmux_tui::text::wrap_line_bounded(
                     &detail.line,
                     TextWrapGeometry::with_continuation(width, width),
@@ -829,6 +888,7 @@ fn detail_lines(active: &super::state::ActiveGuide, theme: &ReviewTheme) -> Vec<
             )]),
             wrap: true,
             action: None,
+            markdown: None,
         });
         return lines;
     };
@@ -839,6 +899,7 @@ fn detail_lines(active: &super::state::ActiveGuide, theme: &ReviewTheme) -> Vec<
         line,
         wrap: true,
         action: None,
+        markdown: None,
     };
     if section.state == SectionState::Planned {
         lines.push(prose(Line::from_spans(vec![
@@ -846,8 +907,11 @@ fn detail_lines(active: &super::state::ActiveGuide, theme: &ReviewTheme) -> Vec<
             Span::styled(" not written yet", theme.muted),
         ])));
     }
-    for text in section.body.lines() {
-        lines.push(prose(body_line(active, text, theme)));
+    if !section.body.trim().is_empty() {
+        lines.push(DetailLine {
+            markdown: Some(markdown_body(active, &section.body, theme)),
+            ..prose(Line::default())
+        });
     }
     let cited = &entry.citations;
     if !cited.is_empty() {
@@ -925,6 +989,7 @@ fn citation_line(
         line: Line::from_spans(spans),
         wrap: false,
         action: Some(PanelClick::Citation(id.to_owned())),
+        markdown: None,
     })
 }
 
@@ -965,33 +1030,39 @@ fn finding_line(
     Line::from_spans(spans)
 }
 
-/// One body line with its `[[c7]]` tokens shown as badges.
-fn body_line(active: &super::state::ActiveGuide, text: &str, theme: &ReviewTheme) -> Line {
-    let mut spans = Vec::new();
-    let mut rest = text;
+/// A section body as markdown, its `[[c7]]` tokens written as their badges' text so they are
+/// measured and wrapped with the prose, and shown with the badges' styles.
+fn markdown_body(
+    active: &super::state::ActiveGuide,
+    body: &str,
+    theme: &ReviewTheme,
+) -> MarkdownBody {
+    let mut source = String::with_capacity(body.len());
+    let mut badges: Vec<(String, Vec<Span>)> = Vec::new();
+    let mut rest = body;
     while let Some(start) = rest.find("[[") {
         let after = &rest[start + 2..];
         let Some(end) = after.find("]]") else {
             break;
         };
-        if start > 0 {
-            spans.push(Span::styled(rest[..start].to_owned(), theme.text));
-        }
+        source.push_str(&rest[..start]);
         let token = after[..end].trim();
-        match active.number(token) {
-            Some(number) => {
-                spans.extend(badge_spans(
-                    number,
-                    active.citation_look(token).into(),
-                    theme,
-                ));
+        let spans = active.number(token).map_or_else(
+            || vec![Span::styled(format!("[[{token}]]"), theme.muted)],
+            |number| badge_spans(number, active.citation_look(token).into(), theme),
+        );
+        let text: String = spans.iter().map(|span| span.content.as_str()).collect();
+        for character in text.chars() {
+            if character.is_ascii_punctuation() {
+                source.push('\\');
             }
-            None => spans.push(Span::styled(format!("[[{token}]]"), theme.muted)),
+            source.push(character);
+        }
+        if !badges.iter().any(|(known, _)| *known == text) {
+            badges.push((text, spans));
         }
         rest = &after[end + 2..];
     }
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_owned(), theme.text));
-    }
-    Line::from_spans(spans)
+    source.push_str(rest);
+    MarkdownBody { source, badges }
 }
