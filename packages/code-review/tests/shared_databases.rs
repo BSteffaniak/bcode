@@ -1,6 +1,6 @@
-//! Several processes share one review state database: review apps in different repositories,
-//! review apps in the same repository, and the daemon's code review plugin. Every operation of
-//! every process succeeds while the others keep reading and writing.
+//! Several processes share the review state and cache databases: review apps in different
+//! repositories, review apps in the same repository, and the daemon's code review plugin. Every
+//! operation of every process succeeds while the others keep reading and writing.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use bcode_code_review::cache::{CacheKind, ReviewCache};
 use bcode_code_review::{CodeReviewConfig, CodeReviewStateLocation, ReviewStore};
 use bcode_code_review_models::{
     BindReviewAssistantRequest, CreateReviewWorkspaceRequest, ListReviewAssistantsRequest,
@@ -206,4 +207,55 @@ fn processes_share_the_state_database_without_failing() {
         .filter_map(|(role, mut child)| (!child.wait().unwrap().success()).then_some(role))
         .collect();
     assert!(failed.is_empty(), "workers failed: {failed:?}");
+}
+
+const CACHE_WORKER_ENV: &str = "BCODE_CODE_REVIEW_CACHE_WORKER";
+const CACHE_TEST_NAME: &str = "a_second_process_shares_the_cache_another_has_open";
+
+#[test]
+fn a_second_process_shares_the_cache_another_has_open() {
+    if let Ok(path) = std::env::var(CACHE_WORKER_ENV) {
+        let cache = ReviewCache::open(Path::new(&path));
+        assert!(cache.enabled(), "the second process has a cache");
+        let found = cache.get_many(CacheKind::MergeBase, &["first".to_owned()]);
+        assert_eq!(
+            found.get("first").map(|entry| entry.value.as_str()),
+            Some("from the first process")
+        );
+        cache.put_many(
+            CacheKind::MergeBase,
+            &[("second".to_owned(), "from the second process".to_owned())],
+        );
+        cache.close();
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("review-cache.db");
+    // The first app keeps its cache for as long as it runs.
+    let cache = ReviewCache::open(&path);
+    assert!(cache.enabled());
+    cache.put_many(
+        CacheKind::MergeBase,
+        &[("first".to_owned(), "from the first process".to_owned())],
+    );
+    // Long enough for the held write to be written.
+    std::thread::sleep(Duration::from_secs(1));
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            CACHE_TEST_NAME,
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(CACHE_WORKER_ENV, &path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "the second process failed");
+    let found = cache.get_many(CacheKind::MergeBase, &["second".to_owned()]);
+    assert_eq!(
+        found.get("second").map(|entry| entry.value.as_str()),
+        Some("from the second process")
+    );
 }

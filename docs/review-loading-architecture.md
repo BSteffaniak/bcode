@@ -202,9 +202,12 @@ bases kept 90 days, listings and pull requests 30, stacks 7, pruned when it open
 (200,000 merge bases, 4,000 listings, 20,000 pull requests, 1,000 stacks; past a cap, the oldest
 go, trimmed once held writes are written), never needed
 for correctness, safe to delete. It goes through Switchy (Turso), like the review store, with one
-worker thread owning the connection; writes do not wait. It is `review-cache.db` in Bcode's state directory
+worker thread per process owning the connection; writes do not wait. It is `review-cache.db` in Bcode's state directory
 (`code-review/`), or the file `BCODE_CODE_REVIEW_CACHE` names (`off` disables it); an unreadable
-file is rebuilt; one another process holds leaves this process without it. Stacks are kept for 7 days: a review shows a kept stack
+file is rebuilt. Every review app and the daemon share it: a worker opens it only while it has
+work, after taking a turn (an exclusive lock on `review-cache.db.access.lock`), and closes it
+when idle or after holding it for 0.5 s. A read whose turn does not come within 0.5 s is a miss;
+held writes wait for a later turn. Stacks are kept for 7 days: a review shows a kept stack
 at once and confirms it after its first frame. A screen that needs the stack as it is now uses one
 as it is for 30 s, confirms it (one `pulls.get`) up to 1 h old, and resolves it again past that,
 because confirming does not see pull requests opened on top of the stack.
@@ -256,8 +259,8 @@ Everything above is built; where it differs from the plan, it says so.
 * **Screen:** the layer strip says whether the layer is loading or failed, how many layers are
   still loading, and whether the stack is being checked or when it was last confirmed; a failed
   layer's tab shows `!`. Discovery's unconfirmed chain is shown in the wizard and on home.
-* **Persistence:** the cache database (`review-cache.db`; Switchy over Turso, one worker thread,
-  reads before writes) keeps merge bases, listings, hunks, pull requests, stacks, and discovery
+* **Persistence:** the cache database (`review-cache.db`; Switchy over Turso, one worker thread
+  per process taking turns at the file, reads before writes) keeps merge bases, listings, hunks, pull requests, stacks, and discovery
   answers (kept while the references they read are unchanged), each kind bounded by age and size.
   A review also keeps the stacks it last opened with (`ReviewWorkspace::stack_snapshots`), so it
   opens at once even when the cache is gone; the stack is confirmed after the first frame.

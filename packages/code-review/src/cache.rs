@@ -15,17 +15,19 @@
 //! * provider facts ([`CacheKind::Pull`], [`CacheKind::Stack`]): suggestions shown at once and
 //!   confirmed with the provider afterwards, with when they were written.
 //!
-//! One worker thread owns the database; calls send it requests. Reads wait for their answer and
-//! come first: writes are held until no read has arrived for [`WRITE_DELAY`] and then written in
-//! small transactions, so a burst of reads (opening a review) never waits behind writes. A read
-//! also sees the writes still held, so it sees every earlier write.
+//! One worker thread per cache owns the connection; calls send it requests. Each review app and
+//! the daemon has its own worker, and the workers take turns at the file (see `crate::access`):
+//! a worker opens the database only while it has work and closes it when idle. Reads wait for
+//! their answer and come first: writes are held until no read has arrived for [`WRITE_DELAY`] and
+//! then written in small transactions, so a burst of reads (opening a review) never waits behind
+//! writes. A read also sees the writes still held, so it sees every earlier write.
 //! See `docs/review-loading-architecture.md`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use switchy::database::query::{
     FilterableQuery as _, SortDirection, count_all, select, where_eq, where_gte, where_in, where_lt,
 };
@@ -33,6 +35,8 @@ use switchy::database::schema::{Column, DataType, create_table};
 use switchy::database::{Database, DatabaseError, DatabaseValue, Row};
 use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
 use switchy::schema::runner::MigrationRunner;
+
+use crate::access::AccessTurn;
 
 /// Environment variable naming the cache file, or `off` to disable it.
 pub const CODE_REVIEW_CACHE_ENV: &str = "BCODE_CODE_REVIEW_CACHE";
@@ -46,6 +50,20 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const WRITE_DELAY: Duration = Duration::from_millis(200);
 /// Entries per write transaction; reads are answered between them.
 const WRITE_CHUNK: usize = 64;
+/// Longest the worker keeps the database open while other processes may be waiting for it.
+const MAX_HOLD: Duration = Duration::from_millis(500);
+/// Pause after giving the turn back at [`MAX_HOLD`], so a waiting process takes it first.
+const YIELD_AFTER_HOLD: Duration = Duration::from_millis(5);
+/// Longest a read waits for its turn; past it the read is a miss.
+const READ_TURN_WAIT: Duration = Duration::from_millis(500);
+/// Longest held writes wait for their turn before waiting for the next quiet moment.
+const WRITE_TURN_WAIT: Duration = Duration::from_millis(50);
+/// Longest a starting worker waits for its first turn; it opens the cache later otherwise.
+const START_TURN_WAIT: Duration = Duration::from_millis(250);
+/// Longest a closing worker waits for its turn to write what it holds.
+const CLOSE_TURN_WAIT: Duration = Duration::from_secs(2);
+/// Most writes held while the database is unavailable; past it, the oldest are dropped.
+const MAX_HELD: usize = 20_000;
 
 /// What an entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -192,7 +210,7 @@ impl ReviewCache {
     }
 
     /// The cache at `path` (its directory is created), rebuilt when unreadable; disabled when it
-    /// cannot be opened at all (another process holding it, say).
+    /// can be neither opened nor rebuilt. Other processes using it at the same time share it.
     #[must_use]
     pub fn open(path: &Path) -> Self {
         Self {
@@ -314,12 +332,13 @@ impl Drop for ReviewCache {
 
 /// Start the worker for the database at `path`: open it (rebuilding a file that is not a
 /// readable cache), migrate it, drop expired entries, then answer requests until every sender is
-/// gone. `None` when it cannot be opened.
+/// gone. `None` when it cannot be opened at all; a cache other processes are using at the moment
+/// is opened when its turn comes.
 fn start(path: &Path) -> Option<Worker> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let path = path.to_path_buf();
+    let mut connection = Connection::new(path);
     let (ready, opened) = mpsc::channel();
     let (requests, incoming) = mpsc::channel::<Request>();
     let (finish, finished) = mpsc::channel();
@@ -333,13 +352,15 @@ fn start(path: &Path) -> Option<Worker> {
                 let _ = ready.send(false);
                 return;
             };
-            let Some(database) = runtime.block_on(open_or_rebuild(&path)) else {
-                let _ = ready.send(false);
+            let usable = runtime.block_on(async {
+                connection.database(START_TURN_WAIT).await.is_some() || !connection.broken
+            });
+            let _ = ready.send(usable);
+            if !usable {
                 return;
-            };
-            let _ = ready.send(true);
-            runtime.block_on(serve(database.as_ref(), incoming));
-            drop(database);
+            }
+            runtime.block_on(serve(&mut connection, incoming));
+            drop(connection);
             let _ = finish.send(());
         })
         .ok()?;
@@ -355,11 +376,98 @@ fn start(path: &Path) -> Option<Worker> {
     }
 }
 
-async fn open_or_rebuild(path: &Path) -> Option<Box<dyn Database>> {
-    match open_database(path).await {
-        Ok(database) => Some(database),
-        // Held by another process: this one does without.
-        Err(error) if is_lock_error(&error) => None,
+/// The cache database while the worker holds its turn at it.
+struct Open {
+    database: Box<dyn Database>,
+    /// Released after `database` is closed.
+    _turn: AccessTurn,
+    since: Instant,
+}
+
+/// The worker's way to the database. Several processes share the file (each review app keeps
+/// its own cache worker), so the worker opens it only while it has work, during a turn (see
+/// `crate::access`), and closes it when idle or after holding it for [`MAX_HOLD`].
+struct Connection {
+    path: PathBuf,
+    turn: PathBuf,
+    open: Option<Open>,
+    /// Whether expired and excess entries were dropped since this worker started.
+    maintained: bool,
+    /// The file could be neither opened nor rebuilt.
+    broken: bool,
+}
+
+impl Connection {
+    fn new(path: &Path) -> Self {
+        let mut turn = path.as_os_str().to_owned();
+        turn.push(".access.lock");
+        Self {
+            path: path.to_path_buf(),
+            turn: PathBuf::from(turn),
+            open: None,
+            maintained: false,
+            broken: false,
+        }
+    }
+
+    /// The database, taking the turn (waiting at most `wait`) and opening it when closed.
+    /// `None` when the turn did not come, or the file cannot be opened.
+    async fn database(&mut self, wait: Duration) -> Option<&dyn Database> {
+        if self.open.is_none() {
+            let turn = AccessTurn::take(&self.turn, wait).ok()??;
+            let database = open_or_rebuild(&self.path, !self.maintained).await;
+            match database {
+                Opened::Ready(database) => {
+                    self.maintained = true;
+                    self.open = Some(Open {
+                        database,
+                        _turn: turn,
+                        since: Instant::now(),
+                    });
+                }
+                // Held by a process that does not take turns: try again later.
+                Opened::Locked => return None,
+                Opened::Broken => {
+                    self.broken = true;
+                    return None;
+                }
+            }
+        }
+        self.open.as_ref().map(|open| open.database.as_ref())
+    }
+
+    /// Whether the database has been open long enough that another waiter should go first.
+    fn held_too_long(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.since.elapsed() >= MAX_HOLD)
+    }
+
+    const fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Close the database and give up the turn.
+    fn close(&mut self) {
+        self.open = None;
+    }
+}
+
+/// How an open went.
+enum Opened {
+    Ready(Box<dyn Database>),
+    /// Another process holds the file without taking turns.
+    Locked,
+    /// The file is not a cache and could not be rebuilt.
+    Broken,
+}
+
+/// Open the cache at `path`, rebuilding a file that is not a readable cache. With `maintain`,
+/// also drop expired entries and keep each kind to its size.
+async fn open_or_rebuild(path: &Path, maintain: bool) -> Opened {
+    match open_database(path, maintain).await {
+        Ok(database) => Opened::Ready(database),
+        Err(error) if is_lock_error(&error) => Opened::Locked,
         // Unreadable or from an incompatible version: start over.
         Err(_) => {
             for suffix in ["", "-wal", "-shm"] {
@@ -367,16 +475,20 @@ async fn open_or_rebuild(path: &Path) -> Option<Box<dyn Database>> {
                 file.push(suffix);
                 let _ = std::fs::remove_file(PathBuf::from(file));
             }
-            open_database(path).await.ok()
+            open_database(path, maintain)
+                .await
+                .map_or(Opened::Broken, Opened::Ready)
         }
     }
 }
 
-async fn open_database(path: &Path) -> Result<Box<dyn Database>, String> {
+async fn open_database(path: &Path, maintain: bool) -> Result<Box<dyn Database>, String> {
     let database = switchy::database_connection::builder()
         .turso()
         .with_path(path)
         .with_busy_timeout(BUSY_TIMEOUT)
+        // Turso's multi-process WAL mode is experimental; processes take turns at the file
+        // instead, so one connection is open at a time.
         .with_multiprocess_wal(false)
         .build()
         .await
@@ -401,6 +513,9 @@ async fn open_database(path: &Path) -> Result<Box<dyn Database>, String> {
         .run(database.as_ref())
         .await
         .map_err(|error| error.to_string())?;
+    if !maintain {
+        return Ok(database);
+    }
     let now = SystemTime::now();
     for kind in CacheKind::ALL {
         let expired = millis_of(now.checked_sub(kind.kept_for()).unwrap_or(UNIX_EPOCH));
@@ -452,25 +567,46 @@ type Held = std::collections::VecDeque<(CacheKind, String, String)>;
 /// Answer `incoming` until every sender is gone, then write what is held. Once every held write
 /// is written in a quiet moment, the kinds written to are trimmed to their size; closing only
 /// writes (the next open trims).
-async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
+///
+/// The database is opened for a request and closed once nothing has arrived and nothing is held
+/// for [`WRITE_DELAY`], or after [`MAX_HOLD`], so other processes get their turns. A read whose
+/// turn does not come within [`READ_TURN_WAIT`] is answered from the held writes alone; held
+/// writes whose turn does not come wait for a later quiet moment.
+async fn serve(connection: &mut Connection, incoming: mpsc::Receiver<Request>) {
     let mut held = Held::new();
     let mut grown = std::collections::BTreeSet::new();
     loop {
-        let request = if held.is_empty() {
+        let request = if held.is_empty() && !connection.is_open() {
             incoming
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         } else {
             incoming.recv_timeout(WRITE_DELAY)
         };
+        if connection.held_too_long() {
+            connection.close();
+            // Let a waiter woken by the release take the turn before this worker asks again.
+            std::thread::sleep(YIELD_AFTER_HOLD);
+        }
         match request {
             Ok(Request::Put { kind, entries }) => {
                 grown.insert(kind);
                 held.extend(entries.into_iter().map(|(key, value)| (kind, key, value)));
+                while held.len() > MAX_HELD {
+                    held.pop_front();
+                }
             }
-            Ok(read) => answer(database, read, &held).await,
+            Ok(read) => {
+                let database = connection.database(READ_TURN_WAIT).await;
+                answer(database, read, &held).await;
+            }
+            // Quiet with nothing held: give the turn back.
+            Err(mpsc::RecvTimeoutError::Timeout) if held.is_empty() => connection.close(),
             // Quiet: write a chunk, then look for reads again.
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                let Some(database) = connection.database(WRITE_TURN_WAIT).await else {
+                    continue;
+                };
                 let chunk: Vec<_> = held.drain(..held.len().min(WRITE_CHUNK)).collect();
                 let _ = put(database, chunk).await;
                 if held.is_empty() {
@@ -480,15 +616,21 @@ async fn serve(database: &dyn Database, incoming: mpsc::Receiver<Request>) {
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = put(database, held.into_iter().collect()).await;
+                if !held.is_empty()
+                    && let Some(database) = connection.database(CLOSE_TURN_WAIT).await
+                {
+                    let _ = put(database, held.into_iter().collect()).await;
+                }
+                connection.close();
                 return;
             }
         }
     }
 }
 
-/// Answer a read from the database and the writes still `held` (which are newer).
-async fn answer(database: &dyn Database, request: Request, held: &Held) {
+/// Answer a read from the database (when this worker has its turn) and the writes still `held`
+/// (which are newer).
+async fn answer(database: Option<&dyn Database>, request: Request, held: &Held) {
     let now = SystemTime::now();
     let newer = |kind: CacheKind, wanted: &dyn Fn(&str) -> bool| -> Entries {
         held.iter()
@@ -507,7 +649,9 @@ async fn answer(database: &dyn Database, request: Request, held: &Held) {
     match request {
         Request::Get { kind, keys, reply } => {
             let mut found = Entries::new();
+            // Without the database (its turn did not come), only held writes are found.
             for chunk in keys.chunks(KEYS_PER_QUERY) {
+                let Some(database) = database else { break };
                 let ids: Vec<DatabaseValue> = chunk
                     .iter()
                     .map(|key| DatabaseValue::String(id(kind, key)))
@@ -534,15 +678,18 @@ async fn answer(database: &dyn Database, request: Request, held: &Held) {
         } => {
             // Keys in [prefix, prefix + U+10FFFF).
             let end = format!("{prefix}\u{10ffff}");
-            let rows = database
-                .select(TABLE)
-                .columns(&["key", "value", "written_ms"])
-                .filter(Box::new(where_eq("kind", kind.as_str())))
-                .filter(Box::new(where_gte("key", prefix.clone())))
-                .filter(Box::new(where_lt("key", end)))
-                .execute(database)
-                .await
-                .unwrap_or_default();
+            let rows = match database {
+                Some(database) => database
+                    .select(TABLE)
+                    .columns(&["key", "value", "written_ms"])
+                    .filter(Box::new(where_eq("kind", kind.as_str())))
+                    .filter(Box::new(where_gte("key", prefix.clone())))
+                    .filter(Box::new(where_lt("key", end)))
+                    .execute(database)
+                    .await
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
             let mut found: Entries = rows.iter().filter_map(entry_of).collect();
             found.extend(newer(kind, &|key| key.starts_with(prefix.as_str())));
             let _ = reply.send(found);
