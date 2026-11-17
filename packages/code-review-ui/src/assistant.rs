@@ -36,6 +36,7 @@ pub const PALETTE_ACTIONS: &[&str] = &[
     "assistant_open",
     "assistant_delete",
     "assistant_delete_all",
+    "assistant_reset_size",
 ];
 
 /// The command palette entries of the panel's actions, with their keys in the panel.

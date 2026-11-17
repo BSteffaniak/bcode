@@ -507,6 +507,8 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.assistant_delete_all", scope = "code-review-assistant", description = "Delete every conversation the review app started (asks first)", defaults = [
     ] },
+    { id = "bcode.code_review.assistant_reset_size", scope = "code-review-assistant", description = "Reset the panel size to the configured default", defaults = [
+    ] },
     { id = "bcode.code_review.history_up", scope = "code-review-assistant-history", description = "Previous conversation", defaults = [
         "up",
         "ctrl+p",

@@ -179,12 +179,16 @@ from it, is in [code review assistant](code-review-assistant.md).
   shortens to `✦ AI` and then `✦` as the header narrows, is a filled pill while the panel is
   open, and shows a spinner or `?` while the panel is closed and the conversation works or needs
   you.
-* **Placement.** From 100 columns the panel docks on the right (by default 40% of the width,
-  36 to 100 columns, and the screen keeps 60); narrower, it docks at the bottom (40% of the
-  height, at least 8 rows, and the screen keeps 8); when neither fits, the focused panel takes
-  the whole screen and `esc` returns to it. Drag the panel's inner edge to resize it; the size
-  is kept as a share of the screen, so the panel keeps its proportion when the terminal is
-  resized (the limits above still win). Below 24
+* **Placement.** From 100 columns the panel docks on the right (at least 36 columns, as wide
+  as it is set or dragged while the screen keeps 60); narrower, it docks at the bottom (at
+  least 8 rows, as tall as it is set or dragged while the screen keeps 8); when neither fits,
+  the focused panel takes the whole screen and `esc` returns to it. Its starting size is
+  `assistant.width` / `assistant.height` in configuration (columns or rows, or a percentage
+  such as `"40%"`; 40% by default). Drag the panel's inner edge to resize it; the size is kept
+  as a share of the screen, so the panel keeps its proportion when the terminal is resized (the
+  limits above still win), and it is remembered app-wide for the next run, over the
+  configured size. The palette's "Assistant: Reset the panel size to the configured default"
+  forgets it. Below 24
   columns or 6 rows it shows its title row and input only, below 12 columns its title row only.
 * **What it knows.** Each message carries a stored `review app view` block (the screen, the
   review's id, title, kind and sources, the stack layers and the current one, the comparison

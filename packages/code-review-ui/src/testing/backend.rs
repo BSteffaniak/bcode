@@ -165,6 +165,12 @@ impl TestBackend {
         self.services.set_failing(operation, fail);
     }
 
+    /// Calls of `operation` made so far through the services (failed ones included).
+    #[must_use]
+    pub fn calls(&self, operation: &str) -> usize {
+        self.services.calls(operation)
+    }
+
     /// Answer every later call of `operation` only after `yields` yields to other tasks, so
     /// work started after it finishes first (zero answers at once again).
     pub fn set_delay(&self, operation: &str, yields: u32) {

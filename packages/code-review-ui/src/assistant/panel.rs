@@ -8,8 +8,13 @@
 //!   focused (hidden but open while it is not). Docked, the screen and the panel are a BMUX
 //!   panel group ([`crate::panels::dock_group`]): the panel's inner edge is the divider, styled
 //!   and dragged like the review's, and a dragged size is kept as a share of the area, so the
-//!   panel keeps its proportion when the terminal is resized. The minimums above still win
-//!   when the area shrinks. While the panel is not painted it takes no pointer input.
+//!   panel keeps its proportion when the terminal is resized. The panel grows until the screen
+//!   keeps its minimum, and the minimums still win when the area shrinks. While the panel is
+//!   not painted it takes no pointer input.
+//! * **Size.** Until a divider is dragged, the panel takes `assistant.width` or
+//!   `assistant.height` from configuration ([`DockLength`], 40% by default). A dragged share is
+//!   saved app-wide in the review store when the drag ends (once per drag) and restored on the
+//!   next run, overriding the configured size; `assistant_reset_size` forgets it.
 //! * **Conversation.** The first message of a new conversation creates a Bcode session with the
 //!   review app's origin, tagged with the review and stack layer on screen (or none on home and
 //!   in the wizard), and sends the message. The panel follows the active session like an AI card
@@ -32,7 +37,7 @@ use super::chips::{Chip, ChipId, ChipPlan, ChipRow};
 use super::history::Tag;
 use super::models::{ModelState, Target};
 use super::picker::{Picker, RowState};
-use super::profile::Category;
+use super::profile::{Category, DockLength};
 use super::{ASSISTANT_SCOPE, HISTORY_SCOPE, Place, PlaceKey, Screen};
 use crate::agent::{AgentPhase, AgentStreams, FeedKeys};
 use crate::context::UiContext;
@@ -42,8 +47,9 @@ use crate::rows::{ActionCells, AgentAction, Folds, ItemAction};
 use crate::services::ReviewServices;
 use crate::theme::ReviewTheme;
 use bcode_code_review_models::{
-    BindReviewAssistantRequest, GetReviewAssistantRequest, ReviewAssistantBinding,
-    ReviewAssistantLookup, ReviewAssistantTag, UnbindReviewAssistantRequest,
+    BindReviewAssistantRequest, GetReviewAssistantPanelSizeRequest, GetReviewAssistantRequest,
+    PANEL_SHARE_SCALE, ReviewAssistantBinding, ReviewAssistantLookup, ReviewAssistantPanelSize,
+    ReviewAssistantTag, SaveReviewAssistantPanelSizeRequest, UnbindReviewAssistantRequest,
 };
 use bmux_keyboard::KeyStroke;
 use bmux_tui::component::{
@@ -89,8 +95,6 @@ pub const SCREEN_MIN_WIDTH: u16 = 60;
 pub const SCREEN_MIN_HEIGHT: u16 = 8;
 /// Narrowest right dock.
 pub const MIN_WIDTH: u16 = 36;
-/// Widest right dock.
-pub const MAX_WIDTH: u16 = 100;
 /// Lowest bottom dock.
 pub const MIN_HEIGHT: u16 = 8;
 /// Below this width or [`COMPACT_HEIGHT`] rows the panel shows its title row and input only.
@@ -216,6 +220,10 @@ enum Done {
     Catalog(Result<crate::host::ModelCatalog, String>),
     /// The app default was read.
     Default(Result<bcode_code_review_models::ReviewAssistantSettings, String>),
+    /// The saved panel size was read.
+    PanelSize(Result<Option<ReviewAssistantPanelSize>, String>),
+    /// The panel size was saved, or why it was not.
+    PanelSizeSaved(Result<(), String>),
     /// A session's model was read.
     SessionModel {
         session: String,
@@ -288,6 +296,30 @@ struct Painted {
     title: Option<Rect>,
 }
 
+/// The saved panel size: whether it was read, and what is left to save.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SizeSync {
+    /// Whether the saved size was asked for (once per run).
+    asked: bool,
+    /// Whether the size was dragged or reset in this run, so a saved size read later does not
+    /// replace it.
+    chosen: bool,
+    /// What is left to save.
+    pending: SizeSave,
+}
+
+/// What of the panel size is left to save.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SizeSave {
+    /// Nothing.
+    #[default]
+    Clean,
+    /// The divider drag under way resized the panel; it is saved when the drag ends.
+    Dragging,
+    /// Saved on the next poll.
+    Due,
+}
+
 /// The app-wide assistant panel.
 pub struct Assistant {
     services: ReviewServices,
@@ -297,6 +329,8 @@ pub struct Assistant {
     right_share: Option<u16>,
     /// The bottom dock's height chosen by dragging, as a share of the area's height.
     bottom_share: Option<u16>,
+    /// Where the saved panel size stands.
+    size: SizeSync,
     /// The screen and the docked panel as a panel group, and the area and dock it was built
     /// for.
     dock: RefCell<PanelGroupState>,
@@ -391,6 +425,7 @@ impl Assistant {
             visibility: Shown::Closed,
             right_share: None,
             bottom_share: None,
+            size: SizeSync::default(),
             dock: RefCell::new(PanelGroupState::new(Vec::new())),
             dock_key: Cell::new(None),
             session: None,
@@ -613,6 +648,8 @@ impl Assistant {
         self.title_press = None;
         self.dock_key.set(None);
         *self.dock.borrow_mut() = PanelGroupState::new(Vec::new());
+        // A drag cut short keeps the size it reached.
+        self.end_drag();
     }
 
     /// The badge the Ask AI button shows: only while the panel is not on screen.
@@ -702,35 +739,43 @@ impl Assistant {
     }
 
     /// Build the dock group for `area` and `dock` when either changed: the panel takes its
-    /// share of the area (two fifths by default) within its limits, the screen the rest.
+    /// dragged share of the area, else its configured size, within its limits; the screen
+    /// takes the rest.
     ///
-    /// * Right: [`MIN_WIDTH`]..=[`MAX_WIDTH`] columns, leaving the screen [`SCREEN_MIN_WIDTH`].
-    /// * Bottom: at least [`MIN_HEIGHT`] rows, leaving the screen [`SCREEN_MIN_HEIGHT`].
+    /// * Right: at least [`MIN_WIDTH`] columns, and at most what leaves the screen
+    ///   [`SCREEN_MIN_WIDTH`].
+    /// * Bottom: at least [`MIN_HEIGHT`] rows, and at most what leaves the screen
+    ///   [`SCREEN_MIN_HEIGHT`].
+    ///
+    /// The dock thresholds leave room for both minimums; should an area not, the panel's
+    /// minimum wins over the screen's, and neither exceeds the area.
     fn sync_dock(&self, area: Rect, dock: Dock) {
         if self.dock_key.get() == Some((area, dock)) {
             return;
         }
-        let (length, share, screen_min, min, max) = match dock {
+        let config = self.services.assistant_config();
+        let (length, share, default, screen_min, min) = match dock {
             Dock::Right => (
                 area.width,
                 self.right_share,
+                config.width,
                 SCREEN_MIN_WIDTH,
                 MIN_WIDTH,
-                MAX_WIDTH,
             ),
             Dock::Bottom | Dock::Zoomed => (
                 area.height,
                 self.bottom_share,
+                config.height,
                 SCREEN_MIN_HEIGHT,
                 MIN_HEIGHT,
-                u16::MAX,
             ),
         };
-        let max = max
-            .min(length.saturating_sub(screen_min))
-            .max(min.min(length));
+        let max = length.saturating_sub(screen_min).max(min.min(length));
         let panel = share
-            .map_or(length * 2 / 5, |share| cells_of(share, length))
+            .map_or_else(
+                || DockLength::cells_of(default, length),
+                |share| cells_of(share, length),
+            )
             .clamp(min.min(max), max)
             .min(length);
         let screen = length - panel;
@@ -755,22 +800,99 @@ impl Assistant {
         self.sync_dock(area, dock);
         let group = dock_group(dock_axis(dock), PanelGroupStyles::default());
         let outcome = group.handle_event(area, &mut self.dock.borrow_mut(), event);
-        if matches!(outcome, PanelGroupOutcome::Resized { .. }) {
-            let layout = group.layout(area, &self.dock.borrow());
-            if let Some(panel) = layout.panels.get(1) {
-                match dock {
-                    Dock::Right => self.right_share = Some(share_of(panel.width, area.width)),
-                    Dock::Bottom => {
-                        self.bottom_share = Some(share_of(panel.height, area.height));
+        match outcome {
+            PanelGroupOutcome::Resized { .. } => {
+                let layout = group.layout(area, &self.dock.borrow());
+                if let Some(panel) = layout.panels.get(1) {
+                    match dock {
+                        Dock::Right => self.right_share = Some(share_of(panel.width, area.width)),
+                        Dock::Bottom => {
+                            self.bottom_share = Some(share_of(panel.height, area.height));
+                        }
+                        Dock::Zoomed => {}
                     }
-                    Dock::Zoomed => {}
+                    self.size.chosen = true;
+                    self.size.pending = SizeSave::Dragging;
                 }
             }
+            PanelGroupOutcome::DividerDragEnded { .. } => self.end_drag(),
+            _ => {}
         }
         if outcome != PanelGroupOutcome::Ignored {
             self.touch();
         }
         outcome
+    }
+
+    /// A divider drag ended: the size it reached is saved on the next poll, once.
+    fn end_drag(&mut self) {
+        if self.size.pending == SizeSave::Dragging {
+            self.size.pending = SizeSave::Due;
+        }
+    }
+
+    /// Forget the dragged sizes: the panel takes its configured size again, and the saved
+    /// size is cleared.
+    pub fn reset_size(&mut self) {
+        self.right_share = None;
+        self.bottom_share = None;
+        self.size.chosen = true;
+        self.size.pending = SizeSave::Due;
+        self.dock_key.set(None);
+        self.notice = Some(("panel size reset to the default".to_owned(), false));
+        self.touch();
+    }
+
+    /// Read the saved panel size once, and save the size when a drag or a reset changed it.
+    fn sync_size(&mut self, ui: &UiContext) {
+        if !self.size.asked {
+            self.size.asked = true;
+            let services = self.services.clone();
+            let repo = self.repo.clone();
+            let inbox = Arc::clone(&self.inbox);
+            ui.spawn(Box::pin(async move {
+                let result = services
+                    .call(GetReviewAssistantPanelSizeRequest { repo_path: repo })
+                    .await
+                    .map(|response| response.size)
+                    .map_err(|error| error.message);
+                push(&inbox, Done::PanelSize(result));
+            }));
+        }
+        if self.size.pending == SizeSave::Due {
+            self.size.pending = SizeSave::Clean;
+            let size = ReviewAssistantPanelSize {
+                right_share: self.right_share,
+                bottom_share: self.bottom_share,
+                updated_at_ms: 0,
+            };
+            let services = self.services.clone();
+            let repo = self.repo.clone();
+            let inbox = Arc::clone(&self.inbox);
+            ui.spawn(Box::pin(async move {
+                let result = services
+                    .call(SaveReviewAssistantPanelSizeRequest {
+                        repo_path: repo,
+                        size,
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.message);
+                push(&inbox, Done::PanelSizeSaved(result));
+            }));
+        }
+    }
+
+    /// The saved panel size was read: it applies unless the size was chosen in this run.
+    /// Unreadable or never saved (`None`), the configured size applies.
+    fn restore_size(&mut self, size: Option<ReviewAssistantPanelSize>) {
+        let Some(size) = size.filter(|_| !self.size.chosen) else {
+            return;
+        };
+        let valid = |share: Option<u16>| share.filter(|share| *share <= PANEL_SHARE_SCALE);
+        self.right_share = valid(size.right_share);
+        self.bottom_share = valid(size.bottom_share);
+        self.dock_key.set(None);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -1257,6 +1379,7 @@ impl Assistant {
     /// whether anything changed.
     pub fn poll(&mut self, ui: &UiContext) -> bool {
         self.serve_tools();
+        self.sync_size(ui);
         if self.is_open() {
             let relist = std::mem::take(&mut self.models.relist);
             self.load_models(relist, ui);
@@ -1390,6 +1513,12 @@ impl Assistant {
             Done::Stopped(error) => {
                 if let Some(error) = error {
                     self.notice = Some((format!("could not stop: {error}"), true));
+                }
+            }
+            Done::PanelSize(result) => self.restore_size(result.ok().flatten()),
+            Done::PanelSizeSaved(result) => {
+                if let Err(error) = result {
+                    self.notice = Some((format!("could not save the panel size: {error}"), true));
                 }
             }
             other => self.finish_models(other, ui),
@@ -2860,6 +2989,7 @@ impl Assistant {
             "assistant_effort" => self.cycle_effort(&Target::Conversation, ui),
             "assistant_permissions" => self.open_permissions(),
             "assistant_tools" => self.open_tools(),
+            "assistant_reset_size" => self.reset_size(),
             "assistant_scroll_up" | "assistant_scroll_down" => {
                 let page = self.shown.get().1.max(2) - 1;
                 let rows = i64::try_from(page).unwrap_or(1);

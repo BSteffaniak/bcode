@@ -84,13 +84,14 @@ the rectangle it is given (its own header, body and footer), so no route lays th
 The decision is made per frame from the app's area, in this order:
 
 1. **Right dock.** At least 100 columns: the panel takes the right column from the top row to
-   the bottom row. Its width is the user's share of the area's width (default 40%), within
-   36..=100 columns and clamped so the route keeps 60 columns. The divider on its left edge
-   drags.
+   the bottom row. Its width is the dragged share of the area's width, else `assistant.width`
+   (default 40%), at least 36 columns and at most what leaves the route 60 columns; there is no
+   other maximum, so on a wide terminal the panel can be dragged as wide as that allows. The
+   divider on its left edge drags.
 2. **Bottom dock.** Fewer columns and at least 16 rows: the panel takes the bottom rows across
-   the whole width. Its height is the user's share of the area's height (default 40%), at least
-   8 rows and clamped so the route keeps 8 rows. The divider on its top edge (the title row,
-   where a double press still zooms) drags.
+   the whole width. Its height is the dragged share of the area's height, else
+   `assistant.height` (default 40%), at least 8 rows and at most what leaves the route 8 rows.
+   The divider on its top edge (the title row, where a double press still zooms) drags.
 3. **Zoomed.** Smaller than both: the focused panel takes the whole area; an unfocused open
    panel is hidden (it stays open, and the Ask AI button shows that it is). `esc` returns to the
    route.
@@ -100,13 +101,41 @@ horizontal on the right, vertical at the bottom) with the review panels' resize 
 divider is highlighted while hovered or dragged and its handle is the hit region the group
 registers at the cells it lays out. A drag keeps the panel's size as a share of the area, so
 the panel keeps its proportion when the terminal is resized; the limits above win when the area
-shrinks, and the share applies again once it grows. A frame that does not paint the panel
+shrinks, and the share applies again once it grows. The dock thresholds leave room for
+both minimums (100 columns hold the route's 60 and the panel's 36; 16 rows hold 8 and 8), so
+a docked panel never drops below its minimum; smaller areas zoom (step 3). Width and height hold the same constraints
+for the layout, the divider's hit region and the painted divider, all taken from the one
+panel group. A frame that does not paint the panel
 (closed, or hidden while zoomed and unfocused) clears its painted regions, hover and any divider
 drag, so the cells it covered take pointer input for the route again.
 
-The shares chosen by dragging are app state for the run; `assistant.width` and
-`assistant.height` in configuration set the defaults. The review body loses its own assistant
-pane: `panels.rs` keeps the file and threads panels only.
+#### Size
+
+* **Configured default.** `assistant.width` (right dock) and `assistant.height` (bottom dock)
+  in `[plugins.config."bcode.code_review".assistant]` set the size the panel starts at. Each
+  takes a positive integer, a count of columns or rows (`width = 60`), or a string holding a
+  percentage of the app's width or height from 1 to 100 (`width = "40%"`, spaces allowed
+  around the number). Both default to `"40%"`. The dock's limits above apply to the result.
+  Any other value (zero, a negative or fractional number, a percentage outside 1..=100, a
+  string without `%`, a boolean) is reported as a configuration warning
+  (`plugins.config."bcode.code_review".assistant.width must be a number of columns or a
+  percentage such as "40%"; using "40%"`), shown where the app shows its configuration
+  problems, and the default applies.
+* **Remembered drag.** When a divider drag that resized the panel ends (the button is
+  released, or the panel stops being painted mid-drag), the right and bottom shares are saved
+  once, app-wide, in the review store's assistant settings table (its own `panel_size` record
+  beside the model and effort record, so neither overwrites the other; no migration). Moves
+  during the drag and a press without a move write nothing. The next run reads the record on
+  its first poll and the saved share overrides the configured default for its dock; a dock
+  never dragged keeps the configured default. A size dragged or reset before the record is
+  read is kept. A save that fails says `could not save the panel size: …` on the panel's
+  notice line, and the size still applies for the run.
+* **Reset.** The palette entry "Assistant: Reset the panel size to the configured default"
+  (`assistant_reset_size`, unbound by default) forgets both shares, saves the cleared record
+  and lays the panel out at the configured size again.
+
+The review body loses its own assistant pane: `panels.rs` keeps the file and threads panels
+only.
 
 Right dock (at least 100 columns):
 
@@ -512,8 +541,9 @@ which happens on start and on reconnect):
 
 ```toml
 [plugins.config."bcode.code_review".assistant]
-# width = 60      # default panel width in columns (right dock)
-# height = 14     # default panel height in rows (bottom dock)
+# width = "40%"   # starting width of the right dock: columns (60) or a percentage ("40%")
+# height = "40%"  # starting height of the bottom dock: rows (14) or a percentage ("40%")
+                  # a dragged size, remembered across runs, overrides these until reset
 # model = "fake-echo"   # app default model until one is chosen (`provider/model` too)
 # effort = "high"       # app default reasoning effort until one is chosen
 
@@ -846,6 +876,7 @@ applying SQL) have review analogs or are marked not applicable.
 | `code-review-assistant` | `alt+p` | Permissions overlay (`assistant_permissions`) | `alt+r`, `alt+d`, `alt+p` cycle one policy each; here `alt+r` renames and `alt+d` deletes, as before, so one overlay holds the categories |
 | `code-review-assistant` | `alt+t` | List the assistant's tools (`assistant_tools`) | Same |
 | `code-review-assistant` | none (palette) | Delete every conversation the review app started (`assistant_delete_all`) | Same |
+| `code-review-assistant` | none (palette) | Reset the panel size to the configured default (`assistant_reset_size`) | Not applicable |
 | `code-review-assistant` | `ctrl+o` (and palette) | Open this conversation in `bcode tui` | Palette only |
 | `code-review-composer` | `alt+m`, `shift+tab` | Model and effort for the question (question mode) | Not applicable |
 | `code-review-feed` | `alt+m`, `shift+tab` | Model and effort for the focused card's session | Not applicable |

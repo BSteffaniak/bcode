@@ -145,6 +145,66 @@ pub struct AssistantConfig {
     pub model: Option<String>,
     /// The reasoning effort they get until one is chosen in the app.
     pub effort: Option<String>,
+    /// The right dock's width until one is dragged.
+    pub width: DockLength,
+    /// The bottom dock's height until one is dragged.
+    pub height: DockLength,
+}
+
+/// A docked panel's default size along its axis (`assistant.width` or `assistant.height`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockLength {
+    /// A number of columns or rows.
+    Cells(u16),
+    /// A percentage (1 to 100) of the app's width or height.
+    Percent(u16),
+}
+
+impl Default for DockLength {
+    fn default() -> Self {
+        Self::Percent(40)
+    }
+}
+
+impl DockLength {
+    /// Read a configured value: a positive integer counts cells, a string such as `"40%"` is a
+    /// percentage from 1 to 100. `None` when it is neither.
+    #[must_use]
+    pub fn parse(value: &toml::Value) -> Option<Self> {
+        match value {
+            toml::Value::Integer(cells) => u16::try_from(*cells)
+                .ok()
+                .filter(|cells| *cells > 0)
+                .map(Self::Cells),
+            toml::Value::String(text) => text
+                .trim()
+                .strip_suffix('%')
+                .and_then(|percent| percent.trim().parse::<u16>().ok())
+                .filter(|percent| (1..=100).contains(percent))
+                .map(Self::Percent),
+            _ => None,
+        }
+    }
+
+    /// The cells this size takes of `length` cells, before the dock's limits apply.
+    #[must_use]
+    pub fn cells_of(self, length: u16) -> u16 {
+        match self {
+            Self::Cells(cells) => cells,
+            Self::Percent(percent) => {
+                u16::try_from(u32::from(length) * u32::from(percent) / 100).unwrap_or(length)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DockLength {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cells(cells) => write!(formatter, "{cells}"),
+            Self::Percent(percent) => write!(formatter, "\"{percent}%\""),
+        }
+    }
 }
 
 impl Default for AssistantConfig {
@@ -157,6 +217,8 @@ impl Default for AssistantConfig {
             extra: Vec::new(),
             model: None,
             effort: None,
+            width: DockLength::default(),
+            height: DockLength::default(),
         }
     }
 }
@@ -182,6 +244,22 @@ impl AssistantConfig {
                     *slot = Some(text.trim().to_owned());
                 }
                 Some(_) => problems.push(format!("{prefix}.{key} must be a non-empty string")),
+            }
+        }
+        for (key, slot, unit) in [
+            ("width", &mut config.width, "columns"),
+            ("height", &mut config.height, "rows"),
+        ] {
+            let Some(value) = assistant.get(key) else {
+                continue;
+            };
+            match DockLength::parse(value) {
+                Some(length) => *slot = length,
+                None => problems.push(format!(
+                    "{prefix}.{key} must be a number of {unit} or a percentage such as \"40%\"; \
+                     using {}",
+                    DockLength::default()
+                )),
             }
         }
         let Some(tools) = assistant.get("tools") else {
