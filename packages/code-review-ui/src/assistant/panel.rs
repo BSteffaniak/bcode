@@ -6,6 +6,7 @@
 //!   keeps [`SCREEN_MIN_WIDTH`]), docked at the bottom from [`BOTTOM_DOCK_HEIGHT`] rows (the
 //!   screen keeps [`SCREEN_MIN_HEIGHT`]), and otherwise zoomed over the whole area while it is
 //!   focused (hidden but open while it is not). The divider on the panel's inner edge drags.
+//!   While the panel is not painted it takes no pointer input.
 //! * **Conversation.** The first message of a new conversation creates a Bcode session with the
 //!   review app's origin, tagged with the review and stack layer on screen (or none on home and
 //!   in the wizard), and sends the message. The panel follows the active session like an AI card
@@ -263,6 +264,7 @@ enum Mode {
 /// What the last frame painted, for pointer input.
 #[derive(Debug, Clone, Default)]
 struct Painted {
+    /// The panel's cells and dock; `None` while the panel is not on screen.
     panel: Option<(Rect, Dock)>,
     area: Rect,
     feed: Option<Rect>,
@@ -574,10 +576,27 @@ impl Assistant {
     /// Whether the panel was painted over `point` in the last frame.
     #[must_use]
     pub fn contains(&self, point: Point) -> bool {
-        self.painted
-            .borrow()
-            .panel
+        self.on_screen()
             .is_some_and(|(rect, _)| rect.contains(point))
+    }
+
+    /// Where the last frame painted the panel, while it is still placed there: not once it was
+    /// closed, hidden or moved to another dock since.
+    fn on_screen(&self) -> Option<(Rect, Dock)> {
+        let painted = self.painted.borrow();
+        let (rect, dock) = painted.panel?;
+        let placed = self.split(painted.area).panel.map(|(_, placed)| placed);
+        (placed == Some(dock)).then_some((rect, dock))
+    }
+
+    /// The frame did not paint the panel: forget its cells, hover and divider drag, so nothing
+    /// under them reaches the panel.
+    pub fn not_painted(&mut self) {
+        *self.painted.borrow_mut() = Painted::default();
+        self.hover = None;
+        self.history_delete.set(None);
+        self.title_press = None;
+        self.drag = None;
     }
 
     /// The badge the Ask AI button shows: only while the panel is not on screen.
@@ -1801,8 +1820,11 @@ impl Assistant {
         let Event::Mouse(mouse) = event else {
             return None;
         };
+        let Some((panel, dock)) = self.on_screen() else {
+            self.not_painted();
+            return None;
+        };
         let painted = self.painted.borrow().clone();
-        let (panel, dock) = painted.panel?;
         if let Some(dragged) = self.drag {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Left) => {

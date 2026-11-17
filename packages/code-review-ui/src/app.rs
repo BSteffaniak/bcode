@@ -1640,6 +1640,9 @@ impl View for ReviewApp {
                     &self.theme,
                     frame,
                 );
+            } else {
+                // Closed, or open but hidden: nothing of the panel takes pointer input.
+                self.assistant.not_painted();
             }
             self.assistant.paint_overlay(area, &self.theme, frame);
             if let Some(overlay) = self.appearance.as_mut() {
