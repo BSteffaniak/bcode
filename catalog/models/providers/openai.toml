@@ -3,8 +3,10 @@ display_name = "OpenAI"
 kind = "open_ai_compatible"
 website_url = "https://openai.com"
 default_model_id = "gpt-4.1-mini"
-default_codex_model_id = "gpt-6-astra"
+default_codex_model_id = "gpt-6.2-sol"
 fallback_model_ids = [
+  "gpt-6.2-astra",
+  "gpt-6.2-sol",
   "gpt-6-astra",
   "gpt-6.1-sol",
   "gpt-6-sol",
@@ -437,6 +439,501 @@ default_effort = "medium"
 summary_values = ["auto", "detailed"]
 default_summary = "auto"
 
+[models."gpt-6.2-astra"]
+model_id = "gpt-6.2-astra"
+display_name = "GPT-6.2 Astra"
+aliases = ["gpt-6.2-astra*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1050000
+max_output_tokens = 128000
+documentation_url = "https://developers.openai.com/api/docs/models/gpt-6.2-astra"
+notes = "Maximum API input: 922,000 tokens. Reasoning effort none is not supported. Codex subscription availability and limits are not verified. Pricing rules cover Standard, Fast, and Ultrafast processing; regional, Batch, Flex, and background adjustments are not represented. Ultrafast rules carry the 3x promotional rate, which OpenAI raises to 6x Standard on 2027-03-01 (Pacific time)."
+
+[[models."gpt-6.2-astra".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+
+[[models."gpt-6.2-astra".deployments]]
+provider = "openai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
+
+[models."gpt-6.2-astra".pricing]
+# OpenAI model documentation and pricing page, 2026-11-17. Above 272K input
+# tokens, the whole request bills 2x input/cache rates and 1.5x output. Fast
+# (priority) bills 2x Standard. Ultrafast bills 3x Standard through 2027-02-28
+# and 6x Standard from 2027-03-01 (Pacific time); the rules carry the 3x rate.
+currency = "USD"
+unit = "per_million_tokens"
+context_threshold_tokens = 272000
+input_micros = 8000000
+cached_input_micros = 400000
+cache_write_input_micros = 10000000
+output_micros = 40000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 8000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 16000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 24000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 16000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 32000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 48000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 400000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 800000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 1200000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 800000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 1600000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 2400000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 10000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 20000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 30000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 20000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 40000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 60000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 40000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 80000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 120000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 60000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 120000000
+
+[[models."gpt-6.2-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 180000000
+
+[models."gpt-6.2-astra".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+parallel_tool_calls = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-6.2-astra".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "detailed"]
+default_summary = "auto"
+
+[models."gpt-6.2-sol"]
+model_id = "gpt-6.2-sol"
+display_name = "GPT-6.2 Sol"
+aliases = ["gpt-6.2-sol*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1050000
+max_output_tokens = 128000
+documentation_url = "https://developers.openai.com/api/docs/models/gpt-6.2-sol"
+notes = "Maximum API input: 922,000 tokens. Reasoning effort none is not supported. Codex subscription availability and limits are not verified. Pricing rules cover Standard, Fast, and Ultrafast processing; regional, Batch, Flex, and background adjustments are not represented. Ultrafast rules carry the 3x promotional rate, which OpenAI raises to 6x Standard on 2027-03-01 (Pacific time)."
+
+[[models."gpt-6.2-sol".deployments]]
+provider = "openai"
+auth_mode = "chatgpt_subscription"
+api_surface = "chatgpt_codex"
+integration = "bcode"
+
+[[models."gpt-6.2-sol".deployments]]
+provider = "openai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
+
+[models."gpt-6.2-sol".pricing]
+# OpenAI model documentation and pricing page, 2026-11-17. Above 272K input
+# tokens, the whole request bills 2x input/cache rates and 1.5x output. Fast
+# (priority) bills 2x Standard. Ultrafast bills 3x Standard through 2027-02-28
+# and 6x Standard from 2027-03-01 (Pacific time); the rules carry the 3x rate.
+currency = "USD"
+unit = "per_million_tokens"
+context_threshold_tokens = 272000
+input_micros = 2000000
+cached_input_micros = 100000
+cache_write_input_micros = 2500000
+output_micros = 10000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 2000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 4000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 6000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 4000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 8000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 12000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 100000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 200000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 300000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 200000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 400000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 600000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 2500000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 5000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 7500000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 5000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 10000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 15000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+max_request_input_tokens = 272000
+price_micros = 10000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+max_request_input_tokens = 272000
+price_micros = 20000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 30000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "standard"
+min_request_input_tokens = 272001
+price_micros = 15000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "priority"
+min_request_input_tokens = 272001
+price_micros = 30000000
+
+[[models."gpt-6.2-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 45000000
+
+[models."gpt-6.2-sol".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-6.2-sol".reasoning]
+effort_values = ["low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+summary_values = ["auto", "detailed"]
+default_summary = "auto"
+
 [models."gpt-6-astra"]
 model_id = "gpt-6-astra"
 display_name = "GPT-6 Astra"
@@ -470,7 +967,8 @@ max_output_tokens = 128000
 [models."gpt-6-astra".pricing]
 # OpenAI list pricing (platform.openai.com/docs/models/gpt-6-astra, 2026-09-03).
 # Prompts above 272K input tokens bill 2x input and cache rates and 1.5x output
-# for the whole request.
+# for the whole request. Ultrafast bills 6x Standard (OpenAI pricing page,
+# 2026-11-17).
 currency = "USD"
 unit = "per_million_tokens"
 context_threshold_tokens = 272000
@@ -607,6 +1105,70 @@ service_tier = "priority"
 min_request_input_tokens = 272001
 price_micros = 150000000
 
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 60000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 120000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 6000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 12000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 75000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 150000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 300000000
+
+[[models."gpt-6-astra".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 450000000
+
 [models."gpt-6-astra".capabilities]
 text_input = true
 image_input = true
@@ -634,7 +1196,7 @@ family = "gpt-6"
 context_window = 1050000
 max_output_tokens = 128000
 documentation_url = "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
-notes = "Maximum API input: 922,000 tokens. Chat Completions does not support tool calling; use Responses for tools. Reasoning effort none and minimal are not supported. Codex subscription availability and limits are not verified. Pricing rules cover Standard and Fast processing; regional, Batch, and Flex adjustments are not represented."
+notes = "Maximum API input: 922,000 tokens. Chat Completions does not support tool calling; use Responses for tools. Reasoning effort none and minimal are not supported. Codex subscription availability and limits are not verified. Pricing rules cover Standard, Fast, and Ultrafast processing; regional, Batch, and Flex adjustments are not represented."
 
 [[models."gpt-6.1-sol".deployments]]
 provider = "openai"
@@ -788,6 +1350,70 @@ invocation_class = "on_demand"
 service_tier = "priority"
 min_request_input_tokens = 272001
 price_micros = 30000000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 12000000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 24000000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 600000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 1200000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 15000000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 30000000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+max_request_input_tokens = 272000
+price_micros = 60000000
+
+[[models."gpt-6.1-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+service_tier = "ultrafast"
+min_request_input_tokens = 272001
+price_micros = 90000000
 
 [models."gpt-6.1-sol".capabilities]
 text_input = true

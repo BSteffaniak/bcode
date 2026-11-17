@@ -145,8 +145,10 @@ pub enum OpenAiServiceTier {
     Default,
     /// Use lower-cost flex processing.
     Flex,
-    /// Use priority processing.
+    /// Use priority processing, which `OpenAI` also calls Fast mode.
     Priority,
+    /// Use Ultrafast processing on the models that support it.
+    Ultrafast,
 }
 
 /// `OpenAI` Responses input truncation policy.
@@ -385,6 +387,7 @@ impl TurnState {
                     OpenAiServiceTier::Default => "default",
                     OpenAiServiceTier::Flex => "flex",
                     OpenAiServiceTier::Priority => "priority",
+                    OpenAiServiceTier::Ultrafast => "ultrafast",
                 }
                 .into(),
             );
@@ -5976,11 +5979,12 @@ fn openai_usage_context(request: &ModelTurnRequest) -> OpenAiUsageContext {
             .as_ref()
             .and_then(|options| options.service_tier)
             .and_then(|tier| match tier {
-                // Auto/priority/flex are requests, not confirmation of the billed tier.
+                // Auto/priority/flex/ultrafast are requests, not confirmation of the billed tier.
                 OpenAiServiceTier::Default => Some("standard".to_owned()),
-                OpenAiServiceTier::Auto | OpenAiServiceTier::Flex | OpenAiServiceTier::Priority => {
-                    None
-                }
+                OpenAiServiceTier::Auto
+                | OpenAiServiceTier::Flex
+                | OpenAiServiceTier::Priority
+                | OpenAiServiceTier::Ultrafast => None,
             }),
         prompt_cache_retention: options
             .and_then(|options| options.prompt_cache_retention)
@@ -12871,6 +12875,35 @@ mod tests {
         assert_eq!(body["truncation"], "disabled");
         assert_eq!(body["safety_identifier"], "user-123");
         assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn ultrafast_tier_is_requested_but_billed_only_when_confirmed() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request
+            .provider_context
+            .set_extension(&OpenAiResponsesRequestOptions {
+                service_tier: Some(OpenAiServiceTier::Ultrafast),
+                ..OpenAiResponsesRequestOptions::default()
+            })
+            .expect("typed extension should encode");
+
+        let body = build_responses_request(&settings, &request, "gpt-6.2-sol")
+            .expect("ultrafast request should build");
+        assert_eq!(body["service_tier"], "ultrafast");
+        // OpenAI may serve the request at another tier, so the request alone selects no tariff.
+        assert_eq!(openai_usage_context(&request).service_tier, None);
+
+        let event = serde_json::json!({"response": {
+            "service_tier":"ultrafast", "usage":{"input_tokens":100,"output_tokens":10}
+        }});
+        let usage = token_usage_from_responses_event(&event, OpenAiCompatibleDialect::ResponsesApi)
+            .unwrap();
+        assert_eq!(
+            usage.pricing_context.service_tier.as_deref(),
+            Some("ultrafast")
+        );
     }
 
     #[test]

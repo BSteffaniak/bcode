@@ -3615,7 +3615,7 @@ mod tests {
         );
         assert_eq!(
             provider.default_codex_model_id.as_deref(),
-            Some("gpt-6-astra")
+            Some("gpt-6.2-sol")
         );
 
         // The `gpt-6` alias resolves to Astra, and both deployments carry the full window.
@@ -3739,7 +3739,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_fallback_prefers_astra_then_latest_sol() {
+    fn openai_fallback_prefers_latest_astra_and_sol() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let provider = catalog.provider("openai").expect("openai provider exists");
 
@@ -3749,7 +3749,7 @@ mod tests {
                 .iter()
                 .take(3)
                 .collect::<Vec<_>>(),
-            vec!["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol"]
+            vec!["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra"]
         );
     }
 

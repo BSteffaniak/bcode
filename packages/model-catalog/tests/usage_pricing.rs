@@ -3,6 +3,79 @@
 use bcode_model_catalog::{ModelCatalog, price_session_usage};
 use bcode_session_models::{SessionCostEstimate, SessionTokenUsage};
 
+fn openai_api_key_target() -> bcode_model_catalog_models::ModelSupportTarget {
+    bcode_model_catalog_models::ModelSupportTarget {
+        provider: "openai".to_owned(),
+        auth_mode: "api_key".to_owned(),
+        api_surface: "responses_api".to_owned(),
+        integration: Some("bcode".to_owned()),
+    }
+}
+
+/// Price 1,000 output, cached, and cache-write tokens at each side of the 272K boundary.
+fn assert_tier_pricing(catalog: &ModelCatalog, id: &str, tier: &str, standard: u64, long: u64) {
+    for (input, expected) in [(272_000, standard), (272_001, long)] {
+        let usage: SessionTokenUsage = serde_json::from_value(serde_json::json!({
+            "catalog_provider_id":"openai", "catalog_entry_id":id,
+            "pricing_target":openai_api_key_target(),
+            "input_tokens":input, "output_tokens":1_000, "total_tokens":input + 1_000,
+            "cached_input_tokens":1_000, "cache_write_input_tokens":1_000,
+            "pricing_context":{"service_tier":tier,"invocation_class":"ondemand","request_input_tokens":input}
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                price_session_usage(catalog, &usage),
+                SessionCostEstimate::Estimated { total_micros, .. } if total_micros == expected
+            ),
+            "{id} {tier} input={input}: {:?}",
+            price_session_usage(catalog, &usage)
+        );
+    }
+}
+
+#[test]
+fn gpt_6_2_catalog_metadata_and_tier_pricing() {
+    let catalog = ModelCatalog::load_bundled().unwrap();
+    let models =
+        catalog.provider_models_for_support_target("openai", &openai_api_key_target(), false);
+    for id in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+        let entry = catalog.model("openai", id).unwrap();
+        assert_eq!(entry.model_id, id);
+        assert_eq!(entry.context_window, Some(1_050_000));
+        assert_eq!(entry.max_output_tokens, Some(128_000));
+        assert!(entry.capabilities.tool_use);
+        assert!(entry.capabilities.image_input);
+        assert!(
+            !entry
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .effort_values
+                .contains("none")
+        );
+        assert!(models.iter().any(|model| model.model_id == id));
+    }
+    // Ultrafast carries OpenAI's promotional 3x Standard rate for the GPT-6.2 models.
+    for (id, tier, standard, long) in [
+        ("gpt-6.2-astra", "standard", 2_210_400, 4_400_816),
+        ("gpt-6.2-astra", "priority", 4_420_800, 8_801_632),
+        ("gpt-6.2-astra", "ultrafast", 6_631_200, 13_202_448),
+        ("gpt-6.2-sol", "standard", 552_600, 1_100_204),
+        ("gpt-6.2-sol", "priority", 1_105_200, 2_200_408),
+        ("gpt-6.2-sol", "ultrafast", 1_657_800, 3_300_612),
+    ] {
+        assert_tier_pricing(&catalog, id, tier, standard, long);
+    }
+}
+
+#[test]
+fn earlier_ultrafast_models_bill_six_times_standard() {
+    let catalog = ModelCatalog::load_bundled().unwrap();
+    assert_tier_pricing(&catalog, "gpt-6-astra", "ultrafast", 16_581_000, 33_012_120);
+    assert_tier_pricing(&catalog, "gpt-6.1-sol", "ultrafast", 3_315_600, 6_601_224);
+}
+
 #[test]
 fn gpt_6_1_sol_catalog_metadata_and_pricing() {
     let catalog = ModelCatalog::load_bundled().unwrap();
