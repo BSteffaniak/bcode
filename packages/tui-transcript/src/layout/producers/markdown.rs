@@ -969,6 +969,7 @@ impl Component for MarkdownBody {
                 allocation: None,
                 clip: rect,
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         }
     }

@@ -161,7 +161,7 @@ impl PluginTuiSurface for Probe {
         cx.push_image(ImageContribution::Present(ImagePlacement {
             key: ImageKey::new("image"),
             payload: ImagePayload::Pixels {
-                bytes: vec![255, 0, 0, 255],
+                bytes: vec![255, 0, 0, 255].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgba8,
@@ -171,6 +171,7 @@ impl PluginTuiSurface for Probe {
             allocation: None,
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Persistent,
+            z: 0,
         }));
     }
     fn retained_selection_text(&self) -> BTreeMap<SelectionContentId, String> {

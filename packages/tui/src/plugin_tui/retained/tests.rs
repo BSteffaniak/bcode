@@ -66,7 +66,7 @@ fn publish(view: &RetainedFrontend) -> FrontendResourceId {
             cx.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
-                    bytes: vec![255, 0, 0, 255],
+                    bytes: vec![255, 0, 0, 255].into(),
                     width: 1,
                     height: 1,
                     format: ImagePixelFormat::Rgba8,
@@ -76,6 +76,7 @@ fn publish(view: &RetainedFrontend) -> FrontendResourceId {
                 allocation: None,
                 fit: ImageFit::Contain,
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
             cx.set_cursor(bmux_tui::geometry::Point::new(1, 1), true);
         })
@@ -311,7 +312,7 @@ fn prepared_capture_keeps_persistent_images_and_host_occlusion() {
                 cx.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("persistent"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![255, 0, 0, 255],
+                        bytes: vec![255, 0, 0, 255].into(),
                         width: 1,
                         height: 1,
                         format: ImagePixelFormat::Rgba8,
@@ -321,6 +322,7 @@ fn prepared_capture_keeps_persistent_images_and_host_occlusion() {
                     allocation: None,
                     fit: ImageFit::Contain,
                     lifecycle: ImageLifecycle::Persistent,
+                    z: 0,
                 }));
             },
             |_, _| Ok::<(), ()>(()),

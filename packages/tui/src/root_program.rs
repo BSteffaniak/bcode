@@ -5585,7 +5585,8 @@ mod tests {
                 frame.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("root-failure-image"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![self.0.load(std::sync::atomic::Ordering::Relaxed), 0, 0, 255],
+                        bytes: vec![self.0.load(std::sync::atomic::Ordering::Relaxed), 0, 0, 255]
+                            .into(),
                         width: 1,
                         height: 1,
                         format: ImagePixelFormat::Rgba8,
@@ -5595,6 +5596,7 @@ mod tests {
                     lifecycle: ImageLifecycle::Frame,
                     fit: ImageFit::Stretch,
                     allocation: None,
+                    z: 0,
                 }));
             }
             fn handle_event(

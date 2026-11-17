@@ -155,7 +155,7 @@ fn only_slot(body: &MarkdownBody, width: u64) -> VisualSlot {
 
 fn pixels() -> Arc<ImagePayload> {
     Arc::new(ImagePayload::Pixels {
-        bytes: vec![0; 4],
+        bytes: vec![0; 4].into(),
         width: 1,
         height: 1,
         format: bmux_tui::image::ImagePixelFormat::Rgba8,

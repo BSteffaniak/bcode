@@ -109,7 +109,7 @@ fn paint(host: &mut TranscriptV2Host, at: Instant) -> Vec<Rect> {
 
 fn pixels() -> Arc<ImagePayload> {
     Arc::new(ImagePayload::Pixels {
-        bytes: vec![255; 4],
+        bytes: vec![255; 4].into(),
         width: 1,
         height: 1,
         format: ImagePixelFormat::Rgba8,

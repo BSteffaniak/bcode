@@ -279,7 +279,7 @@ fn out_of_bounds_actions_and_images_reject_the_output() {
                 _ => output.images.push(bmux_tui::image::ImagePlacement {
                     key: "image".into(),
                     payload: bmux_tui::image::ImagePayload::Png {
-                        bytes: vec![1],
+                        bytes: vec![1].into(),
                         width: 1,
                         height: 1,
                     },
@@ -288,6 +288,7 @@ fn out_of_bounds_actions_and_images_reject_the_output() {
                     allocation: None,
                     clip: area,
                     lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                    z: 0,
                 }),
             }
             Some(output)

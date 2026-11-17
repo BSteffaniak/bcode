@@ -68,7 +68,7 @@ pub(super) fn load_preview(
     Ok(Some(PreviewImage {
         key: format!("recap-{}-{}-{asset_id}", document.id, document.revision),
         payload: ImagePayload::Pixels {
-            bytes: preview.into_raw(),
+            bytes: preview.into_raw().into(),
             width,
             height,
             format: ImagePixelFormat::Rgba8,
@@ -98,6 +98,7 @@ impl Component for PreviewImage {
             allocation: None,
             clip: area,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         }));
     }
 }

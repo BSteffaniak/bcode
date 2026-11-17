@@ -518,6 +518,7 @@ impl PluginRows {
                 allocation: None,
                 clip,
                 lifecycle: image.lifecycle,
+                z: image.z,
             }));
         }
     }

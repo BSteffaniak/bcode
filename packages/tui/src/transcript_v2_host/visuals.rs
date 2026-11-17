@@ -262,7 +262,7 @@ struct ResultCache {
     clock: u64,
 }
 
-const fn payload_bytes(payload: &ImagePayload) -> usize {
+fn payload_bytes(payload: &ImagePayload) -> usize {
     match payload {
         ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.len(),
     }

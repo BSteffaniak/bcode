@@ -413,7 +413,7 @@ impl DecodedMarkdownImage {
     #[must_use]
     pub fn into_payload(self) -> ImagePayload {
         ImagePayload::Pixels {
-            bytes: self.rgba,
+            bytes: self.rgba.into(),
             width: self.width,
             height: self.height,
             format: ImagePixelFormat::Rgba8,

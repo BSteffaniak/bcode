@@ -112,7 +112,7 @@ pub fn accept_image(
             image: ImagePlacement {
                 key: ImageKey::new("artifact-image"),
                 payload: ImagePayload::Pixels {
-                    bytes,
+                    bytes: bytes.into(),
                     width,
                     height,
                     format: ImagePixelFormat::Rgba8,
@@ -122,6 +122,7 @@ pub fn accept_image(
                 clip: area,
                 fit: ImageFit::Contain,
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             },
         },
     );
@@ -226,7 +227,7 @@ mod tests {
         assert_eq!(
             image.payload,
             ImagePayload::Pixels {
-                bytes: vec![255, 0, 0, 255],
+                bytes: vec![255, 0, 0, 255].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgba8

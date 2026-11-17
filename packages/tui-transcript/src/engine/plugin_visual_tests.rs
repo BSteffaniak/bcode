@@ -417,7 +417,7 @@ fn image_placement_agrees_with_the_rows_that_show_it() {
     let image = ImagePlacement {
         key: "preview".into(),
         payload: ImagePayload::Png {
-            bytes: vec![1, 2, 3],
+            bytes: vec![1, 2, 3].into(),
             width: 2,
             height: 2,
         },
@@ -426,6 +426,7 @@ fn image_placement_agrees_with_the_rows_that_show_it() {
         allocation: None,
         clip: destination,
         lifecycle: ImageLifecycle::Frame,
+        z: 0,
     };
     accept(
         &mut engine,
