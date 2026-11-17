@@ -852,8 +852,8 @@ pub fn transient_viewed_record(
 /// Save a transient review as a durable workspace and return the record written.
 ///
 /// The workspace is created with the same title and sources and gets the whole local record
-/// (viewed, presentation, reviewed-revision and stack state); the drafts, AI exchanges, and
-/// suggestions move into its scope.
+/// (viewed, presentation, reviewed-revision and stack state); the drafts, AI exchanges,
+/// suggestions, and guided-review guides move into its scope.
 ///
 /// # Errors
 ///
@@ -900,6 +900,16 @@ pub async fn save_as(
         super::notes::NoteScope::for_workspace(&workspace),
     );
     super::notes::move_drafts(services.clone(), from.clone(), to.clone(), notes.drafts).await?;
+    if let (Some(from_scope), Some(to_scope)) = (from.scope.clone(), to.scope.clone()) {
+        let _: bcode_code_review_models::RekeyReviewGuidesResponse = services
+            .call(bcode_code_review_models::RekeyReviewGuidesRequest {
+                repo_path: workspace.repo_root.clone(),
+                from: from_scope,
+                to: to_scope,
+            })
+            .await
+            .map_err(|error| error.message)?;
+    }
     super::notes::move_agent_notes(services, from, to, notes.exchanges, notes.suggestions).await?;
     Ok(workspace)
 }

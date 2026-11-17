@@ -1869,8 +1869,9 @@ impl ReviewSurface {
                 self.viewed_sync.stored = Some(saved);
                 self.viewed_sync.writes += 1;
                 self.request_save();
-                // Annotations now live in the saved review's scope.
+                // Annotations and guides now live in the saved review's scope.
                 self.notes_requested = false;
+                self.reload_guide();
                 self.status = None;
                 self.toasts
                     .push(ToastSeverity::Success, "Review saved", None);
