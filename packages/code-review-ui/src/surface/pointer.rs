@@ -250,6 +250,10 @@ impl ReviewSurface {
                 }
                 None
             }
+            ItemAction::Guide(number) => {
+                self.guide_badge_click(number);
+                None
+            }
             ItemAction::Comment => {
                 let anchor = review.doc.anchor_for(&click.key)?;
                 review.selection = None;

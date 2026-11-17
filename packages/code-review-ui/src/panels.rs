@@ -16,6 +16,12 @@
 //! 3. The threads panel shows when the user opened it: to the right when the body is at least
 //!    [`THREADS_RIGHT_BODY`] columns, under the document when the body has at least
 //!    [`THREADS_BOTTOM_BODY_HEIGHT`] rows, otherwise not at all.
+//! 4. The guide panel shows when the user opened it: to the right when the body is at least
+//!    [`GUIDE_RIGHT_BODY`] columns (at least [`GUIDE_MIN_WIDTH`] wide; the file panel gives way
+//!    first, and is left out when both would leave the document too little), under the
+//!    document when the body has at least [`GUIDE_BOTTOM_BODY_HEIGHT`] rows (at least
+//!    [`GUIDE_MIN_HEIGHT`] tall), otherwise not at all. When the threads panel is to the right
+//!    too, the two share the right column, the guide on top.
 //!
 //! The review assistant is not a review panel: the app docks it beside or under the whole
 //! screen ([`crate::assistant::panel`]).
@@ -53,6 +59,19 @@ const THREADS_DEFAULT_HEIGHT: u16 = 10;
 const THREADS_MIN_HEIGHT: u16 = 4;
 /// Smallest bordered panel height.
 const MIN_PANE_ROWS: u16 = 3;
+/// Body width from which the guide panel sits to the right.
+pub const GUIDE_RIGHT_BODY: u16 = 100;
+/// Body height from which the guide panel can sit under the document.
+pub const GUIDE_BOTTOM_BODY_HEIGHT: u16 = 16;
+/// Narrowest guide panel beside the document.
+pub const GUIDE_MIN_WIDTH: u16 = 36;
+/// Shortest guide panel under the document.
+pub const GUIDE_MIN_HEIGHT: u16 = 8;
+/// Default guide panel width (right) or height (bottom).
+const GUIDE_DEFAULT_WIDTH: u16 = 48;
+const GUIDE_DEFAULT_HEIGHT: u16 = 10;
+/// Share of the right column the guide takes over the threads panel, in percent.
+const GUIDE_SIDE_PERCENT: u16 = 60;
 
 /// A panel of the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +82,10 @@ pub enum PanelId {
     Review,
     /// Threads list.
     Threads,
+    /// The guide.
+    Guide,
+    /// The right column holding the guide over the threads panel.
+    Side,
 }
 
 /// Where a side panel (threads) is.
@@ -85,6 +108,8 @@ pub struct PanelPlan {
     pub files: bool,
     /// Where the threads panel shows.
     pub threads: SidePlacement,
+    /// Where the guide panel shows.
+    pub guide: SidePlacement,
 }
 
 /// Panel visibility, sizes, and the BMUX group states.
@@ -94,6 +119,8 @@ pub struct Panels {
     pub root: RefCell<PanelGroupState>,
     /// Vertical group of the review column: document, then bottom panels.
     pub column: RefCell<PanelGroupState>,
+    /// Vertical group of the right column when the guide and the threads share it.
+    pub side: RefCell<PanelGroupState>,
     /// Panels in `root`, in order.
     root_members: Vec<PanelId>,
     /// Panels in `column`, in order (the document first).
@@ -102,6 +129,8 @@ pub struct Panels {
     pub files_choice: Option<bool>,
     /// Whether the user opened the threads panel.
     pub threads_open: bool,
+    /// Whether the user opened the guide panel.
+    pub guide_open: bool,
     /// Sizes chosen by resizing, as shares of the body.
     shares: Shares,
     /// Cell sizes from state saved before sizes were proportional, until converted.
@@ -121,6 +150,10 @@ struct Shares {
     threads_right: Option<u16>,
     /// Threads panel height under the document, of the body height.
     threads_bottom: Option<u16>,
+    /// Guide panel width beside the document, of the body width.
+    guide_right: Option<u16>,
+    /// Guide panel height under the document, of the body height.
+    guide_bottom: Option<u16>,
 }
 
 /// Cell sizes saved before sizes were proportional.
@@ -135,10 +168,12 @@ impl Default for Panels {
         Self {
             root: RefCell::new(PanelGroupState::new(Vec::new())),
             column: RefCell::new(PanelGroupState::new(Vec::new())),
+            side: RefCell::new(PanelGroupState::new(Vec::new())),
             root_members: Vec::new(),
             column_members: Vec::new(),
             files_choice: None,
             threads_open: false,
+            guide_open: false,
             shares: Shares::default(),
             legacy: Legacy::default(),
             converted: false,
@@ -187,10 +222,13 @@ impl Panels {
             files: state.file_panel_share,
             threads_right: state.threads_right_share,
             threads_bottom: state.threads_bottom_share,
+            guide_right: state.guide_right_share,
+            guide_bottom: state.guide_bottom_share,
         };
         Self {
             files_choice: state.file_panel_visible,
             threads_open: state.threads_panel_visible.unwrap_or(false),
+            guide_open: state.guide_panel_visible.unwrap_or(false),
             legacy: Legacy {
                 files: state.file_panel_width.filter(|_| shares.files.is_none()),
                 threads: state
@@ -213,6 +251,9 @@ impl Panels {
             file_panel_share: self.shares.files,
             threads_right_share: self.shares.threads_right,
             threads_bottom_share: self.shares.threads_bottom,
+            guide_panel_visible: if self.guide_open { Some(true) } else { None },
+            guide_right_share: self.shares.guide_right,
+            guide_bottom_share: self.shares.guide_bottom,
         }
     }
 
@@ -226,12 +267,6 @@ impl Panels {
     #[must_use]
     pub const fn plan(&self, width: u16, height: u16) -> PanelPlan {
         let bordered = width >= MIN_BORDERED_WIDTH && height >= MIN_BORDERED_HEIGHT;
-        let files = bordered
-            && width >= FILES_MIN_BODY
-            && match self.files_choice {
-                Some(open) => open,
-                None => width >= FILES_AUTO_BODY,
-            };
         let threads = if !bordered || !self.threads_open {
             SidePlacement::Hidden
         } else if width >= THREADS_RIGHT_BODY {
@@ -241,10 +276,34 @@ impl Panels {
         } else {
             SidePlacement::Hidden
         };
+        let guide = if !bordered || !self.guide_open {
+            SidePlacement::Hidden
+        } else if width >= GUIDE_RIGHT_BODY {
+            SidePlacement::Right
+        } else if height >= GUIDE_BOTTOM_BODY_HEIGHT {
+            SidePlacement::Bottom
+        } else {
+            SidePlacement::Hidden
+        };
+        let mut files = bordered
+            && width >= FILES_MIN_BODY
+            && match self.files_choice {
+                Some(open) => open,
+                None => width >= FILES_AUTO_BODY,
+            };
+        // Beside the guide, the file panel is left out when both at their narrowest would leave
+        // the document too little.
+        if files
+            && matches!(guide, SidePlacement::Right)
+            && width.saturating_sub(REVIEW_MIN_WIDTH) < FILES_MIN_WIDTH + GUIDE_MIN_WIDTH
+        {
+            files = false;
+        }
         PanelPlan {
             bordered,
             files,
             threads,
+            guide,
         }
     }
 
@@ -264,6 +323,12 @@ impl Panels {
     #[must_use]
     pub fn column_members(&self) -> &[PanelId] {
         &self.column_members
+    }
+
+    /// Panels of the right column when the guide and the threads share it.
+    #[must_use]
+    pub const fn side_members(&self) -> &'static [PanelId] {
+        &[PanelId::Guide, PanelId::Threads]
     }
 
     /// Convert cell sizes saved before sizes were proportional into shares of this body, as
@@ -302,9 +367,9 @@ impl Panels {
     /// Bring the group states in line with the plan for a `width` x `height` body.
     ///
     /// Side panels take their share of the body (or their default size), clamped to their
-    /// minimum and to what leaves the document [`REVIEW_MIN_WIDTH`] columns. When the file and
-    /// threads panels together leave the document less, the threads panel gives way first,
-    /// down to its minimum, then the file panel.
+    /// minimum and to what leaves the document [`REVIEW_MIN_WIDTH`] columns. When the side
+    /// panels together leave the document less, the threads panel gives way first (down to its
+    /// minimum), then the file panel; beside the guide, the file panel gives way first.
     pub fn sync(&mut self, width: u16, height: u16) -> PanelPlan {
         let plan = self.plan(width, height);
         if self.plan == Some(plan) && self.body == (width, height) {
@@ -322,22 +387,50 @@ impl Panels {
                 .map_or(default, |share| cells_of(share, width))
                 .clamp(FILES_MIN_WIDTH, side_max)
         });
-        let mut threads = (plan.threads == SidePlacement::Right).then(|| {
-            self.shares
-                .threads_right
-                .map_or(THREADS_DEFAULT_WIDTH, |share| cells_of(share, width))
-                .clamp(FILES_MIN_WIDTH, side_max)
-        });
-        let sides = |files: Option<u16>, threads: Option<u16>| {
-            files.unwrap_or(0).saturating_add(threads.unwrap_or(0))
+        let guide_right = plan.guide == SidePlacement::Right;
+        let right_member = match (guide_right, plan.threads == SidePlacement::Right) {
+            (true, true) => Some(PanelId::Side),
+            (true, false) => Some(PanelId::Guide),
+            (false, true) => Some(PanelId::Threads),
+            (false, false) => None,
         };
-        if let Some(cells) = threads.as_mut() {
-            let excess = sides(files, Some(*cells)).saturating_sub(side_room);
-            *cells = cells.saturating_sub(excess).max(FILES_MIN_WIDTH);
-        }
-        if let Some(cells) = files.as_mut() {
-            let excess = sides(Some(*cells), threads).saturating_sub(side_room);
-            *cells = cells.saturating_sub(excess).max(FILES_MIN_WIDTH);
+        let right_min = if guide_right {
+            GUIDE_MIN_WIDTH
+        } else {
+            FILES_MIN_WIDTH
+        };
+        let right_max = side_room.max(right_min);
+        let mut right = right_member.map(|_| {
+            let (share, default) = if guide_right {
+                (self.shares.guide_right, GUIDE_DEFAULT_WIDTH)
+            } else {
+                (self.shares.threads_right, THREADS_DEFAULT_WIDTH)
+            };
+            share
+                .map_or(default, |share| cells_of(share, width))
+                .clamp(right_min, right_max)
+        });
+        let sides = |files: Option<u16>, right: Option<u16>| {
+            files.unwrap_or(0).saturating_add(right.unwrap_or(0))
+        };
+        let shrink_right = |files: Option<u16>, right: &mut Option<u16>| {
+            if let Some(cells) = right.as_mut() {
+                let excess = sides(files, Some(*cells)).saturating_sub(side_room);
+                *cells = cells.saturating_sub(excess).max(right_min);
+            }
+        };
+        let shrink_files = |files: &mut Option<u16>, right: Option<u16>| {
+            if let Some(cells) = files.as_mut() {
+                let excess = sides(Some(*cells), right).saturating_sub(side_room);
+                *cells = cells.saturating_sub(excess).max(FILES_MIN_WIDTH);
+            }
+        };
+        if guide_right {
+            shrink_files(&mut files, right);
+            shrink_right(files, &mut right);
+        } else {
+            shrink_right(files, &mut right);
+            shrink_files(&mut files, right);
         }
         let mut members = Vec::new();
         let mut lengths = Vec::new();
@@ -348,43 +441,107 @@ impl Panels {
             constraints.push(PanelGroupConstraints::new(FILES_MIN_WIDTH, Some(side_max)));
         }
         members.push(PanelId::Review);
-        lengths.push(width.saturating_sub(sides(files, threads)));
+        lengths.push(width.saturating_sub(sides(files, right)));
         constraints.push(PanelGroupConstraints::new(
             REVIEW_MIN_WIDTH.min(width),
             None,
         ));
-        if let Some(cells) = threads {
-            members.push(PanelId::Threads);
+        if let (Some(member), Some(cells)) = (right_member, right) {
+            members.push(member);
             lengths.push(cells);
-            constraints.push(PanelGroupConstraints::new(FILES_MIN_WIDTH, Some(side_max)));
+            constraints.push(PanelGroupConstraints::new(right_min, Some(right_max)));
         }
         let mut root = PanelGroupState::new(flex_sizes(&lengths));
         root.set_constraints(constraints);
         *self.root.borrow_mut() = root;
         self.root_members = members;
-        // The column: the document, then the bottom panels.
-        let mut column_members = vec![PanelId::Review];
-        let mut column_constraints = vec![PanelGroupConstraints::new(MIN_PANE_ROWS, None)];
-        let mut column_lengths = vec![height];
-        if plan.threads == SidePlacement::Bottom {
-            let max = height.saturating_sub(MIN_PANE_ROWS).max(THREADS_MIN_HEIGHT);
-            let cells = self
-                .shares
+        self.sync_side(height);
+        self.sync_column(plan, height);
+        plan
+    }
+
+    /// The right column shared by the guide (on top) and the threads, at `height` rows.
+    fn sync_side(&self, height: u16) {
+        let guide = u16::try_from(u32::from(height) * u32::from(GUIDE_SIDE_PERCENT) / 100)
+            .unwrap_or(height);
+        let guide = guide
+            .max(GUIDE_MIN_HEIGHT)
+            .min(height.saturating_sub(THREADS_MIN_HEIGHT))
+            .max(MIN_PANE_ROWS.min(height));
+        let mut side = PanelGroupState::new(flex_sizes(&[guide, height.saturating_sub(guide)]));
+        side.set_constraints(vec![
+            PanelGroupConstraints::new(MIN_PANE_ROWS.min(height), None),
+            PanelGroupConstraints::new(MIN_PANE_ROWS.min(height), None),
+        ]);
+        *self.side.borrow_mut() = side;
+    }
+
+    /// The review column: the document, then the guide and threads panels under it.
+    fn sync_column(&mut self, plan: PanelPlan, height: u16) {
+        let mut members = vec![PanelId::Review];
+        let mut lengths = Vec::new();
+        let mut constraints = Vec::new();
+        let room = height.saturating_sub(MIN_PANE_ROWS);
+        let mut guide = (plan.guide == SidePlacement::Bottom).then(|| {
+            self.shares
+                .guide_bottom
+                .map_or(GUIDE_DEFAULT_HEIGHT, |share| cells_of(share, height))
+                .clamp(GUIDE_MIN_HEIGHT, room.max(GUIDE_MIN_HEIGHT))
+                .min(height)
+        });
+        let mut threads = (plan.threads == SidePlacement::Bottom).then(|| {
+            self.shares
                 .threads_bottom
                 .map_or(THREADS_DEFAULT_HEIGHT, |share| cells_of(share, height))
-                .clamp(THREADS_MIN_HEIGHT, max)
-                .min(height);
-            column_members.push(PanelId::Threads);
-            column_lengths = vec![height - cells, cells];
-            column_constraints.push(PanelGroupConstraints::new(THREADS_MIN_HEIGHT, Some(max)));
-        } else {
-            column_constraints = vec![PanelGroupConstraints::new(0, None)];
+                .clamp(THREADS_MIN_HEIGHT, room.max(THREADS_MIN_HEIGHT))
+                .min(height)
+        });
+        // Both under the document: the threads give way first, then the guide.
+        let total = |guide: Option<u16>, threads: Option<u16>| {
+            guide.unwrap_or(0).saturating_add(threads.unwrap_or(0))
+        };
+        if let Some(cells) = threads.as_mut() {
+            let excess = total(guide, Some(*cells)).saturating_sub(room);
+            *cells = cells.saturating_sub(excess).max(THREADS_MIN_HEIGHT);
         }
-        let mut column = PanelGroupState::new(flex_sizes(&column_lengths));
-        column.set_constraints(column_constraints);
+        if let Some(cells) = guide.as_mut() {
+            let excess = total(Some(*cells), threads).saturating_sub(room);
+            *cells = cells.saturating_sub(excess).max(GUIDE_MIN_HEIGHT);
+        }
+        if total(guide, threads) > room {
+            // No room for both at their minimum: the threads panel is left out.
+            threads = None;
+        }
+        let document = height.saturating_sub(total(guide, threads));
+        lengths.push(document);
+        constraints.push(PanelGroupConstraints::new(
+            if guide.is_some() || threads.is_some() {
+                MIN_PANE_ROWS
+            } else {
+                0
+            },
+            None,
+        ));
+        if let Some(cells) = guide {
+            members.push(PanelId::Guide);
+            lengths.push(cells);
+            constraints.push(PanelGroupConstraints::new(
+                GUIDE_MIN_HEIGHT,
+                Some(room.max(GUIDE_MIN_HEIGHT)),
+            ));
+        }
+        if let Some(cells) = threads {
+            members.push(PanelId::Threads);
+            lengths.push(cells);
+            constraints.push(PanelGroupConstraints::new(
+                THREADS_MIN_HEIGHT,
+                Some(room.max(THREADS_MIN_HEIGHT)),
+            ));
+        }
+        let mut column = PanelGroupState::new(flex_sizes(&lengths));
+        column.set_constraints(constraints);
         *self.column.borrow_mut() = column;
-        self.column_members = column_members;
-        plan
+        self.column_members = members;
     }
 
     /// Record the sizes a divider drag left, as shares of the body. Returns whether a
@@ -402,6 +559,9 @@ impl Panels {
             match member {
                 PanelId::Files => self.shares.files = Some(share_of(cells, width)),
                 PanelId::Threads => self.shares.threads_right = Some(share_of(cells, width)),
+                PanelId::Guide | PanelId::Side => {
+                    self.shares.guide_right = Some(share_of(cells, width));
+                }
                 PanelId::Review => {}
             }
         }
@@ -412,8 +572,10 @@ impl Panels {
             height,
         );
         for (member, cells) in self.column_members.iter().zip(column).skip(1) {
-            if *member == PanelId::Threads {
-                self.shares.threads_bottom = Some(share_of(cells, height));
+            match member {
+                PanelId::Threads => self.shares.threads_bottom = Some(share_of(cells, height)),
+                PanelId::Guide => self.shares.guide_bottom = Some(share_of(cells, height)),
+                PanelId::Files | PanelId::Review | PanelId::Side => {}
             }
         }
         before != self.shares
@@ -452,6 +614,21 @@ impl Panels {
         self.threads_open = !self.threads_open;
         self.plan = None;
         self.threads_open
+    }
+
+    /// Toggle the guide panel; returns whether the user wants it open.
+    pub const fn toggle_guide(&mut self) -> bool {
+        self.guide_open = !self.guide_open;
+        self.plan = None;
+        self.guide_open
+    }
+
+    /// Open the guide panel.
+    pub const fn show_guide(&mut self) {
+        if !self.guide_open {
+            self.guide_open = true;
+            self.plan = None;
+        }
     }
 
     /// Grow (positive) or shrink the file panel by `delta` columns, within the same limits as
@@ -644,6 +821,84 @@ mod tests {
         let widths = root_widths(&mut panels, THREADS_RIGHT_BODY, 40);
         assert_eq!(widths.iter().sum::<u16>(), THREADS_RIGHT_BODY);
         assert!(widths[1] >= REVIEW_MIN_WIDTH, "{widths:?}");
+    }
+
+    #[test]
+    fn guide_panel_sits_beside_the_document_or_under_it() {
+        let mut panels = Panels::default();
+        assert_eq!(panels.plan(200, 40).guide, SidePlacement::Hidden);
+        assert!(panels.toggle_guide());
+        assert_eq!(
+            panels.plan(GUIDE_RIGHT_BODY, 40).guide,
+            SidePlacement::Right
+        );
+        assert_eq!(
+            panels
+                .plan(GUIDE_RIGHT_BODY - 1, GUIDE_BOTTOM_BODY_HEIGHT)
+                .guide,
+            SidePlacement::Bottom
+        );
+        assert_eq!(
+            panels
+                .plan(GUIDE_RIGHT_BODY - 1, GUIDE_BOTTOM_BODY_HEIGHT - 1)
+                .guide,
+            SidePlacement::Hidden
+        );
+        assert_eq!(
+            panels.plan(MIN_BORDERED_WIDTH - 1, 40).guide,
+            SidePlacement::Hidden
+        );
+        let state = panels.state();
+        assert_eq!(state.guide_panel_visible, Some(true));
+        assert_eq!(Panels::restore(&state).state(), state);
+    }
+
+    #[test]
+    fn beside_the_guide_the_file_panel_gives_way_first() {
+        let mut panels = Panels::restore(&ReviewPanelState {
+            file_panel_visible: Some(true),
+            guide_panel_visible: Some(true),
+            ..ReviewPanelState::default()
+        });
+        for width in [GUIDE_RIGHT_BODY, 120, 150, 200, 333] {
+            let widths = root_widths(&mut panels, width, 40);
+            assert_eq!(widths.iter().sum::<u16>(), width, "{width}: {widths:?}");
+            let members = panels.root_members().to_vec();
+            let review = members.iter().position(|member| *member == PanelId::Review);
+            let guide = members.iter().position(|member| *member == PanelId::Guide);
+            let (Some(review), Some(guide)) = (review, guide) else {
+                panic!("{width}: {members:?}");
+            };
+            assert!(widths[review] >= REVIEW_MIN_WIDTH, "{width}: {widths:?}");
+            assert!(widths[guide] >= GUIDE_MIN_WIDTH, "{width}: {widths:?}");
+        }
+        // From the narrowest body with the guide beside it, both fit at their narrowest.
+        assert!(panels.plan(GUIDE_RIGHT_BODY, 40).files);
+    }
+
+    #[test]
+    fn guide_and_threads_share_the_right_column_or_stack_under_the_document() {
+        let mut panels = Panels::restore(&ReviewPanelState {
+            threads_panel_visible: Some(true),
+            guide_panel_visible: Some(true),
+            ..ReviewPanelState::default()
+        });
+        panels.sync(200, 40);
+        assert_eq!(panels.root_members().last(), Some(&PanelId::Side));
+        panels.sync(90, 40);
+        assert_eq!(
+            panels.column_members(),
+            [PanelId::Review, PanelId::Guide, PanelId::Threads]
+        );
+        let heights = Panels::lengths(PanelGroupAxis::Vertical, &panels.column.borrow(), 90, 40);
+        assert_eq!(heights.iter().sum::<u16>(), 40);
+        assert!(
+            heights[0] >= MIN_PANE_ROWS && heights[1] >= GUIDE_MIN_HEIGHT,
+            "{heights:?}"
+        );
+        // Short: no room for both under the document; the threads panel is left out.
+        panels.sync(90, GUIDE_BOTTOM_BODY_HEIGHT);
+        assert_eq!(panels.column_members(), [PanelId::Review, PanelId::Guide]);
     }
 
     #[test]

@@ -51,6 +51,7 @@ pub mod context;
 pub mod conversation;
 pub mod entry;
 pub mod files;
+pub mod guide;
 pub mod history;
 pub mod home;
 pub mod host;

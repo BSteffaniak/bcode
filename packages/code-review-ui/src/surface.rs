@@ -113,6 +113,7 @@ const LIST_ID: &str = "review";
 /// Layout ids of the body.
 const ROOT_ID: &str = "review.panels";
 const COLUMN_ID: &str = "review.column";
+const SIDE_ID: &str = "review.side";
 /// Pane of the review document.
 pub const REVIEW_PANE_ID: &str = "review.pane";
 /// Pane of the file panel.
@@ -159,6 +160,7 @@ mod conversation;
 mod feed;
 mod find;
 mod flows;
+mod guide;
 mod history;
 mod pointer;
 mod reconcile;
@@ -176,6 +178,7 @@ pub use assistant_actions::{ComparisonChange, GoTo, ReviewCommand, VersionPick, 
 pub use conversation::{BarState, ConversationMessage, WatchCancel};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
+pub use guide::{GUIDE_PANE_ID, GUIDE_SCOPE, PEEK_ID};
 pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
 
 pub use find::{SearchState, ThreadsFilter};
@@ -195,6 +198,8 @@ pub enum Focus {
     Filter,
     /// The threads panel.
     Threads,
+    /// The guide panel.
+    Guide,
 }
 
 /// Saving of presentation state.
@@ -268,6 +273,7 @@ struct Extras<'a> {
     composer: Option<&'a Composer>,
     search: Option<&'a SearchHighlights>,
     cards: super::rows::card::CardContext<'a>,
+    guide: &'a crate::guide::GuideMarks,
 }
 
 const fn row_context<'a>(
@@ -287,6 +293,7 @@ const fn row_context<'a>(
         composer: extras.composer,
         search: extras.search,
         cards: Some(extras.cards),
+        guide: Some(extras.guide),
     }
 }
 
@@ -815,6 +822,8 @@ pub struct ReviewSurface {
     reflection: review_tools::Reflection,
     /// The assistant panel request and the header cells left for the Ask AI button.
     link: crate::assistant::ScreenLink,
+    /// The guided review.
+    guide: guide::GuideUi,
 }
 
 impl std::fmt::Debug for ReviewSurface {
@@ -843,11 +852,7 @@ impl ReviewSurface {
             sources,
             title,
             config,
-            document_config: DocumentConfig {
-                viewed_reset: config.viewed_reset,
-                fold_viewed: config.fold_viewed(),
-                ..DocumentConfig::default()
-            },
+            document_config: document_config(&config),
             inbox: Inbox::default(),
             phase: Phase::Idle,
             started: None,
@@ -935,6 +940,7 @@ impl ReviewSurface {
             leaving: Leaving::default(),
             feed_requests: VecDeque::new(),
             feed_wake: None,
+            guide: guide::GuideUi::new(),
         }
     }
 
@@ -953,6 +959,7 @@ impl ReviewSurface {
             composer: self.composer.as_ref(),
             search: self.search.as_ref().map(|search| &search.highlights),
             cards: self.card_context(self.viewed_layers().len()),
+            guide: &self.guide.marks,
         }
     }
 
@@ -2078,6 +2085,7 @@ impl ReviewSurface {
             annotate::jump_to_annotation(review, &key);
             changed = true;
         }
+        changed |= self.retry_guide_jump();
         if let Some(review) = &mut self.review
             && let Some(motion) = review.motion.clone()
             && !matches!(
@@ -2131,6 +2139,8 @@ impl ReviewSurface {
                 self.refresh_conversations(host);
             }
             Message::Conversation(message) => self.apply_conversation(*message, host),
+            Message::Guide { generation, result } => self.apply_guide(generation, result),
+            Message::Peek { citation, result } => self.apply_peek(&citation, result),
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -2570,6 +2580,7 @@ impl ReviewSurface {
     /// Open the review's current sources again, keeping position and expansions.
     fn reopen(&mut self, host: &UiContext) {
         self.refreshing = true;
+        self.reload_guide();
         let services = self.services.clone();
         let repo = self.repo_path.clone();
         let sources = self.sources.clone();
@@ -2636,7 +2647,16 @@ impl ReviewSurface {
                     return action;
                 }
             }
-            Focus::Review => {}
+            Focus::Guide => {
+                if let Some(action) = self.guide_key(stroke, host) {
+                    return action;
+                }
+            }
+            Focus::Review => {
+                if let Some(action) = self.peek_key(stroke, host) {
+                    return action;
+                }
+            }
         }
         if let Some(action) = self.feed_key(stroke, host) {
             self.count = None;
@@ -3098,9 +3118,13 @@ impl ReviewSurface {
         let plan = self.panels.current();
         let files = plan.is_some_and(|plan| plan.files);
         let threads = plan.is_some_and(|plan| plan.threads != super::panels::SidePlacement::Hidden);
+        let guide = plan.is_some_and(|plan| plan.guide != super::panels::SidePlacement::Hidden);
         self.focus = match self.focus {
             Focus::Review if files => Focus::Files,
-            Focus::Review | Focus::Files | Focus::Filter if threads => Focus::Threads,
+            Focus::Review | Focus::Files | Focus::Filter if guide => Focus::Guide,
+            Focus::Review | Focus::Files | Focus::Filter | Focus::Guide if threads => {
+                Focus::Threads
+            }
             Focus::Composer | Focus::Search => self.focus,
             _ => Focus::Review,
         };
@@ -3724,6 +3748,7 @@ impl ReviewSurface {
         };
         let mut redraw = routed.outcome != EventOutcome::Ignored;
         redraw |= self.after_body_event(&routed, mouse.kind);
+        redraw |= self.after_guide_event(host);
         // Wheel over the file panel scrolls the tree.
         let rows = match mouse.kind {
             MouseEventKind::ScrollDown => TREE_WHEEL_ROWS,
@@ -3796,6 +3821,8 @@ impl ReviewSurface {
             Some(Focus::Files)
         } else if inside(THREADS_PANE_ID) {
             Some(Focus::Threads)
+        } else if inside(GUIDE_PANE_ID) {
+            Some(Focus::Guide)
         } else if inside(REVIEW_PANE_ID) || inside(LIST_ID) {
             Some(Focus::Review)
         } else {
@@ -4212,6 +4239,11 @@ impl ReviewSurface {
                 push(key("focus_next"), "next pane");
                 push(key("threads_back"), "back");
             }
+            Focus::Guide => {
+                for (action, label) in guide::HINTS {
+                    push(key(action), label);
+                }
+            }
             Focus::Review => {
                 let cursor = self
                     .review
@@ -4370,6 +4402,11 @@ impl ReviewSurface {
                 keys(THREADS_SCOPE),
                 Some("Threads panel"),
             ));
+            entries.extend(super::palette::entries(
+                &crate::keymap::actions_for(GUIDE_SCOPE),
+                keys(GUIDE_SCOPE),
+                Some("Guide panel"),
+            ));
             entries
         } else {
             let mut entries = super::palette::entries(&review, keys(SCOPE), None);
@@ -4444,6 +4481,9 @@ impl ReviewSurface {
             "show_ignored" => return self.toggle_show_ignored(host),
             _ => {}
         }
+        if let Some(result) = self.guide_action(action, host) {
+            return result;
+        }
         if let Some(result) = self.surface_action(action, count, host) {
             return result;
         }
@@ -4460,6 +4500,7 @@ impl ReviewSurface {
         let shown = match self.focus {
             Focus::Files | Focus::Filter => plan.files,
             Focus::Threads => plan.threads != super::panels::SidePlacement::Hidden,
+            Focus::Guide => plan.guide != super::panels::SidePlacement::Hidden,
             Focus::Review | Focus::Composer | Focus::Search => true,
         };
         if !shown {
@@ -4472,6 +4513,8 @@ impl ReviewSurface {
             }
         }
         self.sync_thread_rows();
+        self.sync_guide_marks();
+        self.sync_guide_model(plan.guide);
         let constraints = Constraints::tight(body.size());
         // Pass 1: learn the document's size from a probe in its place.
         let probe = Cell::new(None);
@@ -4598,6 +4641,7 @@ impl ReviewSurface {
                 threads: &self.folds.threads,
                 revision: self.talk.card_revision() ^ self.folds.revision.rotate_left(17),
             },
+            guide: &self.guide.marks,
         };
         // Lay out (twice when the cursor must be revealed: the reveal needs the synced index).
         let mut layout = layout_list(review, &params, syntax, extras, constraints);
@@ -4741,11 +4785,16 @@ impl ReviewSurface {
     /// The body component: panels and their contents, with `list` as the document.
     fn body<'a>(&'a self, review: &'a Review, list: ListSlot<'a>) -> Element<'a> {
         let theme = &self.theme;
+        // The context peek shows cited code outside the review in the document's place.
+        let list: Element<'a> = self.guide.peek.as_ref().map_or_else(
+            || Element::new(list),
+            |peek| Element::new(crate::guide::PeekView::new(PEEK_ID, peek, theme)),
+        );
         let Some(plan) = self.panels.current() else {
-            return Element::new(list);
+            return list;
         };
         if !plan.bordered {
-            return Element::new(list);
+            return list;
         }
         let review_pane = Self::pane(
             REVIEW_PANE_ID,
@@ -4784,7 +4833,8 @@ impl ReviewSurface {
                         for member in &self.panels.column_members()[1..] {
                             column = match member {
                                 PanelId::Threads => column.child(self.threads_pane(review)),
-                                PanelId::Files | PanelId::Review => column,
+                                PanelId::Guide => column.child(self.guide_pane(plan.guide)),
+                                PanelId::Files | PanelId::Review | PanelId::Side => column,
                             };
                         }
                         root.child(column)
@@ -4793,9 +4843,48 @@ impl ReviewSurface {
                     };
                 }
                 PanelId::Threads => root = root.child(self.threads_pane(review)),
+                PanelId::Guide => root = root.child(self.guide_pane(plan.guide)),
+                PanelId::Side => {
+                    let side = PanelGroupComponent::new(
+                        SIDE_ID,
+                        super::panels::group(PanelGroupAxis::Vertical, theme.panels),
+                        &self.panels.side,
+                    )
+                    .child(self.guide_pane(plan.guide))
+                    .child(self.threads_pane(review));
+                    root = root.child(side);
+                }
             }
         }
         Element::new(root)
+    }
+
+    fn guide_pane(&self, placement: super::panels::SidePlacement) -> PaneComponent<'_, '_> {
+        let theme = &self.theme;
+        let focused = self.focus == Focus::Guide;
+        let (title, status) = self.guide_titles();
+        let chrome = Pane::new()
+            .title(theme.pane_title(&title, focused))
+            .right_title(theme.pane_status(&status))
+            .styles(self.pane_styles())
+            .chrome(theme.component.chrome);
+        if self.guide.state.active.is_none() {
+            let empty = EmptyStateComponent::new("review.guide.empty", "No guide for this review")
+                .icon(theme.icons.guide_marker)
+                .body(&self.guide.empty)
+                .policy(EmptyStatePolicy::centered())
+                .styles(theme.component.empty_state_styles());
+            return Self::pane(GUIDE_PANE_ID, chrome, focused, &self.guide.pane, empty);
+        }
+        let view = crate::guide::GuidePanelView::new(
+            guide::GUIDE_VIEW_ID,
+            &self.guide.model,
+            theme,
+            placement != super::panels::SidePlacement::Bottom,
+            &self.guide.scroll,
+            &self.guide.clicks,
+        );
+        Self::pane(GUIDE_PANE_ID, chrome, focused, &self.guide.pane, view)
     }
 
     fn files_pane<'a>(&'a self, review: &'a Review) -> PaneComponent<'a, 'a> {
@@ -4894,6 +4983,15 @@ impl ReviewSurface {
             theme.tree_selection_bar(),
         );
         Self::pane(THREADS_PANE_ID, chrome, focused, &self.threads_pane, list)
+    }
+}
+
+/// The document configuration `config` asks for.
+fn document_config(config: &ReviewViewConfig) -> DocumentConfig {
+    DocumentConfig {
+        viewed_reset: config.viewed_reset,
+        fold_viewed: config.fold_viewed(),
+        ..DocumentConfig::default()
     }
 }
 
@@ -5326,6 +5424,9 @@ const fn item_hints(cursor: Option<&ItemKey>) -> &'static [(&'static str, &'stat
 /// Actions whose first key the footer hints show.
 const HINT_ACTIONS: &[&str] = &[
     "assistant_toggle",
+    "guide_toggle",
+    "guide_next",
+    "guide_back",
     "compare_view",
     "compare_baseline",
     "publish",
@@ -5425,7 +5526,7 @@ impl View for ReviewSurface {
                     .map(|key| ((*action).to_owned(), key))
             })
             .collect();
-        for scope in [FILES_SCOPE, THREADS_SCOPE] {
+        for scope in [FILES_SCOPE, THREADS_SCOPE, GUIDE_SCOPE] {
             for action in crate::keymap::actions_for(scope) {
                 if let Some(key) = host.keymap_keys(scope, &action.id).into_iter().next() {
                     let name = action
@@ -5596,6 +5697,9 @@ impl View for ReviewSurface {
         if self.review.is_some() && !self.notes_requested {
             self.notes_requested = true;
             self.load_notes(host);
+        }
+        if self.review.is_some() {
+            self.request_guide(host);
         }
         if self.review.is_some() {
             self.start_comparison(host);

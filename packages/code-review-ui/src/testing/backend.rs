@@ -99,6 +99,16 @@ impl TestBackend {
         self
     }
 
+    /// Use `config` for guided reviews.
+    #[must_use]
+    pub fn with_guide_config(
+        mut self,
+        config: bcode_code_review::guide::config::GuideConfig,
+    ) -> Self {
+        self.services = self.services.with_guide(config);
+        self
+    }
+
     /// Use `config` for comparisons with earlier versions.
     #[must_use]
     pub fn with_compare_config(mut self, config: crate::config::compare::CompareConfig) -> Self {

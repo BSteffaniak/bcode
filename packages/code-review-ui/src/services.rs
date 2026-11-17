@@ -250,6 +250,16 @@ store_operations! {
     models::SaveReviewAssistantPanelSizeRequest => models::SaveReviewAssistantPanelSizeResponse,
         models::OP_REVIEW_ASSISTANT_PANEL_SIZE_SAVE,
         |store, request| store.save_assistant_panel_size(&request);
+    models::ListReviewGuidesRequest => models::ListReviewGuidesResponse,
+        "guide.list", |store, request| store.list_guides(&request);
+    models::CreateReviewGuideRequest => models::CreateReviewGuideResponse,
+        "guide.create", |store, request| store.create_guide(request);
+    models::GetGuideVersionRequest => models::GetGuideVersionResponse,
+        "guide.version.get", |store, request| store.guide_version(&request);
+    models::SaveGuideVersionRequest => models::SaveGuideVersionResponse,
+        "guide.version.save", |store, request| store.save_guide_version(request);
+    models::ListGuideSectionMarksRequest => models::ListGuideSectionMarksResponse,
+        "guide.marks.list", |store, request| store.list_guide_section_marks(&request);
     PreviewBundle => models::PublishReviewPreviewResponse,
         models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW,
         |_store, request| bcode_code_review::store::preview_bundle(&request.0);
@@ -280,6 +290,7 @@ pub struct ReviewServices {
     conversation: Arc<crate::config::conversation::ConversationConfig>,
     assistant: Arc<crate::assistant::profile::AssistantConfig>,
     compare: crate::config::compare::CompareConfig,
+    guide: Arc<bcode_code_review::guide::config::GuideConfig>,
     /// Providers and contributors: built-in ones, plus plugin-backed ones once found.
     providers: Arc<Mutex<ProviderRegistry>>,
     /// Whether plugin-backed providers were looked for (once, in the background).
@@ -313,6 +324,7 @@ impl ReviewServices {
             conversation: Arc::default(),
             assistant: Arc::default(),
             compare: crate::config::compare::CompareConfig::default(),
+            guide: Arc::default(),
             providers: Arc::default(),
             plugins_sought: Arc::default(),
             #[cfg(test)]
@@ -485,6 +497,19 @@ impl ReviewServices {
     #[must_use]
     pub const fn with_compare(mut self, config: crate::config::compare::CompareConfig) -> Self {
         self.compare = config;
+        self
+    }
+
+    /// How guided reviews are written and shown.
+    #[must_use]
+    pub fn guide_config(&self) -> Arc<bcode_code_review::guide::config::GuideConfig> {
+        Arc::clone(&self.guide)
+    }
+
+    /// Use `config` for guided reviews.
+    #[must_use]
+    pub fn with_guide(mut self, config: bcode_code_review::guide::config::GuideConfig) -> Self {
+        self.guide = Arc::new(config);
         self
     }
 

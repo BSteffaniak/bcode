@@ -120,6 +120,8 @@ pub struct LoadedConfig {
     pub compare: compare::CompareConfig,
     /// The review assistant, from the plugin table's `assistant` table.
     pub assistant: crate::assistant::profile::AssistantConfig,
+    /// Guided reviews, from the plugin table's `guide` table.
+    pub guide: bcode_code_review::guide::config::GuideConfig,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
     /// Configured theme selection (`[tui.theme]`).
@@ -238,6 +240,17 @@ fn read_plugin_table(table: &toml::Table, loaded: &mut LoadedConfig) {
         crate::assistant::profile::AssistantConfig::from_plugin_table(table);
     loaded.assistant = assistant;
     loaded.diagnostics.extend(problems);
+    let guide = table
+        .get("guide")
+        .and_then(|value| serde_json::to_value(value).ok());
+    let (guide, problems) =
+        bcode_code_review::guide::config::GuideConfig::from_value(guide.as_ref());
+    loaded.guide = guide;
+    loaded.diagnostics.extend(
+        problems
+            .into_iter()
+            .map(|problem| format!("plugins.config.\"{PLUGIN_ID}\".{problem}")),
+    );
     if let Some(stack) = table.get("stack") {
         match stack.clone().try_into::<ReviewStackLimit>() {
             Ok(limit) => loaded.stack_limit = limit,

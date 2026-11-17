@@ -432,6 +432,15 @@ pub struct ReviewPanelState {
     /// Threads panel height, under the document, as a share of the body height.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads_bottom_share: Option<u16>,
+    /// Whether the guide panel is visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_panel_visible: Option<bool>,
+    /// Guide panel width, beside the document, as a share of the body width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_right_share: Option<u16>,
+    /// Guide panel height, under the document, as a share of the body height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_bottom_share: Option<u16>,
 }
 
 /// Revealed context of one file.

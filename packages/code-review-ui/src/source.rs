@@ -91,6 +91,14 @@ impl VirtualItemSource<RowKey> for DocumentSource<'_> {
                     .annotation_stamp(item)
                     .wrapping_mul(0x9e37_79b9)
             }
+            Some(item @ (ReviewItem::Line(_) | ReviewItem::LinePair(_))) => {
+                // A guide badge reserves cells (wrapping can change), and the current section's
+                // tint changes how the row paints.
+                base ^ self
+                    .context
+                    .guide_stamp(index, item)
+                    .wrapping_mul(0xc2b2_ae35)
+            }
             Some(ReviewItem::Composer(_)) => {
                 base ^ self
                     .context

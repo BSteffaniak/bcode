@@ -43,6 +43,20 @@ pub enum Message {
     HistoryPanel(Result<bcode_code_review_models::StackTimeline, String>),
     /// Pull request conversation work finished.
     Conversation(Box<super::surface::ConversationMessage>),
+    /// The review's guides were read (load `generation`), or why they could not be.
+    Guide {
+        /// The guide load this answers.
+        generation: u64,
+        /// What was read.
+        result: Result<Box<super::guide::GuideLoaded>, String>,
+    },
+    /// A file the context peek shows was read (for `citation`), or why it could not be.
+    Peek {
+        /// The citation peeked at.
+        citation: String,
+        /// The file's lines.
+        result: Result<Vec<String>, String>,
+    },
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

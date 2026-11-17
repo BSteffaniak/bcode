@@ -163,6 +163,14 @@ pub struct Icons {
     pub file_rule: &'static str,
     /// Name of the BMUX spinner preset of busy items (`braille` or `ascii`).
     pub spinner: &'static str,
+    /// A guide citation whose quoted text checked out. Never the viewed or approval mark.
+    pub guide_verified: &'static str,
+    /// A guide citation not checked (no quote, or a problem), shown dimmed.
+    pub guide_unverified: &'static str,
+    /// A guide section or citation that no longer matches the code.
+    pub guide_stale: &'static str,
+    /// The guide itself: its panel and its chip.
+    pub guide_marker: &'static str,
 }
 
 impl Icons {
@@ -218,6 +226,10 @@ impl Icons {
         half_lower: "▄",
         file_rule: "─",
         spinner: "braille",
+        guide_verified: "◈",
+        guide_unverified: "◇",
+        guide_stale: "⚠",
+        guide_marker: "§",
     };
 
     /// ASCII glyphs.
@@ -272,6 +284,10 @@ impl Icons {
         half_lower: "-",
         file_rule: "-",
         spinner: "ascii",
+        guide_verified: "#",
+        guide_unverified: "?",
+        guide_stale: "!",
+        guide_marker: "S",
     };
 
     /// The glyph set of `style`.
@@ -428,8 +444,25 @@ pub struct ReviewTheme {
     pub publish: SplitButtonStyles,
     /// What a comparison marks: lines new since its baseline, its markers and summaries.
     pub since: SinceStyles,
+    /// What a guided review marks: citation badges and the current section's lines.
+    pub guide: GuideStyles,
     /// Glyphs.
     pub icons: Icons,
+}
+
+/// Styles of a guided review (see `docs/code-review-guide.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuideStyles {
+    /// The gutter of lines the current section cites: a tint of the accent.
+    pub focus: Style,
+    /// The badge of a verified citation.
+    pub badge: Style,
+    /// The badge of a citation not verified: dimmed.
+    pub unverified: Style,
+    /// What says cited code is outside the change (unchanged, outside the review).
+    pub context: Style,
+    /// A citation problem, or a section whose code changed.
+    pub problem: Style,
 }
 
 /// Styles of a comparison's marks (see `docs/review-stack-history.md`).
@@ -593,9 +626,7 @@ impl ReviewTheme {
             pane_title_focused: bold(tiers.accent),
             pill: pill(&tiers),
             pill_accent: tiers.on_accent,
-            pill_warning: bold(component.warning.fg.map_or(component.warning, |fg| {
-                Style::new().bg(fg).fg(on(fg, &tiers))
-            })),
+            pill_warning: pill_warning(&component, &tiers),
             selection_bar: bold(tiers.accent),
             accent: tiers.accent,
             muted: tiers.muted,
@@ -658,6 +689,7 @@ impl ReviewTheme {
             toasts: components.toasts,
             publish: components.publish,
             since: since_styles(&tiers, &component, &diff),
+            guide: guide_styles(&tiers, &component),
             icons,
         }
     }
@@ -1081,6 +1113,39 @@ fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyl
         removed_inline: Style::new().add_modifier(Modifier::CROSSED_OUT | Modifier::DIM),
         seen: Style::new().add_modifier(Modifier::DIM),
         label: ink.add_modifier(Modifier::BOLD),
+    }
+}
+
+/// A pill for something that needs the reviewer: the warning color filled, readable ink on it.
+fn pill_warning(component: &ComponentTheme, tiers: &Tiers) -> Style {
+    component
+        .warning
+        .fg
+        .map_or(component.warning, |fg| {
+            Style::new().bg(fg).fg(on(fg, tiers))
+        })
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Share of the accent in the gutter tint of the current guide section's lines.
+const GUIDE_FOCUS_SHARE: f64 = 0.35;
+
+fn guide_styles(tiers: &Tiers, component: &ComponentTheme) -> GuideStyles {
+    let accent = tiers.accent.fg;
+    let focus = tiers
+        .canvas
+        .bg
+        .and_then(|canvas| canvas.mix(accent?, GUIDE_FOCUS_SHARE))
+        .map_or_else(
+            || tiers.accent.add_modifier(Modifier::REVERSED),
+            |bg| Style::new().bg(bg).patch(tiers.strong),
+        );
+    GuideStyles {
+        focus: focus.add_modifier(Modifier::BOLD),
+        badge: tiers.accent.add_modifier(Modifier::BOLD),
+        unverified: tiers.dim,
+        context: tiers.muted.add_modifier(Modifier::ITALIC),
+        problem: component.warning,
     }
 }
 

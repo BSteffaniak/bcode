@@ -361,6 +361,77 @@ keymap_actions = [
     { id = "bcode.code_review.threads_back", scope = "code-review-threads", description = "Back to the review", defaults = [
         "esc",
     ] },
+    { id = "bcode.code_review.guide_toggle", scope = "code-review", description = "Guide: open, focus, or close the guide panel", defaults = [
+        "alt+g",
+    ] },
+    { id = "bcode.code_review.guide_next", scope = "code-review", description = "Guide: next citation, then the next section", defaults = [
+        "alt+down",
+    ] },
+    { id = "bcode.code_review.guide_previous", scope = "code-review", description = "Guide: previous citation, then the previous section", defaults = [
+        "alt+up",
+    ] },
+    { id = "bcode.code_review.guide_next_unreviewed", scope = "code-review", description = "Guide: next section not reviewed", defaults = [
+        "alt+u",
+    ] },
+    { id = "bcode.code_review.guide_at_line", scope = "code-review", description = "Guide: show the section citing the line", defaults = [
+        "'",
+    ] },
+    { id = "bcode.code_review.guide_back", scope = "code-review", description = "Guide: jump back to where the last guide jump left", defaults = [
+        "backspace",
+    ] },
+    { id = "bcode.code_review.guide_down", scope = "code-review-guide", description = "Next section", defaults = [
+        "j",
+        "down",
+    ] },
+    { id = "bcode.code_review.guide_up", scope = "code-review-guide", description = "Previous section", defaults = [
+        "k",
+        "up",
+    ] },
+    { id = "bcode.code_review.guide_open", scope = "code-review-guide", description = "Open the section and show its first citation", defaults = [
+        "enter",
+    ] },
+    { id = "bcode.code_review.guide_fold", scope = "code-review-guide", description = "Fold or unfold the section", defaults = [
+        "space",
+    ] },
+    { id = "bcode.code_review.guide_cite_next", scope = "code-review-guide", description = "Next citation of the section", defaults = [
+        "]",
+    ] },
+    { id = "bcode.code_review.guide_cite_previous", scope = "code-review-guide", description = "Previous citation of the section", defaults = [
+        "[",
+    ] },
+    { id = "bcode.code_review.guide_copy", scope = "code-review-guide", description = "Copy the section as markdown", defaults = [
+        "y",
+    ] },
+    { id = "bcode.code_review.guide_reviewed", scope = "code-review-guide", description = "Mark the section reviewed (not available yet)", defaults = [
+        "v",
+    ] },
+    { id = "bcode.code_review.guide_expand", scope = "code-review-guide", description = "Expand the section (not available yet)", defaults = [
+        "e",
+    ] },
+    { id = "bcode.code_review.guide_ask", scope = "code-review-guide", description = "Ask about the section (not available yet)", defaults = [
+        "a",
+    ] },
+    { id = "bcode.code_review.guide_comment", scope = "code-review-guide", description = "Draft a comment from the finding (not available yet)", defaults = [
+        "c",
+    ] },
+    { id = "bcode.code_review.guide_promote", scope = "code-review-guide", description = "Promote the provisional section (not available yet)", defaults = [
+        "p",
+    ] },
+    { id = "bcode.code_review.guide_discard", scope = "code-review-guide", description = "Discard the provisional section (not available yet)", defaults = [
+        "x",
+    ] },
+    { id = "bcode.code_review.guide_refresh", scope = "code-review-guide", description = "Refresh the section (not available yet)", defaults = [
+        "r",
+    ] },
+    { id = "bcode.code_review.guide_restructure", scope = "code-review-guide", description = "Restructure the guide (not available yet)", defaults = [
+        "shift+r",
+    ] },
+    { id = "bcode.code_review.guide_versions", scope = "code-review-guide", description = "Versions of the guide (not available yet)", defaults = [
+        "shift+v",
+    ] },
+    { id = "bcode.code_review.guide_leave", scope = "code-review-guide", description = "Back to the review", defaults = [
+        "esc",
+    ] },
     { id = "bcode.code_review.home_down", scope = "code-review-home", description = "Next review", defaults = [
         "j",
         "down",

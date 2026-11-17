@@ -19,6 +19,8 @@ pub const COMPOSER_SCOPE: &str = "code-review-composer";
 pub const FILES_SCOPE: &str = "code-review-files";
 /// Thread panel scope.
 pub const THREADS_SCOPE: &str = "code-review-threads";
+/// Guide panel scope.
+pub const GUIDE_SCOPE: &str = "code-review-guide";
 /// Review assistant dock scope.
 pub const ASSISTANT_SCOPE: &str = "code-review-assistant";
 /// Review assistant conversation history scope.
@@ -116,6 +118,7 @@ mod tests {
             COMPOSER_SCOPE,
             FILES_SCOPE,
             THREADS_SCOPE,
+            GUIDE_SCOPE,
             ASSISTANT_SCOPE,
             ASSISTANT_HISTORY_SCOPE,
             FEED_SCOPE,
@@ -222,6 +225,7 @@ mod tests {
             crate::wizard::WIZARD_SCOPE,
             crate::surface::FILES_SCOPE,
             crate::surface::THREADS_SCOPE,
+            crate::surface::GUIDE_SCOPE,
             crate::surface::COMPOSER_SCOPE,
             crate::surface::FEED_SCOPE,
             crate::assistant::ASSISTANT_SCOPE,

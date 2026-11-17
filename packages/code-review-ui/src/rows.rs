@@ -6,7 +6,9 @@
 //! cached rows, so their geometry always agrees.
 //!
 //! * Diff lines and side-by-side pairs are laid out by BMUX `layout_diff_row` with one gutter
-//!   per document, intra-line emphasis, syntax ranges, and an explicit overflow policy.
+//!   per document, intra-line emphasis, syntax ranges, and an explicit overflow policy. A guide
+//!   citation's badge is a trailing adornment BMUX measures and places (reserving its cells),
+//!   and its click target is the cells the layout reports it painted.
 //! * Header, hunk, notice, gap, and annotation rows are composed from styled spans and clipped
 //!   by BMUX text primitives (`Line::truncate`, `place_trailing`); nothing measures text by
 //!   bytes or characters.
@@ -31,9 +33,9 @@ use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span, TrailingAlign, TrailingPlacement};
 use bmux_tui::text_width::display_width;
 use bmux_tui_components::diff_viewer::{
-    ChangedRange, DiffLineKind, DiffRowCell, DiffRowGutter, DiffRowItem, DiffRowLayout,
-    DiffRowOptions, DiffRowOverflow, DiffRowText, DiffSourceSide, DiffSyntaxRange, diff_row_height,
-    intraline_changed_ranges, layout_diff_row,
+    ChangedRange, DiffGutterMode, DiffLineKind, DiffRowCell, DiffRowGutter, DiffRowItem,
+    DiffRowLayout, DiffRowOptions, DiffRowOverflow, DiffRowText, DiffRowTrailing, DiffSourceSide,
+    DiffSyntaxRange, DiffTrailingFit, diff_row_height, intraline_changed_ranges, layout_diff_row,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -301,6 +303,8 @@ pub enum ItemAction {
     Card(card::CardAction),
     /// A part of a comparison's rows.
     Compare(compare::CompareAction),
+    /// A guide citation's badge, by its number.
+    Guide(u16),
 }
 
 /// Clickable cells on one row of an item.
@@ -455,6 +459,8 @@ struct CacheKey {
     syntax: u64,
     annotation_revision: u64,
     content: ContentStamp,
+    /// The guide's marks on a diff row (see [`RowContext::guide_stamp`]).
+    guide: u64,
 }
 
 /// Load state of one line's text, for [`ContentStamp`].
@@ -684,6 +690,8 @@ pub struct RowContext<'a> {
     pub search: Option<&'a SearchHighlights>,
     /// What pull request cards are drawn from.
     pub cards: Option<card::CardContext<'a>>,
+    /// The guide's citation markers.
+    pub guide: Option<&'a crate::guide::GuideMarks>,
 }
 
 impl RowContext<'_> {
@@ -705,6 +713,7 @@ impl RowContext<'_> {
             },
             annotation_revision: self.annotation_stamp(item),
             content: ContentStamp::of(item),
+            guide: self.guide_stamp(index, item),
         };
         self.cache.borrow_mut().get_or_build(key, || {
             let mut rows = self.build(index, item, width);
@@ -736,6 +745,83 @@ impl RowContext<'_> {
         }
     }
 
+    /// The guide's marks of the diff item at `index` on its old and new sides: a citation badge
+    /// where a cited range starts showing, and whether the current section cites the line.
+    #[must_use]
+    pub fn guide_marks(&self, index: usize, item: &ReviewItem) -> [crate::guide::RowMarks; 2] {
+        use crate::guide::RowMarks;
+        let Some(marks) = self.guide.filter(|marks| !marks.is_empty()) else {
+            return [RowMarks::default(); 2];
+        };
+        // The line the item before shows on `side`, when it is a diff row of the same file.
+        let previous = |file: &bcode_code_review::document::FileKey, side: ReviewLineSide| {
+            let item = self.doc.item(index.checked_sub(1)?)?;
+            match (item, side) {
+                (ReviewItem::Line(line), ReviewLineSide::Old) if *line.file == *file => {
+                    line.old_line
+                }
+                (ReviewItem::Line(line), ReviewLineSide::New) if *line.file == *file => {
+                    line.new_line
+                }
+                (ReviewItem::LinePair(pair), ReviewLineSide::Old) if *pair.file == *file => {
+                    pair.old.as_ref().map(|side| side.line)
+                }
+                (ReviewItem::LinePair(pair), ReviewLineSide::New) if *pair.file == *file => {
+                    pair.new.as_ref().map(|side| side.line)
+                }
+                _ => None,
+            }
+        };
+        let at = |file: &bcode_code_review::document::FileKey, side, line: Option<u32>| {
+            line.map_or_else(RowMarks::default, |line| {
+                marks.at(file, side, line, previous(file, side))
+            })
+        };
+        match item {
+            ReviewItem::Line(line) => [
+                at(&line.file, ReviewLineSide::Old, line.old_line),
+                at(&line.file, ReviewLineSide::New, line.new_line),
+            ],
+            ReviewItem::LinePair(pair) => [
+                at(
+                    &pair.file,
+                    ReviewLineSide::Old,
+                    pair.old.as_ref().map(|side| side.line),
+                ),
+                at(
+                    &pair.file,
+                    ReviewLineSide::New,
+                    pair.new.as_ref().map(|side| side.line),
+                ),
+            ],
+            _ => [RowMarks::default(); 2],
+        }
+    }
+
+    /// Stamp of the guide's marks on the diff item at `index` (zero for other items and rows
+    /// without marks), so its rows are built again when they change.
+    #[must_use]
+    pub fn guide_stamp(&self, index: usize, item: &ReviewItem) -> u64 {
+        if !is_diff_row(item) {
+            return 0;
+        }
+        let [old, new] = self.guide_marks(index, item);
+        old.stamp().rotate_left(32) ^ new.stamp()
+    }
+
+    /// Badge spans of `marks`, when it has a badge.
+    fn badge(&self, marks: crate::guide::RowMarks) -> Option<Vec<Span>> {
+        marks.badge.map(|badge| {
+            crate::guide::panel::badge_spans(badge.number, badge.glyph, &self.params.theme)
+        })
+    }
+
+    /// The badge a unified line shows: its new side's, else its old side's.
+    const fn unified_badge(marks: [crate::guide::RowMarks; 2]) -> crate::guide::RowMarks {
+        let [old, new] = marks;
+        if new.badge.is_some() { new } else { old }
+    }
+
     /// Stamp of the highlights both blob sides of a diff row's file have, so its cached rows
     /// are rebuilt only when a highlight for that file lands.
     fn syntax_stamp(&self, item: &ReviewItem) -> u64 {
@@ -756,25 +842,42 @@ impl RowContext<'_> {
     #[must_use]
     pub fn height(&self, index: usize, width: u16) -> Option<u64> {
         let styles = &self.params.theme;
-        let height = match self.doc.item(index)? {
-            ReviewItem::Line(line) => diff_row_height(
-                DiffRowItem::Unified {
-                    kind: diff_kind(line.kind),
-                    old_line: line.old_line,
-                    new_line: line.new_line,
-                    text: DiffRowText::plain(content_text(&line.content, styles).0),
-                },
-                width,
-                self.options(),
-            ) as u64,
-            ReviewItem::LinePair(pair) => diff_row_height(
-                DiffRowItem::SideBySide {
-                    old: pair.old.as_ref().map(|side| plain_cell(side, styles)),
-                    new: pair.new.as_ref().map(|side| plain_cell(side, styles)),
-                },
-                width,
-                self.options(),
-            ) as u64,
+        let item = self.doc.item(index)?;
+        let height = match item {
+            ReviewItem::Line(line) => {
+                let badge = self.badge(Self::unified_badge(self.guide_marks(index, item)));
+                diff_row_height(
+                    DiffRowItem::Unified {
+                        kind: diff_kind(line.kind),
+                        old_line: line.old_line,
+                        new_line: line.new_line,
+                        text: with_badge(
+                            DiffRowText::plain(content_text(&line.content, styles).0),
+                            badge.as_deref(),
+                        ),
+                    },
+                    width,
+                    self.options(),
+                ) as u64
+            }
+            ReviewItem::LinePair(pair) => {
+                let [old_marks, new_marks] = self.guide_marks(index, item);
+                let (old_badge, new_badge) = (self.badge(old_marks), self.badge(new_marks));
+                diff_row_height(
+                    DiffRowItem::SideBySide {
+                        old: pair
+                            .old
+                            .as_ref()
+                            .map(|side| plain_cell(side, styles, old_badge.as_deref())),
+                        new: pair
+                            .new
+                            .as_ref()
+                            .map(|side| plain_cell(side, styles, new_badge.as_deref())),
+                    },
+                    width,
+                    self.options(),
+                ) as u64
+            }
             ReviewItem::Placeholder(placeholder) => u64::from(placeholder.estimated_rows.max(1)),
             ReviewItem::Thread(_)
             | ReviewItem::AgentThread(_)
@@ -890,7 +993,7 @@ impl RowContext<'_> {
                 self.gutter_indent(width),
             ),
             ReviewItem::Line(line) => self.unified_rows(index, line, width),
-            ReviewItem::LinePair(pair) => self.pair_rows(pair, width),
+            ReviewItem::LinePair(pair) => self.pair_rows(index, pair, width),
             ReviewItem::Gap(gap) => gap_rows(gap, self.params, cells, self.gutter_indent(width)),
             ReviewItem::Thread(thread) => thread_rows(
                 thread,
@@ -967,14 +1070,23 @@ impl RowContext<'_> {
             let words = compare::word_ranges(was, text);
             syntax = compare::with_word_marks(&syntax, &words, styles.since.word);
         }
+        let guide = self.doc.item(index).map_or_else(
+            || [crate::guide::RowMarks::default(); 2],
+            |item| self.guide_marks(index, item),
+        );
+        let shown = Self::unified_badge(guide);
+        let badge = self.badge(shown);
         let layout = layout_diff_row(
             DiffRowItem::Unified {
                 kind,
                 old_line: line.old_line,
                 new_line: line.new_line,
-                text: DiffRowText::plain(text)
-                    .with_changed_ranges(&changed)
-                    .with_syntax(&syntax),
+                text: with_badge(
+                    DiffRowText::plain(text)
+                        .with_changed_ranges(&changed)
+                        .with_syntax(&syntax),
+                    badge.as_deref(),
+                ),
             },
             width,
             self.options(),
@@ -989,7 +1101,53 @@ impl RowContext<'_> {
         if line.seen {
             self.dim_seen(&mut rows.lines);
         }
+        let focus = guide[0].focus || guide[1].focus;
+        self.paint_guide(
+            &mut rows,
+            |_| focus,
+            |_| shown.badge.map(|badge| badge.number),
+        );
         rows
+    }
+
+    /// Tint the gutter of `rows`' sides the current guide section cites, and make each badge the
+    /// layout painted clickable.
+    fn paint_guide(
+        &self,
+        rows: &mut ItemRows,
+        focus: impl Fn(DiffSourceSide) -> bool,
+        badge: impl Fn(DiffSourceSide) -> Option<u16>,
+    ) {
+        let Some(layout) = rows.diff.as_ref() else {
+            return;
+        };
+        for column in layout.columns() {
+            if !column.present || !focus(column.side) || column.gutter == DiffGutterMode::Empty {
+                continue;
+            }
+            let gutter = column.cells.start..column.content.start;
+            if gutter.is_empty() {
+                continue;
+            }
+            for line in &mut rows.lines {
+                *line = patch_cells(line, gutter.clone(), self.params.theme.guide.focus);
+            }
+        }
+        for trailing in layout.trailing() {
+            let (Some(number), Ok(row), Ok(start), Ok(end)) = (
+                badge(trailing.side),
+                u16::try_from(trailing.row),
+                u16::try_from(trailing.cells.start),
+                u16::try_from(trailing.cells.end),
+            ) else {
+                continue;
+            };
+            rows.actions.push(ActionCells {
+                row,
+                cells: start..end,
+                action: ItemAction::Guide(number),
+            });
+        }
     }
 
     /// Dim `lines` of a hunk with nothing new since the baseline, when such hunks dim.
@@ -1001,8 +1159,13 @@ impl RowContext<'_> {
         }
     }
 
-    fn pair_rows(&self, pair: &LinePairItem, width: u16) -> ItemRows {
+    fn pair_rows(&self, index: usize, pair: &LinePairItem, width: u16) -> ItemRows {
         let styles = &self.params.theme;
+        let guide = self.doc.item(index).map_or_else(
+            || [crate::guide::RowMarks::default(); 2],
+            |item| self.guide_marks(index, item),
+        );
+        let (old_badge, new_badge) = (self.badge(guide[0]), self.badge(guide[1]));
         let emphasis = if pair.emphasize {
             match (
                 pair.old.as_ref().and_then(|side| side.content.text()),
@@ -1034,8 +1197,12 @@ impl RowContext<'_> {
         let (old_since, new_since) = (marked(pair.old.as_ref()), marked(pair.new.as_ref()));
         let layout = layout_diff_row(
             DiffRowItem::SideBySide {
-                old: old.as_ref().map(|side| pair_cell(side, &emphasis.old)),
-                new: new.as_ref().map(|side| pair_cell(side, &emphasis.new)),
+                old: old
+                    .as_ref()
+                    .map(|side| pair_cell(side, &emphasis.old, old_badge.as_deref())),
+                new: new
+                    .as_ref()
+                    .map(|side| pair_cell(side, &emphasis.new, new_badge.as_deref())),
             },
             width,
             self.options(),
@@ -1059,6 +1226,15 @@ impl RowContext<'_> {
         if pair.seen {
             self.dim_seen(&mut rows.lines);
         }
+        let side = |side: DiffSourceSide| match side {
+            DiffSourceSide::Old => guide[0],
+            DiffSourceSide::New => guide[1],
+        };
+        self.paint_guide(
+            &mut rows,
+            |at| side(at).focus,
+            |at| side(at).badge.map(|badge| badge.number),
+        );
         rows
     }
 
@@ -1176,24 +1352,61 @@ impl RowContext<'_> {
 }
 
 /// One side of a pair without emphasis or syntax (geometry only).
-fn plain_cell<'a>(side: &'a PairSide, styles: &ReviewTheme) -> DiffRowCell<'a> {
+fn plain_cell<'a>(
+    side: &'a PairSide,
+    styles: &ReviewTheme,
+    badge: Option<&'a [Span]>,
+) -> DiffRowCell<'a> {
     DiffRowCell::new(
         diff_kind(side.kind),
         Some(side.line),
-        DiffRowText::plain(content_text(&side.content, styles).0),
+        with_badge(
+            DiffRowText::plain(content_text(&side.content, styles).0),
+            badge,
+        ),
     )
+}
+
+/// `text` with a guide citation badge as its trailing adornment, reserving its cells so it is
+/// never painted over content.
+const fn with_badge<'a>(text: DiffRowText<'a>, badge: Option<&'a [Span]>) -> DiffRowText<'a> {
+    match badge {
+        Some(spans) => text.with_trailing(DiffRowTrailing::new(spans, DiffTrailingFit::Reserve)),
+        None => text,
+    }
+}
+
+/// `line` with `style` patched over its cells `cells`.
+fn patch_cells(line: &Line, cells: Range<usize>, style: Style) -> Line {
+    let width = line.width();
+    let start = cells.start.min(width);
+    let end = cells.end.min(width);
+    if start >= end {
+        return line.clone();
+    }
+    let mut spans = line.viewport(0, start).spans;
+    spans.extend(line.viewport(start, end - start).patch_style(style).spans);
+    spans.extend(line.viewport(end, width - end).spans);
+    Line::from_spans(spans)
 }
 
 /// One laid-out side of a side-by-side pair.
 type PairCell<'s> = (LineKind, u32, &'s str, Vec<DiffSyntaxRange>);
 
-fn pair_cell<'a>(side: &'a PairCell<'_>, changed: &'a [ChangedRange]) -> DiffRowCell<'a> {
+fn pair_cell<'a>(
+    side: &'a PairCell<'_>,
+    changed: &'a [ChangedRange],
+    badge: Option<&'a [Span]>,
+) -> DiffRowCell<'a> {
     DiffRowCell::new(
         diff_kind(side.0),
         Some(side.1),
-        DiffRowText::plain(side.2)
-            .with_changed_ranges(changed)
-            .with_syntax(&side.3),
+        with_badge(
+            DiffRowText::plain(side.2)
+                .with_changed_ranges(changed)
+                .with_syntax(&side.3),
+            badge,
+        ),
     )
 }
 

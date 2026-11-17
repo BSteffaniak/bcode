@@ -637,7 +637,15 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
         }
         let doc = scenario.surface().document().unwrap();
         let syntax = SyntaxStore::default();
-        for overflow in [DiffRowOverflow::Wrap, DiffRowOverflow::Truncate] {
+        // Guide badges on every run of every file's lines, both sides: their reserved cells must
+        // be measured as they are built.
+        let marks = every_line_cited(doc);
+        for (overflow, guide) in [
+            (DiffRowOverflow::Wrap, None),
+            (DiffRowOverflow::Truncate, None),
+            (DiffRowOverflow::Wrap, Some(&marks)),
+            (DiffRowOverflow::Truncate, Some(&marks)),
+        ] {
             let params = ViewParams {
                 theme: ReviewTheme::derive(None, IconStyle::Unicode),
                 overflow,
@@ -667,6 +675,7 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
                 composer: None,
                 search: None,
                 cards: None,
+                guide,
             };
             for index in 0..doc.len() {
                 for width in [0_u16, 1, 2, 5, 9, 14, 30, 61, 130] {
@@ -680,6 +689,85 @@ fn measurement_hints_equal_the_built_rows_of_every_item() {
             }
         }
     }
+}
+
+/// Guide markers citing every line of every file of `doc` on both sides.
+fn every_line_cited(doc: &bcode_code_review::document::ReviewDocument) -> crate::guide::GuideMarks {
+    use bcode_code_review_models::{
+        Citation, CitationRelation, GuideOrigin, GuideScope, GuideStatus, GuideVersion,
+        REVIEW_GUIDE_SCHEMA_VERSION, ReviewGuide, ReviewLineInterval, ReviewLineSide, RevisionRef,
+        Section, SectionKind, SectionState, Verification,
+    };
+    let mut citations = std::collections::BTreeMap::new();
+    for (index, file) in doc.file_keys().enumerate() {
+        for side in [ReviewLineSide::Old, ReviewLineSide::New] {
+            let id = format!("c{index}{side:?}");
+            citations.insert(
+                id.clone(),
+                Citation {
+                    id,
+                    source_id: Some(file.source_id.clone()),
+                    path: file.path.clone(),
+                    side,
+                    lines: ReviewLineInterval {
+                        start: 1,
+                        end: 100_000,
+                    },
+                    revision: RevisionRef::WorkingTree,
+                    blob_oid: None,
+                    quote_hash: String::new(),
+                    excerpt: String::new(),
+                    relation: CitationRelation::Changed,
+                    verification: Verification::Unverified,
+                },
+            );
+        }
+    }
+    let ids: Vec<String> = citations.keys().cloned().collect();
+    let version = GuideVersion {
+        guide_id: "g".to_owned(),
+        version: 1,
+        schema_version: REVIEW_GUIDE_SCHEMA_VERSION,
+        heads: std::collections::BTreeMap::new(),
+        based_on: None,
+        origin: GuideOrigin::default(),
+        status: GuideStatus::Complete,
+        generation: None,
+        outline: vec![Section {
+            id: "s1".to_owned(),
+            kind: SectionKind::Step,
+            title: "everything".to_owned(),
+            body: String::new(),
+            findings: Vec::new(),
+            citations: ids,
+            children: Vec::new(),
+            state: SectionState::Written,
+            refreshed_from: None,
+            checks: Vec::new(),
+        }],
+        citations,
+        retired_sections: Vec::new(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let guide = ReviewGuide {
+        guide_id: "g".to_owned(),
+        review_key: String::new(),
+        scope: GuideScope::Review,
+        parent_guide_id: None,
+        title: "g".to_owned(),
+        current_version: 1,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        archived_at_ms: None,
+    };
+    let active = crate::guide::ActiveGuide::new(guide, version, Vec::new(), None);
+    crate::guide::GuideMarks::build(
+        &active,
+        bcode_code_review::guide::config::Markers::All,
+        true,
+        1,
+    )
 }
 
 #[test]
