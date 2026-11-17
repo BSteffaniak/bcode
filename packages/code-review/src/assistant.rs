@@ -487,7 +487,7 @@ impl<'a> ReviewTools<'a> {
                 (
                     binding.workspace,
                     binding.resolved,
-                    binding.stacks,
+                    binding.stacks.to_stacks(),
                     Some(session_id.clone()),
                 )
             }

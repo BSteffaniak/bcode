@@ -663,7 +663,7 @@ fn the_history_lists_every_conversation_and_switches_to_the_one_searched() {
         session_id: "legacy-session".to_owned(),
         workspace: setup.other.clone(),
         resolved: Vec::new(),
-        stacks: Vec::new(),
+        stacks: bcode_code_review_models::ReviewAssistantStacks::default(),
         created_at_ms: 0,
         updated_at_ms: 0,
         started: None,

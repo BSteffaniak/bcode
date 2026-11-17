@@ -141,7 +141,9 @@ impl Harness {
                     session_id: session.to_owned(),
                     workspace: workspace.clone(),
                     resolved: resolved.sources,
-                    stacks: resolved.stacks,
+                    stacks: bcode_code_review_models::ReviewAssistantStacks::from_stacks(
+                        &resolved.stacks,
+                    ),
                     created_at_ms: 0,
                     updated_at_ms: 0,
                     started: None,

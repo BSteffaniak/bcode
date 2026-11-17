@@ -19,8 +19,8 @@ use crate::context::UiContext;
 use crate::loader::Message;
 use bcode_code_review::document::{FileRef, ItemKey};
 use bcode_code_review_models::{
-    REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION, ReviewAssistantBinding, ReviewLineSide,
-    ReviewWorkspace,
+    REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION, ReviewAssistantBinding, ReviewAssistantStacks,
+    ReviewLineSide, ReviewWorkspace,
 };
 use bmux_tui_components::status_bar::StatusSeverity;
 use bmux_tui_components::toast_stack::ToastSeverity;
@@ -124,23 +124,20 @@ impl ReviewSurface {
     pub(super) fn assistant_binding(&mut self, session_id: String) -> ReviewAssistantBinding {
         let workspace = self.workspace_mut().clone();
         let (resolved, stacks) = self.review.as_ref().map_or_else(
-            || (Vec::new(), Vec::new()),
+            || (Vec::new(), ReviewAssistantStacks::default()),
             |review| {
                 let mut resolved = Vec::new();
-                let mut stacks = Vec::new();
+                let mut stacks: Vec<&bcode_code_review_models::ResolvedReviewStack> = Vec::new();
+                let mut seen = BTreeSet::new();
                 for group in review.doc.groups() {
                     resolved.push(group.source.clone());
                     if let Some(stack) = group.stack
-                        && !stacks.iter().any(
-                            |known: &bcode_code_review_models::ResolvedReviewStack| {
-                                known.source_id == stack.stack.source_id
-                            },
-                        )
+                        && seen.insert(stack.stack.source_id.as_str())
                     {
-                        stacks.push(stack.stack.clone());
+                        stacks.push(&stack.stack);
                     }
                 }
-                (resolved, stacks)
+                (resolved, ReviewAssistantStacks::from_stacks(stacks))
             },
         );
         ReviewAssistantBinding {

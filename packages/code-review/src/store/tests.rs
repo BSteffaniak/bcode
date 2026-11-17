@@ -1605,7 +1605,7 @@ fn assistant_bindings_keep_where_they_started_and_list_and_unbind() {
                     session_id: session.to_owned(),
                     workspace,
                     resolved: Vec::new(),
-                    stacks: Vec::new(),
+                    stacks: bcode_code_review_models::ReviewAssistantStacks::default(),
                     created_at_ms: 0,
                     updated_at_ms: 0,
                     started: None,

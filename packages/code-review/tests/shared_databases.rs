@@ -121,7 +121,7 @@ fn worker(role: &str, repo: &Path, state: &Path, run_for: Duration) -> Vec<Strin
                         session_id: format!("{role}-session"),
                         workspace: recorded,
                         resolved: Vec::new(),
-                        stacks: Vec::new(),
+                        stacks: bcode_code_review_models::ReviewAssistantStacks::default(),
                         created_at_ms: 0,
                         updated_at_ms: 0,
                         started: None,

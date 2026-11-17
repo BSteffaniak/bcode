@@ -345,7 +345,7 @@ mod tests {
             session_id: session.to_owned(),
             workspace: workspace(id, title),
             resolved: Vec::new(),
-            stacks: Vec::new(),
+            stacks: bcode_code_review_models::ReviewAssistantStacks::default(),
             created_at_ms: updated,
             updated_at_ms: updated,
             started: None,
