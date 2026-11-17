@@ -387,7 +387,7 @@ fn a_review_without_a_guide_says_how_to_get_one() {
         screen.text()
     );
     assert!(
-        screen.contains("Ask the review assistant"),
+        screen.contains("enter asks the review"),
         "{}",
         screen.text()
     );
@@ -397,6 +397,17 @@ fn a_review_without_a_guide_says_how_to_get_one() {
         screen.contains("no guide for this review yet"),
         "{}",
         screen.text()
+    );
+    // `enter` on the empty panel asks the assistant for a walkthrough.
+    setup.scenario.surface_mut().take_assistant_requests();
+    setup.scenario.key("enter");
+    stable(&mut setup.scenario);
+    assert_eq!(
+        setup.scenario.surface_mut().take_assistant_requests(),
+        vec![crate::assistant::LinkRequest::Message {
+            text: crate::surface::WALKTHROUGH.to_owned(),
+            send: true,
+        }]
     );
 }
 

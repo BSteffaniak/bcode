@@ -12,6 +12,11 @@
 //!
 //! Every row comes from the bounded [`Feed`](crate::agent::Feed), so a card's height is bounded
 //! whatever the session did.
+//!
+//! In the review assistant's conversation ([`dock_rows`]), a turn that writes the guide on
+//! screen shows one live guide card ([`GuideCard`]) in place of its guide tool lines: the
+//! guide's sections as the review reads them, each one a click away in the diff. Turns of other
+//! guides, and failed guide calls, keep their ordinary tool lines.
 
 use super::{
     ActionCells, AgentAction, Folds, ItemAction, ItemRows, Look, SuggestionAction, action_row,
@@ -20,6 +25,7 @@ use super::{
 };
 use crate::agent::feed::{FeedItem, PendingPermission, TOOL_TAIL_LINES, ToolLine, ToolState, Turn};
 use crate::agent::{AgentPhase, AgentState, AgentStreams};
+use crate::guide::{CardSectionState, CardStatus, GuideCard};
 use crate::theme::ReviewTheme;
 use bcode_code_review_models::{ReviewAiExchange, ReviewAiExchangeStatus};
 use bmux_tui::style::Modifier;
@@ -35,6 +41,16 @@ const ERROR_ROWS: usize = 3;
 const MODEL_LABEL_CELLS: usize = 40;
 /// Cells continuation rows of an error are indented by (under its text, past the icon).
 const ERROR_INDENT: usize = 2;
+
+/// Cells of indentation per section depth on a guide card (deeper sections indent no further
+/// than [`GUIDE_CARD_MAX_DEPTH`]).
+const GUIDE_CARD_INDENT: usize = 2;
+/// Depth past which guide card rows stop indenting.
+const GUIDE_CARD_MAX_DEPTH: u16 = 3;
+/// Tools whose lines a guide card replaces (the guide tools).
+const GUIDE_TOOL_PREFIX: &str = "code_review.guide.";
+/// Guide tools that write; a turn calling one of them shows a guide card.
+const GUIDE_WRITE_TOOLS: [&str; 2] = ["code_review.guide.start", "code_review.guide.write"];
 
 /// Separator between a feed item's key and the exchange it belongs to, in [`Folds::feed_open`].
 const OPEN_SEPARATOR: char = '\u{1f}';
@@ -53,6 +69,53 @@ pub fn item_id(item: &FeedItem) -> Option<&str> {
         FeedItem::Tool(tool) => Some(&tool.id),
         _ => None,
     }
+}
+
+/// The `guide_id` a guide tool call's JSON arguments name. Arguments are kept bounded, so a
+/// long call may be cut: the id is then read from the text before the cut.
+#[must_use]
+pub fn guide_id_of(arguments: &str) -> Option<String> {
+    if let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(arguments)
+    {
+        return object
+            .get("guide_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned);
+    }
+    let rest = &arguments[arguments.find("\"guide_id\"")? + "\"guide_id\"".len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let id: String = rest
+        .chars()
+        .take_while(|c| *c != '"' && *c != '\\')
+        .collect();
+    (!id.trim().is_empty() && rest[id.len()..].starts_with('"')).then_some(id)
+}
+
+/// Whether `turn` writes the guide `card` shows, so the card stands in for its guide tool
+/// lines: it calls a guide write tool naming the card's guide, or (when none of its writes
+/// names a guide, a guide started without an id) the card's version is written by `session`.
+fn writes_guide(turn: &Turn, card: &GuideCard, session: &str) -> bool {
+    let mut writes = false;
+    let mut named = false;
+    for item in &turn.items {
+        let FeedItem::Tool(tool) = item else {
+            continue;
+        };
+        if !GUIDE_WRITE_TOOLS.contains(&tool.name.as_str()) {
+            continue;
+        }
+        writes = true;
+        if let Some(id) = guide_id_of(&tool.arguments) {
+            if id == card.guide_id {
+                return true;
+            }
+            named = true;
+        }
+    }
+    writes && !named && card.session.as_deref() == Some(session)
 }
 
 /// The turn an exchange's card shows, and whether it is the session's newest turn.
@@ -258,9 +321,18 @@ impl Card<'_> {
     }
 
     /// The items of `turn`; opened items are keyed by `exchange_id`, and the toggles of item `i`
-    /// carry `base + i`.
-    fn turn(&mut self, turn: &Turn, exchange_id: &str, folds: &Folds, base: usize) {
+    /// carry `base + i`. With `guide`, the turn's guide tool lines (except failed ones) give way
+    /// to that guide card, shown where the first of them was.
+    fn turn(
+        &mut self,
+        turn: &Turn,
+        exchange_id: &str,
+        folds: &Folds,
+        base: usize,
+        guide: Option<&GuideCard>,
+    ) {
         let theme = self.theme;
+        let mut card_shown = false;
         if turn.earlier > 0 {
             self.push(vec![Span::styled(
                 format!("+{} earlier", turn.earlier),
@@ -295,6 +367,16 @@ impl Card<'_> {
                             theme,
                         );
                         self.extend_indented(rows, 2);
+                    }
+                }
+                FeedItem::Tool(tool)
+                    if guide.is_some()
+                        && tool.name.starts_with(GUIDE_TOOL_PREFIX)
+                        && tool.state != ToolState::Failed =>
+                {
+                    if let Some(card) = guide.filter(|_| !card_shown) {
+                        card_shown = true;
+                        self.guide_card(card);
                     }
                 }
                 FeedItem::Tool(tool) => self.tool(tool, open, toggle),
@@ -368,6 +450,98 @@ impl Card<'_> {
         }
     }
 
+    /// A guide card: the guide's title, version and progress, its sections (each a click away
+    /// in the diff), and an Open button that shows the guide.
+    fn guide_card(&mut self, card: &GuideCard) {
+        let theme = self.theme;
+        let icons = &theme.icons;
+        let (status, style) = match card.status {
+            CardStatus::Writing => (
+                format!("{} writing {}/{}", icons.running, card.written, card.total),
+                theme.badge_draft,
+            ),
+            CardStatus::Finishing => (format!("{} finishing…", icons.running), theme.badge_draft),
+            CardStatus::Complete => (
+                format!(
+                    "{} {} section{}",
+                    icons.viewed,
+                    card.total,
+                    if card.total == 1 { "" } else { "s" }
+                ),
+                theme.badge_resolved,
+            ),
+            CardStatus::Stopped => (
+                format!("stopped · {}/{} written", card.written, card.total),
+                theme.muted,
+            ),
+            CardStatus::Failed => (
+                format!("failed · {}/{} written", card.written, card.total),
+                theme.error,
+            ),
+        };
+        self.push(vec![
+            Span::styled(icons.guide_marker, theme.accent),
+            Span::raw(" "),
+            Span::styled(
+                format!("Guide · v{} · ", card.version),
+                theme.accent.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(card.title.clone(), theme.tiers.strong),
+            Span::raw("  "),
+            Span::styled(status, style),
+        ]);
+        let mut writing_marked = !card.busy();
+        for section in &card.sections {
+            let (glyph, glyph_style, title_style) = match section.state {
+                CardSectionState::Planned => (icons.running, theme.tiers.dim, theme.tiers.dim),
+                CardSectionState::Written => (icons.unviewed, theme.muted, theme.text),
+                CardSectionState::Reviewed => (icons.viewed, theme.viewed, theme.text),
+                CardSectionState::Provisional => (icons.unviewed, theme.tiers.dim, theme.muted),
+            };
+            let depth = usize::from(section.depth.min(GUIDE_CARD_MAX_DEPTH));
+            let mut lead = vec![Span::raw(" ".repeat(GUIDE_CARD_INDENT * (depth + 1)))];
+            if section.current {
+                lead[0] = Span::raw(" ".repeat(GUIDE_CARD_INDENT * (depth + 1) - 1));
+                lead.push(Span::styled(icons.accent_bar, theme.accent));
+            }
+            lead.push(Span::styled(glyph, glyph_style));
+            lead.push(Span::raw(" "));
+            let mut label = format!("{} {}", section.number, section.title);
+            if !writing_marked && section.state == CardSectionState::Planned {
+                writing_marked = true;
+                label.push_str(" · writing…");
+            }
+            let style = if section.current {
+                title_style.add_modifier(Modifier::BOLD)
+            } else {
+                title_style
+            };
+            self.push_toggle(
+                lead,
+                label,
+                style,
+                ItemAction::Agent(AgentAction::GuideSection(
+                    u16::try_from(section.entry).unwrap_or(u16::MAX),
+                )),
+            );
+        }
+        if card.more > 0 {
+            self.push(vec![Span::styled(
+                format!(
+                    "{}+{} more section{}",
+                    " ".repeat(GUIDE_CARD_INDENT),
+                    card.more,
+                    if card.more == 1 { "" } else { "s" }
+                ),
+                theme.tiers.dim,
+            )]);
+        }
+        self.buttons(&[(
+            format!("Open guide {}", icons.external),
+            ItemAction::Agent(AgentAction::GuideOpen),
+        )]);
+    }
+
     fn tool(&mut self, tool: &ToolLine, open: bool, toggle: ItemAction) {
         let theme = self.theme;
         let (icon, style) = match tool.state {
@@ -438,7 +612,7 @@ impl Card<'_> {
         if let Some((turn, newest)) =
             state.and_then(|state| exchange_turn(exchange, state, newest_exchange))
         {
-            self.turn(turn, &exchange.exchange_id, folds, 0);
+            self.turn(turn, &exchange.exchange_id, folds, 0, None);
             return newest;
         }
         if let Some(state) = state.filter(|_| exchange.status != ReviewAiExchangeStatus::Pending) {
@@ -542,7 +716,8 @@ pub fn dock_key(session: &str) -> String {
 ///
 /// Every observed turn (the question as `▍you`, then reasoning, tool lines and answers as on an
 /// AI card), the pending permission prompt, and a status line while the session works. Toggles
-/// carry `turn index * MAX_TURN_ITEMS + item index`.
+/// carry `turn index * MAX_TURN_ITEMS + item index`. A turn writing `guide` (the guide on
+/// screen) shows its card in place of its guide tool lines.
 #[must_use]
 pub fn dock_rows(
     session: &str,
@@ -550,7 +725,7 @@ pub fn dock_rows(
     folds: &Folds,
     theme: &ReviewTheme,
     width: usize,
-    draft: bool,
+    (draft, guide): (bool, Option<&GuideCard>),
 ) -> (Vec<Line>, Vec<ActionCells<ItemAction>>) {
     let mut card = Card {
         theme,
@@ -572,11 +747,13 @@ pub fn dock_rows(
         if !turn.question.is_empty() {
             card.question(&turn.question);
         }
+        let guide = guide.filter(|guide| writes_guide(turn, guide, session));
         card.turn(
             turn,
             &key,
             folds,
             index * crate::agent::feed::MAX_TURN_ITEMS,
+            guide,
         );
     }
     if let Some(permission) = &state.feed.permission {
@@ -838,4 +1015,27 @@ fn card_buttons(card: &CardButtons<'_>) -> Vec<(String, ItemAction)> {
         buttons.push(("Delete".to_owned(), agent(AgentAction::Delete)));
     }
     buttons
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guide_id_of;
+
+    #[test]
+    fn a_guide_id_is_read_from_whole_or_cut_arguments() {
+        assert_eq!(
+            guide_id_of(r#"{"guide_id":"g-1","ops":[]}"#).as_deref(),
+            Some("g-1")
+        );
+        // Arguments are kept bounded; a cut call still names its guide before the cut.
+        assert_eq!(
+            guide_id_of(r#"{"guide_id": "g-2", "ops":[{"op":"put_section","body":"long…"#)
+                .as_deref(),
+            Some("g-2")
+        );
+        assert_eq!(guide_id_of(r#"{"title":"x"}"#), None);
+        assert_eq!(guide_id_of(r#"{"guide_id":"#), None);
+        assert_eq!(guide_id_of(r#"{"guide_id":"unterminated"#), None);
+        assert_eq!(guide_id_of(r#"{"guide_id":""}"#), None);
+    }
 }

@@ -148,7 +148,7 @@ pub mod compare;
 pub mod file;
 pub mod thread_card;
 
-pub use agent::{dock_key, dock_rows, exchange_turn, is_newest, item_id, open_key};
+pub use agent::{dock_key, dock_rows, exchange_turn, guide_id_of, is_newest, item_id, open_key};
 
 /// Presentation inputs shared by every row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +256,10 @@ pub enum AgentAction {
     Model,
     /// Open or close the feed item at this index of the card's turn (reasoning, tool output).
     Toggle(u16),
+    /// Show the guide section at this index (in reading order) of a guide card.
+    GuideSection(u16),
+    /// Show the guide of a guide card.
+    GuideOpen,
 }
 
 /// How threads and AI answers are folded (presentation only; persisted with the workspace).

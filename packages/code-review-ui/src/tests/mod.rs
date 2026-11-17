@@ -16,6 +16,7 @@ mod conversation;
 mod feed;
 mod files;
 mod guide;
+mod guide_assistant;
 mod interaction;
 mod parity;
 mod publish;

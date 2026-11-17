@@ -53,7 +53,7 @@ pub(super) fn user(text: &str) -> TranscriptViewItem {
     )
 }
 
-fn answer(text: &str) -> TranscriptViewItem {
+pub(super) fn answer(text: &str) -> TranscriptViewItem {
     item(
         "answer",
         TranscriptViewItemKind::AssistantMessage {
@@ -63,7 +63,7 @@ fn answer(text: &str) -> TranscriptViewItem {
 }
 
 /// A finished `name` call with `arguments`.
-fn tool(id: &str, name: &str, arguments: &str) -> TranscriptViewItem {
+pub(super) fn tool(id: &str, name: &str, arguments: &str) -> TranscriptViewItem {
     item(
         id,
         TranscriptViewItemKind::ToolInvocation {

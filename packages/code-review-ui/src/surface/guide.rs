@@ -83,6 +83,28 @@ pub(super) struct GuideUi {
     pub(super) peek: Option<Peek>,
     /// The guide load the next answer must come from.
     generation: u64,
+    /// The guide the next load shows instead of the one on screen.
+    pub(super) prefer: Option<Prefer>,
+    /// A reload was asked for while a load ran.
+    pub(super) reload_wanted: bool,
+    /// A `guide_show` call waiting for the guide it names to be read.
+    pub(super) pending_show: Option<crate::assistant::actions::GuideShowArguments>,
+    /// A guide jump happened since the app last asked (it then shows the assistant's Guide tab
+    /// when the guide cannot dock).
+    pub(super) stepped: bool,
+    /// The guide card as last built, with the state revision it was built at.
+    pub(super) card: RefCell<Option<(u64, std::sync::Arc<crate::guide::GuideCard>)>>,
+    /// Where the guide was painted on the assistant's Guide tab in the last frame.
+    pub(super) tab_area: Cell<Option<Rect>>,
+}
+
+/// Which guide the next load shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Prefer {
+    /// This guide.
+    Guide(String),
+    /// The newest whole-review guide (one just started without an id).
+    Newest,
 }
 
 impl GuideUi {
@@ -101,18 +123,25 @@ impl GuideUi {
             clicks: RefCell::new(Vec::new()),
             peek: None,
             generation: 0,
+            prefer: None,
+            reload_wanted: false,
+            pending_show: None,
+            stepped: false,
+            card: RefCell::new(None),
+            tab_area: Cell::new(None),
         }
     }
 }
 
 /// Read the review's guide: its guides, the one shown (`preferred` when it still exists, else
-/// the newest whole-review guide, else the newest), that guide's current version and reviewed
-/// sections, and its citations' freshness against `sources`.
+/// the most recently changed guide when `newest`, else the newest whole-review guide, else the
+/// newest), that guide's current version and reviewed sections, and its citations' freshness
+/// against `sources`.
 async fn read_guide(
     services: ReviewServices,
     scope: NoteScope,
     sources: Vec<ResolvedSource>,
-    preferred: Option<String>,
+    (preferred, newest): (Option<String>, bool),
 ) -> Result<Box<GuideLoaded>, String> {
     let listed: ListReviewGuidesResponse = services
         .call(ListReviewGuidesRequest {
@@ -126,6 +155,7 @@ async fn read_guide(
     let guides = listed.guides;
     let chosen = preferred
         .and_then(|id| guides.iter().find(|record| record.guide.guide_id == id))
+        .or_else(|| guides.first().filter(|_| newest))
         .or_else(|| {
             guides
                 .iter()
@@ -205,12 +235,17 @@ impl ReviewSurface {
                 sources.push(group.source.clone());
             }
         }
-        let preferred = self
-            .guide
-            .state
-            .active
-            .as_ref()
-            .map(|active| active.guide.guide_id.clone());
+        let newest = self.guide.prefer == Some(Prefer::Newest);
+        let preferred = match self.guide.prefer.take() {
+            Some(Prefer::Guide(id)) => Some(id),
+            Some(Prefer::Newest) => None,
+            None => self
+                .guide
+                .state
+                .active
+                .as_ref()
+                .map(|active| active.guide.guide_id.clone()),
+        };
         let scope = self.note_scope();
         self.guide.state.loading = true;
         self.guide.state.load = GuideLoad::Loading;
@@ -219,14 +254,17 @@ impl ReviewSurface {
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
-            let result = read_guide(services, scope, sources, preferred).await;
+            let result = read_guide(services, scope, sources, (preferred, newest)).await;
             inbox.push(Message::Guide { generation, result });
         }));
     }
 
-    /// Read the review's guide again (it was written, or the review changed).
+    /// Read the review's guide again (it was written, or the review changed). A reload asked
+    /// for while a load runs reads again once that load is in.
     pub fn reload_guide(&mut self) {
-        if !self.guide.state.loading {
+        if self.guide.state.loading {
+            self.guide.reload_wanted = true;
+        } else {
             self.guide.state.load = GuideLoad::Idle;
         }
     }
@@ -249,6 +287,9 @@ impl ReviewSurface {
         match result {
             Ok(loaded) => self.guide.state.apply(*loaded),
             Err(error) => self.guide.state.fail(error),
+        }
+        if std::mem::take(&mut self.guide.reload_wanted) {
+            self.guide.state.load = GuideLoad::Idle;
         }
         let after = self
             .guide
@@ -356,10 +397,33 @@ impl ReviewSurface {
                 theme.muted,
             )])],
             GuideLoad::Ready => {
-                let mut lines = vec![Line::from_spans(vec![Span::styled(
-                    format!("Ask the review assistant ({assistant}) to walk you through it."),
-                    theme.muted,
-                )])];
+                let directions = self
+                    .action_keys
+                    .get("guide_walkthrough_directions")
+                    .cloned()
+                    .filter(|key| !key.is_empty());
+                let mut lines = vec![
+                    Line::from_spans(vec![
+                        Span::styled("enter", theme.accent),
+                        Span::styled(
+                            format!(
+                                " asks the review assistant ({assistant}) to walk you through it"
+                            ),
+                            theme.muted,
+                        ),
+                    ]),
+                    Line::from_spans(vec![Span::styled(
+                        directions.map_or_else(
+                            || {
+                                "with directions: “Guide: walk me through this review, with \
+                                 directions” in the palette"
+                                    .to_owned()
+                            },
+                            |key| format!("{key} adds directions first"),
+                        ),
+                        theme.muted,
+                    )]),
+                ];
                 if self.is_transient() {
                     lines.push(Line::from_spans(vec![Span::styled(
                         "Save the review to keep its guide.",
@@ -466,6 +530,7 @@ impl ReviewSurface {
             self.guide.state.push_jump(cursor);
         }
         self.guide.state.engaged = true;
+        self.guide.stepped = true;
         self.guide.state.bump();
         if let Some(file) = self.guide_file(target)
             && self.guide_move(&file, target)
@@ -553,7 +618,7 @@ impl ReviewSurface {
     }
 
     /// Select section `entry` and show its citation at `cite` (when it has one).
-    fn guide_show(&mut self, entry: usize, cite: Option<usize>, host: &UiContext) {
+    pub(super) fn guide_show(&mut self, entry: usize, cite: Option<usize>, host: &UiContext) {
         let Some(active) = self.guide.state.active.as_mut() else {
             return;
         };
@@ -576,7 +641,7 @@ impl ReviewSurface {
 
     /// `guide_next` / `guide_previous`: the current section's next (previous) citation, else
     /// the next (previous) section and its first citation.
-    fn guide_step(&mut self, forward: bool, host: &UiContext) -> Action {
+    pub(super) fn guide_step(&mut self, forward: bool, host: &UiContext) -> Action {
         let Some(active) = self.guide.state.active.as_ref() else {
             self.no_guide();
             return Action::Redraw;
@@ -616,7 +681,7 @@ impl ReviewSurface {
     }
 
     /// `guide_next_unreviewed`: the next written section not reviewed, after the current one.
-    fn guide_next_unreviewed(&mut self, host: &UiContext) -> Action {
+    pub(super) fn guide_next_unreviewed(&mut self, host: &UiContext) -> Action {
         let Some(active) = self.guide.state.active.as_ref() else {
             self.no_guide();
             return Action::Redraw;
@@ -692,7 +757,7 @@ impl ReviewSurface {
 
     /// Select section `entry` (at citation `cite`) and show it in the panel, without moving
     /// the document.
-    fn focus_guide_section(&mut self, entry: usize, cite: Option<usize>) {
+    pub(super) fn focus_guide_section(&mut self, entry: usize, cite: Option<usize>) {
         let Some(active) = self.guide.state.active.as_mut() else {
             return;
         };
@@ -739,7 +804,7 @@ impl ReviewSurface {
         Action::Redraw
     }
 
-    fn no_guide(&mut self) {
+    pub(super) fn no_guide(&mut self) {
         let message = match &self.guide.state.load {
             GuideLoad::Idle | GuideLoad::Loading => "reading the guide…".to_owned(),
             GuideLoad::Failed(error) => format!("the guide could not be read: {error}"),
@@ -774,6 +839,14 @@ impl ReviewSurface {
             "guide_next_unreviewed" => self.guide_next_unreviewed(host),
             "guide_at_line" => self.guide_at_line(),
             "guide_back" => self.guide_back(),
+            "guide_walkthrough" => {
+                self.walk_me_through(true);
+                Action::Redraw
+            }
+            "guide_walkthrough_directions" => {
+                self.walk_me_through(false);
+                Action::Redraw
+            }
             _ => return None,
         })
     }
@@ -831,7 +904,11 @@ impl ReviewSurface {
             return Some(Action::Redraw);
         }
         if self.guide.state.active.is_none() {
-            self.no_guide();
+            if action == "guide_open" && self.guide.state.load == GuideLoad::Ready {
+                self.walk_me_through(true);
+            } else {
+                self.no_guide();
+            }
             return Some(Action::Redraw);
         }
         match action {

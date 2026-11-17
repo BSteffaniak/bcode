@@ -10,7 +10,7 @@
 //!   followed AI card session, or in the assistant's session (handed over by the app,
 //!   [`ReviewSurface::apply_assistant_tools`]), the review reloads its comments and viewed files
 //!   from the store, as for the reviewer's own edits; a finished `code_review.navigate` moves the
-//!   cursor there. Card tool calls already finished when a session is first observed are not
+//!   cursor there; a finished guide write reads the guide again (see `guide_assist`). Card tool calls already finished when a session is first observed are not
 //!   replayed.
 
 use super::ReviewSurface;
@@ -188,6 +188,7 @@ impl ReviewSurface {
         let mut wrote = false;
         let mut viewed = false;
         let mut navigate = None;
+        let mut guide_tools = Vec::new();
         for session in &sessions {
             let Some(state) = self.agents.state(session) else {
                 continue;
@@ -227,6 +228,8 @@ impl ReviewSurface {
                     viewed = true;
                 } else if tool.name == NAVIGATE_TOOL {
                     navigate = Some(tool.arguments.clone());
+                } else {
+                    guide_tools.push((tool.name.clone(), tool.arguments.clone()));
                 }
             }
             // Calls that left the observed window never come back.
@@ -235,6 +238,7 @@ impl ReviewSurface {
         self.reflection
             .applied
             .retain(|session, _| sessions.contains(session));
+        self.follow_guide_tools(&guide_tools);
         self.apply_tool_effects(wrote, viewed, navigate, host);
     }
 
@@ -255,6 +259,7 @@ impl ReviewSurface {
                 navigate = Some(arguments.clone());
             }
         }
+        self.follow_guide_tools(tools);
         self.apply_tool_effects(wrote, viewed, navigate, host);
     }
 

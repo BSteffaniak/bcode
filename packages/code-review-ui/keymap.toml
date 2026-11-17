@@ -379,6 +379,10 @@ keymap_actions = [
     { id = "bcode.code_review.guide_back", scope = "code-review", description = "Guide: jump back to where the last guide jump left", defaults = [
         "backspace",
     ] },
+    { id = "bcode.code_review.guide_walkthrough", scope = "code-review", description = "Guide: walk me through this review", defaults = [
+    ] },
+    { id = "bcode.code_review.guide_walkthrough_directions", scope = "code-review", description = "Guide: walk me through this review, with directions…", defaults = [
+    ] },
     { id = "bcode.code_review.guide_down", scope = "code-review-guide", description = "Next section", defaults = [
         "j",
         "down",
@@ -577,6 +581,9 @@ keymap_actions = [
         "alt+t",
     ] },
     { id = "bcode.code_review.assistant_delete_all", scope = "code-review-assistant", description = "Delete every conversation the review app started (asks first)", defaults = [
+    ] },
+    { id = "bcode.code_review.assistant_guide_tab", scope = "code-review-assistant", description = "Switch between the conversation and the guide (when the screen has no room for the guide panel)", defaults = [
+        "alt+g",
     ] },
     { id = "bcode.code_review.assistant_reset_size", scope = "code-review-assistant", description = "Reset the panel size to the configured default", defaults = [
     ] },

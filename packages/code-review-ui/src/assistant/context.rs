@@ -371,6 +371,39 @@ pub struct PullView {
     pub failing: Vec<String>,
 }
 
+/// The review's guide on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GuideView {
+    /// Guide id.
+    pub guide_id: String,
+    /// Title.
+    pub title: String,
+    /// The version shown.
+    pub version: u32,
+    /// The guide's current version.
+    pub current_version: u32,
+    /// The version's status (`generating`, `complete`, `cancelled`, ...).
+    pub status: String,
+    /// Sections.
+    pub sections: usize,
+    /// Sections written.
+    pub written: usize,
+    /// Sections the reviewer marked reviewed.
+    pub reviewed: usize,
+    /// Citations.
+    pub citations: usize,
+    /// Citations verified.
+    pub verified: usize,
+    /// Sections whose code changed since they were written.
+    pub stale: usize,
+    /// The section the reviewer is on: id, outline number, title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_section: Option<(String, String, String)>,
+    /// The guide panel: `beside`, `under`, `no_room` (open, but the body has no room for it),
+    /// or `closed`.
+    pub panel: String,
+}
+
 /// The review on screen.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReviewView {
@@ -409,6 +442,9 @@ pub struct ReviewView {
     /// Pull request state already loaded, for the current layer or pull request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullView>,
+    /// The review's guide on screen, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideView>,
     /// Whether the review is still opening.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub loading: bool,
@@ -795,6 +831,7 @@ fn keep_sections(value: &mut serde_json::Value, sections: &[String]) {
         ("selection", &["selection"]),
         ("threads", &["threads"]),
         ("pull_request", &["pull_request"]),
+        ("guide", &["guide"]),
         (
             "review",
             &[
@@ -887,6 +924,32 @@ fn review_lines(review: &ReviewView, lines: &mut Vec<String>) {
     stack_lines(review, lines);
     comparison_lines(review, lines);
     place_lines(review, lines);
+    if let Some(guide) = &review.guide {
+        lines.push(guide_line(guide));
+    }
+}
+
+/// The review's guide: which, how far written and reviewed, and where the reviewer is in it.
+fn guide_line(guide: &GuideView) -> String {
+    let mut line = format!(
+        "guide: id={}  v{}  status={}  sections={}/{} written  reviewed={}  verified={}/{}",
+        value(&guide.guide_id),
+        guide.version,
+        guide.status,
+        guide.written,
+        guide.sections,
+        guide.reviewed,
+        guide.verified,
+        guide.citations
+    );
+    if guide.stale > 0 {
+        let _ = write!(line, "  stale={}", guide.stale);
+    }
+    if let Some((id, number, title)) = &guide.current_section {
+        let _ = write!(line, "  at=§{number} {} ({id})", value(title));
+    }
+    let _ = write!(line, "  panel={}", guide.panel);
+    line
 }
 
 /// The stack and the file counts.
@@ -1496,6 +1559,24 @@ mod tests {
         }
     }
 
+    fn huge_guide() -> GuideView {
+        GuideView {
+            guide_id: "g".repeat(300),
+            title: "t".repeat(5_000),
+            version: 3,
+            current_version: 3,
+            status: "generating".to_owned(),
+            sections: 200,
+            written: 12,
+            reviewed: 4,
+            citations: 1_000,
+            verified: 900,
+            stale: 2,
+            current_section: Some(("s3".to_owned(), "3.1".to_owned(), "x".repeat(4_000))),
+            panel: "no_room".to_owned(),
+        }
+    }
+
     fn huge_review() -> ViewContext {
         let layers: Vec<LayerView> = (1..=200)
             .map(|number| LayerView {
@@ -1585,6 +1666,7 @@ mod tests {
                     checks: "failing 2/14".to_owned(),
                     failing: (0..40).map(|index| format!("check-{index}")).collect(),
                 }),
+                guide: Some(huge_guide()),
                 loading: false,
             }),
             ..ViewContext::default()

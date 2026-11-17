@@ -161,6 +161,7 @@ mod feed;
 mod find;
 mod flows;
 mod guide;
+mod guide_assist;
 mod history;
 mod pointer;
 mod reconcile;
@@ -179,6 +180,7 @@ pub use conversation::{BarState, ConversationMessage, WatchCancel};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
 pub use guide::{GUIDE_PANE_ID, GUIDE_SCOPE, PEEK_ID};
+pub use guide_assist::{GUIDE_TAB_VIEW_ID, WALKTHROUGH, WALKTHROUGH_DIRECTIONS};
 pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
 
 pub use find::{SearchState, ThreadsFilter};
@@ -2141,6 +2143,7 @@ impl ReviewSurface {
             Message::Conversation(message) => self.apply_conversation(*message, host),
             Message::Guide { generation, result } => self.apply_guide(generation, result),
             Message::Peek { citation, result } => self.apply_peek(&citation, result),
+            Message::GuideStopped(result) => self.guide_stop_written(result),
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -5700,6 +5703,7 @@ impl View for ReviewSurface {
         }
         if self.review.is_some() {
             self.request_guide(host);
+            self.run_pending_guide_show(host);
         }
         if self.review.is_some() {
             self.start_comparison(host);

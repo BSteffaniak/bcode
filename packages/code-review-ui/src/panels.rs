@@ -623,6 +623,16 @@ impl Panels {
         self.guide_open
     }
 
+    /// Whether the guide panel has room in the body as last laid out (beside or under the
+    /// document), opened or not.
+    #[must_use]
+    pub const fn guide_fits(&self) -> bool {
+        let (width, height) = self.body;
+        width >= MIN_BORDERED_WIDTH
+            && height >= MIN_BORDERED_HEIGHT
+            && (width >= GUIDE_RIGHT_BODY || height >= GUIDE_BOTTOM_BODY_HEIGHT)
+    }
+
     /// Open the guide panel.
     pub const fn show_guide(&mut self) {
         if !self.guide_open {

@@ -27,6 +27,7 @@ use bcode_code_review_models::{ReviewAssistantBinding, ReviewAssistantTag};
 
 /// The panel's actions a screen's command palette lists (and runs on the panel).
 pub const PALETTE_ACTIONS: &[&str] = &[
+    "assistant_guide_tab",
     "assistant_model",
     "assistant_effort",
     "assistant_permissions",
@@ -85,6 +86,14 @@ pub enum LinkRequest {
     Model(models::Target),
     /// Cycle a target's reasoning effort.
     Effort(models::Target),
+    /// Send `text` as the user's message in the panel's conversation (`send`), or put it in
+    /// the message input for the user to finish.
+    Message {
+        /// The message.
+        text: String,
+        /// Whether it is sent at once.
+        send: bool,
+    },
 }
 
 impl ScreenLink {

@@ -364,7 +364,7 @@ impl<'a> GuidePanelView<'a> {
 
 /// `content` with `trailing` against the right edge of `width` cells (content shortened first),
 /// padded to exactly `width` cells.
-fn fit(content: &Line, trailing: &Line, width: usize) -> Line {
+pub(crate) fn fit(content: &Line, trailing: &Line, width: usize) -> Line {
     let placed = content.with_trailing(
         trailing,
         width,

@@ -79,6 +79,7 @@ impl ReviewSurface {
             view.threads.focused = self.focused_thread(&thread.thread_id);
         }
         view.pull_request = self.pull_view(view.stack.as_ref().and_then(|stack| stack.current));
+        view.guide = self.guide_view();
         view
     }
 

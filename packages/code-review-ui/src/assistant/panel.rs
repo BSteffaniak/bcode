@@ -31,6 +31,15 @@
 //!   ([`Assistant::take_finished_tools`]), which lets the review on screen reload what they
 //!   changed. Calls already finished when a session is first followed are not replayed, unless
 //!   the panel created the session.
+//! * **Guide.** The app hands the panel the review's guide as a card ([`Assistant::set_guide`]):
+//!   a turn writing it shows the card in place of its guide tool lines, and a click on a section
+//!   or Open is handed back to the app. When the review has a guide but the screen has no room
+//!   to dock its panel, the title row gets `Chat` and `Guide` tabs (title-row actions, laid out
+//!   and hit-tested by the pane): the Guide tab gives the conversation's place to the guide,
+//!   which the app paints there ([`Assistant::guide_area`]) and whose keys and clicks it
+//!   routes to the review. `Chat` carries a dot while the conversation needs the user or has a
+//!   new answer. A stopped turn is reported ([`Assistant::take_stopped`]) so the guide it was
+//!   writing is marked stopped, its written sections kept.
 
 use super::button::Badge;
 use super::chips::{Chip, ChipId, ChipPlan, ChipRow};
@@ -85,6 +94,8 @@ pub const INPUT_ID: &str = "app.assistant.input";
 pub const HISTORY_ID: &str = "app.assistant.history";
 /// Layout id of the group of the screen and the docked panel.
 pub const DOCK_ID: &str = "app.assistant.dock";
+/// Layout id of the guide's place on the Guide tab.
+pub const GUIDE_TAB_ID: &str = "app.assistant.guide";
 /// Width from which the panel docks on the right.
 pub const RIGHT_DOCK_WIDTH: u16 = 100;
 /// Height from which the panel docks at the bottom (below [`RIGHT_DOCK_WIDTH`]).
@@ -177,6 +188,14 @@ pub enum Outcome {
     OpenSession(bcode_session_models::SessionId),
     /// Draft a comment with this body at the review's cursor line.
     DraftComment(String),
+    /// Show the guide section at this index (in reading order), from a guide card.
+    GuideSection(usize),
+    /// Show the guide (its panel, else the Guide tab), from a guide card.
+    GuideOpen,
+    /// A key for the guide on the Guide tab.
+    GuideKey(KeyStroke),
+    /// A pointer event over the guide on the Guide tab.
+    GuideMouse,
 }
 
 /// Background work of the panel that finished.
@@ -215,7 +234,10 @@ enum Done {
         permission_id: String,
         error: Option<String>,
     },
-    Stopped(Option<String>),
+    Stopped {
+        session: String,
+        error: Option<String>,
+    },
     /// The models Bcode offers were listed.
     Catalog(Result<crate::host::ModelCatalog, String>),
     /// The app default was read.
@@ -261,7 +283,7 @@ enum OverlayPurpose {
 /// The conversation's rows at one width.
 #[derive(Debug)]
 struct Rows {
-    key: (u64, u64, u64, u16, &'static str),
+    key: (u64, u64, u64, u16, &'static str, u64),
     lines: Vec<Line>,
     actions: Vec<ActionCells<ItemAction>>,
 }
@@ -294,6 +316,22 @@ struct Painted {
     history_delete: Option<(Rect, String)>,
     /// The title row.
     title: Option<Rect>,
+    /// The guide's place on the Guide tab.
+    guide: Option<Rect>,
+}
+
+/// The review's guide as the panel shows it: the card, and the Chat and Guide tabs.
+#[derive(Debug, Default)]
+struct GuideView {
+    /// The card of the guide on screen.
+    card: Option<Arc<crate::guide::GuideCard>>,
+    /// Whether the tabs show (the review has a guide its screen cannot dock).
+    available: bool,
+    /// Whether the Guide tab is chosen.
+    shown: bool,
+    /// The conversation's turns, and whether it was working, when the Guide tab was chosen
+    /// (a turn finished since puts a dot on `Chat`).
+    seen: (usize, bool),
 }
 
 /// The saved panel size: whether it was read, and what is left to save.
@@ -399,6 +437,10 @@ pub struct Assistant {
     zoom: Zoom,
     /// The theme of the last frame (overlays are built with it).
     theme: Cell<ReviewTheme>,
+    /// The review's guide: its card and the tabs.
+    guide: GuideView,
+    /// Sessions whose turn was stopped from the panel, not handed out yet.
+    stopped: Vec<String>,
 }
 
 impl std::fmt::Debug for Assistant {
@@ -472,7 +514,86 @@ impl Assistant {
                 None,
                 crate::theme::IconStyle::default(),
             )),
+            guide: GuideView::default(),
+            stopped: Vec::new(),
         }
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Guide
+    // ----------------------------------------------------------------------------------------
+
+    /// The review's guide as the app reads it now: its card (`None` off a review or without a
+    /// guide), and whether the Chat and Guide tabs show because the screen cannot dock the
+    /// guide's panel. Without the tabs the conversation shows.
+    pub fn set_guide(&mut self, card: Option<Arc<crate::guide::GuideCard>>, tabs: bool) {
+        let tabs = tabs && card.is_some();
+        if self.guide.card != card {
+            self.guide.card = card;
+            self.touch();
+        }
+        if self.guide.available != tabs {
+            self.guide.available = tabs;
+            if !tabs {
+                self.guide.shown = false;
+            }
+            self.touch();
+        }
+    }
+
+    /// Whether the Chat and Guide tabs show.
+    #[must_use]
+    pub const fn guide_tabs(&self) -> bool {
+        self.guide.available
+    }
+
+    /// Whether the Guide tab is chosen.
+    #[must_use]
+    pub const fn guide_tab_shown(&self) -> bool {
+        self.guide.available && self.guide.shown
+    }
+
+    /// Choose the Guide tab, when the tabs show.
+    pub fn show_guide_tab(&mut self) {
+        if !self.guide.available || self.guide.shown {
+            return;
+        }
+        self.guide.shown = true;
+        self.guide.seen = self
+            .session
+            .as_deref()
+            .and_then(|session| self.agents.state(session))
+            .map_or((0, false), |state| (state.feed.turns.len(), state.working));
+        self.touch();
+    }
+
+    /// Choose the Chat tab.
+    pub const fn show_chat_tab(&mut self) {
+        if self.guide.shown {
+            self.guide.shown = false;
+            self.touch();
+        }
+    }
+
+    /// Where the guide goes on the Guide tab in the last frame, while it shows there.
+    #[must_use]
+    pub fn guide_area(&self) -> Option<Rect> {
+        self.painted.borrow().guide
+    }
+
+    /// Whether the `Chat` tab carries a dot: the conversation needs the user, or a turn
+    /// finished since the Guide tab was chosen.
+    fn chat_needs_look(&self) -> bool {
+        let Some(state) = self.session.as_deref().and_then(|s| self.agents.state(s)) else {
+            return false;
+        };
+        let (turns, working) = self.guide.seen;
+        state.needs_you() || (!state.working && (working || state.feed.turns.len() > turns))
+    }
+
+    /// Sessions whose turn was stopped from the panel since the last call.
+    pub fn take_stopped(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.stopped)
     }
 
     // ----------------------------------------------------------------------------------------
@@ -1106,6 +1227,27 @@ impl Assistant {
     /// runs without the profile's tool limits).
     fn send_input(&mut self, place: &Place, ui: &UiContext) -> Outcome {
         let text = self.input.borrow().buffer().text().to_string();
+        self.send_text(&text, true, place, ui)
+    }
+
+    /// Send `text` from `place` as the user's message, as if typed (a screen's request, such
+    /// as "walk me through this review"); the input keeps what is typed in it unless `typed`.
+    pub fn send_message(&mut self, text: &str, place: &Place, ui: &UiContext) -> Outcome {
+        self.show_chat_tab();
+        self.send_text(text, false, place, ui)
+    }
+
+    /// Put `text` in the message input for the user to finish and send, replacing what was
+    /// typed there.
+    pub fn prefill(&mut self, text: &str) {
+        self.show_chat_tab();
+        let mut input = empty_input();
+        TextInputControl::new(&self.policy).handle_paste(&mut input, text);
+        *self.input.borrow_mut() = input;
+        self.touch();
+    }
+
+    fn send_text(&mut self, text: &str, typed: bool, place: &Place, ui: &UiContext) -> Outcome {
         let text = text.trim_end().to_owned();
         if text.trim().is_empty() {
             return Outcome::Ignored;
@@ -1129,7 +1271,9 @@ impl Assistant {
             agent: Some(super::profile::PROFILE_ID.to_owned()),
             tool_allowlist: self.tool_allowlist(),
         };
-        *self.input.borrow_mut() = empty_input();
+        if typed {
+            *self.input.borrow_mut() = empty_input();
+        }
         self.scroll.set(0);
         self.notice = None;
         self.failure = None;
@@ -1510,9 +1654,11 @@ impl Assistant {
                     self.notice = Some((format!("could not answer: {error}"), true));
                 }
             }
-            Done::Stopped(error) => {
+            Done::Stopped { session, error } => {
                 if let Some(error) = error {
                     self.notice = Some((format!("could not stop: {error}"), true));
+                } else {
+                    self.stopped.push(session);
                 }
             }
             Done::PanelSize(result) => self.restore_size(result.ok().flatten()),
@@ -1760,6 +1906,17 @@ impl Assistant {
             }
             Mode::Chat => {}
         }
+        // On the Guide tab the panel's own keys apply, and every other key is the guide's.
+        if self.guide_tab_shown() {
+            if let Some(action) = ui.keymap_action(ASSISTANT_SCOPE, stroke) {
+                let action = action.strip_prefix("bcode.code_review.").unwrap_or(&action);
+                let outcome = self.run_action(action, place, ui);
+                if outcome != Outcome::Ignored {
+                    return outcome;
+                }
+            }
+            return Outcome::GuideKey(stroke);
+        }
         // A pending permission prompt takes the feed keys (the input is hidden meanwhile).
         if self.prompt_pending()
             && let Some(action) = ui.keymap_action(crate::keymap::FEED_SCOPE, stroke)
@@ -1965,11 +2122,11 @@ impl Assistant {
         let inbox = Arc::clone(&self.inbox);
         ui.spawn(Box::pin(async move {
             let error = host
-                .cancel_turn(session)
+                .cancel_turn(session.clone())
                 .await
                 .err()
                 .map(|error| error.message);
-            push(&inbox, Done::Stopped(error));
+            push(&inbox, Done::Stopped { session, error });
         }));
     }
 
@@ -2063,6 +2220,22 @@ impl Assistant {
                 ui.request_redraw();
             }
             return None;
+        }
+        if painted
+            .guide
+            .is_some_and(|area| area.contains(mouse.position))
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            )
+        {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.visibility = Shown::Focused;
+                self.touch();
+            }
+            return Some(Outcome::GuideMouse);
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2238,6 +2411,14 @@ impl Assistant {
                     Outcome::Redraw
                 }
                 "open" => self.open_in_bcode(),
+                "chat" => {
+                    self.show_chat_tab();
+                    Outcome::Redraw
+                }
+                "guide" => {
+                    self.show_guide_tab();
+                    Outcome::Redraw
+                }
                 _ => Outcome::Redraw,
             });
         }
@@ -2267,6 +2448,8 @@ impl Assistant {
     fn feed_action(&mut self, action: AgentAction, ui: &UiContext) -> Outcome {
         match action {
             AgentAction::Open => return self.open_in_bcode(),
+            AgentAction::GuideSection(index) => return Outcome::GuideSection(usize::from(index)),
+            AgentAction::GuideOpen => return Outcome::GuideOpen,
             AgentAction::Copy => {
                 if let Some(answer) = self.latest_answer() {
                     self.notice = Some(match ui.copy_text(&answer) {
@@ -2990,6 +3173,19 @@ impl Assistant {
             "assistant_permissions" => self.open_permissions(),
             "assistant_tools" => self.open_tools(),
             "assistant_reset_size" => self.reset_size(),
+            "assistant_guide_tab" => {
+                if !self.guide.available {
+                    self.notice = Some((
+                        "the guide's tab shows when the screen has no room for its panel"
+                            .to_owned(),
+                        false,
+                    ));
+                } else if self.guide.shown {
+                    self.show_chat_tab();
+                } else {
+                    self.show_guide_tab();
+                }
+            }
             "assistant_scroll_up" | "assistant_scroll_down" => {
                 let page = self.shown.get().1.max(2) - 1;
                 let rows = i64::try_from(page).unwrap_or(1);
@@ -3145,6 +3341,13 @@ impl Assistant {
             push(self.key_of("assistant_back"), "back");
             return hints;
         }
+        if self.guide_tab_shown() {
+            push(self.key_of("assistant_guide_tab"), "chat");
+            push(self.key_of("assistant_stop"), "stop");
+            push(self.key_of("assistant_back"), "back");
+            push(self.key_of("assistant_close"), "close");
+            return hints;
+        }
         push(Some("enter".to_owned()), "send");
         push(self.key_of("assistant_model"), "model");
         push(self.key_of("assistant_effort"), "effort");
@@ -3280,6 +3483,7 @@ impl Assistant {
             })
         };
         painted.feed = absolute(FEED_ID);
+        painted.guide = absolute(GUIDE_TAB_ID);
         painted.history = absolute(HISTORY_ID);
         painted.chips = absolute(super::chips::CHIPS_ID)
             .map(|chips| self.chip_regions(chips))
@@ -3369,7 +3573,12 @@ impl Assistant {
 
     /// The title row's buttons, in order: `+ new`, `⟲`, `↗` (only with a session) and `✕`.
     fn title_actions(&self) -> Vec<&'static str> {
-        let mut ids = vec!["new", "history"];
+        let mut ids = if self.guide.available {
+            vec!["chat", "guide"]
+        } else {
+            Vec::new()
+        };
+        ids.extend(["new", "history"]);
         if self.session.is_some() {
             ids.push("open");
         }
@@ -3407,15 +3616,29 @@ impl Assistant {
         if !compact {
             chrome = chrome.right_title(theme.pane_status(&self.status_text()));
             for id in self.title_actions() {
-                let label = match id {
-                    "new" => "+ new".to_owned(),
-                    "history" => "⟲".to_owned(),
-                    "open" => theme.icons.external.to_owned(),
-                    _ => "✕".to_owned(),
+                let shown = self.guide_tab_shown();
+                let (label, style) = match id {
+                    "chat" => {
+                        let dot = if shown && self.chat_needs_look() {
+                            " •"
+                        } else {
+                            ""
+                        };
+                        let style = if shown { theme.muted } else { theme.pill };
+                        (format!("Chat{dot}"), style)
+                    }
+                    "guide" => {
+                        let style = if shown { theme.pill } else { theme.muted };
+                        ("Guide".to_owned(), style)
+                    }
+                    "new" => ("+ new".to_owned(), theme.accent),
+                    "history" => ("⟲".to_owned(), theme.accent),
+                    "open" => (theme.icons.external.to_owned(), theme.accent),
+                    _ => ("✕".to_owned(), theme.accent),
                 };
                 chrome = chrome.action(PaneTitleAction::new(
                     id,
-                    Line::from_spans(vec![Span::styled(format!(" {label} "), theme.accent)]),
+                    Line::from_spans(vec![Span::styled(format!(" {label} "), style)]),
                 ));
             }
         }
@@ -3433,6 +3656,9 @@ impl Assistant {
         let mut content = Column::new().id("app.assistant.content");
         if let Some(picker) = &self.picker {
             return self.history_content(content, picker, now_ms, theme, focused);
+        }
+        if self.guide_tab_shown() && matches!(self.mode, Mode::Chat) {
+            return self.guide_content(content, theme);
         }
         if !compact {
             content = content.child(ChipRow::new(self.chips(place, theme), &self.chip_plan));
@@ -3524,6 +3750,18 @@ impl Assistant {
                         .focused(focused),
                 )),
         )
+    }
+
+    /// The Guide tab: the notice line, then the guide's place, which the app paints.
+    fn guide_content<'a>(&self, mut content: Column<'a>, theme: &ReviewTheme) -> Column<'a> {
+        if let Some((text, error)) = &self.notice {
+            let style = if *error { theme.error } else { theme.muted };
+            content = content.child(one_line(Line::from_spans(vec![Span::styled(
+                text.clone(),
+                style,
+            )])));
+        }
+        content.flex(Flex::new(1, GuideSlot))
     }
 
     /// The history picker: its search input, a note while loading or degraded, and its rows.
@@ -3665,6 +3903,7 @@ impl Assistant {
             self.revision,
             width,
             place.screen.name(),
+            self.guide.card.as_ref().map_or(0, |card| card.revision),
         );
         if self
             .rows
@@ -3679,7 +3918,14 @@ impl Assistant {
         let (mut lines, actions) = session.as_deref().map_or_else(
             || (self.intro(place.screen, width, theme), Vec::new()),
             |session| {
-                crate::rows::dock_rows(session, &self.agents, &self.folds, theme, width, draft)
+                crate::rows::dock_rows(
+                    session,
+                    &self.agents,
+                    &self.folds,
+                    theme,
+                    width,
+                    (draft, self.guide.card.as_deref()),
+                )
             },
         );
         if let Some(failure) = &self.failure {
@@ -4146,6 +4392,24 @@ const fn dock_axis(dock: Dock) -> PanelGroupAxis {
         Dock::Right => PanelGroupAxis::Horizontal,
         Dock::Bottom | Dock::Zoomed => PanelGroupAxis::Vertical,
     }
+}
+
+/// The guide's place on the Guide tab: it takes the cells it is given and paints nothing; the
+/// app paints the review's guide there.
+struct GuideSlot;
+
+impl Component for GuideSlot {
+    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+        LayoutNode::leaf(
+            LayoutId::new(GUIDE_TAB_ID),
+            LogicalSize::new(
+                constraints.max_width(),
+                constraints.max_height().unwrap_or(0),
+            ),
+        )
+    }
+
+    fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
 }
 
 /// A member of the dock group painted on its own (the screen by the app, the panel by

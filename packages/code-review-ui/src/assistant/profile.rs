@@ -30,7 +30,7 @@ const TOOL_DEADLINE_MS: u32 = 30_000;
 pub enum Category {
     /// Reading reviews: plugin read tools and the app's view of the screen.
     ReviewReads,
-    /// Changing reviews: comments, replies, resolution, viewed marks, suggestions.
+    /// Changing reviews: comments, replies, resolution, viewed marks, suggestions, guides.
     ReviewWrites,
     /// Publishing review comments.
     Publish,
@@ -105,6 +105,8 @@ impl Category {
                 "code_review.create_review",
                 "code_review.update_review",
                 "code_review.delete_review",
+                "code_review.guide.start",
+                "code_review.guide.write",
                 actions::COMPLETE_PASS,
             ],
             Self::Publish => &[
@@ -118,6 +120,7 @@ impl Category {
                 actions::SET_VIEW,
                 actions::REFRESH,
                 actions::OPEN_REVIEW,
+                actions::GUIDE_SHOW,
             ],
             Self::FileReads => &[
                 "filesystem.read",
@@ -398,6 +401,20 @@ screen new_review, a title and sources (the wizard opens filled in for the user 
 * Archive, rename, delete reviews: code_review.update_review / code_review.delete_review \
 (delete only when asked; prefer archiving).
 
+Guides (\"walk me through this review\", \"guide me through it\"): a guide is a cited, \
+versioned walkthrough of the review that the app shows beside the diff and steps through. Write \
+one with the guide tools: code_review.guide.plan first (it says whether one writer suffices and \
+what depth asks for); then code_review.guide.start with the planned outline (purpose, scope, \
+reading_order with one step per stop in the diff, then only the adaptive sections the change \
+has evidence for) and the user's directions in `directions` (what to focus on or skip); then one \
+code_review.guide.write per section (put_section with its body and citations), so the reviewer \
+sees sections fill in; finally set_status complete. Cite every claim with exact lines and a \
+short `quote` copied from them; when a write reports citation problems, fix the citation with \
+the suggestion given instead of dropping it. Keep sections short. Never restructure a written \
+guide (move or remove written sections) unless the user asks for a restructure. Use \
+bcode.code-review.guide_show to show a section or citation, or to step through the guide, when \
+the user asks to be taken somewhere in it.
+
 Never run the bcode command line through the shell to create or open reviews: the tools above \
 create every kind of review the app can. When a tool cannot do what was asked, say what is \
 missing instead.
@@ -417,7 +434,8 @@ pub fn client_tools() -> Vec<ClientToolDescriptor> {
                       the active comparison (baseline, view, toggles, each layer's or other \
                       source's result and changed files, the stack's recent pushes), the file, \
                       cursor and selected lines, threads on the file and the focused thread, \
-                      and loaded pull request state. Pass `sections` to read only some of it \
+                      loaded pull request state, and the review's guide (version, status, \
+                      sections written and reviewed, the current section). Pass `sections` to read only some of it \
                       and `max_files` to list fewer files per layer; a shortened list has a \
                       count of what it left out beside it (`files_omitted`, `omitted`). A \
                       `truncated` object says what was left out to fit."
@@ -431,7 +449,7 @@ pub fn client_tools() -> Vec<ClientToolDescriptor> {
                         "type": "string",
                         "enum": [
                             "screen", "review", "stack", "comparison", "file", "selection",
-                            "threads", "pull_request", "home", "wizard"
+                            "threads", "pull_request", "guide", "home", "wizard"
                         ]
                     },
                     "description": "Sections to return; all when omitted."

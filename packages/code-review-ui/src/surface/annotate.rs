@@ -753,6 +753,8 @@ impl ReviewSurface {
             | AgentAction::Never
             | AgentAction::Stop
             | AgentAction::Toggle(_) => self.feed_action(action),
+            // Guide cards show only in the assistant's conversation.
+            AgentAction::GuideSection(_) | AgentAction::GuideOpen => {}
         }
         None
     }

@@ -31,6 +31,8 @@ pub const COMPLETE_PASS: &str = "bcode.code-review.complete_pass";
 pub const PULL_REQUEST_REVIEW: &str = "bcode.code-review.pull_request_review";
 /// Opens the publish dialog.
 pub const PUBLISH: &str = "bcode.code-review.publish";
+/// Shows the review's guide and steps through it.
+pub const GUIDE_SHOW: &str = "bcode.code-review.guide_show";
 
 /// Pull requests and stacks listed at most.
 pub const MAX_FOUND: usize = 50;
@@ -199,7 +201,38 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
             "Open the app's publish dialog for the review on screen (as shift+p does), to publish its draft comments with a publisher such as GitHub. The user confirms in the dialog; nothing is sent until they do.",
             &json!({}),
         ),
+        descriptor(
+            GUIDE_SHOW,
+            ClientToolPolicy::ReadOnly,
+            "Show the review's guide (written with code_review.guide.start and code_review.guide.write) and move the user through it exactly as the guide keys do: open the guide panel (or the assistant's Guide tab when the screen has no room for it), select a section, show one of its citations in the diff, or step to the next, previous or next unreviewed section. Without arguments it opens the guide where the user left it. Returns what is on screen now, with the guide's current section.",
+            &json!({
+                "guide_id": {"type": "string", "description": "The guide to show (default: the one on screen, else the review's newest)."},
+                "version": {"type": "integer", "minimum": 1, "description": "Must be the version on screen (the guide's current one)."},
+                "section": {"type": "string", "description": "Section id (s3, s3.1) or outline number (3.1) to show, with its first citation."},
+                "citation": {"type": "string", "description": "Citation id (c7) to show in the diff, in the section citing it."},
+                "step": {"type": "string", "enum": ["next", "previous", "next_unreviewed"], "description": "Step from the current place, as alt+down, alt+up and alt+u do."},
+                "focus": {"type": "boolean", "description": "Give the guide panel the keyboard (default false)."}
+            }),
+        ),
     ]
+}
+
+/// What `guide_show` takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuideShowArguments {
+    /// The guide to show.
+    pub guide_id: Option<String>,
+    /// The version, which must be the one on screen.
+    pub version: Option<u32>,
+    /// Section id or outline number.
+    pub section: Option<String>,
+    /// Citation id.
+    pub citation: Option<String>,
+    /// `next`, `previous` or `next_unreviewed`.
+    pub step: Option<String>,
+    /// Whether the guide panel takes the keyboard.
+    pub focus: bool,
 }
 
 /// What `find_pull_requests` takes.

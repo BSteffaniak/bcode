@@ -124,6 +124,8 @@ pub struct ReviewApp {
     awaiting: Option<Awaiting>,
     /// An assistant move waiting for the review on screen to close.
     leaving: Option<Leaving>,
+    /// Whether the last frame showed the screen (the zoomed assistant covers it otherwise).
+    screen_shown: bool,
 }
 
 /// An assistant tool's work finished on a task.
@@ -219,6 +221,7 @@ impl ReviewApp {
             tool_work: Arc::default(),
             awaiting: None,
             leaving: None,
+            screen_shown: true,
         };
         match entry {
             Entry::Home => app.show_home(false),
@@ -430,7 +433,13 @@ impl ReviewApp {
             // The whole place (binding and view) only for a press in the panel.
             let place = self.place(down && self.assistant.contains(mouse.position));
             if let Some(outcome) = self.assistant.mouse(event, &place, host) {
-                return Some(self.assistant_outcome(outcome));
+                if outcome == crate::assistant::Outcome::GuideMouse {
+                    if let Route::Review(review) = &mut self.route {
+                        review.guide_tab_mouse(event, host);
+                    }
+                    return Some(Action::Redraw);
+                }
+                return Some(self.assistant_outcome(outcome, host));
             }
             // A click on the screen gives it the keyboard back.
             if down && self.assistant.is_focused() {
@@ -445,7 +454,15 @@ impl ReviewApp {
             Event::Key(stroke) => {
                 let place = self.place(stroke.key == KeyCode::Enter);
                 let outcome = self.assistant.key(*stroke, &place, host);
-                Some(self.assistant_outcome(outcome))
+                if let crate::assistant::Outcome::GuideKey(stroke) = outcome {
+                    return Some(match &mut self.route {
+                        Route::Review(review) => review
+                            .guide_tab_key(stroke, host)
+                            .map_or(Action::None, |action| self.review_action(action, host)),
+                        _ => Action::None,
+                    });
+                }
+                Some(self.assistant_outcome(outcome, host))
             }
             Event::Paste(text) => {
                 self.assistant.paste(text);
@@ -475,6 +492,12 @@ impl ReviewApp {
             changed = true;
         }
         changed |= self.finish_tool_work(host);
+        for session in self.assistant.take_stopped() {
+            if let Route::Review(review) = &mut self.route {
+                review.guide_turn_stopped(&session, host);
+            }
+            changed = true;
+        }
         let tools = self.assistant.take_finished_tools();
         if tools.is_empty() {
             return changed;
@@ -1044,7 +1067,8 @@ impl ReviewApp {
             | actions::SET_VIEW
             | actions::COMPLETE_PASS
             | actions::PULL_REQUEST_REVIEW
-            | actions::PUBLISH => self.review_tool(&tool, &arguments, host),
+            | actions::PUBLISH
+            | actions::GUIDE_SHOW => self.review_tool(&tool, &arguments, host),
             other => Self::refused(
                 "unknown_tool",
                 format!("the review app has no tool {other}"),
@@ -1083,6 +1107,8 @@ impl ReviewApp {
             actions::PUBLISH => {
                 review.assistant_command(crate::surface::ReviewCommand::Publish, host)
             }
+            actions::GUIDE_SHOW => parse::<actions::GuideShowArguments>(arguments)
+                .and_then(|show| review.assistant_guide_show(&show, host)),
             _ => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -1426,9 +1452,33 @@ impl ReviewApp {
 impl ReviewApp {
     /// The run loop's action for what the assistant panel did; a Draft comment drafts on the
     /// review on screen.
-    fn assistant_outcome(&mut self, outcome: crate::assistant::Outcome) -> Action {
+    fn assistant_outcome(
+        &mut self,
+        outcome: crate::assistant::Outcome,
+        host: &UiContext,
+    ) -> Action {
         match outcome {
-            crate::assistant::Outcome::Ignored => Action::None,
+            crate::assistant::Outcome::Ignored
+            | crate::assistant::Outcome::GuideKey(_)
+            | crate::assistant::Outcome::GuideMouse => Action::None,
+            crate::assistant::Outcome::GuideSection(entry) => {
+                if let Route::Review(review) = &mut self.route {
+                    review.guide_card_show(entry, host);
+                }
+                Action::Redraw
+            }
+            crate::assistant::Outcome::GuideOpen => {
+                let docked = self.screen_shown;
+                match &mut self.route {
+                    Route::Review(review) if docked && review.guide_docks() => {
+                        review.open_guide_panel();
+                        self.assistant.unfocus();
+                    }
+                    Route::Review(_) => self.assistant.show_guide_tab(),
+                    _ => {}
+                }
+                Action::Redraw
+            }
             crate::assistant::Outcome::Redraw => Action::Redraw,
             crate::assistant::Outcome::OpenSession(session_id) => {
                 Action::OpenSession { session_id }
@@ -1481,7 +1531,7 @@ impl ReviewApp {
                     }
                     let place = self.place(true);
                     let outcome = self.assistant.run_action(&name, &place, host);
-                    let result = self.assistant_outcome(outcome);
+                    let result = self.assistant_outcome(outcome, host);
                     if result != Action::Redraw && result != Action::None {
                         action = result;
                     }
@@ -1492,9 +1542,37 @@ impl ReviewApp {
                 crate::assistant::LinkRequest::Effort(target) => {
                     self.assistant.cycle_effort(&target, host);
                 }
+                crate::assistant::LinkRequest::Message { text, send } => {
+                    self.assistant.focus();
+                    if send {
+                        let place = self.place(true);
+                        let outcome = self.assistant.send_message(&text, &place, host);
+                        let result = self.assistant_outcome(outcome, host);
+                        if result != Action::Redraw && result != Action::None {
+                            action = result;
+                        }
+                    } else {
+                        self.assistant.prefill(&text);
+                    }
+                }
             }
         }
         Some(action)
+    }
+
+    /// Give the assistant the review's guide: its card, and the Chat and Guide tabs when the
+    /// screen (`screen_shown`) has no room to dock the guide panel. A guide jump shows the Guide
+    /// tab when the tabs show.
+    fn share_guide(&mut self, screen_shown: bool) {
+        let Route::Review(review) = &mut self.route else {
+            self.assistant.set_guide(None, false);
+            return;
+        };
+        let tabs = review.has_guide() && (!screen_shown || !review.guide_docks());
+        self.assistant.set_guide(review.guide_card(), tabs);
+        if review.take_guide_stepped() && tabs {
+            self.assistant.show_guide_tab();
+        }
     }
 
     /// Give the review the assistant's `model · effort` labels for its question composer and
@@ -1637,6 +1715,8 @@ impl View for ReviewApp {
                 }
                 None => self.button = None,
             }
+            self.screen_shown = split.screen.is_some();
+            self.share_guide(self.screen_shown);
             if let Some((rect, dock)) = split.panel {
                 let place = self.place(false);
                 self.assistant.paint(
@@ -1647,6 +1727,12 @@ impl View for ReviewApp {
                     &self.theme,
                     frame,
                 );
+                if let Route::Review(review) = &mut self.route {
+                    match self.assistant.guide_area() {
+                        Some(guide) => review.paint_guide_tab(guide, frame),
+                        None => review.guide_tab_hidden(),
+                    }
+                }
             } else {
                 // Closed, or open but hidden: nothing of the panel takes pointer input.
                 self.assistant.not_painted();
@@ -1663,7 +1749,7 @@ impl View for ReviewApp {
             return result;
         }
         if let Some(outcome) = self.assistant.overlay_event(event, host) {
-            return EventResult::from_action(self.assistant_outcome(outcome));
+            return EventResult::from_action(self.assistant_outcome(outcome, host));
         }
         if let Some(action) = self.assistant_event(event, host) {
             self.refresh_keymap(host);
