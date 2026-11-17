@@ -753,3 +753,68 @@ fn reviewed_verified_and_approved_glyphs_stay_distinct() {
         "the unverified glyph only marks unverified citations: {text}"
     );
 }
+
+/// Give citation `id` of the shown guide the text at its lines in `fixture`'s checkout, so its
+/// freshness can be told after the file changes.
+fn quote_citation(setup: &mut Setup, fixture: &crate::testing::fixture::GitFixture, id: &str) {
+    let repo_path = setup.workspace.repo_root.clone();
+    let record = setup
+        .backend
+        .call_now(bcode_code_review_models::GetGuideVersionRequest {
+            repo_path: repo_path.clone(),
+            guide_id: "guide-1".to_owned(),
+            version: None,
+        })
+        .version
+        .expect("version");
+    let mut version = record.version;
+    let citation = version.citations.get_mut(id).expect("citation");
+    let text = std::fs::read_to_string(fixture.root().join(&citation.path)).expect("file");
+    let lines: Vec<&str> = text.lines().collect();
+    let range = usize::try_from(citation.lines.start - 1).expect("start")
+        ..usize::try_from(citation.lines.end).expect("end");
+    citation.excerpt = lines[range].join("\n");
+    let _ = setup
+        .backend
+        .call_now(bcode_code_review_models::SaveGuideVersionRequest {
+            repo_path,
+            version,
+            expected_revision: record.revision,
+        });
+    setup.scenario.surface_mut().reload_guide();
+    stable(&mut setup.scenario);
+}
+
+#[test]
+fn a_refresh_tells_citation_freshness_against_the_new_head() {
+    let (mut setup, cited, fixture) = guided(160, 40);
+    quote_citation(&mut setup, &fixture, "c1");
+    let freshness = |setup: &Setup| {
+        setup
+            .scenario
+            .surface()
+            .guide()
+            .and_then(|guide| guide.freshness("c1").cloned())
+    };
+    assert_eq!(
+        freshness(&setup),
+        Some(bcode_code_review_models::Freshness::Fresh)
+    );
+    let (file, line) = &cited.changed;
+    let path = fixture.root().join(&file.path);
+    let text = std::fs::read_to_string(&path).expect("file");
+    std::fs::write(&path, format!("{}{text}", "pushed\n".repeat(10))).expect("write");
+    fixture.run(&["commit", "-qam", "push lines above the cited change"]);
+    setup.scenario.key("r");
+    stable(&mut setup.scenario);
+    assert_eq!(
+        freshness(&setup),
+        Some(bcode_code_review_models::Freshness::Moved {
+            lines: ReviewLineInterval {
+                start: line + 10,
+                end: line + 10,
+            }
+        }),
+        "freshness is told against the head the refresh resolved"
+    );
+}

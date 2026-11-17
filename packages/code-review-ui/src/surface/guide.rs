@@ -87,6 +87,9 @@ pub(super) struct GuideUi {
     pub(super) prefer: Option<Prefer>,
     /// A reload was asked for while a load ran.
     pub(super) reload_wanted: bool,
+    /// The sources the last load assessed freshness against; a load is asked for again when the
+    /// review's sources differ (a refresh picked up a push, or a filling review got a source).
+    assessed: Vec<ResolvedSource>,
     /// A `guide_show` call waiting for the guide it names to be read.
     pub(super) pending_show: Option<crate::assistant::actions::GuideShowArguments>,
     /// A guide jump happened since the app last asked (it then shows the assistant's Guide tab
@@ -125,6 +128,7 @@ impl GuideUi {
             generation: 0,
             prefer: None,
             reload_wanted: false,
+            assessed: Vec::new(),
             pending_show: None,
             stepped: false,
             card: RefCell::new(None),
@@ -217,15 +221,46 @@ async fn read_guide(
     }))
 }
 
+/// Whether the distinct sources of `doc`, in order, are `assessed`.
+fn same_sources(
+    doc: &bcode_code_review::document::ReviewDocument,
+    assessed: &[ResolvedSource],
+) -> bool {
+    let mut seen = 0;
+    for group in doc.groups() {
+        let source = &group.source;
+        if assessed[..seen]
+            .iter()
+            .any(|known| known.source_id == source.source_id)
+        {
+            continue;
+        }
+        if assessed.get(seen) != Some(source) {
+            return false;
+        }
+        seen += 1;
+    }
+    seen == assessed.len()
+}
+
 impl ReviewSurface {
     /// Read the review's guide when it was not read yet (or a reload was asked for).
+    ///
+    /// Freshness is assessed against the review's sources, so nothing is read while a refresh
+    /// is opening new ones, and a read guide is read again once the sources it was assessed
+    /// against are no longer the review's.
     pub(super) fn request_guide(&mut self, host: &UiContext) {
-        if self.guide.state.loading || self.guide.state.load != GuideLoad::Idle {
+        if self.refreshing || self.guide.state.loading {
             return;
         }
         let Some(review) = self.review.as_ref() else {
             return;
         };
+        if self.guide.state.load != GuideLoad::Idle
+            && same_sources(&review.doc, &self.guide.assessed)
+        {
+            return;
+        }
         let mut sources: Vec<ResolvedSource> = Vec::new();
         for group in review.doc.groups() {
             if !sources
@@ -235,6 +270,7 @@ impl ReviewSurface {
                 sources.push(group.source.clone());
             }
         }
+        self.guide.assessed.clone_from(&sources);
         let newest = self.guide.prefer == Some(Prefer::Newest);
         let preferred = match self.guide.prefer.take() {
             Some(Prefer::Guide(id)) => Some(id),
