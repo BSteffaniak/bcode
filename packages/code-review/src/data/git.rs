@@ -213,6 +213,20 @@ pub fn count_file_records(mut command: Command, cap: u64) -> Result<(u64, bool),
     Ok((count, false))
 }
 
+/// [`limited_records`] of the records `accept` takes: the rest are digested but neither kept
+/// nor counted.
+///
+/// # Errors
+///
+/// As [`limited_records`].
+pub fn limited_records_matching(
+    command: Command,
+    keep: usize,
+    accept: impl Fn(&[u8]) -> bool,
+) -> Result<LimitedRecords, DataError> {
+    limited_records_where(command, keep, accept)
+}
+
 fn limited_records_where(
     mut command: Command,
     keep: usize,
@@ -259,6 +273,62 @@ fn limited_records_where(
     }
     result.digest = hasher.finalize().to_vec();
     Ok(result)
+}
+
+/// The first `keep` records of `command`'s output, split at `separator`, and whether it printed
+/// more: past `keep` git is stopped, so a search with millions of matches costs no more than
+/// `keep` of them. An exit status of 1 with no output (nothing matched, as `git grep` says) is an
+/// empty answer, not an error.
+///
+/// # Errors
+///
+/// * [`DataError::Io`] when git cannot be started or read.
+/// * [`DataError::Git`] when git exits unsuccessfully otherwise.
+pub fn first_records(
+    mut command: Command,
+    keep: usize,
+    separator: u8,
+) -> Result<(Vec<String>, bool), DataError> {
+    use std::io::{BufRead as _, Read as _};
+    let _slot = Slot::acquire();
+    let mut child = command.spawn()?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| DataError::Git("git stderr unavailable".to_owned()))?;
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| DataError::Git("git stdout unavailable".to_owned()))?;
+    let mut records = Vec::new();
+    let mut more = false;
+    for record in std::io::BufReader::new(stdout).split(separator) {
+        let record = record?;
+        if records.len() == keep {
+            more = true;
+            break;
+        }
+        records.push(String::from_utf8_lossy(&record).into_owned());
+    }
+    if more {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = errors.join();
+        return Ok((records, true));
+    }
+    let status = child.wait()?;
+    let errors = errors.join().unwrap_or_default();
+    if status.success()
+        || (status.code() == Some(1) && records.is_empty() && errors.trim().is_empty())
+    {
+        return Ok((records, false));
+    }
+    Err(DataError::Git(errors.trim().to_owned()))
 }
 
 /// Require a confined glob: non-empty, relative, without `.`/`..` or `.git` segments, and

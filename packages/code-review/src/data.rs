@@ -13,6 +13,7 @@
 mod blob;
 mod flight;
 pub(crate) mod git;
+pub(crate) mod grep;
 mod hunks;
 mod index;
 mod paths;

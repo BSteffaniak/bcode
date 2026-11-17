@@ -11,6 +11,7 @@
 use super::text::{
     excerpt, find_runs, interval_at, line_similarity, quote_hash, same_exact, same_loose, slice,
 };
+use crate::data::grep;
 use crate::data::search::fuzzy_score;
 use crate::data::{DataError, ReviewData};
 use bcode_code_review_models::{
@@ -43,6 +44,8 @@ const MAX_SIMILARITY_WORK: usize = 400_000;
 const SIMILARITY_NEIGHBORHOOD: usize = 2_000;
 /// Most lines of a file read for a check.
 pub const MAX_CITE_FILE_LINES: u32 = 200_000;
+/// Most definition sites offered for a symbol.
+const MAX_SYMBOL_SITES: usize = 5;
 /// Most files of one source's diff considered.
 const MAX_DIFF_FILES: usize = 20_000;
 
@@ -902,6 +905,34 @@ impl CitationReader for ReviewDataReader<'_> {
             }
         }
         suggestions
+    }
+
+    fn symbol_sites(&self, revision: &RevisionRef, symbol: &str) -> Vec<SymbolSite> {
+        if !grep::is_identifier(symbol) {
+            return Vec::new();
+        }
+        let pattern = grep::definition_pattern(symbol);
+        grep::grep(
+            &self.repo_path,
+            revision,
+            &grep::GrepQuery {
+                pattern: &pattern,
+                mode: grep::GrepMode::Regex,
+                ignore_case: false,
+                paths: &[],
+            },
+            MAX_SYMBOL_SITES,
+        )
+        .map(|(hits, _)| {
+            hits.into_iter()
+                .map(|hit| SymbolSite {
+                    path: hit.path,
+                    line: hit.line,
+                    text: hit.text,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
     }
 }
 

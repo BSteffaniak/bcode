@@ -15,6 +15,7 @@
 //! read from the snapshot the review app keeps of them (see [`pull_threads`]); the operations
 //! that change threads change local ones only.
 
+pub mod code;
 pub mod create;
 pub mod fit;
 pub mod manage;
@@ -886,36 +887,7 @@ impl<'a> ReviewTools<'a> {
             return Ok(out);
         }
         out.push_str("columns: old line, new line, marker (+ added, - removed), text\n");
-        for hunk in &hunks.hunks {
-            let _ = writeln!(
-                out,
-                "@@ -{},{} +{},{} @@{}",
-                hunk.old_start,
-                hunk.old_count,
-                hunk.new_start,
-                hunk.new_count,
-                hunk.heading
-                    .as_deref()
-                    .map(|heading| format!(" {heading}"))
-                    .unwrap_or_default()
-            );
-            for line in &hunk.lines {
-                let number =
-                    |line: Option<u32>| line.map_or_else(String::new, |line| line.to_string());
-                let marker = match line.kind {
-                    ReviewLineKind::Added => '+',
-                    ReviewLineKind::Removed => '-',
-                    ReviewLineKind::Context => ' ',
-                };
-                let _ = writeln!(
-                    out,
-                    "{:>6} {:>6} {marker}{}",
-                    number(line.old_line),
-                    number(line.new_line),
-                    line.content
-                );
-            }
-        }
+        write_hunks(&mut out, &hunks.hunks);
         if let Some(truncated) = hunks.truncated {
             let _ = writeln!(
                 out,
@@ -1803,6 +1775,39 @@ impl LineMap {
             new: Some(new),
             kind: ReviewLineKind::Context,
         })
+    }
+}
+
+/// Hunks as numbered lines: a `@@` header per hunk, then `old new marker text` per line.
+fn write_hunks(out: &mut String, hunks: &[bcode_code_review_models::ReviewHunk]) {
+    for hunk in hunks {
+        let _ = writeln!(
+            out,
+            "@@ -{},{} +{},{} @@{}",
+            hunk.old_start,
+            hunk.old_count,
+            hunk.new_start,
+            hunk.new_count,
+            hunk.heading
+                .as_deref()
+                .map(|heading| format!(" {heading}"))
+                .unwrap_or_default()
+        );
+        for line in &hunk.lines {
+            let number = |line: Option<u32>| line.map_or_else(String::new, |line| line.to_string());
+            let marker = match line.kind {
+                ReviewLineKind::Added => '+',
+                ReviewLineKind::Removed => '-',
+                ReviewLineKind::Context => ' ',
+            };
+            let _ = writeln!(
+                out,
+                "{:>6} {:>6} {marker}{}",
+                number(line.old_line),
+                number(line.new_line),
+                line.content
+            );
+        }
     }
 }
 
