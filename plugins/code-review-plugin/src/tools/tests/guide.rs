@@ -830,3 +830,94 @@ fn a_review_named_by_id_is_written_under_the_sessions_grant() {
         "a granted session starts no other guide: {output}"
     );
 }
+
+#[test]
+fn resuming_takes_over_only_versions_the_session_may_write() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let (guide, _, _) = started(&mut harness);
+    let second = harness.json(
+        "code_review.guide.start",
+        &json!({"guide_id": guide, "mode": "new_version", "copy": true}),
+        SESSION,
+    );
+    assert_eq!(second["version"], 2);
+
+    grant(
+        &harness,
+        SESSION,
+        Some(GuideGrant {
+            guide_id: guide.clone(),
+            version: Some(1),
+            mode: GrantMode::Generate,
+        }),
+    );
+    for arguments in [
+        json!({"guide_id": guide, "mode": "resume", "version": 2}),
+        json!({"guide_id": guide, "mode": "new_version"}),
+    ] {
+        let output = refusal(&mut harness, "code_review.guide.start", &arguments, SESSION);
+        assert!(output.contains("version 1"), "{arguments}: {output}");
+    }
+    let resumed = harness.json(
+        "code_review.guide.start",
+        &json!({"guide_id": guide, "mode": "resume", "version": 1}),
+        SESSION,
+    );
+    assert_eq!(resumed["version"], 1, "{resumed}");
+    assert_eq!(
+        stored_version(&harness, &guide, Some(2))
+            .version
+            .status
+            .as_str(),
+        "generating",
+        "the version the grant does not name is left to its writer"
+    );
+    grant(&harness, SESSION, None);
+
+    let other = "22222222-2222-4333-8444-555555555555";
+    harness.bind(other);
+    let resume = json!({"guide_id": guide, "mode": "resume", "version": 2});
+    let output = refusal(&mut harness, "code_review.guide.start", &resume, other);
+    assert!(
+        output.contains("in_use"),
+        "a version being written is not taken over: {output}"
+    );
+    harness.json(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "version": 2, "ops": [{"op": "set_status", "status": "complete"}]}),
+        SESSION,
+    );
+    let output = refusal(&mut harness, "code_review.guide.start", &resume, other);
+    assert!(
+        output.contains("new_version"),
+        "a complete version of another conversation is not reopened: {output}"
+    );
+    harness.json(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "version": 2, "ops": [{"op": "set_status", "status": "failed"}]}),
+        SESSION,
+    );
+    let taken = harness.json("code_review.guide.start", &resume, other);
+    assert_eq!(
+        taken["status"], "generating",
+        "a failed version is resumed: {taken}"
+    );
+    assert_eq!(
+        stored_version(&harness, &guide, Some(2))
+            .version
+            .origin
+            .session_id
+            .as_deref(),
+        Some(other)
+    );
+    let output = refusal(&mut harness, "code_review.guide.start", &resume, SESSION);
+    assert!(output.contains("in_use"), "{output}");
+    harness.json(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "version": 2, "ops": [{"op": "set_status", "status": "cancelled"}]}),
+        other,
+    );
+    let back = harness.json("code_review.guide.start", &resume, SESSION);
+    assert_eq!(back["version"], 2, "a stopped version is resumed: {back}");
+}

@@ -55,6 +55,12 @@ pub const GUIDE_CONFLICT: &str = "conflict";
 pub const GUIDE_CITATION_PROBLEMS: &str = "citation_problems";
 /// Refusal code: the document the batch would write is over a bound or inconsistent.
 pub const GUIDE_INVALID_DOCUMENT: &str = "invalid_document";
+/// Refusal code: another conversation is writing the version.
+pub const GUIDE_IN_USE: &str = "in_use";
+/// How long a version another conversation is writing must go unwritten before a session
+/// without a grant may resume it (its writer is taken to have gone).
+pub const RESUME_IDLE_MS: u64 = 10 * 60 * 1000;
+
 /// What a guide covers, as a writer names it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -509,7 +515,7 @@ impl ReviewTools<'_> {
             (mode, _) => mode,
         };
         if let Some(grant) = &review.guide_grant {
-            Self::start_within_grant(grant, existing.as_ref())?;
+            Self::start_within_grant(grant, existing.as_ref(), mode, start.version)?;
         }
         let template = Self::template(review, config, start.template.as_deref())?;
         let context = self.context(review, config, declared, &template.name);
@@ -562,11 +568,15 @@ impl ReviewTools<'_> {
         }))
     }
 
-    /// Whether a session holding `grant` may start a version of `existing`: only versions of the
-    /// granted guide, and only with a grant that writes whole versions.
+    /// Whether a session holding `grant` may start (`mode`) a version of `existing`, resuming or
+    /// basing on `version`: only versions of the granted guide, only with a grant that writes
+    /// whole versions, and only the granted version (or a new current one when the grant follows
+    /// the current version).
     fn start_within_grant(
         grant: &GuideGrant,
         existing: Option<&GuideRecord>,
+        mode: StartMode,
+        version: Option<u32>,
     ) -> Result<(), AssistantError> {
         let refuse = |message: String| AssistantError::Refused {
             code: OUTSIDE_GRANT,
@@ -586,10 +596,29 @@ impl ReviewTools<'_> {
                 grant_summary(&grant.mode)
             )));
         }
-        Ok(())
+        let granted = grant.version.unwrap_or(record.guide.current_version);
+        let fits = match mode {
+            StartMode::Resume => version.unwrap_or(record.guide.current_version) == granted,
+            StartMode::NewVersion | StartMode::New => grant.version.is_none(),
+        };
+        if fits {
+            Ok(())
+        } else {
+            Err(refuse(format!(
+                "this conversation may only write version {granted} of guide {} ({}); ask the user",
+                record.guide.guide_id,
+                grant_summary(&grant.mode)
+            )))
+        }
     }
 
     /// Mark version `number` of `guide` generating again, written by `session` from now on.
+    ///
+    /// Without a grant for the guide, a session resumes its own versions, versions whose writing
+    /// failed or was stopped, and versions another conversation is writing only once they have
+    /// gone [`RESUME_IDLE_MS`] unwritten; complete and superseded versions of others are not
+    /// reopened (a new version is started instead). The checks run in the same turn as the
+    /// change, so a writer that changes meanwhile is seen.
     fn resume(
         &self,
         review: &OpenReview,
@@ -598,22 +627,35 @@ impl ReviewTools<'_> {
         number: u32,
         now: u64,
     ) -> Result<GuideVersionRecord, AssistantError> {
-        let session = session.map(str::to_owned);
+        let Some(session) = session.map(str::to_owned) else {
+            return Err(AssistantError::Refused {
+                code: OUTSIDE_GRANT,
+                message: "only a conversation can resume writing a version".to_owned(),
+            });
+        };
+        let granted = review
+            .guide_grant
+            .as_ref()
+            .is_some_and(|grant| grant.guide_id == guide.guide.guide_id);
         let resumed = self.store.update_guide_version(
             &review.repo_root,
             guide.guide.guide_id.clone(),
             Some(number),
             None,
-            move |version: &mut GuideVersion| -> Result<(), String> {
+            move |version: &mut GuideVersion| -> Result<(), (&'static str, String)> {
+                let own = version.origin.session_id.as_deref() == Some(session.as_str());
+                if !granted && !own {
+                    resumable(version, now)?;
+                }
                 version.status = GuideStatus::Generating;
-                version.origin.session_id.clone_from(&session);
+                version.origin.session_id = Some(session.clone());
                 version.updated_at_ms = now;
                 Ok(())
             },
         )?;
         resumed
             .map(|(record, ())| record)
-            .map_err(AssistantError::Invalid)
+            .map_err(|(code, message)| AssistantError::Refused { code, message })
     }
 
     /// Fork a new current version of `guide`, based on the version `start` names (its current
@@ -1468,6 +1510,37 @@ enum Refusal {
     Ops(Vec<OpError>),
 }
 
+/// Whether a version another conversation wrote may be resumed without a grant, or the refusal.
+fn resumable(version: &GuideVersion, now: u64) -> Result<(), (&'static str, String)> {
+    match &version.status {
+        GuideStatus::Failed { .. } | GuideStatus::Cancelled => Ok(()),
+        GuideStatus::Complete | GuideStatus::Superseded => Err((
+            OUTSIDE_GRANT,
+            format!(
+                "version {} is {} and another conversation wrote it; start a new version (mode new_version, copy true) to change it",
+                version.version,
+                version.status.as_str()
+            ),
+        )),
+        GuideStatus::Planning
+        | GuideStatus::Generating
+        | GuideStatus::Synthesizing
+        | GuideStatus::Verifying => {
+            if now.saturating_sub(version.updated_at_ms) >= RESUME_IDLE_MS {
+                Ok(())
+            } else {
+                Err((
+                    GUIDE_IN_USE,
+                    format!(
+                        "another conversation is writing version {}; wait for it, or start a new version",
+                        version.version
+                    ),
+                ))
+            }
+        }
+    }
+}
+
 /// The mode `session` may write `version` of `guide` with: the binding's grant for the guide
 /// (on its version, or the guide's current one), or without a grant, everything on versions the
 /// session started. A session holding a grant for another guide writes none of this one.
@@ -1674,4 +1747,27 @@ fn numbered_checks(checks: &[CitationCheck]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_another_conversation_writes_is_resumable_only_once_idle() {
+        let mut version = new_version("g1", BTreeMap::new(), GuideOrigin::default(), 1_000);
+        let now = 1_000 + RESUME_IDLE_MS;
+        assert_eq!(
+            resumable(&version, now - 1).map_err(|(code, _)| code),
+            Err(GUIDE_IN_USE)
+        );
+        assert_eq!(resumable(&version, now), Ok(()));
+        version.status = GuideStatus::Complete;
+        assert_eq!(
+            resumable(&version, now).map_err(|(code, _)| code),
+            Err(OUTSIDE_GRANT)
+        );
+        version.status = GuideStatus::Cancelled;
+        assert_eq!(resumable(&version, 1_000), Ok(()));
+    }
 }

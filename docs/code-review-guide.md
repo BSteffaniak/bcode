@@ -309,7 +309,14 @@ write, as `Generate`, only the versions whose origin is that session; `guide.sta
 when the session's grant for it is narrower than `Generate`. A session holding a grant writes
 only the granted guide: writing, resuming or starting versions of any other guide, and starting
 a new guide, are refused. The grant applies however the review is reached, including a saved
-review named by `review`.
+review named by `review`. A grant naming a version lets its session resume only that version
+and start no new one.
+
+Without a grant, `resume` takes over a version only when it is the session's own, its writing
+failed or was stopped, or the conversation writing it has not written for ten minutes (its
+writer is taken to have gone). Another conversation's complete or superseded version is not
+reopened; a new version is started instead. These checks run in the same store turn as the
+takeover.
 
 | Grant | Allowed operations |
 |---|---|
