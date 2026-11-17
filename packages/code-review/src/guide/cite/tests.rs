@@ -536,3 +536,32 @@ fn citations_are_read_from_a_repository_at_the_pinned_revisions() {
     assert_eq!(checks[1].status, CitationCheckStatus::Verified);
     assert_eq!(codes(&checks[2].problems), [GUIDE_CITE_PATH_NOT_FOUND]);
 }
+
+#[test]
+fn a_quote_longer_than_is_compared_is_kept_unverified_not_verified_by_its_start() {
+    let mut fake = fake();
+    let file: Vec<String> = (1..=260)
+        .map(|line| format!("let x{line} = {line};"))
+        .collect();
+    let mut quote: Vec<String> = file[..200].to_vec();
+    quote.extend((0..50).map(|line| format!("invented {line}")));
+    fake.contents
+        .insert((head(), "net/long.rs".to_owned()), file);
+    let check = check_citation(
+        &fake,
+        &cite("net/long.rs", 1, 250, Some(&quote.join("\n"))),
+        7,
+    );
+    assert_eq!(check.status, CitationCheckStatus::Problem, "{check:?}");
+    assert_eq!(codes(&check.problems), ["quote_too_long"]);
+    assert!(
+        matches!(&check.citation.verification, Verification::Problem { code, .. } if code == "quote_too_long"),
+        "{:?}",
+        check.citation.verification
+    );
+    assert_eq!(
+        check.citation.lines,
+        interval(1, 250),
+        "the citation is kept as asked"
+    );
+}

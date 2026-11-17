@@ -161,7 +161,8 @@ quote, symbol, relation_hint}` against the version's pinned heads:
    are `quote_ambiguous` (with candidate ranges); a close match (line similarity at least 0.8) is
    `quote_mismatch` (with the best range and its similarity); nothing is `quote_not_found`, with
    the symbol's definition sites as suggestions when a symbol was given. Without a quote the
-   citation is kept unverified with the hint to add a quote.
+   citation is kept unverified with the hint to add a quote. A quote of more than 200 lines is
+   not matched at all (part of it proves nothing about the rest): it is `quote_too_long`.
 6. **Relation.** The range is intersected with the source's hunks: changed, hunk context, or
    unchanged; a file outside the diff is outside the review. A model that said the range is in the
    diff when no changed line is gets the `not_in_diff` warning; the citation stays, shown as

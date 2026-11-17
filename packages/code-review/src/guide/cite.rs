@@ -20,11 +20,11 @@ use bcode_code_review_models::{
     GUIDE_CITE_AMBIGUOUS_SOURCE, GUIDE_CITE_DELETED_ON_SIDE, GUIDE_CITE_INVALID_RANGE,
     GUIDE_CITE_NO_SOURCES, GUIDE_CITE_NOT_IN_DIFF, GUIDE_CITE_PATH_NOT_FOUND,
     GUIDE_CITE_QUOTE_AMBIGUOUS, GUIDE_CITE_QUOTE_MISMATCH, GUIDE_CITE_QUOTE_NOT_FOUND,
-    GUIDE_CITE_RANGE_OUT_OF_BOUNDS, GUIDE_CITE_RENAMED, GUIDE_CITE_UNKNOWN_LAYER,
-    GUIDE_CITE_UNREADABLE, REVIEW_BLOB_LINES_MAX_COUNT, ResolvedSource, ResolvedSourceMode,
-    ReviewBlobLinesRequest, ReviewBlobSelector, ReviewFileHunksRequest, ReviewFileStatus,
-    ReviewFilesSearchRequest, ReviewHunk, ReviewIndexRequest, ReviewLineInterval, ReviewLineKind,
-    ReviewLineSide, RevisionRef, Verification,
+    GUIDE_CITE_QUOTE_TOO_LONG, GUIDE_CITE_RANGE_OUT_OF_BOUNDS, GUIDE_CITE_RENAMED,
+    GUIDE_CITE_UNKNOWN_LAYER, GUIDE_CITE_UNREADABLE, REVIEW_BLOB_LINES_MAX_COUNT, ResolvedSource,
+    ResolvedSourceMode, ReviewBlobLinesRequest, ReviewBlobSelector, ReviewFileHunksRequest,
+    ReviewFileStatus, ReviewFilesSearchRequest, ReviewHunk, ReviewIndexRequest, ReviewLineInterval,
+    ReviewLineKind, ReviewLineSide, RevisionRef, Verification,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -467,7 +467,19 @@ impl<'a> Check<'a> {
             self.no_quote();
             return;
         }
-        let quote = &quote[..quote.len().min(MAX_QUOTE_LINES)];
+        if quote.len() > MAX_QUOTE_LINES {
+            // Part of a quote proves nothing about the rest, so it is not matched at all.
+            self.problem(
+                GUIDE_CITE_QUOTE_TOO_LONG,
+                format!(
+                    "the quote has {} lines; quotes of at most {MAX_QUOTE_LINES} lines are checked, so the citation is kept unverified; cite a shorter range with its quote",
+                    quote.len()
+                ),
+                json!({ "max_lines": MAX_QUOTE_LINES }),
+            );
+            return;
+        }
+        let quote = quote.as_slice();
         let requested = self.citation.lines;
         let range = slice(lines, requested).unwrap_or_default();
         if !find_runs(range, quote, same_exact, 1).is_empty()

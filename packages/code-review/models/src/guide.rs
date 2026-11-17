@@ -58,6 +58,8 @@ pub const GUIDE_CITE_QUOTE_AMBIGUOUS: &str = "quote_ambiguous";
 pub const GUIDE_CITE_QUOTE_MISMATCH: &str = "quote_mismatch";
 /// Citation problem: the quote was not found in the file.
 pub const GUIDE_CITE_QUOTE_NOT_FOUND: &str = "quote_not_found";
+/// Citation problem: the quote has more lines than are compared; cite a shorter range.
+pub const GUIDE_CITE_QUOTE_TOO_LONG: &str = "quote_too_long";
 /// Citation problem: the cited content could not be read (binary, too large, or a read error).
 pub const GUIDE_CITE_UNREADABLE: &str = "unreadable";
 /// Citation warning: the model said the range is in the diff, but no changed line is.
