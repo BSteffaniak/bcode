@@ -378,24 +378,61 @@ whose estimate passes `confirm_above_tokens` needs confirmation.
 
 ## Presentation
 
-* **Guide panel** placement follows the body width: beside the document on wide screens (stacked
-  above threads when both are open), under the document on narrow ones, and as a Guide tab of the
-  assistant panel when the body has no room. It degrades to titles only, then to a header chip.
+The review app reads the review's guide once the review is open: the review's guides, the one
+shown (the newest whole-review guide), its current version, its reviewed sections, and its
+citations' freshness against the revisions on screen. The screen only reads guides; they are
+written through the plugin tools.
+
+* **Guide panel** (`alt+g`). Beside the document when the body is at least 100 columns (at least
+  36 wide; the file panel gives way first and is left out when both would leave the document too
+  little); stacked above the threads panel in the right column when that is open too; under the
+  document (at least 8 rows) on narrower bodies with at least 16 rows; otherwise not shown.
+  Visibility and the sizes dragged are kept with the review's presentation state
+  (`guide_panel_visible`, `guide_right_share`, `guide_bottom_share`).
+  * Beside the document, the outline (numbers, titles, citation badges, and a state glyph) sits
+    above the current section; the outline scrolls to keep the current section in view.
+  * Under the document, the current section shows alone; its header says where it is (`3.1/9`).
+  * Narrower than 24 columns, only the outline's numbers and titles show.
+  * The current section shows its body (citation tokens as badges), its citations (path, lines,
+    and how they relate to the review: changed, context, unchanged, or outside the review), and
+    its findings. A banner says when the version is being written, failed, was stopped, is not
+    the guide's current version, or has sections whose code changed since.
+  * The pane's title names the guide and version; its status counts reviewed sections,
+    verified citations, and stale sections.
+  * Every row is composed from styled spans and fitted with BMUX text primitives; one geometry
+    drives painting, hit regions, and clicks, and only painted rows register hits. Clicking an
+    outline row or a citation shows it in the diff; the header's `◂` / `▸` step sections.
 * **Glyphs stay distinct.** Reviewed sections use the viewed pair (`✓` / `○`). A verified
-  citation shows `◈`; an unverified one a dimmed `◇`; a citation problem `⚠`. `✓` keeps meaning
-  reviewed or approved.
-* **Inline markers.** The first row of each cited range carries a trailing badge such as `[3]`,
-  styled by verification; the current section's ranges are tinted. The badge is a trailing
-  adornment that BMUX's diff-row layout measures and places, so geometry, painting and hit regions
-  share one layout definition. `guide.markers` is `current`, `all`, or `off`.
-* **Context citations** in a diff file's gap reveal the gap; a file outside the review opens a
-  read-only peek labelled as outside the review.
-* **Keys.** `alt+g` toggles the guide; `alt+down` / `alt+up` step sections; `alt+u` jumps to the
-  next unreviewed section; `'` shows the section citing the cursor line; `backspace` jumps back.
-  The `code-review-guide` focus scope adds movement, folding, citation stepping, reviewed, expand,
-  ask, draft comment, promote, discard, refresh, restructure, copy, and versions.
-* **Assistant card.** A turn's guide tool calls collapse into one live card bound to the guide,
-  reading the same state as the panel. In `bcode tui` they stay ordinary tool lines.
+  citation shows `◈`; an unverified one a dimmed `◇`; a citation problem or stale code `⚠`. `✓`
+  keeps meaning reviewed or approved, and the guide never shows the approval mark. ASCII icons
+  use `#`, `?` and `!`.
+* **Inline markers.** The first row of each run of a cited range the document shows carries a
+  trailing badge such as `[3]◈`, styled by verification. The badge is a BMUX diff-row trailing
+  adornment that reserves its cells (`DiffTrailingFit::Reserve`), so measurement, painting and
+  the badge's click target come from one layout; a row too narrow for it omits it. Clicking a
+  badge shows the section citing it. The current section's lines get the `guide.focus` tint in
+  their gutter. `guide.markers` (`current`, `all`, or `off`) chooses which citations get badges;
+  the current section's tint shows whatever it says. Nothing is marked until the guide is used
+  (its panel opened or a guide key pressed).
+* **Navigation.** A guide jump remembers where the cursor was (64 deep) and moves to the cited
+  line. A range hidden in a gap of a loaded diff file is revealed first; a file still loading is
+  moved to once it loads; a file the review does not show (or a citation outside the review)
+  opens a read-only **peek** in the document's place, labelled as outside the review, which
+  `esc` or `backspace` closes.
+* **Keys** (`code-review`): `alt+g` opens, focuses, or closes the panel; `alt+down` / `alt+up`
+  step through the current section's citations, then to the next (previous) section; `alt+u`
+  goes to the next section not reviewed; `'` shows the section citing the line at the cursor;
+  `backspace` jumps back. The `code-review-guide` focus scope moves (`j` / `k`), shows the
+  section and its first citation (`enter`), folds (`space`), steps citations (`]` / `[`), and
+  copies the section as markdown (`y`). Its keys for reviewed, expand, ask, draft comment,
+  promote, discard, refresh, restructure, and versions are reserved for the review actions and
+  say so until those are built.
+* **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
+  `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
+  review theme's tiers.
+* **Not yet.** The Guide tab of the assistant panel when the body has no room, the header chip
+  when the panel cannot show, a draggable split between outline and section, rendered markdown
+  in section bodies, and the assistant card come with generation from the assistant.
 
 ## Review actions
 
@@ -488,7 +525,7 @@ path inside the repository, so write-path rules apply.
 |---|---|---|
 | P1 | Models, store, citation checks, freshness | Yes |
 | P2 | Plugin tools, grants in the review assistant binding, configuration and context | Yes |
-| P3 | Read-only guide panel, diff markers, navigation | No |
+| P3 | Read-only guide panel, diff markers, navigation | Yes |
 | P4 | Single-agent generation from the assistant, guide card, tab fallback | No |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | No |
 | P6 | Freshness in the UI, refresh forks, versions picker, since guides | No |

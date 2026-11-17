@@ -851,6 +851,12 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `>` | Widen file panel |
 | `<` | Narrow file panel |
 | `shift+t` | Show / hide threads panel |
+| `alt+g` | Guide: open, focus, or close the guide panel |
+| `alt+down` | Guide: next citation, then the next section |
+| `alt+up` | Guide: previous citation, then the previous section |
+| `alt+u` | Guide: next section not reviewed |
+| `'` | Guide: show the section citing the line |
+| `backspace` | Guide: jump back to where the last guide jump left |
 | `ctrl+k` | Ask AI: open, focus, or close the review assistant |
 | `c` | Comment on the line, range, or file (reply on a thread) |
 | `a` | Ask Bcode about the line, range, or file |
@@ -952,6 +958,23 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `right` | Next threads filter |
 | `left` | Previous threads filter |
 | `esc` | Back to the review |
+
+### Guide panel (focused) (`code-review-guide`)
+
+| Keys | Action |
+|---|---|
+| `j`, `down` | Next section |
+| `k`, `up` | Previous section |
+| `enter` | Open the section and show its first citation |
+| `space` | Fold or unfold the section |
+| `]` | Next citation of the section |
+| `[` | Previous citation of the section |
+| `y` | Copy the section as markdown |
+| `v`, `e`, `a`, `c`, `p`, `x`, `r`, `shift+r`, `shift+v` | Reserved for the review actions (reviewed, expand, ask, draft comment, promote, discard, refresh, restructure, versions); not available yet |
+| `esc` | Back to the review |
+
+See [Guided review](code-review-guide.md#presentation) for the panel and the diff's citation
+markers.
 
 ### Comment composer (`code-review-composer`)
 
