@@ -46,6 +46,6 @@ pub fn paint_backdrop(
     target.rasterize(LocalRect::terminal(buffer.area()), |x, y| {
         let position = Point::new(u16::try_from(x).ok()?, u16::try_from(y).ok()?);
         let cell = buffer.get(position)?;
-        (!cell.is_wide_continuation()).then(|| (cell.symbol.clone(), cell.style))
+        (!cell.is_wide_continuation()).then(|| (cell.symbol.to_string(), cell.style))
     });
 }
