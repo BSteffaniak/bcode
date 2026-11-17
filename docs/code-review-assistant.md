@@ -232,6 +232,7 @@ collides with an existing default in its scope (`code-review-home` has no `ctrl+
 | `code-review-assistant` | `alt+d` | Delete this conversation, after a confirmation (`assistant_delete`) |
 | `code-review-assistant` | `ctrl+k`, `esc`, `ctrl+c`, `ctrl+x`, `ctrl+o`, `pageup`, `pagedown` | As today; `esc` returns to the route, whichever it is |
 | `code-review-assistant` | `alt+m`, `shift+tab`, `alt+p`, `alt+t` | Model, effort, permissions, tools (see [Parity with bdata](#keys-1)) |
+| `code-review-assistant` | `alt+g` | Switch between the conversation and the guide, while the panel has `Chat` and `Guide` tabs (`assistant_guide_tab`) |
 | `code-review-assistant-history` | `up`, `down`, typing | Move, search |
 | `code-review-assistant-history` | `enter` | Switch to the conversation |
 | `code-review-assistant-history` | `alt+r` | Rename |
@@ -440,7 +441,7 @@ error).
 | `code_review.summary`, `list_files`, `file_diff`, `file_content`, `list_threads`, `get_thread`, `pull_request` | review reads | read | As documented in the app, on any review. `file_content` also reads at a `revision` the review knows. | Store and git data. |
 | `code_review.search_code`, `diff_hunks`, `related_files` | review reads | read | Code at the review's pinned revisions: search (text, word, regex, symbol) with each match related to the review, the hunks overlapping a range, and a file's tests, callers, configuration and docs. | Reads revisions `filesystem.grep` cannot (a pull request's head). |
 | `code_review.guide.get`, `guide.check`, `guide.plan`, `guide.export` | review reads | read | Read, check, plan and export guided-review guides; see [Guided review](code-review-guide.md). | Store data and citation checks at pinned revisions. |
-| `code_review.guide.start`, `guide.write` | (guide writes; not yet in the assistant profile) | guide (allowed by default, category `code_review.guide`) | Start and write guides under the session's grant. | Durable guide data any session may write. |
+| `code_review.guide.start`, `guide.write` | review writes | guide (allowed by default, category `code_review.guide`) | Start and write guides under the session's grant; the assistant writes a walkthrough with them (see [Guides](#guides)). | Durable guide data any session may write. |
 | `code_review.create_review` | review writes | mutating | Creates a saved review from sources: `pull_request` (number or URL), `stack` (top number: whole stack), `stack_layers` (numbers: step-through), `branch` (base, head), `current_branch`, `range` (base, head, merge_base), `commits` (revs), `commit`, `working_tree` / `staged` / `unstaged` with optional `paths` (repository-relative directories or files), `files` (`paths` in the selector syntax: a file or folder, `folder/`, a glob, `path:START-END`; optional `exclude`; code as it is now) and `repository` (whole, or `paths` folders), and `directory` (any directory inside a repository: the review is created in that repository; files and repository sources without `paths` are limited to it), and `show_ignored` (files, folder and repository sources also list ignored files; stored with the review). Pull request kinds take `provider` (default `github`). Returns the id, title, sources and the repository. Every source kind converts back to a `create_review` source (`create::source_argument`, an exhaustive match), and a test drives every wizard mode through it, so the tool cannot fall behind the wizard. Pull request kinds record the provider and repository (from the `origin` remote when omitted); the app resolves them on open. | A store write that must work without the app. |
 | `code_review.find_paths` | review reads | read | Resolves what the user calls something ("the hello plugin", "bcode-git", "Cargo.toml") to repository paths: folder names, package names (`Cargo.toml`, `package.json`, `pyproject.toml`), file names and path endings, best first, with the files under each folder now, how it matched, `ambiguous` when the two best are equally likely, and `weak` when the best only partly matches the name. Respects `.gitignore` unless `include_ignored`. See [Reviewing files and folders](review-files-and-folders.md). | Reads the data service's path index. |
 | `code_review.update_review` | review writes | mutating | Renames, archives or restores one review, or many (`reviews`). | Store write. |
@@ -470,12 +471,58 @@ unsupported source instead of silently reviewing the whole repository.
 | `bcode.code-review.complete_pass` | review writes | mutating | Marks the review pass complete, as `shift+m`. | Needs the resolved revisions on screen. |
 | `bcode.code-review.pull_request_review` | publish | mutating | Approves, requests changes or comments on a pull request of the open review, or approves every fully viewed stack layer. | Forge providers in the app. |
 | `bcode.code-review.publish` | publish | mutating | Previews or publishes the review's comments with a publisher plugin (GitHub), as `shift+p`. | Publisher plugins are reached through the app. |
+| `bcode.code-review.guide_show` | navigation | read-only | Opens the review's guide (its panel, or the panel's Guide tab when the screen has no room) and moves through it as the guide keys do: `section` (id or outline number), `citation`, `step` (`next`, `previous`, `next_unreviewed`), `focus`; `guide_id` and `version` must name the guide and version on screen (a guide not read yet is read first and shown once read). Returns the screen and where the reviewer is in the guide. | Screen state. |
 
 Every client tool answers with what it did (or why not, checked before acting, as the app's own
 keys check), and the screen shows it at once because the app performs it. Plugin writes are
 reflected as today: the app watches finished `code_review.*` calls in followed sessions and
 reloads; `create_review`, `update_review` and `delete_review` reload home, and deleting the
 review on screen returns home with a toast.
+
+### Guides
+
+The assistant writes guided reviews ([Guided review](code-review-guide.md)) with the guide
+tools. Its instructions carry a Guides paragraph: plan first (`code_review.guide.plan`), start
+with the planned outline (purpose, scope, a reading order with one step per stop in the diff,
+then only the adaptive sections the change has evidence for) and the user's directions, write
+one section per `code_review.guide.write`, finish with `set_status complete`, cite every claim
+with a quote and fix citations a write reports instead of dropping them, and never restructure
+a written guide unless asked.
+
+* **Asking.** "Walk me through this review" is a review action (`guide_walkthrough`, in the
+  palette and the AI menu) and `enter` on the empty guide panel: it sends that message to the
+  panel's conversation. `guide_walkthrough_directions` puts "Walk me through this review.
+  Directions: " in the panel's input for the user to finish.
+* **Live.** Each finished `guide.start` and `guide.write` of the conversation (or of a followed
+  card session) makes the review read the guide it names again, so the outline appears when the
+  guide is started and its sections fill in one write at a time. Starting a guide opens the guide
+  panel when the review's body has room for it.
+* **Card.** A turn that writes the guide on screen shows one guide card in place of its guide
+  tool lines (failed guide calls keep their lines): the guide's title, version and progress
+  (`writing 2/9`, `stopped · 4/9 written`, `✓ 9 sections`), its sections (at most 12, around
+  where writing is or the reviewer is) with their state (`◌` planned, `○` written, `✓`
+  reviewed) and the current one marked, and `Open guide`. The card reads the review's guide
+  state, the object the guide panel shows, never the tool output. A click on a section shows it
+  and its first citation in the diff; `Open guide` shows the panel (or the Guide tab). Off a
+  review, or for another guide, the lines stay ordinary tool lines, as they are in `bcode tui`.
+* **Guide tab.** When the review has a guide but its body has no room for the guide panel (the
+  screen is short or narrow beside the docked panel, or the zoomed panel covers it), the panel's
+  title row gets `Chat` and `Guide` tabs, title-row actions laid out and hit-tested by the pane
+  with the other buttons. The Guide tab gives the conversation's place to the guide (its title
+  and status, the outline above the current section); its clicks and the guide keys (the guide
+  panel's, then the review's `alt+down`, `alt+u`, `backspace`, ...) go to the review, while the
+  panel's own keys (`esc`, `ctrl+c`, `alt+g`) keep working. A guide jump (a card click,
+  `guide_show`, a guide key) shows the Guide tab while the tabs show. `Chat` carries a dot
+  while the conversation needs the user or a turn finished since the Guide tab was chosen.
+  Below the compact width the title row has no buttons, and so no tabs.
+* **Stop.** Stopping the turn (`ctrl+c`, Stop) cancels it in Bcode; once cancelled, the guide
+  version that session was writing is marked cancelled with a revision-checked write (read again
+  and retried when a write landed meanwhile). Its written sections stay, and the panel and card
+  say it stopped.
+* **`current_view`** has a `guide` section: the guide, its version and the guide's current
+  version, status, sections written and reviewed, citations verified, stale sections, the
+  current section, and where the panel is (`beside`, `under`, `no_room`, `closed`). The view
+  block carries a `guide:` line with the same.
 
 ### Action parity
 
@@ -532,9 +579,9 @@ Bcode's `build` policy decides every exposed call, and a category can only remov
 | Category | Tools | Default | Decided by default as |
 | --- | --- | --- | --- |
 | `review_reads` | read plugin tools (`find_paths`, the code reads and the guide reads among them), `current_view`, `find_pull_requests` | on | allowed (read-only); `code_review.pull_request` declares the repository's web address, so it asks unless a web rule allows it |
-| `review_writes` | write plugin tools, `complete_pass` | on | asks (mutating) |
+| `review_writes` | write plugin tools, `complete_pass`, and the guide writes (`guide.start`, `guide.write`) | on | asks (mutating); guide writes are allowed unless a `code_review.guide` rule says otherwise |
 | `publish` | `code_review.publish`, `bcode.code-review.publish`, `pull_request_review` | on | asks every time in the panel (Always is not offered) |
-| `navigation` | `go_to`, `set_comparison`, `set_view`, `refresh`, `open_review` | on | allowed; `open_review` asks (it changes the screen) |
+| `navigation` | `go_to`, `set_comparison`, `set_view`, `refresh`, `open_review`, `guide_show` | on | allowed; `open_review` asks (it changes the screen) |
 | `file_reads` | `filesystem.read`, `list`, `find`, `grep`, `stat`, `exists` | on | Bcode `read` rules (allowed) |
 | `file_writes` | `filesystem.write`, `edit`, `multi_edit` | on | Bcode `write`/`edit` rules (ask) |
 | `shell` | `shell.run`, `shell.terminal` | on | Bcode `command` rules (ask) |

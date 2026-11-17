@@ -373,6 +373,7 @@ and what is on screen now (`current_view`'s sections `screen`, `review`, `stack`
 | `bcode.code-review.complete_pass` | mutating | Marks the review pass complete (`shift+m`). |
 | `bcode.code-review.pull_request_review` | mutating | Opens the dialog to `approve`, `request_changes`, `comment` or `approve_viewed_layers`; you confirm it. |
 | `bcode.code-review.publish` | mutating | Opens the publish dialog (`shift+p`); you confirm it. |
+| `bcode.code-review.guide_show` | read-only | Opens the review's guide (its panel, or the assistant's Guide tab when the screen has no room for it) and moves through it as the guide keys do: a `section`, a `citation`, or a `step` (`next`, `previous`, `next_unreviewed`). See [Guided review](code-review-guide.md#writing-a-guide-from-the-assistant). |
 
 Read-only app tools run without asking: they change what is shown, not what is stored. Mutating
 ones follow the `build` agent's rules for mutating tools, so moving you to another screen asks
@@ -857,6 +858,8 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `alt+u` | Guide: next section not reviewed |
 | `'` | Guide: show the section citing the line |
 | `backspace` | Guide: jump back to where the last guide jump left |
+| (palette, AI menu) | Guide: walk me through this review |
+| (palette, AI menu) | Guide: walk me through this review, with directions… |
 | `ctrl+k` | Ask AI: open, focus, or close the review assistant |
 | `c` | Comment on the line, range, or file (reply on a thread) |
 | `a` | Ask Bcode about the line, range, or file |
@@ -1020,6 +1023,7 @@ markers.
 | `shift+tab` | Cycle the assistant's reasoning effort |
 | `alt+p` | Turn the assistant's permission categories on or off for this conversation |
 | `alt+t` | List the assistant's tools and how Bcode decides them |
+| `alt+g` | Switch between the conversation and the guide (when the screen has no room for the guide panel) |
 | (palette) | Delete every conversation the review app started (asks first) |
 
 ### Conversation history (`code-review-assistant-history`)

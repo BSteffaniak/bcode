@@ -430,9 +430,31 @@ written through the plugin tools.
 * **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
   `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
   review theme's tiers.
-* **Not yet.** The Guide tab of the assistant panel when the body has no room, the header chip
-  when the panel cannot show, a draggable split between outline and section, rendered markdown
-  in section bodies, and the assistant card come with generation from the assistant.
+* **Not yet.** The header chip when the panel cannot show, a draggable split between outline
+  and section, and rendered markdown in section bodies.
+
+### Writing a guide from the assistant
+
+The review assistant writes a guide with one agent (see
+[the assistant's Guides](code-review-assistant.md#guides)):
+
+* **Asking.** "Walk me through this review" (the palette's `Guide: walk me through this
+  review`, the AI menu, or `enter` on the empty guide panel) sends that message to the
+  assistant's conversation; the variant with directions puts it in the assistant's input for the
+  reviewer to add what to focus on or skip, which the assistant passes to `start.directions`.
+* **Streaming.** The assistant plans, starts the guide with its outline, then writes one section
+  per `guide.write`. Each finished call of its session reaches the review through tool
+  reflection, which reads that guide again: the skeleton (planned sections as `◌`) appears at
+  `start`, and sections fill in as their writes land. A start opens the guide panel where the
+  body has room for it.
+* **Card.** The conversation shows the turn's guide calls as one live card read from the same
+  guide state as the panel; a click on a section drives the diff there.
+* **Guide tab.** Where the body has no room for the panel, the assistant panel's title row has
+  `Chat` and `Guide` tabs and the Guide tab shows the guide, with its keys and clicks.
+* **`guide_show`** opens the guide and moves through it as the keys do; `current_view` reports
+  the guide.
+* **Stop** cancels the turn and marks the version cancelled with a revision-checked write, keeping
+  what was written; the panel's banner says `stopped · N of M sections written`.
 
 ## Review actions
 
@@ -526,7 +548,7 @@ path inside the repository, so write-path rules apply.
 | P1 | Models, store, citation checks, freshness | Yes |
 | P2 | Plugin tools, grants in the review assistant binding, configuration and context | Yes |
 | P3 | Read-only guide panel, diff markers, navigation | Yes |
-| P4 | Single-agent generation from the assistant, guide card, tab fallback | No |
+| P4 | Single-agent generation from the assistant, guide card, tab fallback | Yes |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | No |
 | P6 | Freshness in the UI, refresh forks, versions picker, since guides | No |
 | P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | No |
