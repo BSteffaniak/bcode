@@ -921,3 +921,96 @@ fn resuming_takes_over_only_versions_the_session_may_write() {
     let back = harness.json("code_review.guide.start", &resume, SESSION);
     assert_eq!(back["version"], 2, "a stopped version is resumed: {back}");
 }
+
+#[test]
+fn a_citation_heavy_guide_reads_as_whole_json_within_the_output_bound() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let started = harness.json("code_review.guide.start", &json!({}), SESSION);
+    let guide = started["guide_id"].as_str().expect("id").to_owned();
+    let path = GitFixture::modified_path(0);
+    harness
+        .store()
+        .update_guide_version(
+            harness.fixture.root(),
+            guide.clone(),
+            None,
+            None,
+            move |version| -> Result<(), String> {
+                for index in 0..1_000u32 {
+                    let id = format!("c{index}");
+                    version.citations.insert(
+                        id.clone(),
+                        bcode_code_review_models::Citation {
+                            id,
+                            source_id: None,
+                            path: path.clone(),
+                            side: bcode_code_review_models::ReviewLineSide::New,
+                            lines: bcode_code_review_models::ReviewLineInterval {
+                                start: index + 1,
+                                end: index + 1,
+                            },
+                            revision: bcode_code_review_models::RevisionRef::WorkingTree,
+                            blob_oid: None,
+                            quote_hash: "0".repeat(64),
+                            excerpt: "{ \"nested\": [1, 2, 3] }\n".repeat(15),
+                            relation: bcode_code_review_models::CitationRelation::Changed,
+                            verification: bcode_code_review_models::Verification::Unverified,
+                        },
+                    );
+                }
+                version.outline = (0..200u32)
+                    .map(|index| bcode_code_review_models::Section {
+                        id: format!("s{index}"),
+                        kind: bcode_code_review_models::SectionKind::Note,
+                        title: "t".repeat(1_000),
+                        body: "b".repeat(100),
+                        findings: Vec::new(),
+                        citations: (0..5).map(|n| format!("c{}", index * 5 + n)).collect(),
+                        children: Vec::new(),
+                        state: bcode_code_review_models::SectionState::Written,
+                        refreshed_from: None,
+                        checks: Vec::new(),
+                    })
+                    .collect();
+                Ok(())
+            },
+        )
+        .expect("store")
+        .expect("written");
+    for include in [
+        json!([
+            "outline",
+            "bodies",
+            "citations",
+            "freshness",
+            "versions",
+            "marks"
+        ]),
+        json!(["citations"]),
+        json!(["outline"]),
+    ] {
+        let output = harness.ok(
+            "code_review.guide.get",
+            &json!({"include": include}),
+            SESSION,
+        );
+        assert!(
+            output.len() <= 120 * 1024,
+            "{include}: {} bytes",
+            output.len()
+        );
+        let read: Value = serde_json::from_str(&output)
+            .unwrap_or_else(|error| panic!("{include}: whole JSON: {error}"));
+        assert_eq!(
+            read["version"]["version"], 1,
+            "{include}: the version is kept"
+        );
+        let cut = read["cut"].as_array().expect("named cut");
+        assert!(
+            cut.iter()
+                .all(|note| note.as_str().is_some_and(|note| note.len() < 1_024)),
+            "{include}: cut notes stay short: {cut:?}"
+        );
+    }
+}

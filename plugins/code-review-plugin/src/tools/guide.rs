@@ -600,6 +600,12 @@ pub fn run(
     }
 }
 
+/// `value` as compact JSON.
+fn compact(value: &Value) -> Result<String, AssistantError> {
+    serde_json::to_string(value)
+        .map_err(|error| AssistantError::Invalid(format!("cannot encode the result: {error}")))
+}
+
 /// One call on an opened review.
 struct Call<'a> {
     tools: &'a ReviewTools<'a>,
@@ -696,7 +702,8 @@ impl Call<'_> {
                     },
                 })
             }
-            "code_review.guide.get" => Ok(Answer::ok(encode(&tools.guide_get(
+            // Compact, as the answer's budget is measured.
+            "code_review.guide.get" => Ok(Answer::ok(compact(&tools.guide_get(
                 review,
                 &GuideGet {
                     guide_id: arguments.guide_id,

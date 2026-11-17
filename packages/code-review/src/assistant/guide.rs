@@ -1039,7 +1039,7 @@ impl ReviewTools<'_> {
         if !cut.is_empty() {
             answer["cut"] = json!(cut);
         }
-        Ok(answer)
+        Ok(within_budget(answer))
     }
 
     /// The review's guides, unless it has exactly one unarchived guide.
@@ -1133,7 +1133,7 @@ impl ReviewTools<'_> {
         }
         let mut cut = Vec::new();
         if answer.to_string().len() > GUIDE_GET_BUDGET / 2 {
-            for key in ["areas", "threads", "versions", "marks"] {
+            for key in ["areas", "threads", "versions", "marks", "freshness"] {
                 if let Some(object) = answer.as_object_mut()
                     && object.remove(key).is_some()
                 {
@@ -1404,7 +1404,9 @@ fn fit_sections(
     let bodies = include.contains(&GuideInclude::Bodies);
     let mut cited: Vec<String> = Vec::new();
     let mut cut_bodies: Vec<String> = Vec::new();
-    let mut used = answer.to_string().len();
+    let mut cut_outline: Vec<String> = Vec::new();
+    // Room is kept for the note naming what was cut.
+    let mut used = answer.to_string().len() + CUT_NOTE_ROOM;
     if include.contains(&GuideInclude::Outline) || bodies {
         let mut sections: Vec<Value> = Vec::new();
         for (depth, parent, section) in flatten(&version.outline) {
@@ -1438,15 +1440,26 @@ fn fit_sections(
                     cut_bodies.push(section.id.clone());
                 }
             }
-            used += item.to_string().len();
+            let item_bytes = item.to_string().len();
+            if used + item_bytes > GUIDE_GET_BUDGET {
+                cut_outline.push(section.id.clone());
+                continue;
+            }
+            used += item_bytes;
             sections.push(item);
         }
         answer["sections"] = Value::Array(sections);
     }
+    if !cut_outline.is_empty() {
+        cut.push(format!(
+            "outline entries {} (ask for them with `sections`)",
+            named(&cut_outline)
+        ));
+    }
     if !cut_bodies.is_empty() {
         cut.push(format!(
             "bodies of {} (ask for them with `sections`)",
-            cut_bodies.join(", ")
+            named(&cut_bodies)
         ));
     }
     if include.contains(&GuideInclude::Citations) {
@@ -1471,10 +1484,88 @@ fn fit_sections(
         if !cut_citations.is_empty() {
             cut.push(format!(
                 "citations {} (ask for fewer sections)",
-                cut_citations.join(", ")
+                named(&cut_citations)
             ));
         }
     }
+}
+
+/// Bytes kept free in a `guide.get` answer for the note naming what was cut.
+const CUT_NOTE_ROOM: usize = 4 * 1024;
+/// Ids a cut note names at most.
+const MAX_CUT_IDS: usize = 40;
+
+/// `ids` as a cut note names them: the first [`MAX_CUT_IDS`], then how many more.
+fn named(ids: &[String]) -> String {
+    if ids.len() <= MAX_CUT_IDS {
+        return ids.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        ids[..MAX_CUT_IDS].join(", "),
+        ids.len() - MAX_CUT_IDS
+    )
+}
+
+/// `answer` within [`GUIDE_GET_BUDGET`] as compact JSON: when the parts fitted one by one still
+/// add up to more, the largest optional parts go first, then sections from the end, each named
+/// in `cut`.
+fn within_budget(mut answer: Value) -> Value {
+    let size = |answer: &Value| answer.to_string().len();
+    if size(&answer) <= GUIDE_GET_BUDGET {
+        return answer;
+    }
+    let mut notes: Vec<String> = Vec::new();
+    for key in [
+        "citations",
+        "freshness",
+        "areas",
+        "threads",
+        "versions",
+        "marks",
+    ] {
+        if size(&answer) <= GUIDE_GET_BUDGET {
+            break;
+        }
+        if let Some(object) = answer.as_object_mut()
+            && object.remove(key).is_some()
+        {
+            notes.push(format!("{key} (ask for fewer sections, or for them alone)"));
+        }
+    }
+    let mut dropped: Vec<String> = Vec::new();
+    while size(&answer) > GUIDE_GET_BUDGET {
+        let Some(section) = answer
+            .get_mut("sections")
+            .and_then(Value::as_array_mut)
+            .and_then(Vec::pop)
+        else {
+            break;
+        };
+        dropped.push(
+            section
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+    if !dropped.is_empty() {
+        dropped.reverse();
+        notes.push(format!(
+            "sections {} (ask for them with `sections`)",
+            named(&dropped)
+        ));
+    }
+    if notes.is_empty() {
+        return answer;
+    }
+    if let Some(cut) = answer.get_mut("cut").and_then(Value::as_array_mut) {
+        cut.extend(notes.into_iter().map(Value::String));
+    } else {
+        answer["cut"] = json!(notes);
+    }
+    answer
 }
 
 /// A write refused by one operation-level reason.
