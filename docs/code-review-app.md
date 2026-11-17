@@ -182,7 +182,9 @@ from it, is in [code review assistant](code-review-assistant.md).
 * **Placement.** From 100 columns the panel docks on the right (by default 40% of the width,
   36 to 100 columns, and the screen keeps 60); narrower, it docks at the bottom (40% of the
   height, at least 8 rows, and the screen keeps 8); when neither fits, the focused panel takes
-  the whole screen and `esc` returns to it. Drag the panel's inner edge to resize it. Below 24
+  the whole screen and `esc` returns to it. Drag the panel's inner edge to resize it; the size
+  is kept as a share of the screen, so the panel keeps its proportion when the terminal is
+  resized (the limits above still win). Below 24
   columns or 6 rows it shows its title row and input only, below 12 columns its title row only.
 * **What it knows.** Each message carries a stored `review app view` block (the screen, the
   review's id, title, kind and sources, the stack layers and the current one, the comparison
@@ -715,6 +717,12 @@ strong, muted and dim; and an accent, a second accent and text on the accent. Th
 few roles still get every tier (tinted surfaces on an RGB canvas, no fills with terminal
 colors). Warning color only marks what needs the reviewer, such as the drafts of an unsaved
 review; a modified file takes the accent and a renamed one the second accent.
+
+Panel dividers drag (as do `>` and `<` for the file panel), and a panel keeps the share of the
+screen it was given: resizing the terminal scales the file and threads panels and the assistant
+with it, as BMUX panes do, while the document keeps at least 40 columns and each panel its
+minimum. File and threads panel sizes are saved with the review as shares; sizes saved in
+columns by earlier versions are converted the first time the review shows them.
 
 Panels are rounded unless the theme chooses its own glyphs, and the focused panel's border and
 title take the accent, with counts at the right of each title row. The selected row of the file

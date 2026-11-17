@@ -501,6 +501,20 @@ pub const fn group(axis: PanelGroupAxis, styles: PanelGroupStyles) -> PanelGroup
     resizable(axis, PanelDividerMode::Overlay { before, after }, styles)
 }
 
+/// The group of the app's screen and a docked panel after it (to the right or below): the
+/// handle covers the panel's own edge border, the screen having no border of its own there.
+#[must_use]
+pub const fn dock_group(axis: PanelGroupAxis, styles: PanelGroupStyles) -> PanelGroup {
+    resizable(
+        axis,
+        PanelDividerMode::Overlay {
+            before: 0,
+            after: 1,
+        },
+        styles,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

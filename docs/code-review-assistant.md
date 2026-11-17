@@ -84,16 +84,27 @@ the rectangle it is given (its own header, body and footer), so no route lays th
 The decision is made per frame from the app's area, in this order:
 
 1. **Right dock.** At least 100 columns: the panel takes the right column from the top row to
-   the bottom row. Its width is the user's width (default 40% of the area, 36..=100 columns),
-   clamped so the route keeps 60 columns. The divider on its left edge drags.
+   the bottom row. Its width is the user's share of the area's width (default 40%), within
+   36..=100 columns and clamped so the route keeps 60 columns. The divider on its left edge
+   drags.
 2. **Bottom dock.** Fewer columns and at least 16 rows: the panel takes the bottom rows across
-   the whole width (default 40%, at least 8 rows), clamped so the route keeps 8 rows. The divider
-   on its top edge drags.
+   the whole width. Its height is the user's share of the area's height (default 40%), at least
+   8 rows and clamped so the route keeps 8 rows. The divider on its top edge (the title row,
+   where a double press still zooms) drags.
 3. **Zoomed.** Smaller than both: the focused panel takes the whole area; an unfocused open
    panel is hidden (it stays open, and the Ask AI button shows that it is). `esc` returns to the
    route.
 
-The width and height chosen by dragging are app state for the run; `assistant.width` and
+Docked, the route and the panel are the two members of a BMUX panel group (`app.assistant.dock`,
+horizontal on the right, vertical at the bottom) with the review panels' resize policy: the
+divider is highlighted while hovered or dragged and its handle is the hit region the group
+registers at the cells it lays out. A drag keeps the panel's size as a share of the area, so
+the panel keeps its proportion when the terminal is resized; the limits above win when the area
+shrinks, and the share applies again once it grows. A frame that does not paint the panel
+(closed, or hidden while zoomed and unfocused) clears its painted regions, hover and any divider
+drag, so the cells it covered take pointer input for the route again.
+
+The shares chosen by dragging are app state for the run; `assistant.width` and
 `assistant.height` in configuration set the defaults. The review body loses its own assistant
 pane: `panels.rs` keeps the file and threads panels only.
 

@@ -5,8 +5,11 @@
 //!   ([`Assistant::split`]): docked on the right from [`RIGHT_DOCK_WIDTH`] columns (the screen
 //!   keeps [`SCREEN_MIN_WIDTH`]), docked at the bottom from [`BOTTOM_DOCK_HEIGHT`] rows (the
 //!   screen keeps [`SCREEN_MIN_HEIGHT`]), and otherwise zoomed over the whole area while it is
-//!   focused (hidden but open while it is not). The divider on the panel's inner edge drags.
-//!   While the panel is not painted it takes no pointer input.
+//!   focused (hidden but open while it is not). Docked, the screen and the panel are a BMUX
+//!   panel group ([`crate::panels::dock_group`]): the panel's inner edge is the divider, styled
+//!   and dragged like the review's, and a dragged size is kept as a share of the area, so the
+//!   panel keeps its proportion when the terminal is resized. The minimums above still win
+//!   when the area shrinks. While the panel is not painted it takes no pointer input.
 //! * **Conversation.** The first message of a new conversation creates a Bcode session with the
 //!   review app's origin, tagged with the review and stack layer on screen (or none on home and
 //!   in the wizard), and sends the message. The panel follows the active session like an AI card
@@ -34,6 +37,7 @@ use super::{ASSISTANT_SCOPE, HISTORY_SCOPE, Place, PlaceKey, Screen};
 use crate::agent::{AgentPhase, AgentStreams, FeedKeys};
 use crate::context::UiContext;
 use crate::host::{ContextBlock, TurnRequest};
+use crate::panels::{cells_of, dock_group, share_of};
 use crate::rows::{ActionCells, AgentAction, Folds, ItemAction};
 use crate::services::ReviewServices;
 use crate::theme::ReviewTheme;
@@ -51,6 +55,10 @@ use bmux_tui::geometry::{Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
 use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles, PaneTitleAction};
+use bmux_tui_components::panel_group::{
+    PanelGroupAxis, PanelGroupComponent, PanelGroupConstraints, PanelGroupOutcome, PanelGroupState,
+    PanelGroupStyles, PanelSize,
+};
 use bmux_tui_components::text_input::{
     EdgePolicy, TextInputComponent, TextInputControl, TextInputOutcome, TextInputPolicy,
     TextInputState,
@@ -69,6 +77,8 @@ pub const FEED_ID: &str = "app.assistant.feed";
 pub const INPUT_ID: &str = "app.assistant.input";
 /// Layout id of the history rows.
 pub const HISTORY_ID: &str = "app.assistant.history";
+/// Layout id of the group of the screen and the docked panel.
+pub const DOCK_ID: &str = "app.assistant.dock";
 /// Width from which the panel docks on the right.
 pub const RIGHT_DOCK_WIDTH: u16 = 100;
 /// Height from which the panel docks at the bottom (below [`RIGHT_DOCK_WIDTH`]).
@@ -283,10 +293,14 @@ pub struct Assistant {
     services: ReviewServices,
     repo: PathBuf,
     visibility: Shown,
-    width: Option<u16>,
-    height: Option<u16>,
-    /// The divider is being dragged.
-    drag: Option<Dock>,
+    /// The right dock's width chosen by dragging, as a share of the area's width.
+    right_share: Option<u16>,
+    /// The bottom dock's height chosen by dragging, as a share of the area's height.
+    bottom_share: Option<u16>,
+    /// The screen and the docked panel as a panel group, and the area and dock it was built
+    /// for.
+    dock: RefCell<PanelGroupState>,
+    dock_key: Cell<Option<(Rect, Dock)>>,
     session: Option<String>,
     /// Title of the active conversation, once known.
     title: Option<String>,
@@ -375,9 +389,10 @@ impl Assistant {
             services,
             repo,
             visibility: Shown::Closed,
-            width: None,
-            height: None,
-            drag: None,
+            right_share: None,
+            bottom_share: None,
+            dock: RefCell::new(PanelGroupState::new(Vec::new())),
+            dock_key: Cell::new(None),
             session: None,
             title: None,
             tag: None,
@@ -596,7 +611,8 @@ impl Assistant {
         self.hover = None;
         self.history_delete.set(None);
         self.title_press = None;
-        self.drag = None;
+        self.dock_key.set(None);
+        *self.dock.borrow_mut() = PanelGroupState::new(Vec::new());
     }
 
     /// The badge the Ask AI button shows: only while the panel is not on screen.
@@ -647,32 +663,18 @@ impl Assistant {
                 panel: Some((area, Dock::Zoomed)),
             };
         }
-        if area.width >= RIGHT_DOCK_WIDTH {
-            let default = area.width * 2 / 5;
-            let width = self
-                .width
-                .unwrap_or(default)
-                .clamp(MIN_WIDTH, MAX_WIDTH)
-                .min(area.width - SCREEN_MIN_WIDTH);
-            let screen = Rect::new(area.x, area.y, area.width - width, area.height);
-            let panel = Rect::new(screen.right(), area.y, width, area.height);
+        let dock = if area.width >= RIGHT_DOCK_WIDTH {
+            Some(Dock::Right)
+        } else if area.height >= BOTTOM_DOCK_HEIGHT {
+            Some(Dock::Bottom)
+        } else {
+            None
+        };
+        if let Some(dock) = dock {
+            let (screen, panel) = self.docked(area, dock);
             return Split {
                 screen: Some(screen),
-                panel: Some((panel, Dock::Right)),
-            };
-        }
-        if area.height >= BOTTOM_DOCK_HEIGHT {
-            let default = area.height * 2 / 5;
-            let height = self
-                .height
-                .unwrap_or(default)
-                .max(MIN_HEIGHT)
-                .min(area.height - SCREEN_MIN_HEIGHT);
-            let screen = Rect::new(area.x, area.y, area.width, area.height - height);
-            let panel = Rect::new(area.x, screen.bottom(), area.width, height);
-            return Split {
-                screen: Some(screen),
-                panel: Some((panel, Dock::Bottom)),
+                panel: Some((panel, dock)),
             };
         }
         if self.is_focused() {
@@ -686,6 +688,89 @@ impl Assistant {
                 panel: None,
             }
         }
+    }
+
+    /// The screen's and the panel's cells docked in `area`, laid out by the dock group.
+    fn docked(&self, area: Rect, dock: Dock) -> (Rect, Rect) {
+        self.sync_dock(area, dock);
+        let layout = dock_group(dock_axis(dock), PanelGroupStyles::default())
+            .layout(area, &self.dock.borrow());
+        match layout.panels.as_slice() {
+            [screen, panel] => (*screen, *panel),
+            _ => (area, Rect::new(area.right(), area.y, 0, area.height)),
+        }
+    }
+
+    /// Build the dock group for `area` and `dock` when either changed: the panel takes its
+    /// share of the area (two fifths by default) within its limits, the screen the rest.
+    ///
+    /// * Right: [`MIN_WIDTH`]..=[`MAX_WIDTH`] columns, leaving the screen [`SCREEN_MIN_WIDTH`].
+    /// * Bottom: at least [`MIN_HEIGHT`] rows, leaving the screen [`SCREEN_MIN_HEIGHT`].
+    fn sync_dock(&self, area: Rect, dock: Dock) {
+        if self.dock_key.get() == Some((area, dock)) {
+            return;
+        }
+        let (length, share, screen_min, min, max) = match dock {
+            Dock::Right => (
+                area.width,
+                self.right_share,
+                SCREEN_MIN_WIDTH,
+                MIN_WIDTH,
+                MAX_WIDTH,
+            ),
+            Dock::Bottom | Dock::Zoomed => (
+                area.height,
+                self.bottom_share,
+                SCREEN_MIN_HEIGHT,
+                MIN_HEIGHT,
+                u16::MAX,
+            ),
+        };
+        let max = max
+            .min(length.saturating_sub(screen_min))
+            .max(min.min(length));
+        let panel = share
+            .map_or(length * 2 / 5, |share| cells_of(share, length))
+            .clamp(min.min(max), max)
+            .min(length);
+        let screen = length - panel;
+        let mut state = PanelGroupState::new([
+            PanelSize::flex(screen.max(1)),
+            PanelSize::flex(panel.max(1)),
+        ]);
+        state.set_constraints([
+            PanelGroupConstraints::new(screen_min.min(length), None),
+            PanelGroupConstraints::new(min.min(length), Some(max)),
+        ]);
+        *self.dock.borrow_mut() = state;
+        self.dock_key.set(Some((area, dock)));
+    }
+
+    /// Hand a pointer event to the dock group (a divider press, drag or hover), keeping a
+    /// resized panel's size as a share of `area`. Returns what the group did.
+    fn dock_event(&mut self, event: &Event, area: Rect, dock: Dock) -> PanelGroupOutcome {
+        if dock == Dock::Zoomed {
+            return PanelGroupOutcome::Ignored;
+        }
+        self.sync_dock(area, dock);
+        let group = dock_group(dock_axis(dock), PanelGroupStyles::default());
+        let outcome = group.handle_event(area, &mut self.dock.borrow_mut(), event);
+        if matches!(outcome, PanelGroupOutcome::Resized { .. }) {
+            let layout = group.layout(area, &self.dock.borrow());
+            if let Some(panel) = layout.panels.get(1) {
+                match dock {
+                    Dock::Right => self.right_share = Some(share_of(panel.width, area.width)),
+                    Dock::Bottom => {
+                        self.bottom_share = Some(share_of(panel.height, area.height));
+                    }
+                    Dock::Zoomed => {}
+                }
+            }
+        }
+        if outcome != PanelGroupOutcome::Ignored {
+            self.touch();
+        }
+        outcome
     }
 
     // ----------------------------------------------------------------------------------------
@@ -1825,28 +1910,21 @@ impl Assistant {
             return None;
         };
         let painted = self.painted.borrow().clone();
-        if let Some(dragged) = self.drag {
-            match mouse.kind {
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    let area = painted.area;
-                    match dragged {
-                        Dock::Right => {
-                            self.width = Some(area.right().saturating_sub(mouse.position.x));
-                        }
-                        Dock::Bottom => {
-                            self.height = Some(area.bottom().saturating_sub(mouse.position.y));
-                        }
-                        Dock::Zoomed => {}
-                    }
-                    self.touch();
-                    return Some(Outcome::Redraw);
-                }
-                MouseEventKind::Up(_) => {
-                    self.drag = None;
-                    return Some(Outcome::Redraw);
-                }
-                _ => {}
-            }
+        // A divider drag follows the pointer wherever it goes, until the button is released.
+        let dragging = self.dock.borrow().active_divider().is_some();
+        if dragging
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            self.dock_event(event, painted.area, dock);
+            return Some(Outcome::Redraw);
+        }
+        if mouse.kind == MouseEventKind::Move
+            && self.dock_event(event, painted.area, dock) != PanelGroupOutcome::Ignored
+        {
+            ui.request_redraw();
         }
         if !panel.contains(mouse.position) {
             // The pointer left: the history row's `✕` goes back to the selected row. The move
@@ -1859,7 +1937,7 @@ impl Assistant {
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                Some(self.mouse_down(mouse.position, panel, dock, &painted, place, ui))
+                Some(self.mouse_down(event, mouse.position, dock, &painted, place, ui))
             }
             MouseEventKind::Move => {
                 let hover = painted
@@ -1894,8 +1972,8 @@ impl Assistant {
     /// A left press inside the panel at `position`.
     fn mouse_down(
         &mut self,
+        event: &Event,
         position: Point,
-        panel: Rect,
         dock: Dock,
         painted: &Painted,
         place: &Place,
@@ -1904,16 +1982,20 @@ impl Assistant {
         let Point { x, y } = position;
         self.visibility = Shown::Focused;
         self.touch();
-        if let Some(outcome) = self.press_control(position, painted, place, ui) {
+        if let Some(outcome) = self.press_button(position, painted, place, ui) {
             return outcome;
         }
-        let divider = match dock {
-            Dock::Right => x == panel.x,
-            Dock::Bottom => y == panel.y,
-            Dock::Zoomed => false,
-        };
-        if divider {
-            self.drag = Some(dock);
+        // The divider is the panel's inner edge; on the bottom dock that is the title row,
+        // which still zooms on a double press.
+        let dragging = matches!(
+            self.dock_event(event, painted.area, dock),
+            PanelGroupOutcome::DividerDragStarted { .. }
+        );
+        if self.press_title(position, painted) {
+            self.dock_key.set(None);
+            return Outcome::Redraw;
+        }
+        if dragging {
             return Outcome::Redraw;
         }
         if let Some(area) = painted.history.filter(|area| area.contains(position)) {
@@ -1971,9 +2053,9 @@ impl Assistant {
         }
     }
 
-    /// A press on a control: a history row's `✕` (arms, then deletes), a chip, a title-row
-    /// button, or the title row (a double press zooms). `None` elsewhere.
-    fn press_control(
+    /// A press on a control: a history row's `✕` (arms, then deletes), a chip, or a title-row
+    /// button. `None` elsewhere.
+    fn press_button(
         &mut self,
         position: Point,
         painted: &Painted,
@@ -2030,21 +2112,27 @@ impl Assistant {
                 _ => Outcome::Redraw,
             });
         }
-        if painted.title.is_some_and(|title| title.contains(position)) {
-            let now = Instant::now();
-            let double = self
-                .title_press
-                .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
-            self.title_press = (!double).then_some(now);
-            if double {
-                self.zoom = match self.zoom {
-                    Zoom::Docked => Zoom::Zoomed,
-                    Zoom::Zoomed => Zoom::Docked,
-                };
-                return Some(Outcome::Redraw);
-            }
-        }
         None
+    }
+
+    /// A press on the title row: the second of two quick presses zooms (or docks) the panel.
+    /// Returns whether it did.
+    fn press_title(&mut self, position: Point, painted: &Painted) -> bool {
+        if !painted.title.is_some_and(|title| title.contains(position)) {
+            return false;
+        }
+        let now = Instant::now();
+        let double = self
+            .title_press
+            .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
+        self.title_press = (!double).then_some(now);
+        if double {
+            self.zoom = match self.zoom {
+                Zoom::Docked => Zoom::Zoomed,
+                Zoom::Zoomed => Zoom::Docked,
+            };
+        }
+        double
     }
 
     fn feed_action(&mut self, action: AgentAction, ui: &UiContext) -> Outcome {
@@ -3070,6 +3158,23 @@ impl Assistant {
             .history
             .and_then(|area| self.history_delete_region(area));
         *self.painted.borrow_mut() = painted;
+        self.paint_divider(area, dock, theme, cx);
+    }
+
+    /// Paint the dock group over the screen and the painted panel: it highlights the divider
+    /// while hovered or dragged and registers its handle, at the cells the split laid out.
+    fn paint_divider(&self, area: Rect, dock: Dock, theme: &ReviewTheme, cx: &mut PaintCx<'_, '_>) {
+        if dock == Dock::Zoomed || self.dock_key.get() != Some((area, dock)) {
+            return;
+        }
+        let group = PanelGroupComponent::new(
+            DOCK_ID,
+            dock_group(dock_axis(dock), theme.panels),
+            &self.dock,
+        )
+        .child(Placed)
+        .child(Placed);
+        cx.paint_component(&group, area);
     }
 
     /// Each painted chip's cells, from the plan the chips row was laid out with at `chips`.
@@ -3903,6 +4008,32 @@ impl Component for HistoryRows<'_> {
         let node = block.layout(Constraints::tight(size), &mut LayoutCx::new());
         block.paint(&node, cx);
     }
+}
+
+/// The axis of the dock group for `dock`.
+const fn dock_axis(dock: Dock) -> PanelGroupAxis {
+    match dock {
+        Dock::Right => PanelGroupAxis::Horizontal,
+        Dock::Bottom | Dock::Zoomed => PanelGroupAxis::Vertical,
+    }
+}
+
+/// A member of the dock group painted on its own (the screen by the app, the panel by
+/// [`Assistant::paint`]): it takes the cells the group gives it and paints nothing.
+struct Placed;
+
+impl Component for Placed {
+    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+        LayoutNode::leaf(
+            LayoutId::new("app.assistant.dock.member"),
+            LogicalSize::new(
+                constraints.max_width(),
+                constraints.max_height().unwrap_or(0),
+            ),
+        )
+    }
+
+    fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
 }
 
 #[cfg(test)]
