@@ -16,12 +16,12 @@ fn hello_config() -> bcode_config::BcodeConfig {
     config
 }
 
-/// Stage the packaged hello backend wrapper as an installed plugin root:
+/// Stage the packaged hello backend as an installed plugin root:
 /// the verbatim declaration plus the artifact under its declared library name.
-fn hello_wrapper_root() -> tempfile::TempDir {
+fn hello_backend_root() -> tempfile::TempDir {
     let artifact = PathBuf::from(
-        std::env::var_os("BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT").expect(
-            "build the hello backend wrapper with package-plugin.py --component backend --feature tui; set BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT to its absolute path",
+        std::env::var_os("BCODE_HELLO_BACKEND_ARTIFACT").expect(
+            "BCODE_HELLO_BACKEND_ARTIFACT selects the packaged hello backend; package it with `python3 scripts/package-plugin-fixtures.py` (cargo nextest runs it)",
         ),
     );
     assert!(artifact.is_absolute() && artifact.is_file());
@@ -55,7 +55,7 @@ fn provider_and_auth_command_host_activates_bundled_plugins() {
 
 #[test]
 fn provider_and_auth_command_host_activates_discovered_plugins() {
-    let root = hello_wrapper_root();
+    let root = hello_backend_root();
     assert_echo(cli_plugin_host(&hello_config(), discovered_hello(&root), &[]).unwrap());
 }
 
@@ -66,13 +66,13 @@ fn plugin_service_commands_activate_bundled_plugins() {
 
 #[test]
 fn plugin_service_commands_activate_discovered_plugins() {
-    let root = hello_wrapper_root();
+    let root = hello_backend_root();
     assert_echo(plugin_service_host(&hello_config(), discovered_hello(&root), &[]).unwrap());
 }
 
 #[test]
 fn plugin_check_activates_each_selected_discovered_plugin() {
-    let root = hello_wrapper_root();
+    let root = hello_backend_root();
     let mut checked = Vec::new();
     let count = check_selected_plugins(
         &plugin_selection_for_config(&hello_config()),
@@ -89,7 +89,7 @@ fn plugin_check_activates_each_selected_discovered_plugin() {
 
 #[test]
 fn local_plugin_publish_delivers_to_activated_discovered_plugins() {
-    let root = hello_wrapper_root();
+    let root = hello_backend_root();
     let delivered = publish_local_plugin_event(
         &hello_config(),
         discovered_hello(&root),

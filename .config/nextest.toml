@@ -1,5 +1,25 @@
+# Setup scripts package the dynamic plugin fixtures (see the end of this file).
+experimental = ["setup-scripts"]
+
 # These tests measure wall-clock throughput/latency. Reserve runner capacity so
 # unrelated workspace tests do not consume their CPU budget during measurement.
 [[profile.default.overrides]]
 filter = '(package(bcode_hyperchad) & test(representative_long_snapshot_render_measurement_stays_bounded)) | (package(bcode_server) & test(slow_client_progress_flood_converges_to_latest_checkpoint_after_reconnect))'
 threads-required = "num-test-threads"
+
+# Tests that load packaged dynamic plugins read their artifacts from
+# BCODE_*_ARTIFACT variables. This setup script packages those fixtures with
+# BMUX's packager (incrementally) and exports the variables to exactly these
+# tests. See docs/dynamic-plugin-packaging.md.
+[scripts.setup.package-plugin-fixtures]
+command = "python3 scripts/package-plugin-fixtures.py --nextest-env"
+
+[[profile.default.scripts]]
+filter = '''
+    (package(bcode) & binary(embedded_scoped_plugin))
+    | (package(bcode_cli) & test(plugin_host_tests::))
+    | (package(bcode_tui) & test(plugin_tui::tests::))
+    | (package(bcode_plugin) & test(dynamic))
+    | (package(bcode_plugin_config) & test(discovered_native_artifact))
+'''
+setup = "package-plugin-fixtures"

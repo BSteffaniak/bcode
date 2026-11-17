@@ -8054,38 +8054,44 @@ library = "libexample_plugin.dylib"
         }
     }
 
-    /// Explicitly selected thin backend wrapper for the hello example.
+    /// Explicitly selected packaged backend for the hello example.
     ///
-    /// `bcode_hello_plugin` is an export-free implementation rlib; dynamic
-    /// coverage must load the separately packaged thin wrapper rather than
-    /// probing the test dependency directory for an implementation dylib.
-    fn hello_backend_wrapper_artifact() -> PathBuf {
-        let artifact = std::env::var_os(HELLO_BACKEND_WRAPPER_ARTIFACT_ENV).map_or_else(
+    /// `bcode_hello_plugin` is an rlib in workspace builds; only the packager
+    /// (`--cfg bmux_plugin_dylib` plus a role feature) builds the dynamic
+    /// library, so coverage loads that artifact rather than probing the test
+    /// dependency directory.
+    fn hello_backend_artifact() -> PathBuf {
+        packaged_artifact(HELLO_BACKEND_ARTIFACT_ENV)
+    }
+
+    const HELLO_BACKEND_ARTIFACT_ENV: &str = "BCODE_HELLO_BACKEND_ARTIFACT";
+    const QUESTION_BACKEND_ARTIFACT_ENV: &str = "BCODE_QUESTION_BACKEND_ARTIFACT";
+
+    fn packaged_artifact(variable: &str) -> PathBuf {
+        let artifact = std::env::var_os(variable).map_or_else(
             || {
                 panic!(
-                    "build the Bcode hello thin backend wrapper with package-plugin.py --component backend; set {HELLO_BACKEND_WRAPPER_ARTIFACT_ENV} to its absolute artifact path (not the export-free implementation library)"
+                    "{variable} selects a packaged plugin fixture; package it with `python3 scripts/package-plugin-fixtures.py` (cargo nextest runs it)"
                 )
             },
             PathBuf::from,
         );
         assert!(
             artifact.is_absolute() && artifact.is_file(),
-            "{HELLO_BACKEND_WRAPPER_ARTIFACT_ENV} must select an existing absolute Bcode backend wrapper: {}",
+            "{variable} must select an existing absolute packaged artifact: {}",
             artifact.display(),
         );
         artifact
     }
 
-    const HELLO_BACKEND_WRAPPER_ARTIFACT_ENV: &str = "BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT";
-
     fn load_dynamic_hello_plugin() -> ActivatedNativeTestPlugin {
-        // Keep the embedded declaration unchanged. The selected wrapper artifact
-        // is deployment data, not a reason to rewrite the product manifest.
+        // Keep the embedded declaration unchanged. The selected artifact is
+        // deployment data, not a reason to rewrite the product manifest.
         let manifest = toml::from_str::<PluginManifest>(include_str!(
             "../../../examples/hello-plugin/bcode-plugin.toml"
         ))
         .expect("hello manifest should parse");
-        let artifact = hello_backend_wrapper_artifact();
+        let artifact = hello_backend_artifact();
         let config = crate::shared_instance_tests::fixture_config(&manifest.id);
         let plugin = load_native_component_with_config(
             manifest,
@@ -8093,7 +8099,7 @@ library = "libexample_plugin.dylib"
             config,
             bcode_plugin_sdk::definition::ComponentRole::Backend,
         )
-        .expect("shared native hello backend wrapper should load");
+        .expect("shared native hello backend should load");
         plugin.activate().expect("shared native hello activation");
         ActivatedNativeTestPlugin(Arc::new(plugin))
     }
@@ -9142,45 +9148,14 @@ library = "libexample_plugin.dylib"
     fn static_blocked_abi_bridge_wakes_on_cancellation() {
         assert_blocked_plugin_bridge_wakes_on_cancellation(&load_static_hello_plugin().0);
     }
-    fn question_dynamic_library_path() -> PathBuf {
-        let workspace_library = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/debug")
-            .join(format!(
-                "{}bcode_question_plugin{}",
-                std::env::consts::DLL_PREFIX,
-                std::env::consts::DLL_SUFFIX
-            ));
-        if workspace_library.exists() {
-            return workspace_library;
-        }
-        let executable = std::env::current_exe().expect("current test executable path");
-        let directory = executable.parent().expect("test executable parent");
-        let prefix = format!(
-            "{}bcode_question_dynamic_plugin",
-            std::env::consts::DLL_PREFIX
-        );
-        std::fs::read_dir(directory)
-            .expect("test dependency directory should be readable")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with(&prefix) && name.ends_with(std::env::consts::DLL_SUFFIX)
-                    })
-            })
-            .expect("question plugin dynamic library should be built as a dev dependency")
-    }
-
     fn load_dynamic_question_plugin() -> ActivatedNativeTestPlugin {
         let manifest = toml::from_str::<PluginManifest>(include_str!(
             "../../../plugins/question-plugin/bcode-plugin.toml"
         ))
         .expect("question manifest should parse");
-        // Keep the embedded declaration unchanged. The selected wrapper artifact
-        // is packaging, not a reason to rewrite product manifest identity.
-        let artifact = question_dynamic_library_path();
+        // Keep the embedded declaration unchanged. The selected artifact is
+        // packaging, not a reason to rewrite product manifest identity.
+        let artifact = packaged_artifact(QUESTION_BACKEND_ARTIFACT_ENV);
         let config = crate::shared_instance_tests::fixture_config(&manifest.id);
         let plugin = load_native_component_with_config(
             manifest,
@@ -9402,9 +9377,9 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn aborting_dynamic_library_terminates_only_fixture_process() {
-        // Require the explicit wrapper selection here so a missing artifact cannot
+        // Require the explicit artifact selection here so a missing artifact cannot
         // masquerade as the expected abnormal child termination.
-        let _ = hello_backend_wrapper_artifact();
+        let _ = hello_backend_artifact();
         let executable = std::env::current_exe().expect("current test executable");
         let output = std::process::Command::new(executable)
             .arg("tests::aborting_dynamic_library_subprocess_helper")
@@ -9424,9 +9399,9 @@ library = "libexample_plugin.dylib"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !stderr.contains("shared native hello backend wrapper should load")
+            !stderr.contains("shared native hello backend should load")
                 && !stderr.contains("shared native hello activation"),
-            "helper must reach the abort operation, not fail during wrapper admission: {stderr}"
+            "helper must reach the abort operation, not fail during artifact admission: {stderr}"
         );
     }
 

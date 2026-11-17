@@ -11,7 +11,6 @@ members = [
     "packages/vox",
     "xtask",
     "examples/hello-plugin",
-    "examples/question-dynamic-plugin",
     "plugins/recap-plugin",
     "plugins/vox-plugin",
     "plugins/filesystem-plugin",
@@ -327,7 +326,6 @@ bcode_prompt_profile                    = { version = "0.0.1-alpha.0", default-f
 bcode_prompt_profile_plugin             = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/prompt-profile-plugin" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
 bcode_provider_auth_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth/models" }
-bcode_question_dynamic_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "examples/question-dynamic-plugin" }
 bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/question-plugin" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
 bcode_ralph_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph/models" }

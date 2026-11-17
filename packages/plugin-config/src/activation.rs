@@ -253,12 +253,12 @@ mod tests {
         response.payload
     }
 
-    /// Discover the real packaged hello backend wrapper exactly as an installed
+    /// Discover the real packaged hello backend exactly as an installed
     /// plugin: verbatim declaration plus the artifact under its declared library name.
-    fn stage_hello_wrapper(root: &std::path::Path) {
+    fn stage_hello_backend(root: &std::path::Path) {
         let artifact = std::path::PathBuf::from(
-            std::env::var_os("BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT").expect(
-                "build the hello backend wrapper with package-plugin.py --component backend --feature tui; set BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT to its absolute path",
+            std::env::var_os("BCODE_HELLO_BACKEND_ARTIFACT").expect(
+                "BCODE_HELLO_BACKEND_ARTIFACT selects the packaged hello backend; package it with `python3 scripts/package-plugin-fixtures.py` (cargo nextest runs it)",
             ),
         );
         assert!(artifact.is_absolute() && artifact.is_file());
@@ -300,9 +300,9 @@ mod tests {
     }
 
     #[test]
-    fn discovered_native_wrapper_receives_activation_authority() {
+    fn discovered_native_artifact_receives_activation_authority() {
         let root = tempfile::tempdir().unwrap();
-        stage_hello_wrapper(root.path());
+        stage_hello_backend(root.path());
         let discovered = bcode_plugin::discover_plugins_in_roots(&[root.path().into()]).unwrap();
         let mut host = load_plugin_host(
             &bcode_plugin::PluginSelection::all_enabled(),

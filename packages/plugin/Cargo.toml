@@ -36,15 +36,10 @@ tracing                          = { workspace = true }
 uuid                             = { workspace = true }
 
 [dev-dependencies]
-bcode_hello_plugin            = { workspace = true }
-bcode_question_dynamic_plugin = { workspace = true }
-bcode_question_plugin         = { workspace = true, features = ["native"] }
-tokio                         = { workspace = true, features = ["macros", "rt", "time"] }
+bcode_hello_plugin    = { workspace = true }
+bcode_question_plugin = { workspace = true, features = ["native"] }
+tokio                 = { workspace = true, features = ["macros", "rt", "time"] }
 
 [features]
 default          = []
 fail-on-warnings = []
-
-[package.metadata.cargo-machete]
-# Tests discover and load this dev-dependency as a dynamic library, not a Rust import.
-ignored = ["bcode_question_dynamic_plugin"]

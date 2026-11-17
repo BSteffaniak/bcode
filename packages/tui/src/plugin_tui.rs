@@ -4151,13 +4151,13 @@ library = "libcomposer_fixture.dylib"
     }
 
     fn hello_dynamic_library_path() -> std::path::PathBuf {
-        let artifact = std::env::var_os("BCODE_HELLO_WRAPPER_ARTIFACT").expect(
-            "build/package the Bcode hello thin frontend wrapper with package-plugin.py --component frontend --feature tui; set BCODE_HELLO_WRAPPER_ARTIFACT to its absolute dylib path (not the export-free implementation library)",
+        let artifact = std::env::var_os("BCODE_HELLO_FRONTEND_ARTIFACT").expect(
+            "BCODE_HELLO_FRONTEND_ARTIFACT selects the packaged hello frontend; package it with `python3 scripts/package-plugin-fixtures.py` (cargo nextest runs it)",
         );
         let artifact = std::path::PathBuf::from(artifact);
         assert!(
             artifact.is_absolute() && artifact.is_file(),
-            "BCODE_HELLO_WRAPPER_ARTIFACT must identify an existing absolute wrapper artifact"
+            "BCODE_HELLO_FRONTEND_ARTIFACT must identify an existing absolute packaged artifact"
         );
         artifact
     }
@@ -4888,12 +4888,12 @@ library = "libcomposer_fixture.dylib"
     }
 
     fn discovered_hello_presentation() -> PluginTuiPresentation {
-        let artifact = std::env::var_os("BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT")
+        let artifact = std::env::var_os("BCODE_HELLO_BACKEND_ARTIFACT")
             .map(std::path::PathBuf::from)
-            .expect("build the Bcode hello thin backend wrapper with package-plugin.py --component backend --feature tui; set BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT to its absolute artifact path");
+            .expect("BCODE_HELLO_BACKEND_ARTIFACT selects the packaged hello backend; package it with `python3 scripts/package-plugin-fixtures.py` (cargo nextest runs it)");
         assert!(
             artifact.is_absolute() && artifact.is_file(),
-            "BCODE_HELLO_BACKEND_WRAPPER_ARTIFACT must select an existing absolute Bcode backend wrapper"
+            "BCODE_HELLO_BACKEND_ARTIFACT must select an existing absolute packaged backend"
         );
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/hello-plugin");
@@ -4910,7 +4910,7 @@ library = "libcomposer_fixture.dylib"
             artifact,
             super::fixture::config("example.hello"),
         )])
-        .expect("admit selected thin backend wrapper without rewriting its declaration")
+        .expect("admit the selected packaged backend without rewriting its declaration")
         .into();
         PluginTuiPresentation::with_runtime_config_and_extensions(
             runtime,
