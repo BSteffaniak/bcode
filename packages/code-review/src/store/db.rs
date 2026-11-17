@@ -603,6 +603,7 @@ impl<'a> CodeReviewDb<'a> {
             .as_ref()
             .map_or(now, |existing| existing.created_at_ms);
         binding.started = Some(started_tag(existing.as_ref(), &binding, workspace_id));
+        let binding = super::assistant_bindings::recorded(binding);
         let json = serde_json::to_string(&binding)?;
         if self
             .db
@@ -1671,6 +1672,7 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(super::looks::layer_looks_table_migration());
     source.add_migration(workspace_revision_column_migration());
     source.add_migration(super::assistant_settings::assistant_settings_table_migration());
+    source.add_migration(super::assistant_bindings::compact_assistant_bindings_migration());
 }
 
 /// The revision of a saved review's row, changed by every write, so concurrent writers replace

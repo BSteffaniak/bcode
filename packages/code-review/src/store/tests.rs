@@ -1983,3 +1983,309 @@ fn a_call_waits_for_a_long_operation_to_finish_instead_of_failing() {
     assert!(listed.is_ok(), "{listed:?}");
     assert!(waited >= Duration::from_millis(3_500), "waited {waited:?}");
 }
+
+/// The stacks of a stack of `height` layers stepped through one layer at a time.
+fn stepped_stacks(height: u64) -> Vec<bcode_code_review_models::ResolvedReviewStack> {
+    (1..=height)
+        .map(|top| bcode_code_review_models::ResolvedReviewStack {
+            source_id: format!("source-{top}"),
+            trunk: "main".to_owned(),
+            trunk_oid: "0".repeat(40),
+            base_oid: "0".repeat(40),
+            layers: (1..=top)
+                .map(|number| bcode_code_review_models::ResolvedStackLayer {
+                    number,
+                    title: format!("Layer {number} with a descriptive pull request title"),
+                    base_oid: format!("{:040}", number - 1),
+                    head_oid: format!("{number:040}"),
+                    base_branch: format!("feature-branch-{}", number - 1),
+                    head_branch: format!("feature-branch-{number}"),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The stored JSON of `session`'s binding.
+fn stored_binding_json(repo: &Path, config: &CodeReviewConfig, session: &str) -> Option<String> {
+    let root = resolve_repo_root(repo).expect("root");
+    let session = session.to_owned();
+    with_database(&root, config, move |database| {
+        Box::pin(async move {
+            Ok::<_, StoreError>(
+                database
+                    .select("review_assistant_sessions")
+                    .columns(&["binding_json"])
+                    .filter(Box::new(where_eq("session_id", session)))
+                    .execute_first(database)
+                    .await?
+                    .as_ref()
+                    .and_then(|row| optional_text(row, "binding_json")),
+            )
+        })
+    })
+    .expect("read row")
+}
+
+/// A saved review with viewed state, as the review app binds it.
+fn viewed_workspace(repo: &Path, id: &str) -> ReviewWorkspace {
+    let mut workspace = test_workspace(repo, Vec::new());
+    workspace.id = id.to_owned();
+    workspace.title = "Stacked review".to_owned();
+    workspace.viewed_files = (0..500)
+        .map(|index| format!("src/file-{index}.rs"))
+        .collect();
+    workspace
+}
+
+#[test]
+fn rebinding_keeps_a_stacked_review_binding_bounded() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git_test(&repo, &["init", "--quiet"]);
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let bind = |session: &str, height: u64, detached: bool| {
+        let stacks = stepped_stacks(height);
+        bind_assistant_for_request(
+            BindReviewAssistantRequest {
+                repo_path: repo.clone(),
+                binding: ReviewAssistantBinding {
+                    schema_version:
+                        bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+                    session_id: session.to_owned(),
+                    workspace: viewed_workspace(&repo, "rv-stack"),
+                    resolved: Vec::new(),
+                    stacks: bcode_code_review_models::ReviewAssistantStacks::from_stacks(&stacks),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    started: None,
+                    detached_at_ms: detached.then_some(1),
+                },
+            },
+            &config,
+        )
+        .expect("bind")
+    };
+
+    bind("s-1", 100, false);
+    let first = stored_binding_json(&repo, &config, "s-1").expect("row");
+    for round in 0..40 {
+        bind("s-1", 100, round % 3 == 0);
+    }
+    bind("s-1", 100, false);
+    let last = stored_binding_json(&repo, &config, "s-1").expect("row");
+    assert!(
+        last.len() <= first.len() + 64,
+        "rebinding grew the binding from {} to {} bytes",
+        first.len(),
+        last.len()
+    );
+
+    // Four times the layers take about four times the room, not sixteen.
+    bind("s-2", 400, false);
+    let taller = stored_binding_json(&repo, &config, "s-2").expect("row");
+    assert!(
+        taller.len() < first.len() * 5,
+        "{} bytes against {}",
+        taller.len(),
+        first.len()
+    );
+
+    // What the tools read is what was bound; the saved review's viewed state is read again by
+    // id rather than recorded.
+    let binding = assistant_binding_for_request(
+        &GetReviewAssistantRequest {
+            repo_path: repo.clone(),
+            lookup: ReviewAssistantLookup::Session {
+                session_id: "s-1".to_owned(),
+            },
+        },
+        &config,
+    )
+    .expect("get")
+    .binding
+    .expect("bound");
+    assert_eq!(binding.stacks.to_stacks(), stepped_stacks(100));
+    assert_eq!(binding.workspace.id, "rv-stack");
+    assert_eq!(binding.workspace.title, "Stacked review");
+    assert!(binding.workspace.viewed_files.is_empty());
+    assert_eq!(
+        binding.started.and_then(|started| started.workspace_id),
+        Some("rv-stack".to_owned())
+    );
+}
+
+#[test]
+fn bloated_assistant_rows_are_compacted_by_migration_with_their_meaning_kept() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git_test(&repo, &["init", "--quiet"]);
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let workspace = viewed_workspace(&repo, "rv-stack");
+    let stacks = stepped_stacks(60);
+    let transient = crate::scope::transient_workspace(repo.clone(), None, Vec::new());
+    let rows = legacy_assistant_rows(&workspace, &transient, &stacks);
+    let before: BTreeMap<&str, String> = rows.iter().cloned().collect();
+    insert_and_compact(&repo, &config, rows);
+
+    let get = |session: &str| {
+        assistant_binding_for_request(
+            &GetReviewAssistantRequest {
+                repo_path: repo.clone(),
+                lookup: ReviewAssistantLookup::Session {
+                    session_id: session.to_owned(),
+                },
+            },
+            &config,
+        )
+        .expect("get")
+        .binding
+    };
+    for session in ["tagged", "untagged-detached", "transient"] {
+        let json = stored_binding_json(&repo, &config, session).expect("row");
+        assert!(
+            json.len() * 4 < before[session].len(),
+            "{session}: {} bytes, {} before",
+            json.len(),
+            before[session].len()
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert!(value.get("stacks").is_none(), "{session}: {json}");
+        let binding = get(session).expect("readable");
+        assert_eq!(binding.stacks.to_stacks(), stacks, "{session}");
+    }
+
+    let tagged = get("tagged").expect("tagged");
+    assert_eq!(
+        tagged.started,
+        Some(ReviewAssistantTag {
+            workspace_id: Some("rv-stack".to_owned()),
+            title: Some("Stacked review".to_owned()),
+            layer: Some(7),
+        })
+    );
+    assert_eq!((tagged.created_at_ms, tagged.updated_at_ms), (5, 9));
+    assert_eq!(tagged.workspace.id, "rv-stack");
+    assert_eq!(tagged.workspace.sources, workspace.sources);
+    assert!(tagged.workspace.viewed_files.is_empty());
+
+    let untagged = get("untagged-detached").expect("untagged");
+    assert_eq!(untagged.started, None);
+    assert_eq!(untagged.detached_at_ms, Some(7));
+    assert_eq!(untagged.workspace.title, "Stacked review");
+
+    let transient_binding = get("transient").expect("transient");
+    assert_eq!(transient_binding.workspace, transient);
+
+    for session in ["future", "damaged"] {
+        assert_eq!(
+            stored_binding_json(&repo, &config, session).as_deref(),
+            Some(before[session].as_str()),
+            "{session} is left as it was"
+        );
+    }
+}
+
+/// Assistant rows as earlier versions wrote them: every stack in full and the saved review's
+/// viewed state, with and without a start tag, attached and detached; a transient review; and
+/// rows this version cannot read.
+fn legacy_assistant_rows(
+    workspace: &ReviewWorkspace,
+    transient: &ReviewWorkspace,
+    stacks: &[bcode_code_review_models::ResolvedReviewStack],
+) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "tagged",
+            serde_json::json!({
+                "schema_version": bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+                "session_id": "tagged",
+                "workspace": workspace,
+                "stacks": stacks,
+                "created_at_ms": 5,
+                "updated_at_ms": 9,
+                "started": { "workspace_id": "rv-stack", "title": "Stacked review", "layer": 7 },
+            })
+            .to_string(),
+        ),
+        (
+            "untagged-detached",
+            serde_json::json!({
+                "schema_version": bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+                "session_id": "untagged-detached",
+                "workspace": workspace,
+                "stacks": stacks,
+                "created_at_ms": 6,
+                "updated_at_ms": 8,
+                "detached_at_ms": 7,
+            })
+            .to_string(),
+        ),
+        (
+            "transient",
+            serde_json::json!({
+                "schema_version": bcode_code_review_models::REVIEW_ASSISTANT_BINDING_SCHEMA_VERSION,
+                "session_id": "transient",
+                "workspace": transient,
+                "stacks": stacks,
+                "created_at_ms": 1,
+                "updated_at_ms": 1,
+            })
+            .to_string(),
+        ),
+        (
+            "future",
+            serde_json::json!({
+                "schema_version": 99,
+                "session_id": "future",
+                "workspace": workspace,
+                "stacks": stacks,
+                "created_at_ms": 1,
+                "updated_at_ms": 1,
+            })
+            .to_string(),
+        ),
+        ("damaged", "{not json".to_owned()),
+    ]
+}
+
+/// Insert `rows` as assistant bindings and run the binding compaction again, as on a database
+/// written before it existed.
+fn insert_and_compact(repo: &Path, config: &CodeReviewConfig, rows: Vec<(&'static str, String)>) {
+    let root = resolve_repo_root(repo).expect("root");
+    let db_root = root.clone();
+    with_database(&root, config, move |database| {
+        Box::pin(async move {
+            for (session, json) in rows {
+                database
+                    .insert("review_assistant_sessions")
+                    .value("session_id", session.to_owned())
+                    .value("workspace_id", "rv-stack".to_owned())
+                    .value("repo_root", db_root.display().to_string())
+                    .value("binding_json", json)
+                    .value("created_at_ms", 1_i64)
+                    .value("updated_at_ms", 1_i64)
+                    .execute(database)
+                    .await?;
+            }
+            database
+                .delete(MIGRATIONS_TABLE)
+                .filter(Box::new(where_eq(
+                    "id",
+                    "030_compact_review_assistant_bindings",
+                )))
+                .execute(database)
+                .await?;
+            run_migrations(database).await
+        })
+    })
+    .expect("migrate");
+}

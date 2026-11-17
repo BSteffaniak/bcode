@@ -122,7 +122,7 @@ impl ReviewSurface {
     /// The binding of this review for `session_id`: its workspace and the revisions its open
     /// document resolved to.
     pub(super) fn assistant_binding(&mut self, session_id: String) -> ReviewAssistantBinding {
-        let workspace = self.workspace_mut().clone();
+        let workspace = bcode_code_review::assistant::bound_workspace(self.workspace_mut());
         let (resolved, stacks) = self.review.as_ref().map_or_else(
             || (Vec::new(), ReviewAssistantStacks::default()),
             |review| {

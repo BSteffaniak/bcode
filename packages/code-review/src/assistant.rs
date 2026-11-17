@@ -1802,6 +1802,34 @@ impl LineMap {
     }
 }
 
+/// The workspace an assistant binding records for `workspace`.
+///
+/// A durable workspace is read again by id whenever its binding is used, so the binding keeps
+/// only what names it (id, title, repository, sources, timestamps), not its viewed or
+/// presentation state or stack snapshots. A transient workspace exists only in its binding and
+/// is recorded whole.
+#[must_use]
+pub fn bound_workspace(workspace: &ReviewWorkspace) -> ReviewWorkspace {
+    if crate::scope::is_transient(workspace) {
+        return workspace.clone();
+    }
+    ReviewWorkspace {
+        id: workspace.id.clone(),
+        title: workspace.title.clone(),
+        repo_root: workspace.repo_root.clone(),
+        sources: workspace.sources.clone(),
+        created_at_ms: workspace.created_at_ms,
+        updated_at_ms: workspace.updated_at_ms,
+        viewed_files: std::collections::BTreeSet::new(),
+        archived_at_ms: workspace.archived_at_ms,
+        viewed_marks: Vec::new(),
+        viewed_threads: Vec::new(),
+        reviewed_revisions: BTreeMap::new(),
+        presentation: None,
+        stack_snapshots: Vec::new(),
+    }
+}
+
 /// `path:line`, `path:start-end`, `path`, or `review` for an anchor.
 #[must_use]
 pub fn location_label(anchor: &DraftAnchor) -> String {

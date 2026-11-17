@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+async-trait = { workspace = true }
 bcode_code_review_models = { workspace = true }
 bcode_code_review_provider = { workspace = true }
 bcode_config = { workspace = true }

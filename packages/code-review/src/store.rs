@@ -9,6 +9,7 @@
 //! no connection between calls, so any number of review apps and the daemon's plugin use the
 //! same database concurrently, each call waiting for the one before it.
 
+mod assistant_bindings;
 mod assistant_settings;
 mod conversation;
 mod db;
