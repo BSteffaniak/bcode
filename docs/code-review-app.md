@@ -1148,8 +1148,14 @@ them.
 Review state lives in `code-review.db`, shared by the app and the daemon's plugin. It is in
 `code-review/` under the bcode state directory by default, in the repository's
 `.bcode/code-review` with `state_location = "repo"`, in `state_dir` when that is set, and in
-`BCODE_CODE_REVIEW_STATE_DIR` when that environment variable is set. Schema migrations of the
-shared database run one at a time under the lock file `code-review.db.migrate.lock` beside it.
+`BCODE_CODE_REVIEW_STATE_DIR` when that environment variable is set. Any number of review apps
+(in any repositories) and the daemon's plugin use it at once. The storage engine locks the file
+exclusively while a connection is open and fails an open that finds it locked, so each store
+call first takes a turn: an exclusive lock on `code-review.db.access.lock` beside it, waited for
+(woken when the holder releases it) for up to 30 s, and held only while the call opens, uses,
+and closes the database. Schema migrations run during a turn, the first time each process opens
+the database. A call that waits out the whole 30 s fails with a "stayed in use" error instead of
+a lock error.
 
 ## Testing
 

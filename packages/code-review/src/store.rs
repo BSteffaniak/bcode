@@ -4,9 +4,10 @@
 //! and external imports, and builds whole-review context, bundles, and diffs from them.
 //!
 //! State lives in one Turso database per state directory (see [`CodeReviewConfig`]). Every
-//! call opens the database on a worker thread, runs pending migrations, and closes it again, so
-//! the store holds no connection and the daemon plugin and a standalone app can use the same
-//! database concurrently.
+//! call waits its turn at the database (see `crate::access`), opens it on a worker thread, runs
+//! pending migrations the first time this process opens it, and closes it again. The store holds
+//! no connection between calls, so any number of review apps and the daemon's plugin use the
+//! same database concurrently, each call waiting for the one before it.
 
 mod assistant_settings;
 mod conversation;
@@ -74,8 +75,11 @@ const CODE_REVIEW_STATE_DIR_ENV: &str = "BCODE_CODE_REVIEW_STATE_DIR";
 const DEFAULT_REPO_STATE_ROOT: &str = ".bcode/code-review";
 const DEFAULT_STATE_SUBDIR: &str = "code-review";
 const DATABASE_FILE_NAME: &str = "code-review.db";
-/// Lock file that serializes schema migrations of the state database.
-const MIGRATION_LOCK_FILE_NAME: &str = "code-review.db.migrate.lock";
+/// Lock file whose turns (see `crate::access`) every open of the state database takes first.
+const ACCESS_LOCK_FILE_NAME: &str = "code-review.db.access.lock";
+/// Longest a call waits for its turn at the state database. A turn lasts one call's database
+/// work, so a wait this long means a holder that stopped making progress.
+const DATABASE_ACCESS_WAIT: Duration = Duration::from_secs(30);
 const MIGRATIONS_TABLE: &str = "__bcode_code_review_migrations";
 const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
 const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -109,9 +113,10 @@ pub struct CodeReviewConfig {
 
 /// Typed access to persisted review state under one [`CodeReviewConfig`].
 ///
-/// Each method is one blocking call: it resolves the repository root, opens the state database
-/// on a worker thread, runs pending migrations, and performs the operation. Callers on an async
-/// runtime should call it from a blocking task.
+/// Each method is one blocking call: it resolves the repository root, waits its turn at the
+/// state database, opens it on a worker thread (migrating it the first time this process opens
+/// it), and performs the operation. Callers on an async runtime should call it from a blocking
+/// task.
 ///
 /// # Errors
 ///
@@ -122,7 +127,9 @@ pub struct CodeReviewConfig {
 /// * [`StoreError::Connection`], [`StoreError::Database`], [`StoreError::Migration`],
 ///   [`StoreError::Json`], or [`StoreError::MissingColumn`] when the state database cannot be
 ///   opened, migrated, queried, or decoded.
-/// * [`StoreError::Io`] when the state directory cannot be created.
+/// * [`StoreError::Busy`] when other callers kept the state database for
+///   longer than a call waits for its turn.
+/// * [`StoreError::Io`] when the state directory or its lock file cannot be created.
 /// * [`StoreError::Git`] or [`StoreError::Parse`] for operations that read the repository.
 /// * [`StoreError::UnsupportedPublisher`] for an unknown publisher id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -473,6 +480,9 @@ pub enum StoreError {
     /// The state database could not be opened.
     #[error("database connection failed: {0}")]
     Connection(#[from] switchy::database_connection::InitTursoError),
+    /// Other callers (in this process or others) kept the state database for the whole wait.
+    #[error("the review state database stayed in use for {} s; try again", .0.as_secs())]
+    Busy(Duration),
     /// A database query failed.
     #[error("database operation failed: {0}")]
     Database(#[from] DatabaseError),

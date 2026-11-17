@@ -24,6 +24,7 @@
 //! * [`assistant`] is what agents read and change in a review: the operations behind the code
 //!   review plugin's tools.
 
+mod access;
 pub mod assistant;
 pub mod cache;
 pub mod conversation;

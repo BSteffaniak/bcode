@@ -1941,3 +1941,45 @@ fn assistant_settings_are_one_record_shared_by_every_repository_of_the_store() {
     .expect("save");
     assert!(read(&first).is_some_and(|settings| settings.is_empty()));
 }
+
+/// A call made while another holds the database for longer than any retry schedule would wait
+/// starts once that one finishes, instead of failing.
+#[test]
+fn a_call_waits_for_a_long_operation_to_finish_instead_of_failing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = initialized_test_repository(temp.path());
+    let repo_root = resolve_repo_root(&repo).expect("repo root");
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let hold = Duration::from_secs(4);
+    let (started, holding) = std::sync::mpsc::channel();
+    let long = {
+        let config = config.clone();
+        std::thread::spawn(move || {
+            with_database(&repo_root, &config, move |_database| {
+                Box::pin(async move {
+                    started.send(()).expect("signal");
+                    tokio::time::sleep(hold).await;
+                    Ok(())
+                })
+            })
+        })
+    };
+    holding.recv().expect("long operation started");
+    let waiting = std::time::Instant::now();
+    let listed = list_review_workspaces_for_request(
+        &ListReviewWorkspacesRequest {
+            repo_path: repo,
+            include_archived: false,
+        },
+        &config,
+    );
+    let waited = waiting.elapsed();
+    long.join()
+        .expect("long operation")
+        .expect("long operation succeeds");
+    assert!(listed.is_ok(), "{listed:?}");
+    assert!(waited >= Duration::from_millis(3_500), "waited {waited:?}");
+}

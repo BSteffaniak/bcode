@@ -1265,20 +1265,25 @@ where
 {
     let paths = state_paths(repo_root, config);
     std::fs::create_dir_all(&paths.state_root)?;
+    // Review apps and the daemon's plugin share the database, and the storage engine fails an
+    // open while another process holds it; taking the turn first makes this call wait instead.
+    let Some(turn) = crate::access::AccessTurn::take(
+        &paths.state_root.join(ACCESS_LOCK_FILE_NAME),
+        DATABASE_ACCESS_WAIT,
+    )?
+    else {
+        return Err(StoreError::Busy(DATABASE_ACCESS_WAIT));
+    };
     std::thread::spawn(move || {
+        // Released after the connection below is closed.
+        let _turn = turn;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current-thread Tokio runtime should build");
         runtime.block_on(async {
             let database = open_database(&paths.database_path).await?;
-            {
-                // Callers in other processes (the app and the daemon's plugin) and other
-                // threads of this one share the database; migrating it concurrently would apply
-                // the same schema change twice.
-                let _migrating = lock_migrations(&paths.state_root)?;
-                run_migrations(database.as_ref()).await?;
-            }
+            migrate_once(&paths.database_path, database.as_ref()).await?;
             operation(database.as_ref()).await
         })
     })
@@ -1286,26 +1291,40 @@ where
     .map_err(|_| StoreError::InvalidRequest("database worker panicked".to_string()))?
 }
 
-/// Hold the state directory's migration lock until the returned file is dropped.
+/// State databases this process has migrated, by path.
+static MIGRATED: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// Run pending migrations of the database at `path` unless this process already did.
 ///
-/// The lock is an exclusive advisory lock on a file beside the database. It excludes every
-/// other holder, whether in another process or another thread of this one, because each
-/// caller opens its own handle.
+/// Runs during the caller's turn, so no other caller (in any process) migrates or reads the
+/// database meanwhile.
 ///
 /// # Errors
 ///
-/// * The lock file cannot be opened or created.
-/// * Locking it fails.
-pub fn lock_migrations(state_root: &Path) -> Result<std::fs::File, StoreError> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(state_root.join(MIGRATION_LOCK_FILE_NAME))?;
-    file.lock()?;
-    Ok(file)
+/// * Checking for the migrations table or migrating fails.
+async fn migrate_once(path: &Path, database: &dyn Database) -> Result<(), StoreError> {
+    let migrated = || {
+        MIGRATED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    // A database deleted and created again since has no migrations table.
+    if migrated().contains(path) && database.table_exists(MIGRATIONS_TABLE).await? {
+        return Ok(());
+    }
+    run_migrations(database).await?;
+    migrated().insert(path.to_path_buf());
+    Ok(())
 }
 
+/// Open the database at `path`, retrying briefly while the file is locked.
+///
+/// Callers hold their turn, so the file is locked only by a process that opens it without
+/// taking turns (an older Bcode).
+///
+/// # Errors
+///
+/// * The database cannot be opened, or stays locked through every retry.
 pub async fn open_database(path: &Path) -> Result<Box<dyn Database>, StoreError> {
     let mut attempt = 0_u32;
     let mut delay = DATABASE_OPEN_INITIAL_RETRY_DELAY;
@@ -1314,7 +1333,8 @@ pub async fn open_database(path: &Path) -> Result<Box<dyn Database>, StoreError>
             .turso()
             .with_path(path)
             .with_busy_timeout(DATABASE_BUSY_TIMEOUT)
-            // Avoid Turso's experimental multi-process WAL sidecars for local plugin state.
+            // Turso's multi-process WAL mode is experimental; processes take turns at the file
+            // instead (see `crate::access`), so one connection is open at a time.
             .with_multiprocess_wal(false)
             .build()
             .await
