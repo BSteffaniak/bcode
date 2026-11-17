@@ -70,12 +70,12 @@ planning live in `bcode_code_review::guide`.
   reading order, step, topic, findings, layer link, expansion, note), a title, a markdown body
   with citation tokens `[[c7]]`, findings, citation ids in reading order, child sections, a state
   (planned, written, or provisional from an expand or ask), and verifier checks.
-* **`Finding`**: a risk, question, suggestion, or note, with an optional review thread severity,
-  its citations, and the draft thread it became, when it did.
+* **`Finding`**: a risk, question, suggestion, or note, with an optional review thread severity
+  (info, nit, warning, blocker), its citations, and the draft thread it became, when it did.
 * **`Citation`**: an optional source id, path, side, line interval, the revision read, the blob
   identity (for working-tree and index heads that have no commit), a hash of the normalized quoted
-  text, a bounded excerpt, its relation to the review (changed, hunk context, unchanged, or
-  outside the review), and its verification (verified, possibly adjusted from another range;
+  text, a bounded excerpt, its relation to the review (changed, hunk context, unchanged, in the
+  review without a diff, or outside the review), and its verification (verified, possibly adjusted from another range;
   unverified; or a problem).
 * **`ClaimCheck`**: a verifier's judgement of one claim against its citations (supported,
   unsupported, unclear), with a note. Checks never delete content.
@@ -84,16 +84,20 @@ planning live in `bcode_code_review::guide`.
 * **`GuideThread`**: an "ask" conversation pinned to a section. It does not bump the version.
 * **`GuideSectionMark`**: a section the reviewer marked reviewed, with a fingerprint of its
   citations' quote hashes; a mismatch un-reviews it.
-* **`GuideGrant`**: what one session may change (see [Grants](#grants)).
+* **`GuideGrant`**: what one session may change in one guide (see [Grants](#grants)), on a named
+  version or the guide's current one.
 * **`Freshness`**: derived on read, never stored: fresh, moved (with its new lines), stale (with
   a reason), or gone.
 
 ### Bounds
 
-Per version: 200 sections, 1,000 citations, and 1 MiB of document JSON. Per section body: 16 KiB.
-Per citation excerpt: 2 KiB. Writes over a bound are rejected with the bound named. The store also
-rejects structurally inconsistent documents: duplicate section ids, citation keys that differ from
-their citation's id, and sections or findings that cite an unknown citation id.
+Per version or area: 200 sections, 1,000 citations, and 1 MiB of document JSON. Per section body:
+16 KiB. Per citation excerpt: 2 KiB. Titles: 1 KiB; finding text and claim checks: 4 KiB; thread
+questions: 16 KiB. Writes over a bound are rejected with the bound named. The store also rejects
+structurally inconsistent documents: empty or duplicate section and finding ids, citation keys
+that differ from their citation's id, and sections, findings, or checks that cite an unknown
+citation id. That a section id is never reused within a guide is the write tool's to enforce,
+since it alone sees the edit history.
 
 ### Storage
 
@@ -102,16 +106,22 @@ Guides live in the review store as typed Switchy tables; no SQL text is written 
 | Table | Key | Holds |
 |---|---|---|
 | `review_guides` | `guide_id` | review key, scope, parent, title, current version, row revision, timestamps, archive time |
-| `review_guide_versions` | `guide_id`, `version` | schema version, heads, based-on, origin, status, generation, document (outline and citations), row revision, timestamps |
-| `review_guide_areas` | `guide_id`, `version`, `area_id` | child session, status, document, row revision, timestamps |
+| `review_guide_versions` | `guide_id`, `version` | schema version, heads, based-on, origin, status and its message, generation, document (outline and citations), row revision, timestamps |
+| `review_guide_areas` | `guide_id`, `version`, `area_id` | child session, status and its message, document, row revision, timestamps |
 | `review_guide_threads` | `thread_id` | guide, version, section, session, status, question, timestamps |
 | `review_guide_marks` | `guide_id`, `section_id` | reviewed time, fingerprint |
 
 * **Compare-and-swap writes.** Guide, version and area rows carry a revision that every write
   increments. A write names the revision it read and replaces the row only while it is still that
-  revision. Writers that did not name a revision re-read and re-apply their change, a bounded
-  number of times; a writer that named one gets a conflict with the current revision, which the
-  guide write tool returns to the model so it can re-read and retry.
+  revision, and otherwise fails with `StoreError::RevisionConflict` carrying the current revision.
+  `ReviewStore::update_guide_version` applies a change in one turn at the database: without a
+  named revision a lost race re-reads and re-applies the change, a bounded number of times; with
+  one, the conflict is returned, which the guide write tool passes to the model so it can re-read
+  and retry. A change that refuses (for example an operation outside the session's grant) writes
+  nothing.
+* **Creating** a guide writes the guide row and its first version together; creating one that
+  exists is a conflict, never a replacement. Areas are likewise created once and then replaced by
+  revision.
 * **Forking** a version inserts the next version number (racing forks take the next free number)
   and moves the guide's `current_version` forward with the same compare-and-swap.
 * **Deleting** a guide deletes its versions, areas, threads and marks.
@@ -125,7 +135,9 @@ and guide writes never conflict with viewed marks.
 
 `GuideVersion.schema_version` is the compatibility boundary for the stored document. A version
 whose schema version is not the current one is neither written nor read as a known form: writes
-are rejected, and reads report it as unsupported rather than guessing.
+are rejected and reads fail with `StoreError::Guide` naming the version found, rather than
+guessing. Listing versions reads no documents, so it still shows such a version with its schema
+version. Statuses this build does not know are likewise reported, not mapped to known ones.
 
 ## Citation checks
 
@@ -139,9 +151,11 @@ quote, symbol, relation_hint}` against the version's pinned heads:
    heads.
 3. **Path.** `path_not_found` with fuzzy suggestions; `renamed` (with the new path) when the diff
    renames it; `deleted_on_side` (use the old side) when the file does not exist on that side.
-4. **Range.** `range_out_of_bounds` with the file's line count.
-5. **Quote.** Text is normalized (trailing whitespace trimmed, CRLF folded; indentation-insensitive
-   as a fallback). A match is verified. Otherwise the file is searched: a quote found exactly once
+4. **Range.** `invalid_range` for an empty or reversed range; `range_out_of_bounds` with the
+   file's line count.
+5. **Quote.** Text is normalized (trailing whitespace trimmed, CRLF folded, blank lines around the
+   quote dropped; indentation-insensitive as a fallback). A quote found within the cited lines
+   verifies the citation, so a range may be wider than its quote. Otherwise the file is searched: a quote found exactly once
    elsewhere adjusts the citation to that range and is verified as adjusted; several exact hits
    are `quote_ambiguous` (with candidate ranges); a close match (line similarity at least 0.8) is
    `quote_mismatch` (with the best range and its similarity); nothing is `quote_not_found`, with
@@ -157,26 +171,34 @@ A citation is never dropped. In strict mode a write with any problem is rejected
 which suits a model's self-check loop. Every problem has a machine-readable code, one actionable
 sentence, and a structured suggestion.
 
-The checks are written against a small read interface (sources, file indexes, hunks, file lines,
-symbol search), so they are deterministic and tested without a repository; the review data layer
-implements it.
+The checks are written against a small read interface, `CitationReader` (sources, diff files,
+hunks, file lines, path suggestions, symbol sites), so they are deterministic and tested without a
+repository. `ReviewDataReader` implements it over the review data layer, reading each listing and
+file once per batch; its symbol sites come from the code search tool once that exists, and until
+then a missing quote offers no symbol suggestions. Files over 200,000 lines, binary files, and
+read errors are reported as `unreadable`.
 
 ## Freshness
 
 `guide::freshness` compares a version's pinned heads with the review's current resolution. For
 each citation:
 
-* **Same blob** (or same commit and path): fresh.
-* **Commit heads with fork points:** the layer's delta with the rebase taken out
-  (`history::delta`) says which new-side lines are new since the pinned version. The citation is
-  re-found at its new lines by its excerpt and quote hash (fresh when they did not move, moved
-  otherwise); if a changed span overlaps those lines it is stale ("lines 14–20 changed"). A
-  rebase-only push therefore keeps the guide fresh.
-* **Other heads** (working tree, index, or no fork point): the excerpt is re-found in the new
-  content (fresh or moved); if it is missing, gone.
+* **Same commit** (and path): fresh.
+* **Source gone:** a citation whose source is no longer in the review is gone. Repository
+  context (no source id) follows the primary source.
+* **New-side citations of commit heads with fork points:** the layer's delta with the rebase taken
+  out (`history::delta`: unchanged, rebased only, or changed with per-file line marks) says which
+  current lines are new since the pinned version. The citation is re-found by its excerpt and
+  quote hash, nearest its old lines first (fresh when they did not move, moved otherwise); if a
+  changed span overlaps those lines, or the text is not found, it is stale ("lines 14–20 changed
+  since the guide was written"). A rebase-only push therefore keeps the guide fresh.
+* **Everything else** (old-side citations, working tree or index heads, no fork point, or a delta
+  that could not take the rebase out): the excerpt is re-found in the current content (fresh or
+  moved); if it or the file is missing, gone.
 
-A section is stale when any of its citations is stale or gone. Results are cached by old blob,
-new blob, and range in the review cache, so repeated reads stay bounded.
+A section is stale when any citation it or its findings use is stale or gone. Answers whose
+revisions are all commits are cached in the review cache (`CacheKind::Freshness`, keyed by the
+pinned and current commits, range and quote hash), so repeated reads stay bounded.
 
 ## Tools
 
@@ -357,8 +379,8 @@ apply.
 
 | Phase | Scope | Built |
 |---|---|---|
-| P1 | Models, store, citation checks, freshness | No |
-| P2 | Plugin tools, grants in the binding, configuration and context | No |
+| P1 | Models, store, citation checks, freshness | Yes |
+| P2 | Plugin tools, grants in the review assistant binding, configuration and context | No |
 | P3 | Read-only guide panel, diff markers, navigation | No |
 | P4 | Single-agent generation from the assistant, guide card, tab fallback | No |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | No |
