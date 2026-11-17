@@ -16,7 +16,10 @@ mod db;
 mod history;
 mod looks;
 
-use assistant_settings::{assistant_settings_for_request, save_assistant_settings_for_request};
+use assistant_settings::{
+    assistant_panel_size_for_request, assistant_settings_for_request,
+    save_assistant_panel_size_for_request, save_assistant_settings_for_request,
+};
 use conversation::{conversation_for_request, save_conversation_for_request};
 use history::{list_layer_versions_for_request, record_layer_versions_for_request};
 use looks::{list_layer_looks_for_request, record_layer_looks_for_request};
@@ -291,6 +294,14 @@ store_operations! {
     save_assistant_settings(bcode_code_review_models::SaveReviewAssistantSettingsRequest)
         -> bcode_code_review_models::SaveReviewAssistantSettingsResponse
         => save_assistant_settings_for_request;
+    /// The review app's assistant panel size.
+    assistant_panel_size(&bcode_code_review_models::GetReviewAssistantPanelSizeRequest)
+        -> bcode_code_review_models::GetReviewAssistantPanelSizeResponse
+        => assistant_panel_size_for_request;
+    /// Replace the review app's assistant panel size.
+    save_assistant_panel_size(&bcode_code_review_models::SaveReviewAssistantPanelSizeRequest)
+        -> bcode_code_review_models::SaveReviewAssistantPanelSizeResponse
+        => save_assistant_panel_size_for_request;
     /// Summary of a review target with its draft counts.
     review_context(ReviewContextRequest) -> ReviewContextResponse => review_context_for_request;
     /// Draft threads of a review target.

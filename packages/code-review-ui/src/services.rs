@@ -244,6 +244,12 @@ store_operations! {
     models::SaveReviewAssistantSettingsRequest => models::SaveReviewAssistantSettingsResponse,
         models::OP_REVIEW_ASSISTANT_SETTINGS_SAVE,
         |store, request| store.save_assistant_settings(request);
+    models::GetReviewAssistantPanelSizeRequest => models::GetReviewAssistantPanelSizeResponse,
+        models::OP_REVIEW_ASSISTANT_PANEL_SIZE_GET,
+        |store, request| store.assistant_panel_size(&request);
+    models::SaveReviewAssistantPanelSizeRequest => models::SaveReviewAssistantPanelSizeResponse,
+        models::OP_REVIEW_ASSISTANT_PANEL_SIZE_SAVE,
+        |store, request| store.save_assistant_panel_size(&request);
     PreviewBundle => models::PublishReviewPreviewResponse,
         models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW,
         |_store, request| bcode_code_review::store::preview_bundle(&request.0);
@@ -570,6 +576,12 @@ impl ReviewServices {
         self.probe.set_failing(operation, fail);
     }
 
+    /// Calls of `operation` made so far (failed ones included).
+    #[cfg(test)]
+    pub(crate) fn calls(&self, operation: &str) -> usize {
+        self.probe.calls(operation)
+    }
+
     /// Answer every later call of `operation` only after `yields` yields to other tasks (none
     /// when zero), so work started after it finishes first.
     #[cfg(test)]
@@ -597,6 +609,7 @@ mod probe {
     pub struct Probe {
         failing: Mutex<BTreeSet<String>>,
         delays: Mutex<BTreeMap<String, u32>>,
+        calls: Mutex<BTreeMap<String, usize>>,
     }
 
     impl Probe {
@@ -618,7 +631,22 @@ mod probe {
             }
         }
 
+        pub fn calls(&self, name: &str) -> usize {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        }
+
         pub fn observe(&self, name: &str) -> Result<(), ProviderCallError> {
+            *self
+                .calls
+                .lock()
+                .expect("calls lock")
+                .entry(name.to_owned())
+                .or_default() += 1;
             if self.failing.lock().expect("failing lock").contains(name) {
                 return Err(ProviderCallError {
                     code: "test_failure".to_owned(),

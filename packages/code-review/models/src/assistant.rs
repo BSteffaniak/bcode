@@ -392,6 +392,58 @@ pub struct SaveReviewAssistantSettingsResponse {
     pub settings: ReviewAssistantSettings,
 }
 
+/// Operation reading the review app's assistant panel size.
+pub const OP_REVIEW_ASSISTANT_PANEL_SIZE_GET: &str = "review.assistant.panel_size.get";
+/// Operation saving the review app's assistant panel size.
+pub const OP_REVIEW_ASSISTANT_PANEL_SIZE_SAVE: &str = "review.assistant.panel_size.save";
+
+/// The assistant panel's size chosen by dragging its divider, kept across runs.
+///
+/// One record per review store, beside [`ReviewAssistantSettings`]. Each share is in parts of
+/// [`crate::PANEL_SHARE_SCALE`] of the app's area; `None` uses the configured default size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAssistantPanelSize {
+    /// The right dock's width, as a share of the area's width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_share: Option<u16>,
+    /// The bottom dock's height, as a share of the area's height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_share: Option<u16>,
+    /// When the record was last saved, in milliseconds since the Unix epoch (set by the store).
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+/// Request for the review app's assistant panel size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewAssistantPanelSizeRequest {
+    /// Repository path whose review store holds the record.
+    pub repo_path: PathBuf,
+}
+
+/// Response to [`GetReviewAssistantPanelSizeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetReviewAssistantPanelSizeResponse {
+    /// The record, once one was saved.
+    pub size: Option<ReviewAssistantPanelSize>,
+}
+
+/// Request to replace the review app's assistant panel size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewAssistantPanelSizeRequest {
+    /// Repository path whose review store holds the record.
+    pub repo_path: PathBuf,
+    /// The record; its timestamp is set by the store.
+    pub size: ReviewAssistantPanelSize,
+}
+
+/// Response to [`SaveReviewAssistantPanelSizeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveReviewAssistantPanelSizeResponse {
+    /// The recorded size.
+    pub size: ReviewAssistantPanelSize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

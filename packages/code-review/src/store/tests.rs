@@ -1942,6 +1942,70 @@ fn assistant_settings_are_one_record_shared_by_every_repository_of_the_store() {
     assert!(read(&first).is_some_and(|settings| settings.is_empty()));
 }
 
+#[test]
+fn the_assistant_panel_size_is_its_own_record_beside_the_model_settings() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let repo = initialized_test_repository(temp.path());
+    let read_size = || {
+        super::assistant_settings::assistant_panel_size_for_request(
+            &bcode_code_review_models::GetReviewAssistantPanelSizeRequest {
+                repo_path: repo.clone(),
+            },
+            &config,
+        )
+        .expect("read")
+        .size
+    };
+    let save_size = |size| {
+        super::assistant_settings::save_assistant_panel_size_for_request(
+            &bcode_code_review_models::SaveReviewAssistantPanelSizeRequest {
+                repo_path: repo.clone(),
+                size,
+            },
+            &config,
+        )
+        .expect("save")
+        .size
+    };
+    assert_eq!(read_size(), None, "nothing saved yet");
+    let saved = save_size(bcode_code_review_models::ReviewAssistantPanelSize {
+        right_share: Some(6_000),
+        bottom_share: None,
+        updated_at_ms: 0,
+    });
+    assert!(saved.updated_at_ms > 0);
+    assert_eq!(read_size(), Some(saved));
+    // Saving the model settings leaves the size alone, and the other way round.
+    let settings = super::assistant_settings::save_assistant_settings_for_request(
+        bcode_code_review_models::SaveReviewAssistantSettingsRequest {
+            repo_path: repo.clone(),
+            settings: bcode_code_review_models::ReviewAssistantSettings {
+                model_id: Some("fake-echo".to_owned()),
+                ..bcode_code_review_models::ReviewAssistantSettings::default()
+            },
+        },
+        &config,
+    )
+    .expect("save")
+    .settings;
+    assert_eq!(read_size(), Some(saved));
+    let reset = save_size(bcode_code_review_models::ReviewAssistantPanelSize::default());
+    assert_eq!(read_size(), Some(reset));
+    assert_eq!(
+        super::assistant_settings::assistant_settings_for_request(
+            &bcode_code_review_models::GetReviewAssistantSettingsRequest { repo_path: repo },
+            &config,
+        )
+        .expect("read")
+        .settings,
+        Some(settings)
+    );
+}
+
 /// A call made while another holds the database for longer than any retry schedule would wait
 /// starts once that one finishes, instead of failing.
 #[test]
