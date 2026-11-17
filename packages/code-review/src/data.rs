@@ -18,7 +18,7 @@ mod index;
 mod paths;
 mod rereview;
 mod resolve;
-mod search;
+pub(crate) mod search;
 mod stack;
 mod worktree;
 
@@ -130,6 +130,11 @@ impl ReviewData {
             disk,
             ..Self::default()
         }
+    }
+
+    /// The on-disk cache these reads keep immutable results in.
+    pub(crate) fn disk(&self) -> &crate::cache::ReviewCache {
+        &self.disk
     }
 
     /// Stop `cat-file` processes that have been idle past their limit. There is no background

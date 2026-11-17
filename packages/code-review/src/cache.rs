@@ -11,7 +11,8 @@
 //!
 //! * content-addressed answers that never change ([`CacheKind::MergeBase`],
 //!   [`CacheKind::Index`], and the comparison kinds [`CacheKind::Replay`], [`CacheKind::Delta`],
-//!   [`CacheKind::Marks`]): keyed by commit ids, so they need no invalidation;
+//!   [`CacheKind::Marks`], and guide [`CacheKind::Freshness`]): keyed by commit ids, so they
+//!   need no invalidation;
 //! * provider facts ([`CacheKind::Pull`], [`CacheKind::Stack`]): suggestions shown at once and
 //!   confirmed with the provider afterwards, with when they were written.
 //!
@@ -91,10 +92,12 @@ pub enum CacheKind {
     Delta,
     /// One file's line marks between a fork point, a replay commit, and a head.
     Marks,
+    /// Whether a guide citation still holds between two commits.
+    Freshness,
 }
 
 impl CacheKind {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::MergeBase,
         Self::Index,
         Self::Pull,
@@ -105,6 +108,7 @@ impl CacheKind {
         Self::Replay,
         Self::Delta,
         Self::Marks,
+        Self::Freshness,
     ];
 
     const fn as_str(self) -> &'static str {
@@ -119,6 +123,7 @@ impl CacheKind {
             Self::Replay => "replay",
             Self::Delta => "delta",
             Self::Marks => "marks",
+            Self::Freshness => "freshness",
         }
     }
 
@@ -128,7 +133,7 @@ impl CacheKind {
         match self {
             Self::MergeBase => 200_000,
             Self::Index => 4_000,
-            Self::Pull | Self::Hunks | Self::Marks => 20_000,
+            Self::Pull | Self::Hunks | Self::Marks | Self::Freshness => 20_000,
             Self::Replay | Self::Delta => 10_000,
             Self::Stack => 1_000,
             Self::Discovery | Self::Activity => 2_000,
@@ -146,7 +151,8 @@ impl CacheKind {
             | Self::Discovery
             | Self::Replay
             | Self::Delta
-            | Self::Marks => Duration::from_hours(30 * 24),
+            | Self::Marks
+            | Self::Freshness => Duration::from_hours(30 * 24),
             Self::Stack => crate::provider::STACK_KEPT,
             // A conversation is shown at once and refreshed; older than this is not worth it.
             Self::Activity => Duration::from_hours(7 * 24),

@@ -21,6 +21,8 @@
 //! * [`viewed`] matches identity-pinned viewed marks.
 //! * [`workspace_merge`] merges concurrent writers' changes to one saved review.
 //! * [`scope`] builds transient workspaces and derives the scope annotations are stored under.
+//! * [`guide`] checks guided-review documents and citations and tells whether citations still
+//!   hold at the review's current revisions.
 //! * [`assistant`] is what agents read and change in a review: the operations behind the code
 //!   review plugin's tools.
 
@@ -31,6 +33,7 @@ pub mod conversation;
 pub mod data;
 pub mod discovery;
 pub mod document;
+pub mod guide;
 pub mod history;
 pub mod provider;
 pub mod publish_plan;
