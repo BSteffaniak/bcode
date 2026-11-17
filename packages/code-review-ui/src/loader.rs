@@ -57,8 +57,8 @@ pub enum Message {
         /// The file's lines.
         result: Result<Vec<String>, String>,
     },
-    /// The guide version a stopped turn was writing was marked stopped, or why it was not.
-    GuideStopped(Result<(), String>),
+    /// How many guide versions a stopped turn was writing were marked stopped, or why not.
+    GuideStopped(Result<usize, String>),
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

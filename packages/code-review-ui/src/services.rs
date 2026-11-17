@@ -254,6 +254,8 @@ store_operations! {
         "guide.list", |store, request| store.list_guides(&request);
     models::CreateReviewGuideRequest => models::CreateReviewGuideResponse,
         "guide.create", |store, request| store.create_guide(request);
+    models::ListGuideVersionsRequest => models::ListGuideVersionsResponse,
+        "guide.versions.list", |store, request| store.list_guide_versions(&request);
     models::RekeyReviewGuidesRequest => models::RekeyReviewGuidesResponse,
         "guide.rekey", |store, request| store.rekey_guides(&request);
     models::GetGuideVersionRequest => models::GetGuideVersionResponse,

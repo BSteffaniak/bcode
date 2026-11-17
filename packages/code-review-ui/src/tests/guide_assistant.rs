@@ -484,3 +484,113 @@ fn guide_tool_lines_stay_plain_where_no_guide_is_on_screen() {
     );
     assert!(!screen.contains("Guide v"), "no card: {}", screen.text());
 }
+
+/// Store a guide of `scope` whose current version `session` is writing.
+fn writing_guide(
+    setup: &Setup,
+    guide_id: &str,
+    scope: bcode_code_review_models::GuideScope,
+    session: &str,
+) {
+    let notes = crate::notes::NoteScope::for_workspace(&setup.review);
+    let _ = setup
+        .backend
+        .call_now(bcode_code_review_models::CreateReviewGuideRequest {
+            repo_path: notes.repo_path,
+            target: notes.target,
+            scope: notes.scope,
+            guide: bcode_code_review_models::ReviewGuide {
+                guide_id: guide_id.to_owned(),
+                review_key: String::new(),
+                scope,
+                parent_guide_id: None,
+                title: guide_id.to_owned(),
+                current_version: 1,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                archived_at_ms: None,
+            },
+            version: bcode_code_review_models::GuideVersion {
+                guide_id: guide_id.to_owned(),
+                version: 1,
+                schema_version: bcode_code_review_models::REVIEW_GUIDE_SCHEMA_VERSION,
+                heads: std::collections::BTreeMap::new(),
+                based_on: None,
+                origin: bcode_code_review_models::GuideOrigin {
+                    session_id: Some(session.to_owned()),
+                    ..bcode_code_review_models::GuideOrigin::default()
+                },
+                status: GuideStatus::Generating,
+                generation: None,
+                outline: Vec::new(),
+                citations: std::collections::BTreeMap::new(),
+                retired_sections: Vec::new(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        });
+}
+
+fn status_of(setup: &Setup, guide_id: &str) -> Option<GuideStatus> {
+    setup
+        .backend
+        .call_now(GetGuideVersionRequest {
+            repo_path: setup.review.repo_root.clone(),
+            guide_id: guide_id.to_owned(),
+            version: None,
+        })
+        .version
+        .map(|record| record.version.status)
+}
+
+#[test]
+fn stopping_a_turn_stops_every_guide_it_writes_and_no_other() {
+    let mut setup = setup(170, 50, true);
+    setup.scenario.key("alt+g");
+    setup.settle();
+    setup.scenario.key("enter");
+    setup.settle();
+    let (session, _) = setup
+        .backend
+        .host()
+        .turns()
+        .last()
+        .cloned()
+        .expect("the walkthrough was sent");
+    writing_guide(
+        &setup,
+        "hidden",
+        bcode_code_review_models::GuideScope::Layer {
+            source_id: "elsewhere".to_owned(),
+        },
+        &session,
+    );
+    writing_guide(
+        &setup,
+        "foreign",
+        bcode_code_review_models::GuideScope::Layer {
+            source_id: "other".to_owned(),
+        },
+        "another-session",
+    );
+    let mut turn = Turn::new(&session, crate::surface::WALKTHROUGH);
+    turn.plan_and_start(&mut setup);
+    let shown = turn.guide_id.clone().expect("guide");
+    settle_until(&mut setup, "the started guide is shown", |setup| {
+        setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .is_some_and(|active| active.guide.guide_id == shown)
+    });
+    setup.scenario.key("ctrl+c");
+    settle_until(&mut setup, "the session's versions are stopped", |setup| {
+        status_of(setup, &shown) == Some(GuideStatus::Cancelled)
+            && status_of(setup, "hidden") == Some(GuideStatus::Cancelled)
+    });
+    assert_eq!(
+        status_of(&setup, "foreign"),
+        Some(GuideStatus::Generating),
+        "another conversation's version is left to it"
+    );
+}

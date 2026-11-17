@@ -9,8 +9,10 @@
 //!   assistant's session (or a followed card session) reads the guide it named again, so the
 //!   outline appears once started and sections fill in as each write lands. A start also opens
 //!   the guide panel when the body has room for it.
-//! * **Stopping.** When the reviewer stops the assistant's turn, the version that session was
-//!   writing is marked stopped (cancelled) with a revision-checked write; what was written stays.
+//! * **Stopping.** When the reviewer stops the assistant's turn, every version of the review's
+//!   guides that session is still writing is marked stopped (cancelled) with a revision-checked
+//!   write, on screen or not; a version another conversation resumed meanwhile is left to it.
+//!   What was written stays.
 //! * **Guide tab.** When the body has no room for the guide panel, the app paints the guide in
 //!   the assistant panel's Guide tab and routes its keys and clicks here, to the same state the
 //!   panel uses.
@@ -24,8 +26,13 @@ use crate::assistant::context::GuideView;
 use crate::context::UiContext;
 use crate::guide::{GuideCard, GuideLoad};
 use crate::loader::Message;
+use crate::notes::NoteScope;
 use crate::panels::SidePlacement;
-use bcode_code_review_models::{GetGuideVersionRequest, GuideStatus, SaveGuideVersionRequest};
+use crate::services::ReviewServices;
+use bcode_code_review_models::{
+    GetGuideVersionRequest, GuideStatus, ListGuideVersionsRequest, ListReviewGuidesRequest,
+    SaveGuideVersionRequest,
+};
 use bmux_keyboard::KeyStroke;
 use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
 use bmux_tui::composition::{Column, Flex, TextBlock};
@@ -382,78 +389,24 @@ impl ReviewSurface {
     // Stopping
     // ----------------------------------------------------------------------------------------
 
-    /// The assistant's turn in `session` was stopped: mark the version on screen stopped when
-    /// that session was writing it. Written sections stay.
+    /// The assistant's turn in `session` was stopped: mark every version of the review's guides
+    /// that session is writing stopped (whether or not it is on screen). Written sections stay.
     pub fn guide_turn_stopped(&mut self, session: &str, host: &UiContext) {
-        let Some(active) = self.guide.state.active.as_ref() else {
-            return;
-        };
-        let version = &active.version;
-        let writing = matches!(
-            version.status,
-            GuideStatus::Planning
-                | GuideStatus::Generating
-                | GuideStatus::Synthesizing
-                | GuideStatus::Verifying
-        );
-        if !writing || version.origin.session_id.as_deref() != Some(session) {
-            return;
-        }
-        let (guide_id, number) = (version.guide_id.clone(), version.version);
-        let repo = self.repo_path.clone();
+        let scope = self.note_scope();
         let services = self.services.clone();
         let inbox = self.inbox.clone();
+        let session = session.to_owned();
         host.spawn(Box::pin(async move {
-            let mut result = Err("the version kept changing".to_owned());
-            for _ in 0..STOP_ATTEMPTS {
-                let read = services
-                    .call(GetGuideVersionRequest {
-                        repo_path: repo.clone(),
-                        guide_id: guide_id.clone(),
-                        version: Some(number),
-                    })
-                    .await;
-                let record = match read {
-                    Ok(response) => response.version,
-                    Err(error) => {
-                        result = Err(error.message);
-                        break;
-                    }
-                };
-                let Some(record) = record else {
-                    result = Ok(());
-                    break;
-                };
-                if record.version.status.is_terminal() {
-                    result = Ok(());
-                    break;
-                }
-                let mut version = record.version;
-                version.status = GuideStatus::Cancelled;
-                let saved = services
-                    .call(SaveGuideVersionRequest {
-                        repo_path: repo.clone(),
-                        version,
-                        expected_revision: record.revision,
-                    })
-                    .await;
-                match saved {
-                    Ok(_) => {
-                        result = Ok(());
-                        break;
-                    }
-                    // A write landed meanwhile: read it and try again.
-                    Err(error) => result = Err(error.message),
-                }
-            }
+            let result = stop_writing(&services, &scope, &session).await;
             inbox.push(Message::GuideStopped(result));
         }));
     }
 
-    /// A stopped version's mark landed (or failed): read the guide again.
-    pub(super) fn guide_stop_written(&mut self, result: Result<(), String>) {
+    /// The stopped versions' marks landed (or failed): read the guide again when one did.
+    pub(super) fn guide_stop_written(&mut self, result: Result<usize, String>) {
         match result {
-            Ok(()) => self.set_status(
+            Ok(0) => return,
+            Ok(_) => self.set_status(
                 "stopped writing the guide; written sections stay",
                 StatusSeverity::Info,
             ),
@@ -549,4 +502,107 @@ impl ReviewSurface {
         }
         None
     }
+}
+
+/// Whether `status` is a writing one.
+const fn writing(status: &GuideStatus) -> bool {
+    matches!(
+        status,
+        GuideStatus::Planning
+            | GuideStatus::Generating
+            | GuideStatus::Synthesizing
+            | GuideStatus::Verifying
+    )
+}
+
+/// Mark every version of the guides of `scope` that `session` is writing stopped; returns how
+/// many were marked.
+///
+/// # Errors
+///
+/// * The first call that failed.
+async fn stop_writing(
+    services: &ReviewServices,
+    scope: &NoteScope,
+    session: &str,
+) -> Result<usize, String> {
+    let guides = services
+        .call(ListReviewGuidesRequest {
+            repo_path: scope.repo_path.clone(),
+            target: scope.target.clone(),
+            scope: scope.scope.clone(),
+            include_archived: false,
+        })
+        .await
+        .map_err(|error| error.message)?
+        .guides;
+    let mut stopped = 0;
+    for guide in guides {
+        let versions = services
+            .call(ListGuideVersionsRequest {
+                repo_path: scope.repo_path.clone(),
+                guide_id: guide.guide.guide_id.clone(),
+            })
+            .await
+            .map_err(|error| error.message)?
+            .versions;
+        for summary in versions {
+            if summary.status.as_ref().is_some_and(writing)
+                && stop_version(services, scope, &summary.guide_id, summary.version, session)
+                    .await?
+            {
+                stopped += 1;
+            }
+        }
+    }
+    Ok(stopped)
+}
+
+/// Mark version `number` of `guide_id` stopped while `session` is still writing it, re-reading
+/// it after a write landed meanwhile; returns whether it was marked.
+///
+/// # Errors
+///
+/// * A call that failed, or the version still changing after [`STOP_ATTEMPTS`].
+async fn stop_version(
+    services: &ReviewServices,
+    scope: &NoteScope,
+    guide_id: &str,
+    number: u32,
+    session: &str,
+) -> Result<bool, String> {
+    let mut last = "the version kept changing".to_owned();
+    for _ in 0..STOP_ATTEMPTS {
+        let record = services
+            .call(GetGuideVersionRequest {
+                repo_path: scope.repo_path.clone(),
+                guide_id: guide_id.to_owned(),
+                version: Some(number),
+            })
+            .await
+            .map_err(|error| error.message)?
+            .version;
+        // Another conversation may have resumed it since: then it is that conversation's.
+        let Some(record) = record.filter(|record| {
+            writing(&record.version.status)
+                && record.version.origin.session_id.as_deref() == Some(session)
+        }) else {
+            return Ok(false);
+        };
+        let mut version = record.version;
+        version.status = GuideStatus::Cancelled;
+        match services
+            .call(SaveGuideVersionRequest {
+                repo_path: scope.repo_path.clone(),
+                version,
+                expected_revision: record.revision,
+            })
+            .await
+        {
+            Ok(_) => return Ok(true),
+            // A write landed meanwhile: read it and try again.
+            Err(error) => last = error.message,
+        }
+    }
+    Err(last)
 }

@@ -470,7 +470,9 @@ The review assistant writes a guide with one agent (see
   `Chat` and `Guide` tabs and the Guide tab shows the guide, with its keys and clicks.
 * **`guide_show`** opens the guide and moves through it as the keys do; `current_view` reports
   the guide.
-* **Stop** cancels the turn and marks the version cancelled with a revision-checked write, keeping
+* **Stop** cancels the turn and marks every version of the review's guides that the session is
+  still writing cancelled, on screen or not, with revision-checked writes that re-check the
+  writer each attempt (a version another conversation resumed meanwhile is left to it), keeping
   what was written; the panel's banner says `stopped · N of M sections written`.
 
 ## Review actions
