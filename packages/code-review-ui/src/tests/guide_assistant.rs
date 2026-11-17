@@ -482,5 +482,5 @@ fn guide_tool_lines_stay_plain_where_no_guide_is_on_screen() {
         "{}",
         screen.text()
     );
-    assert!(!screen.contains("Guide · v"), "{}", screen.text());
+    assert!(!screen.contains("Guide v"), "no card: {}", screen.text());
 }

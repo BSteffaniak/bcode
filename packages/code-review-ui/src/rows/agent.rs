@@ -483,12 +483,13 @@ impl Card<'_> {
             Span::styled(icons.guide_marker, theme.accent),
             Span::raw(" "),
             Span::styled(
-                format!("Guide · v{} · ", card.version),
+                format!("Guide v{} ", card.version),
                 theme.accent.add_modifier(Modifier::BOLD),
             ),
-            Span::styled(card.title.clone(), theme.tiers.strong),
-            Span::raw("  "),
+            // Progress before the title, so a narrow panel cuts the title, not the progress.
             Span::styled(status, style),
+            Span::styled(theme.icons.separator, theme.tiers.dim),
+            Span::styled(card.title.clone(), theme.tiers.strong),
         ]);
         let mut writing_marked = !card.busy();
         for section in &card.sections {

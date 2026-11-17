@@ -498,7 +498,8 @@ a written guide unless asked.
   guide is started and its sections fill in one write at a time. Starting a guide opens the guide
   panel when the review's body has room for it.
 * **Card.** A turn that writes the guide on screen shows one guide card in place of its guide
-  tool lines (failed guide calls keep their lines): the guide's title, version and progress
+  tool lines (failed guide calls keep their lines): the guide's version, progress and title (in
+  that order, so a narrow panel shortens the title first)
   (`writing 2/9`, `stopped · 4/9 written`, `✓ 9 sections`), its sections (at most 12, around
   where writing is or the reviewer is) with their state (`◌` planned, `○` written, `✓`
   reviewed) and the current one marked, and `Open guide`. The card reads the review's guide
