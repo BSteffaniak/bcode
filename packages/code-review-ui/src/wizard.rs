@@ -2294,7 +2294,14 @@ impl Wizard {
                         else {
                             return WizardOutcome::Ignored;
                         };
-                        vec![layer(entry.pull.number, &entry.pull.title)]
+                        vec![(
+                            ReviewSourceKind::PullRequest {
+                                provider: provider.clone(),
+                                repository: repository.clone(),
+                                number: entry.pull.number,
+                            },
+                            format!("#{} {}", entry.pull.number, entry.pull.title),
+                        )]
                     }
                 };
                 self.add_sources(sources);

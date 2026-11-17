@@ -218,7 +218,7 @@ fn open_until_stopped(
     {
         return Ok(ControlFlow::Break(()));
     }
-    if rest.is_empty() {
+    if rest.is_empty() && !needs_provider(&included) {
         return Ok(ControlFlow::Continue(()));
     }
 

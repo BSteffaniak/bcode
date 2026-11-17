@@ -143,7 +143,9 @@ fn questions_on_the_second_stack_layer_keep_its_source_identity() {
 #[test]
 fn stack_rail_steps_between_layers_keeping_each_layers_position() {
     let fixture = fixture();
-    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let provider = FakeProvider::new(fixture.root());
+    provider.close(100);
+    let backend = Arc::new(TestBackend::default().with_provider(provider));
     let workspace = create(
         &backend,
         &fixture,
@@ -154,8 +156,8 @@ fn stack_rail_steps_between_layers_keeping_each_layers_position() {
     let review = scenario.surface().review().expect("review");
     let (labels, current) = review.rail();
     assert_eq!(labels.len(), 3, "{labels:?}");
-    assert!(labels[0].starts_with("#101 Layer 101 2/4"), "{labels:?}");
-    assert!(labels[2].starts_with("#103 Layer 103 4/4"), "{labels:?}");
+    assert!(labels[0].starts_with("#101 Layer 101 1/3"), "{labels:?}");
+    assert!(labels[2].starts_with("#103 Layer 103 3/3"), "{labels:?}");
     assert_eq!(current, Some(0));
     let screen = scenario.frame();
     assert!(
@@ -388,7 +390,7 @@ fn step_through_reviews_show_one_pull_request_at_a_time_or_every_one() {
     scenario.key("shift+o");
     let screen = settled(&mut scenario);
     assert_eq!(focus(&scenario), None);
-    assert_eq!(sources_shown(&scenario).len(), 3);
+    assert_eq!(sources_shown(&scenario).len(), 4);
     assert!(
         screen.row_text(2).contains("PR 3 of 4"),
         "{}",
@@ -1116,6 +1118,52 @@ fn files_several_layers_change_are_listed_and_each_jumps_to_its_layer() {
         screen.contains(&format!("{STACK_SHARED_FILE}: changed by")),
         "{}",
         screen.text()
+    );
+}
+
+#[test]
+fn refresh_follows_remote_stack_growth_without_local_git_changes() {
+    let fixture = fixture();
+    let provider = FakeProvider::new(fixture.root());
+    provider.close(103);
+    let backend = Arc::new(TestBackend::default().with_provider(provider));
+    let workspace = create(&backend, &fixture, "Follow stack", vec![layer(102)]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    let before = stored(&backend, &fixture, &workspace.id);
+    assert_eq!(before.sources.len(), 3);
+    let kept = before
+        .sources
+        .iter()
+        .find(|source| source.kind == layer(102))
+        .unwrap()
+        .clone();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    backend.provider().unwrap().reopen(103);
+    scenario.key("r");
+    settled(&mut scenario);
+    let after = stored(&backend, &fixture, &workspace.id);
+    let numbers: Vec<_> = after
+        .sources
+        .iter()
+        .filter_map(|source| match source.kind {
+            ReviewSourceKind::StackLayer { number, .. } => Some(number),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(numbers, [100, 101, 102, 103]);
+    assert!(after.sources.contains(&kept));
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        scenario
+            .surface()
+            .review()
+            .unwrap()
+            .document()
+            .unwrap()
+            .groups()
+            .count(),
+        4
     );
 }
 

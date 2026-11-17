@@ -197,6 +197,8 @@ pub struct Opened {
     /// What each source cut to its file limit says (see
     /// [`bcode_code_review_models::listing_truncated_message`]).
     pub truncated: Vec<String>,
+    /// Stack confirmations retained when an atomic refresh does not stream events.
+    pub stacks: Vec<session::StackNews>,
 }
 
 /// Viewed state an opening review loads before its first frame.
@@ -302,7 +304,14 @@ pub async fn open(
         browse: options.browse,
     };
     let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
-    let (data, registry) = (services.data(), services.providers());
+    // Opening a provider-backed review confirms remote state even when the local repository
+    // and the registry's recent snapshot have not changed.
+    let (data, registry) = (
+        services.data(),
+        services
+            .providers()
+            .with_stack_freshness(std::time::Duration::ZERO),
+    );
     let work = services.blocking(move || {
         // Once the review is closed or reopened, the receiver is gone and the open stops.
         session::open(&data, &registry, &request, |event| {
@@ -482,6 +491,7 @@ impl Streamer<'_> {
         )
         .await;
         opened.truncated = truncated;
+        opened.stacks = self.stacks;
         Ok(Some(opened))
     }
 }
@@ -678,6 +688,7 @@ async fn opened_from(
         stored_viewed,
         complete,
         truncated: Vec::new(),
+        stacks: Vec::new(),
     }
 }
 

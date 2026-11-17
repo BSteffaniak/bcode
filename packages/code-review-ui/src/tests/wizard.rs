@@ -857,7 +857,14 @@ fn pull_requests_and_stacks_come_from_the_provider() {
     scenario.key("enter");
     settled(&mut scenario);
     let created = create(&mut scenario, &backend, &fixture);
-    assert_eq!(kinds(&created), [layer(103)]);
+    assert_eq!(
+        kinds(&created),
+        [ReviewSourceKind::PullRequest {
+            provider: FAKE_PROVIDER.to_owned(),
+            repository: FAKE_REPOSITORY.to_owned(),
+            number: 103,
+        }]
+    );
 }
 
 #[test]
@@ -1281,7 +1288,9 @@ fn every_wizard_mode_can_be_created_through_create_review() {
                 ),
                 SourceType::Stack => matches!(
                     kind,
-                    ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+                    ReviewSourceKind::Stack { .. }
+                        | ReviewSourceKind::StackLayer { .. }
+                        | ReviewSourceKind::PullRequest { .. }
                 ),
                 SourceType::Files => matches!(
                     kind,

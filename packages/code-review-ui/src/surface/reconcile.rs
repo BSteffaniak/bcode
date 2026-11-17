@@ -1,13 +1,8 @@
 //! Keeping a step-through stack review in step with its stack.
 //!
-//! A step-through review saves one source per layer, pinned to its pull request. After a
-//! restack, some of those pull requests are closed or merged (their layers fail with
-//! [`REVIEW_DIAGNOSTIC_PULL_GONE`]) and new ones may have joined. Those failures are not errors to
-//! show: they are held here until the stack is known again (stack news from a layer still open),
-//! then the review's layers are made to match it. Layers that left are removed, new ones are
-//! added in stack order, the review is saved and opened again, and one notice says what changed.
-//! Layers that left keep their comments and viewed marks in the store; only the review stops
-//! showing them.
+//! A step-through review follows the provider-confirmed stack, not a fixed list of pull requests.
+//! New layers join in stack order, while closed or merged layers leave without losing their
+//! comments or viewed marks. Ordinary pull-request sources remain explicit, fixed selections.
 
 use super::ReviewSurface;
 use bcode_code_review_models::{
@@ -65,20 +60,24 @@ pub fn reconcile(
     repository: &str,
     stack: &bcode_code_review_models::ReviewStack,
 ) -> Option<StackChange> {
-    let ours = |source: &ReviewSource| {
-        layer_of(source).is_some_and(|(p, r, _)| p == provider && r == repository)
-    };
     let numbers: Vec<u64> = stack.layers.iter().map(|layer| layer.pull.number).collect();
+    let ours = |source: &ReviewSource| {
+        layer_of(source).is_some_and(|(p, r, n)| {
+            p == provider && r == repository && (numbers.contains(&n) || gone.contains(&source.id))
+        })
+    };
+    // An unrelated stack in the same repository must not replace this review's sources.
+    if !sources.iter().any(|source| {
+        layer_of(source)
+            .is_some_and(|(p, r, n)| p == provider && r == repository && numbers.contains(&n))
+    }) {
+        return None;
+    }
     let removed: Vec<&ReviewSource> = sources
         .iter()
         .filter(|source| ours(source) && gone.contains(&source.id))
         .filter(|source| layer_of(source).is_some_and(|(_, _, n)| !numbers.contains(&n)))
         .collect();
-    // Only a review some of whose layers left is changed: a stack that grew while every layer
-    // still opens is the user's to add (the review may follow only part of it on purpose).
-    if removed.is_empty() {
-        return None;
-    }
     let mut used: BTreeSet<String> = sources.iter().map(|source| source.id.clone()).collect();
     let mut layers = Vec::new();
     let mut added = Vec::new();
@@ -117,6 +116,9 @@ pub fn reconcile(
         }
         result.push(source.clone());
     }
+    if result == sources {
+        return None;
+    }
     Some(StackChange {
         sources: result,
         removed: removed
@@ -143,12 +145,9 @@ impl ReviewSurface {
         true
     }
 
-    /// Match the review's layers to the stack it follows, once both a layer that left and the
-    /// stack are known. The review is saved and opened again with the new layers.
+    /// Match the review's layers to the stack it follows. The review is saved and opened again
+    /// when layers join, leave, or change order.
     pub(super) fn reconcile_stack(&mut self) {
-        if self.gone_layers.is_empty() {
-            return;
-        }
         let Some(news) = self.stack_news.as_ref() else {
             return;
         };
@@ -165,12 +164,18 @@ impl ReviewSurface {
         self.sources.clone_from(&change.sources);
         self.workspace_mut().sources = change.sources;
         self.request_save();
-        let mut body = vec![format!(
-            "Since it was saved: {} closed or merged (removed)",
-            change.removed.join(", ")
-        )];
+        let mut body = Vec::new();
+        if !change.removed.is_empty() {
+            body.push(format!(
+                "{} closed or merged (removed)",
+                change.removed.join(", ")
+            ));
+        }
         if !change.added.is_empty() {
             body.push(format!("{} added", change.added.join(", ")));
+        }
+        if body.is_empty() {
+            body.push("layers reordered".to_owned());
         }
         // Stays until read: it says why layers the reviewer knew are gone.
         self.toasts.push_sticky(
@@ -281,13 +286,45 @@ mod tests {
     }
 
     #[test]
-    fn nothing_changes_without_a_layer_that_left() {
-        let sources = vec![layer_source("source-1", 10)];
+    fn explicit_pull_requests_and_unrelated_stacks_stay_fixed() {
+        let mut pull = layer_source("source-1", 10);
+        pull.kind = ReviewSourceKind::PullRequest {
+            provider: "fake".to_owned(),
+            repository: "o/r".to_owned(),
+            number: 10,
+        };
         assert_eq!(
-            reconcile(&sources, &BTreeSet::new(), "fake", "o/r", &stack(&[10, 11])),
+            reconcile(&[pull], &BTreeSet::new(), "fake", "o/r", &stack(&[10, 11])),
             None
         );
-        // A layer that failed but is still in the stack is not removed.
+        let sources = vec![layer_source("source-1", 10), layer_source("source-2", 90)];
+        let change =
+            reconcile(&sources, &BTreeSet::new(), "fake", "o/r", &stack(&[10, 11])).unwrap();
+        assert_eq!(change.sources.last(), Some(&sources[1]));
+        assert_eq!(
+            reconcile(&sources, &BTreeSet::new(), "fake", "o/r", &stack(&[80, 81])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_growing_stack_adds_layers_without_waiting_for_a_layer_to_leave() {
+        let sources = vec![layer_source("source-1", 10)];
+        let current = stack(&[10, 11]);
+        let change = reconcile(&sources, &BTreeSet::new(), "fake", "o/r", &current).unwrap();
+        assert_eq!(change.sources[0], sources[0]);
+        assert_eq!(change.added, ["#11"]);
+        assert_eq!(change.removed, Vec::<String>::new());
+        assert_eq!(layer_of(&change.sources[1]), Some(("fake", "o/r", 11)));
+        assert_eq!(
+            reconcile(&change.sources, &BTreeSet::new(), "fake", "o/r", &current),
+            None
+        );
+    }
+
+    #[test]
+    fn a_layer_that_failed_but_is_still_in_the_stack_is_not_removed() {
+        let sources = vec![layer_source("source-1", 10)];
         let gone = BTreeSet::from(["source-1".to_owned()]);
         assert_eq!(
             reconcile(&sources, &gone, "fake", "o/r", &stack(&[10])),

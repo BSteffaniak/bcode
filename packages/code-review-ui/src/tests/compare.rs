@@ -213,7 +213,10 @@ pub(super) fn reopened_after_a_restack(
     backend: TestBackend,
 ) -> (GitFixture, Arc<TestBackend>, String, Scenario<ReviewApp>) {
     let fixture = fixture();
-    let backend = Arc::new(backend.with_provider(FakeProvider::new(fixture.root())));
+    // This scenario exercises a three-layer stack after the trunk-facing PR merged.
+    let provider = FakeProvider::new(fixture.root());
+    provider.close(100);
+    let backend = Arc::new(backend.with_provider(provider));
     let workspace = create(
         &backend,
         &fixture,
@@ -486,8 +489,7 @@ fn the_history_matrix_compares_in_place_without_opening_another_review() {
     scenario.key("shift+b");
     let screen = settled(&mut scenario);
     assert!(screen.contains("Stack history"), "{}", screen.text());
-    // The bottom pull request (#101 is the matrix's second row), from the push before to now.
-    scenario.key("down");
+    // The bottom open pull request (#101 is the matrix's first row), from the push before to now.
     scenario.key("enter");
     let screen = settled(&mut scenario);
     assert!(!screen.contains("Stack history"), "{}", screen.text());

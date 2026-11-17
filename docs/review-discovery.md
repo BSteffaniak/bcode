@@ -80,6 +80,21 @@ Measured on an 87-layer stack in a repository with over 2,000 open pull requests
 walk took 88 sequential queries (33 s); with Graphite and git hints it takes the start lookup
 and three batched requests (4–5 s).
 
+## Following a saved stack
+
+A step-through stack review follows the forge-confirmed stack, rather than freezing the pull
+requests present when it was saved. Newly confirmed layers join in stack order; closed or merged
+layers leave without deleting their annotations or viewed marks. Existing layers retain their
+source identities. Explicit `pull_request` sources remain fixed selections, and unrelated stacks
+in the same repository are not combined. Forks remain subject to the provider's path selection
+and sibling warnings; local ancestry or Graphite metadata alone cannot add confirmed layers.
+
+Opening or refreshing a provider-backed review confirms remote state, including when it has
+only one source. A recent saved snapshot can supply the first frame, but does not replace that
+confirmation. Local HEAD/index/worktree change tokens are only sufficient for local reviews;
+remote review refreshes must not short-circuit on those tokens. Atomic refreshes retain stack
+confirmations as well as file contents so newly discovered layers can be reconciled and saved.
+
 ## Fetching
 
 Every layer needs its head and base commits under review-owned refs

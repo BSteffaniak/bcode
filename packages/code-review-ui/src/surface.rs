@@ -1542,6 +1542,13 @@ impl ReviewSurface {
         if self.refreshing {
             return;
         }
+        // Local HEAD/index tokens cannot establish freshness for remote pull requests or stacks.
+        if self.sources.iter().any(|source| {
+            source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
+        }) {
+            self.reopen(host);
+            return;
+        }
         self.refreshing = true;
         let services = self.services.clone();
         let repo = self.repo_path.clone();
@@ -2271,6 +2278,7 @@ impl ReviewSurface {
         self.generation += 1;
         let fingerprints = std::mem::take(&mut opened.fingerprints);
         let truncated = std::mem::take(&mut opened.truncated);
+        let stacks = std::mem::take(&mut opened.stacks);
         // An unsaved review picks up the state stored for its target when it first opens.
         let stored = opened.stored_viewed.take();
         if self.review.is_none() && self.is_transient() {
@@ -2350,6 +2358,9 @@ impl ReviewSurface {
         // Annotations are re-applied to the new document (and re-listed by the next poll).
         self.notes_requested = false;
         self.sync_notes();
+        for news in stacks {
+            self.apply_stack_news(news);
+        }
     }
 
     /// Fill in (or add) the group of a source that arrived after the first frame, in place: the
