@@ -89,15 +89,37 @@ pub fn is_transient_scope_id(workspace_id: &str) -> bool {
 /// * Transient workspaces: `transient-review-workspace-{fingerprint}`, where the fingerprint
 ///   hashes the repository root and each source's kind in order. Source ids, labels, and the
 ///   included flag are not part of it, so the same target opened from any entry point (CLI,
-///   home suggestion, wizard) shares one scope.
+///   home suggestion, wizard) shares one scope. Stack-layer sources of a stack the workspace
+///   also reviews whole are left out: a whole-stack review gains its layers when it opens (so
+///   the view can switch between them) and keeps its scope.
 #[must_use]
 pub fn annotation_workspace_id(workspace: &ReviewWorkspace) -> String {
     if !is_transient(workspace) {
         return workspace.id.clone();
     }
+    let whole: Vec<(&str, &str)> = workspace
+        .sources
+        .iter()
+        .filter_map(|source| match &source.kind {
+            ReviewSourceKind::Stack {
+                provider,
+                repository,
+                ..
+            } => Some((provider.as_str(), repository.as_str())),
+            _ => None,
+        })
+        .collect();
+    let companion = |kind: &ReviewSourceKind| {
+        matches!(kind, ReviewSourceKind::StackLayer { provider, repository, .. }
+            if whole.contains(&(provider.as_str(), repository.as_str())))
+    };
     let mut hasher = Sha256::new();
     hasher.update(workspace.repo_root.display().to_string().as_bytes());
-    for source in &workspace.sources {
+    for source in workspace
+        .sources
+        .iter()
+        .filter(|source| !companion(&source.kind))
+    {
         hasher.update(b"\0");
         // Source kinds always encode; the label is a stable fallback all the same.
         let kind =
@@ -217,6 +239,51 @@ mod tests {
         workspace.id = "workspace-abc".to_owned();
         assert_eq!(annotation_workspace_id(&workspace), "workspace-abc");
         assert!(!is_transient_scope_id("workspace-abc"));
+    }
+
+    #[test]
+    fn a_whole_stack_keeps_its_scope_when_its_layers_join() {
+        let whole = ReviewSourceKind::Stack {
+            provider: "fake".into(),
+            repository: "o/r".into(),
+            top: 3,
+        };
+        let layer = |number| ReviewSourceKind::StackLayer {
+            provider: "fake".into(),
+            repository: "o/r".into(),
+            number,
+        };
+        let alone = transient("/repo", vec![whole.clone()]);
+        let with_layers = transient("/repo", vec![layer(1), layer(2), layer(3), whole]);
+        assert_eq!(
+            annotation_workspace_id(&alone),
+            annotation_workspace_id(&with_layers)
+        );
+        // Layers alone, or of another repository's stack, still count.
+        let layers = transient("/repo", vec![layer(1), layer(2)]);
+        assert_ne!(
+            annotation_workspace_id(&layers),
+            annotation_workspace_id(&transient("/repo", vec![layer(1)]))
+        );
+        let other = transient(
+            "/repo",
+            vec![
+                ReviewSourceKind::StackLayer {
+                    provider: "fake".into(),
+                    repository: "o/other".into(),
+                    number: 1,
+                },
+                ReviewSourceKind::Stack {
+                    provider: "fake".into(),
+                    repository: "o/r".into(),
+                    top: 3,
+                },
+            ],
+        );
+        assert_ne!(
+            annotation_workspace_id(&alone),
+            annotation_workspace_id(&other)
+        );
     }
 
     #[test]

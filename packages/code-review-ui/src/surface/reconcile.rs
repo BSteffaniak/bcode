@@ -1,8 +1,12 @@
-//! Keeping a step-through stack review in step with its stack.
+//! Keeping a stack review in step with its stack.
 //!
-//! A step-through review follows the provider-confirmed stack, not a fixed list of pull requests.
-//! New layers join in stack order, while closed or merged layers leave without losing their
-//! comments or viewed marks. Ordinary pull-request sources remain explicit, fixed selections.
+//! A stack review follows the provider-confirmed stack, not a fixed list of pull requests. It
+//! holds the stack two ways: one source per layer (each pull request against its parent) and one
+//! whole-stack source (trunk to the top layer, one diff), so the view can switch between them
+//! without creating another review. A review that names only one of the two gets the other when
+//! the stack is confirmed. New layers join in stack order, while closed or merged layers leave
+//! without losing their comments or viewed marks, and the whole-stack source follows the stack's
+//! top. Ordinary pull-request sources remain explicit, fixed selections.
 
 use super::ReviewSurface;
 use bcode_code_review_models::{
@@ -23,6 +27,18 @@ fn layer_of(source: &ReviewSource) -> Option<(&str, &str, u64)> {
     }
 }
 
+/// A whole-stack source's provider, repository and top pull request number.
+fn whole_of(source: &ReviewSource) -> Option<(&str, &str, u64)> {
+    match &source.kind {
+        ReviewSourceKind::Stack {
+            provider,
+            repository,
+            top,
+        } => Some((provider, repository, *top)),
+        _ => None,
+    }
+}
+
 /// A source id not in `used`: `source-N` with the lowest free `N` past the ones in use.
 fn free_id(used: &BTreeSet<String>) -> String {
     let mut next = used
@@ -37,7 +53,19 @@ fn free_id(used: &BTreeSet<String>) -> String {
     format!("source-{next}")
 }
 
-/// What reconciling a review's layers with its stack changed.
+/// The label of a whole-stack source whose top layer is `top`.
+fn whole_label(stack: &bcode_code_review_models::ReviewStack) -> String {
+    stack.layers.last().map_or_else(String::new, |top| {
+        format!(
+            "Stack #{} · {} ({} layers)",
+            top.pull.number,
+            top.pull.title,
+            stack.layers.len()
+        )
+    })
+}
+
+/// What reconciling a review's sources with its stack changed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct StackChange {
     /// The review's sources after.
@@ -46,12 +74,16 @@ pub struct StackChange {
     pub removed: Vec<String>,
     /// Layers that joined: their pull requests, `#N`.
     pub added: Vec<String>,
+    /// The review had no layer sources before: they were added so the stack can be shown one
+    /// pull request at a time, not because the stack changed.
+    pub layers_filled: bool,
 }
 
 /// The review's `sources` matched to `stack` (of `provider`'s `repository`): the layer sources of
 /// that stack in its order, existing ones kept (their ids and labels), new ones added; layers in
-/// `gone` that the stack no longer has removed. Other sources keep their place: the stack's
-/// layers take the place of its first layer source. `None` when nothing changes.
+/// `gone` that the stack no longer has removed; then its whole-stack source (kept, with its top
+/// moved to the stack's top, or added). Other sources keep their place: the stack's sources take
+/// the place of its first one. `None` when nothing changes.
 #[must_use]
 pub fn reconcile(
     sources: &[ReviewSource],
@@ -61,55 +93,89 @@ pub fn reconcile(
     stack: &bcode_code_review_models::ReviewStack,
 ) -> Option<StackChange> {
     let numbers: Vec<u64> = stack.layers.iter().map(|layer| layer.pull.number).collect();
-    let ours = |source: &ReviewSource| {
+    let top = *numbers.last()?;
+    let in_stack =
+        |p: &str, r: &str, n: u64| p == provider && r == repository && numbers.contains(&n);
+    let layer_ours = |source: &ReviewSource| {
         layer_of(source).is_some_and(|(p, r, n)| {
             p == provider && r == repository && (numbers.contains(&n) || gone.contains(&source.id))
         })
     };
+    // The whole-stack source this stack keeps: the first one whose top is in the stack.
+    let whole = sources
+        .iter()
+        .find(|source| whole_of(source).is_some_and(|(p, r, n)| in_stack(p, r, n)));
+    let ours = |source: &ReviewSource| {
+        layer_ours(source) || whole.is_some_and(|whole| whole.id == source.id)
+    };
     // An unrelated stack in the same repository must not replace this review's sources.
-    if !sources.iter().any(|source| {
-        layer_of(source)
-            .is_some_and(|(p, r, n)| p == provider && r == repository && numbers.contains(&n))
-    }) {
+    if whole.is_none()
+        && !sources
+            .iter()
+            .any(|source| layer_of(source).is_some_and(|(p, r, n)| in_stack(p, r, n)))
+    {
         return None;
     }
+    let had_layers = sources.iter().any(layer_ours);
+    let included = sources
+        .iter()
+        .filter(|source| ours(source))
+        .any(|source| source.included);
     let removed: Vec<&ReviewSource> = sources
         .iter()
-        .filter(|source| ours(source) && gone.contains(&source.id))
+        .filter(|source| layer_ours(source) && gone.contains(&source.id))
         .filter(|source| layer_of(source).is_some_and(|(_, _, n)| !numbers.contains(&n)))
         .collect();
     let mut used: BTreeSet<String> = sources.iter().map(|source| source.id.clone()).collect();
-    let mut layers = Vec::new();
+    let mut stack_sources = Vec::new();
     let mut added = Vec::new();
     for layer in &stack.layers {
         let kept = sources.iter().find(|source| {
-            ours(source) && layer_of(source).is_some_and(|(_, _, n)| n == layer.pull.number)
+            layer_ours(source) && layer_of(source).is_some_and(|(_, _, n)| n == layer.pull.number)
         });
         if let Some(source) = kept {
-            layers.push(source.clone());
+            stack_sources.push(source.clone());
         } else {
             let id = free_id(&used);
             used.insert(id.clone());
-            let label = format!("#{} {}", layer.pull.number, layer.pull.title);
             added.push(format!("#{}", layer.pull.number));
-            layers.push(ReviewSource {
+            stack_sources.push(ReviewSource {
                 id,
                 kind: ReviewSourceKind::StackLayer {
                     provider: provider.to_owned(),
                     repository: repository.to_owned(),
                     number: layer.pull.number,
                 },
-                label,
-                included: true,
+                label: format!("#{} {}", layer.pull.number, layer.pull.title),
+                included,
             });
         }
     }
+    let whole_kind = ReviewSourceKind::Stack {
+        provider: provider.to_owned(),
+        repository: repository.to_owned(),
+        top,
+    };
+    stack_sources.push(match whole {
+        Some(source) if source.kind == whole_kind => source.clone(),
+        Some(source) => ReviewSource {
+            kind: whole_kind,
+            label: whole_label(stack),
+            ..source.clone()
+        },
+        None => ReviewSource {
+            id: free_id(&used),
+            kind: whole_kind,
+            label: whole_label(stack),
+            included,
+        },
+    });
     let mut result = Vec::new();
     let mut placed = false;
     for source in sources {
         if ours(source) {
             if !placed {
-                result.append(&mut layers);
+                result.append(&mut stack_sources);
                 placed = true;
             }
             continue;
@@ -125,7 +191,8 @@ pub fn reconcile(
             .iter()
             .filter_map(|source| layer_of(source).map(|(_, _, number)| format!("#{number}")))
             .collect(),
-        added,
+        added: if had_layers { added } else { Vec::new() },
+        layers_filled: !had_layers,
     })
 }
 
@@ -163,7 +230,23 @@ impl ReviewSurface {
         self.gone_layers.clear();
         self.sources.clone_from(&change.sources);
         self.workspace_mut().sources = change.sources;
+        if change.layers_filled {
+            // A review made of the whole-stack diff keeps showing it, now with layers to switch
+            // to.
+            self.stack_view = super::stack::StackView::Whole;
+            self.workspace_mut()
+                .presentation
+                .get_or_insert_with(Default::default)
+                .set_stack_view(super::stack::StackView::Whole);
+        }
         self.request_save();
+        // Opening again with the new sources is not a refresh to announce.
+        self.switching = true;
+        self.reopen_pending = true;
+        if change.removed.is_empty() && change.added.is_empty() {
+            // Only the other way of showing the stack joined, or the stack's top moved along.
+            return;
+        }
         let mut body = Vec::new();
         if !change.removed.is_empty() {
             body.push(format!(
@@ -174,18 +257,12 @@ impl ReviewSurface {
         if !change.added.is_empty() {
             body.push(format!("{} added", change.added.join(", ")));
         }
-        if body.is_empty() {
-            body.push("layers reordered".to_owned());
-        }
         // Stays until read: it says why layers the reviewer knew are gone.
         self.toasts.push_sticky(
             ToastSeverity::Info,
             "The stack changed",
             Some(format!("{}.", body.join("; "))),
         );
-        // Opening again with the new layers is not a refresh to announce.
-        self.switching = true;
-        self.reopen_pending = true;
     }
 
     /// Layers that left with no stack to match them to (every layer it knew of left, say): one
@@ -226,6 +303,19 @@ mod tests {
                 number,
             },
             label: format!("#{number} old title"),
+            included: true,
+        }
+    }
+
+    fn whole_source(id: &str, top: u64) -> ReviewSource {
+        ReviewSource {
+            id: id.to_owned(),
+            kind: ReviewSourceKind::Stack {
+                provider: "fake".to_owned(),
+                repository: "o/r".to_owned(),
+                top,
+            },
+            label: format!("Stack #{top}"),
             included: true,
         }
     }
@@ -278,9 +368,15 @@ mod tests {
         let change =
             reconcile(&sources, &gone, "fake", "o/r", &stack(&[10, 13, 12])).expect("a change");
         let ids: Vec<&str> = change.sources.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["source-9", "source-1", "source-10", "source-3"]);
+        // The whole stack joins after the layers, so the view can switch to it.
+        assert_eq!(
+            ids,
+            ["source-9", "source-1", "source-10", "source-3", "source-11"]
+        );
+        assert_eq!(whole_of(&change.sources[4]), Some(("fake", "o/r", 12)));
         assert_eq!(change.removed, ["#11"]);
         assert_eq!(change.added, ["#13"]);
+        assert!(!change.layers_filled);
         // Kept layers keep their labels.
         assert_eq!(change.sources[1].label, "#10 old title");
     }
@@ -324,10 +420,76 @@ mod tests {
 
     #[test]
     fn a_layer_that_failed_but_is_still_in_the_stack_is_not_removed() {
-        let sources = vec![layer_source("source-1", 10)];
+        let sources = vec![layer_source("source-1", 10), whole_source("source-2", 10)];
         let gone = BTreeSet::from(["source-1".to_owned()]);
         assert_eq!(
             reconcile(&sources, &gone, "fake", "o/r", &stack(&[10])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_whole_stack_gains_its_layers_quietly_and_keeps_its_id() {
+        let sources = vec![whole_source("source-1", 12)];
+        let change = reconcile(
+            &sources,
+            &BTreeSet::new(),
+            "fake",
+            "o/r",
+            &stack(&[10, 11, 12]),
+        )
+        .unwrap();
+        let layers: Vec<Option<u64>> = change
+            .sources
+            .iter()
+            .map(|source| layer_of(source).map(|(_, _, number)| number))
+            .collect();
+        assert_eq!(layers, [Some(10), Some(11), Some(12), None]);
+        assert_eq!(change.sources[3], sources[0]);
+        // Not a change of the stack: nothing to announce.
+        assert!(change.layers_filled);
+        assert!(change.added.is_empty() && change.removed.is_empty());
+        assert_eq!(
+            reconcile(
+                &change.sources,
+                &BTreeSet::new(),
+                "fake",
+                "o/r",
+                &stack(&[10, 11, 12])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_whole_stack_follows_the_stacks_top() {
+        let sources = vec![
+            layer_source("source-1", 10),
+            layer_source("source-2", 11),
+            whole_source("source-3", 11),
+        ];
+        let change = reconcile(
+            &sources,
+            &BTreeSet::new(),
+            "fake",
+            "o/r",
+            &stack(&[10, 11, 12]),
+        )
+        .unwrap();
+        let whole = change.sources.last().expect("the whole stack");
+        assert_eq!(whole.id, "source-3");
+        assert_eq!(whole_of(whole), Some(("fake", "o/r", 12)));
+        assert_eq!(change.added, ["#12"]);
+        // A whole stack of another stack is not this one's.
+        let unrelated = vec![whole_source("source-1", 90)];
+        assert_eq!(
+            reconcile(
+                &unrelated,
+                &BTreeSet::new(),
+                "fake",
+                "o/r",
+                &stack(&[10, 11])
+            ),
             None
         );
     }

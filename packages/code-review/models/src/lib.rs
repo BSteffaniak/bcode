@@ -312,6 +312,19 @@ pub enum ReviewLayoutMode {
     SideBySide,
 }
 
+/// How a stack review shows its stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStackView {
+    /// One pull request at a time.
+    #[default]
+    OneLayer,
+    /// Every pull request in one document.
+    AllLayers,
+    /// The whole stack as one diff, labeled by layer.
+    Whole,
+}
+
 /// Side of a diff line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -474,6 +487,10 @@ pub struct ReviewPresentationState {
     /// time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub all_stack_layers: bool,
+    /// How a stack review shows its stack; unset reads [`Self::all_stack_layers`] (saved before
+    /// the whole stack could be switched to).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_view: Option<ReviewStackView>,
     /// The newest conversation activity seen on each pull request (by
     /// `provider/repository#number`), in milliseconds since the Unix epoch: what arrived after
     /// it is new.
@@ -507,6 +524,25 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+impl ReviewPresentationState {
+    /// How a stack review shows its stack, from [`Self::stack_view`], else from
+    /// [`Self::all_stack_layers`].
+    #[must_use]
+    pub fn stack_view(&self) -> ReviewStackView {
+        self.stack_view.unwrap_or(if self.all_stack_layers {
+            ReviewStackView::AllLayers
+        } else {
+            ReviewStackView::OneLayer
+        })
+    }
+
+    /// Record how a stack review shows its stack (keeping [`Self::all_stack_layers`] in step).
+    pub fn set_stack_view(&mut self, view: ReviewStackView) {
+        self.stack_view = Some(view);
+        self.all_stack_layers = view == ReviewStackView::AllLayers;
+    }
+}
+
 impl Default for ReviewPresentationState {
     fn default() -> Self {
         Self {
@@ -524,6 +560,7 @@ impl Default for ReviewPresentationState {
             uncommitted_marks: None,
             show_ignored: None,
             all_stack_layers: false,
+            stack_view: None,
             conversation_seen: BTreeMap::new(),
             collapsed_files: BTreeSet::new(),
             opened_files: BTreeSet::new(),

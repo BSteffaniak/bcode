@@ -994,11 +994,7 @@ impl ReviewSurface {
             self.file_view.uncommitted_marks = state.uncommitted_marks;
             self.file_view.show_ignored = state.show_ignored;
             self.file_view.layout = self.config.file_layout(state.flat_files);
-            self.stack_view = if state.all_stack_layers {
-                stack::StackView::AllLayers
-            } else {
-                stack::StackView::OneLayer
-            };
+            self.stack_view = state.stack_view();
         }
         if workspace.id != TRANSIENT_WORKSPACE_ID {
             self.viewed_sync.base = Some(viewed_sync::Viewed::of(&workspace));

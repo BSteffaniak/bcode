@@ -559,13 +559,34 @@ fn entries_resolve_pull_requests_stacks_and_resume_before_opening() {
         40,
     );
     let workspace = scenario.surface().review().unwrap().workspace().unwrap();
+    // The whole stack, with its layers joined so the view can switch to them.
+    let kinds: Vec<&ReviewSourceKind> = workspace.sources.iter().map(|s| &s.kind).collect();
+    let layer = |number| ReviewSourceKind::StackLayer {
+        provider: FAKE_PROVIDER.to_owned(),
+        repository: FAKE_REPOSITORY.to_owned(),
+        number,
+    };
     assert_eq!(
-        workspace.sources[0].kind,
-        ReviewSourceKind::Stack {
-            provider: FAKE_PROVIDER.to_owned(),
-            repository: FAKE_REPOSITORY.to_owned(),
-            top: 103,
-        }
+        kinds,
+        [
+            &layer(100),
+            &layer(101),
+            &layer(102),
+            &layer(103),
+            &ReviewSourceKind::Stack {
+                provider: FAKE_PROVIDER.to_owned(),
+                repository: FAKE_REPOSITORY.to_owned(),
+                top: 103,
+            }
+        ]
+    );
+    let (rail, selected) = scenario.surface().review().unwrap().rail();
+    assert_eq!(
+        selected
+            .and_then(|index| rail.get(index))
+            .map(|tab| tab.starts_with("Whole stack")),
+        Some(true),
+        "{rail:?}"
     );
 
     let saved = create(

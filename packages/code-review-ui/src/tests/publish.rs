@@ -155,9 +155,11 @@ fn stack_rail_steps_between_layers_keeping_each_layers_position() {
     let mut scenario = resume(&fixture, &backend, &workspace.id);
     let review = scenario.surface().review().expect("review");
     let (labels, current) = review.rail();
-    assert_eq!(labels.len(), 3, "{labels:?}");
+    // One tab per layer, then the whole stack's.
+    assert_eq!(labels.len(), 4, "{labels:?}");
     assert!(labels[0].starts_with("#101 Layer 101 1/3"), "{labels:?}");
     assert!(labels[2].starts_with("#103 Layer 103 3/3"), "{labels:?}");
+    assert!(labels[3].starts_with("Whole stack #101–#103"), "{labels:?}");
     assert_eq!(current, Some(0));
     let screen = scenario.frame();
     assert!(
@@ -414,7 +416,27 @@ fn step_through_reviews_show_one_pull_request_at_a_time_or_every_one() {
     // The file panel groups files by pull request, only the current one open.
     assert!(screen.contains("▸ #101 Layer 101"), "{}", screen.text());
     assert!(screen.contains("▾ #102 Layer 102"), "{}", screen.text());
-    // And back.
+    // Then the whole stack as one diff, labeled by layer, in the same review.
+    scenario.key("shift+o");
+    settled(&mut scenario);
+    let whole = scenario
+        .surface()
+        .review()
+        .and_then(|review| review.workspace())
+        .expect("workspace")
+        .sources
+        .iter()
+        .find(|source| matches!(source.kind, ReviewSourceKind::Stack { .. }))
+        .map(|source| source.id.clone())
+        .expect("the whole stack");
+    assert_eq!(focus(&scenario).as_deref(), Some(whole.as_str()));
+    assert_eq!(sources_shown(&scenario), [whole].into());
+    let (rail, selected) = scenario.surface().review().unwrap().rail();
+    assert!(
+        selected.is_some_and(|index| rail[index].starts_with("Whole stack")),
+        "{rail:?}"
+    );
+    // And back to the pull request it left.
     scenario.key("shift+o");
     settled(&mut scenario);
     assert_eq!(focus(&scenario).as_deref(), Some("source-2"));
@@ -527,9 +549,11 @@ fn whole_stack_publishes_one_review_per_layer_with_summary_fallback() {
     let mut scenario = resume(&fixture, &backend, &workspace.id);
     // Whole-stack files and hunks carry the layer that introduced them.
     let screen = settled(&mut scenario);
+    // It shows the whole stack, with its layers to switch to.
+    let (rail, selected) = scenario.surface().review().unwrap().rail();
     assert!(
-        screen.contains("Whole stack #100–#103"),
-        "{}",
+        selected.is_some_and(|index| rail[index].starts_with("Whole stack #100–#103")),
+        "{rail:?}\n{}",
         screen.text()
     );
 
@@ -1057,8 +1081,12 @@ fn the_stack_history_shows_a_push_and_compares_what_it_changed_in_place() {
     );
     assert!(review.comparing().picks().contains_key(&103));
     // The push added one file to #103: its tab says so.
-    assert!(screen.contains("#103 Layer 103"), "{}", screen.text());
-    assert!(screen.contains("● +1"), "{}", screen.text());
+    let (rail, _) = scenario.surface().review().unwrap().rail();
+    assert!(
+        rail.iter()
+            .any(|tab| tab.starts_with("#103 Layer 103") && tab.contains("● +1")),
+        "{rail:?}"
+    );
     assert!(!screen.contains("Stack history"), "{}", screen.text());
 
     // Closing goes home, not to another review.
@@ -1131,7 +1159,8 @@ fn refresh_follows_remote_stack_growth_without_local_git_changes() {
     let mut scenario = resume(&fixture, &backend, &workspace.id);
     settled(&mut scenario);
     let before = stored(&backend, &fixture, &workspace.id);
-    assert_eq!(before.sources.len(), 3);
+    // Three layers and the whole stack.
+    assert_eq!(before.sources.len(), 4);
     let kept = before
         .sources
         .iter()
@@ -1163,7 +1192,7 @@ fn refresh_follows_remote_stack_growth_without_local_git_changes() {
             .unwrap()
             .groups()
             .count(),
-        4
+        5
     );
 }
 

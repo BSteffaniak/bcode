@@ -195,6 +195,8 @@ pub struct ComparisonChange {
     pub show_hidden_files: Option<bool>,
     /// Every pull request of the stack at once (`false`: one at a time).
     pub all_layers: Option<bool>,
+    /// How a stack shows: `one_pr`, `all_prs`, or `whole` (the whole stack as one diff).
+    pub stack_view: Option<String>,
     /// Compare one pull request between two of its versions (1-based: v1 is the first).
     pub versions: Option<VersionPick>,
     /// How new lines are marked: `both`, `bar`, `tint`, `strong`.
@@ -333,25 +335,15 @@ impl ReviewSurface {
         // Everything is checked before anything moves; a layer shown alone only shows its own
         // files and threads.
         let entries = self.rail_entries();
-        let one_layer = self.stack_view == super::stack::StackView::OneLayer;
         if let Some(source) = thread.as_ref().and_then(|thread| thread.source.as_deref())
-            && one_layer
+            && (self.shown_stack_view() == Some(StackView::OneLayer)
+                || self.source_shows_stack_otherwise(source))
         {
             let (entered, note) = self.thread_layer(&entries, layer, source);
             layer = entered;
             notes.extend(note);
         }
-        let alone = if one_layer {
-            match &layer {
-                Some((position, _)) => entries.get(*position).map(|entry| entry.source_id.clone()),
-                None => self
-                    .review
-                    .as_ref()
-                    .and_then(|review| review.doc.focus().map(str::to_owned)),
-            }
-        } else {
-            None
-        };
+        let alone = self.path_scope(&entries, layer.as_ref().map(|(position, _)| *position));
         let (version, file) = if let Some(thread) = &thread {
             notes.extend(thread_mismatch(target, thread));
             (None, None)
@@ -401,6 +393,26 @@ impl ReviewSurface {
             answer.push(')');
         }
         Ok(answer)
+    }
+
+    /// The source a path is looked for in: the rail entry at `position` when it will show
+    /// alone (one layer at a time, the whole stack, or the whole stack's own entry), else the
+    /// source shown alone now (a layer, or the whole stack). `None` when every layer shows.
+    fn path_scope(
+        &self,
+        entries: &[super::stack::RailEntry],
+        position: Option<usize>,
+    ) -> Option<String> {
+        let view = self.shown_stack_view();
+        let alone = matches!(view, Some(StackView::OneLayer | StackView::Whole));
+        match position.and_then(|position| entries.get(position)) {
+            Some(entry) if alone || entry.whole => Some(entry.source_id.clone()),
+            None if alone => self
+                .review
+                .as_ref()
+                .and_then(|review| review.doc.focus().map(str::to_owned)),
+            _ => None,
+        }
     }
 
     /// The layer to enter, shown one layer at a time, to reach a thread in layer `source`
@@ -544,6 +556,11 @@ impl ReviewSurface {
                  `only_changed: false` first"
             )),
             KeyHidden::Focused { .. } => None,
+            KeyHidden::Alternate { source } => Some(format!(
+                "{what} is not shown: {source} shows the stack another way than the view on \
+                 screen; call bcode.code-review.set_comparison with `stack_view` (`whole` for the \
+                 whole stack as one diff, `one_pr` for its pull requests) first"
+            )),
         }
     }
 
@@ -665,15 +682,28 @@ impl ReviewSurface {
             self.show_compare_hidden(shown);
             done.push(format!("hidden files shown: {shown}"));
         }
-        if let Some(all) = change.all_layers {
-            if (self.stack_view == StackView::AllLayers) != all {
-                self.toggle_stack_view();
+        let wanted = change
+            .stack_view
+            .as_deref()
+            .and_then(parse_stack_view)
+            .or_else(|| {
+                change.all_layers.map(|all| {
+                    if all {
+                        StackView::AllLayers
+                    } else {
+                        StackView::OneLayer
+                    }
+                })
+            });
+        if let Some(wanted) = wanted {
+            if self.shown_stack_view() != Some(wanted) {
+                self.set_stack_view(wanted);
             }
             done.push(
-                if all {
-                    "every pull request"
-                } else {
-                    "one pull request at a time"
+                match wanted {
+                    StackView::OneLayer => "one pull request at a time",
+                    StackView::AllLayers => "every pull request",
+                    StackView::Whole => "the whole stack as one diff",
                 }
                 .to_owned(),
             );
@@ -746,6 +776,19 @@ impl ReviewSurface {
         }
         if change.all_layers.is_some() && !self.steps_through_stack() {
             return Err("only a review that steps through a stack has layers".to_owned());
+        }
+        if let Some(view) = change.stack_view.as_deref() {
+            let Some(wanted) = parse_stack_view(view) else {
+                return Err(format!(
+                    "unknown stack_view {view:?} (one_pr, all_prs, or whole)"
+                ));
+            };
+            if !self.can_show_stack_as(wanted) {
+                return Err(format!(
+                    "this review cannot show {view}: it needs a stack (all_prs needs two or more \
+                     pull requests)"
+                ));
+            }
         }
         if let Some(pick) = change.versions {
             let count = self.version_count(pick.number)?;
@@ -947,5 +990,15 @@ impl ReviewSurface {
         } else {
             status
         })
+    }
+}
+
+/// The stack view `text` names (`one_pr`, `all_prs`, `whole`).
+fn parse_stack_view(text: &str) -> Option<StackView> {
+    match text {
+        "one_pr" => Some(StackView::OneLayer),
+        "all_prs" => Some(StackView::AllLayers),
+        "whole" => Some(StackView::Whole),
+        _ => None,
     }
 }

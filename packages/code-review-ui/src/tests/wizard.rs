@@ -828,10 +828,18 @@ fn pull_requests_and_stacks_come_from_the_provider() {
         repository: FAKE_REPOSITORY.to_owned(),
         number,
     };
-    assert_eq!(
-        kinds(&created),
-        [layer(100), layer(101), layer(102), layer(103)]
-    );
+    let whole = ReviewSourceKind::Stack {
+        provider: FAKE_PROVIDER.to_owned(),
+        repository: FAKE_REPOSITORY.to_owned(),
+        top: 103,
+    };
+    // Stepping through holds the whole stack too, to switch to; it starts one layer at a time.
+    let stack = [layer(100), layer(101), layer(102), layer(103), whole];
+    assert_eq!(kinds(&created), stack);
+    assert!(!created.presentation.is_some_and(
+        |state| state.stack_view() == bcode_code_review_models::ReviewStackView::Whole
+    ));
+    assert_eq!(created.title, "Stack #103 · Layer 103 (4 layers)");
 
     // Whole stack and a single layer.
     let mut scenario = wizard(&fixture, &backend);
@@ -841,14 +849,11 @@ fn pull_requests_and_stacks_come_from_the_provider() {
     scenario.key("enter");
     settled(&mut scenario);
     let created = create(&mut scenario, &backend, &fixture);
-    assert_eq!(
-        kinds(&created),
-        [ReviewSourceKind::Stack {
-            provider: FAKE_PROVIDER.to_owned(),
-            repository: FAKE_REPOSITORY.to_owned(),
-            top: 103,
-        }]
-    );
+    // The same sources, starting with the whole stack as one diff.
+    assert_eq!(kinds(&created), stack);
+    assert!(created.presentation.is_some_and(
+        |state| state.stack_view() == bcode_code_review_models::ReviewStackView::Whole
+    ));
     let mut scenario = wizard(&fixture, &backend);
     pick_type(&mut scenario, 5);
     scenario.key("enter");
@@ -901,7 +906,8 @@ fn stacks_over_the_limit_warn_and_the_warnings_can_be_dismissed() {
     scenario.key("enter");
     settled(&mut scenario);
     let created = create(&mut scenario, &backend, &fixture);
-    assert_eq!(created.sources.len(), 1);
+    // The four layers and the whole stack.
+    assert_eq!(created.sources.len(), 5);
     // Every layer is in the review, and a warning that stays until closed says so.
     let toast = "Stack of 4 layers";
     assert!(
@@ -1254,16 +1260,18 @@ fn every_wizard_mode_can_be_created_through_create_review() {
                 }
                 settled(&mut scenario);
             }
-            created.push((
-                source_type,
-                kinds(&create(&mut scenario, &backend, &fixture)),
-            ));
+            let workspace = create(&mut scenario, &backend, &fixture);
+            let whole = workspace.presentation.as_ref().is_some_and(|state| {
+                state.stack_view() == bcode_code_review_models::ReviewStackView::Whole
+            });
+            created.push((source_type, kinds(&workspace), whole));
         }
     }
     // Each run creates sources of its mode's kinds (a stack's layers are several), and the
-    // runs of a mode differ: every detail is exercised, not one repeated.
-    let mut seen: Vec<(SourceType, Vec<ReviewSourceKind>)> = Vec::new();
-    for (source_type, kinds) in &created {
+    // runs of a mode differ: every detail is exercised, not one repeated. A stack stepped
+    // through and a whole stack hold the same sources and differ in the view they start with.
+    let mut seen: Vec<(SourceType, Vec<ReviewSourceKind>, bool)> = Vec::new();
+    for (source_type, kinds, whole) in &created {
         assert!(!kinds.is_empty(), "{source_type:?} created nothing");
         for kind in kinds {
             let fits = match source_type {
@@ -1305,13 +1313,14 @@ fn every_wizard_mode_can_be_created_through_create_review() {
             };
             assert!(fits, "{source_type:?} created {kind:?}");
         }
+        let run = (*source_type, kinds.clone(), *whole);
         assert!(
-            !seen.contains(&(*source_type, kinds.clone())),
+            !seen.contains(&run),
             "{source_type:?} created {kinds:?} twice"
         );
-        seen.push((*source_type, kinds.clone()));
+        seen.push(run);
     }
-    for (source_type, kinds) in created {
+    for (source_type, kinds, _) in created {
         for kind in kinds {
             let argument = create::source_argument(&kind, None).unwrap_or_else(|| {
                 panic!("{source_type:?} creates {kind:?}, which create_review cannot")

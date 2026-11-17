@@ -352,9 +352,37 @@ impl ReviewSurface {
     /// Keep the placed pull request threads in the review store, where the review tools read
     /// them, when they (or where they are kept) changed, or they were read again well after the
     /// kept read; saves run one at a time, in order.
+    ///
+    /// A thread placed more than once (a stack's pull request shows both in its layer and in the
+    /// whole-stack diff) is kept once, where the review shows it now.
     fn save_pull_threads(&mut self, placed: &[(PullKey, PlacedThread)], host: &UiContext) {
+        let shown = |placed: &PlacedThread| {
+            placed.anchor.source_id.as_deref().is_none_or(|source| {
+                !self
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.doc.source_alternate(source))
+            })
+        };
+        // Thread id → index into `placed` of the placement kept.
+        let mut kept: BTreeMap<String, usize> = BTreeMap::new();
+        for (index, (key, thread)) in placed.iter().enumerate() {
+            let id = bcode_code_review_models::pull_thread_ref(
+                &key.repository,
+                key.number,
+                &thread.thread.id,
+            );
+            let slot = kept.entry(id).or_insert(index);
+            if !shown(&placed[*slot].1) && shown(thread) {
+                *slot = index;
+            }
+        }
+        let kept: BTreeSet<usize> = kept.into_values().collect();
         let threads: Vec<bcode_code_review_models::PullThreadRecord> = placed
             .iter()
+            .enumerate()
+            .filter(|(index, _)| kept.contains(index))
+            .map(|(_, entry)| entry)
             .map(|(key, placed)| bcode_code_review_models::PullThreadRecord {
                 id: bcode_code_review_models::pull_thread_ref(
                     &key.repository,

@@ -42,6 +42,7 @@ impl ReviewDocument {
         rebuilt.fold_seen_hunks = self.fold_seen_hunks;
         rebuilt.revealed_hunks = std::mem::take(&mut self.revealed_hunks);
         rebuilt.filtered = std::mem::take(&mut self.filtered);
+        rebuilt.alternates = std::mem::take(&mut self.alternates);
         rebuilt.tick = self.tick;
         rebuilt.next_ticket = self.next_ticket;
         for (group, hidden) in rebuilt.groups.iter_mut().zip(regrouped.hidden) {

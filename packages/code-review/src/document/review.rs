@@ -118,6 +118,8 @@ pub struct GroupInfo<'a> {
     pub header: Option<ItemKey>,
     /// Whether [`ReviewDocument::set_focus`] hides the group.
     pub hidden: bool,
+    /// Whether [`ReviewDocument::set_alternate_sources`] leaves the group out.
+    pub alternate: bool,
     /// Whether the group's files are still being listed.
     pub loading: bool,
 }
@@ -363,6 +365,12 @@ pub enum KeyHidden {
     },
     /// Another layer is shown alone.
     Focused {
+        /// The source of the item.
+        source: String,
+    },
+    /// The item's source shows the same changes as the sources shown, another way (a stack
+    /// layer while the whole-stack diff shows, or the other way round).
+    Alternate {
         /// The source of the item.
         source: String,
     },
@@ -671,6 +679,10 @@ pub struct ReviewDocument {
     /// Sources left out of the document (pull requests without real changes, when only those
     /// are shown).
     pub(super) filtered: BTreeSet<String>,
+    /// Sources left out because they show the same changes another way (a stack's layers while
+    /// its whole-stack diff is shown, or the other way round): hidden, and not counted in
+    /// totals or viewed progress.
+    pub(super) alternates: BTreeSet<String>,
 }
 
 /// Viewport, protected, and prefetch block ranges (inclusive).
@@ -737,6 +749,7 @@ impl ReviewDocument {
             fold_seen_hunks: false,
             revealed_hunks: BTreeSet::new(),
             filtered: BTreeSet::new(),
+            alternates: BTreeSet::new(),
         };
         for input in sources {
             doc.add_source(input, show_headers);
@@ -2275,6 +2288,7 @@ impl ReviewDocument {
                     part: group.source.part.as_ref().map(|part| part.index),
                 }),
                 hidden: group.hidden,
+                alternate: self.alternates.contains(&group.source.source_id),
                 loading: group.loading,
             })
     }
@@ -2330,7 +2344,9 @@ impl ReviewDocument {
             BlockKind::File(file) => (self.files[file].group, Some(file)),
         };
         let source = self.groups[group].source.source_id.clone();
-        if self.filtered.contains(&source) {
+        if self.alternates.contains(&source) {
+            Some(KeyHidden::Alternate { source })
+        } else if self.filtered.contains(&source) {
             Some(KeyHidden::Filtered { source })
         } else if self.groups[group].hidden {
             Some(KeyHidden::Focused { source })
@@ -2341,12 +2357,19 @@ impl ReviewDocument {
         }
     }
 
-    /// The source shown alone (see [`Self::set_focus`]), when one is.
+    /// The source shown alone (see [`Self::set_focus`] and [`Self::set_alternate_sources`]),
+    /// when one is.
     #[must_use]
     pub fn focus(&self) -> Option<&str> {
-        let mut shown = self.groups.iter().filter(|group| !group.hidden);
+        let mut shown = self
+            .groups
+            .iter()
+            .filter(|group| !group.hidden && !self.alternates.contains(&group.source.source_id));
         let first = shown.next()?;
-        let focused = self.groups.iter().any(|group| group.hidden)
+        let focused = self
+            .groups
+            .iter()
+            .any(|group| group.hidden || self.alternates.contains(&group.source.source_id))
             && shown.all(|group| group.source.source_id == first.source.source_id);
         focused.then_some(first.source.source_id.as_str())
     }
@@ -2356,9 +2379,44 @@ impl ReviewDocument {
         self.group_hidden(self.files[file].group) || self.compare_hidden(file)
     }
 
-    /// Whether group `group` contributes no items: focused away, or filtered out.
+    /// Whether group `group` contributes no items: focused away, filtered out, or an alternate.
     pub(super) fn group_hidden(&self, group: usize) -> bool {
-        self.groups[group].hidden || self.filtered.contains(&self.groups[group].source.source_id)
+        let source = &self.groups[group].source.source_id;
+        self.groups[group].hidden
+            || self.filtered.contains(source)
+            || self.alternates.contains(source)
+    }
+
+    /// Leave the groups of `sources` out as alternates: they show the same changes as other
+    /// groups another way, so they are hidden and not counted in [`Self::totals`] or
+    /// [`Self::viewed_progress`] (their files keep their state). Every other group counts again.
+    /// Returns whether anything changed.
+    pub fn set_alternate_sources(&mut self, sources: BTreeSet<String>) -> bool {
+        if self.alternates == sources {
+            return false;
+        }
+        let before = std::mem::replace(&mut self.alternates, sources);
+        let changed: Vec<usize> = (0..self.groups.len())
+            .filter(|group| {
+                let source = &self.groups[*group].source.source_id;
+                before.contains(source) != self.alternates.contains(source)
+            })
+            .collect();
+        for group in changed {
+            let header = self.groups[group].header_block;
+            self.rebuild_block(header);
+            for file in self.groups[group].files.clone() {
+                self.rebuild_file(file);
+            }
+        }
+        true
+    }
+
+    /// Whether source `source_id` is left out as an alternate (see
+    /// [`Self::set_alternate_sources`]).
+    #[must_use]
+    pub fn source_alternate(&self, source_id: &str) -> bool {
+        self.alternates.contains(source_id)
     }
 
     /// Leave the groups of `sources` out of the document (their files keep their state), and
@@ -2399,24 +2457,41 @@ impl ReviewDocument {
             .map(|file| &file.key)
     }
 
-    /// Lines added and removed across every file.
+    /// Lines added and removed across every file (alternates left out).
     #[must_use]
     pub fn totals(&self) -> (u64, u64) {
-        self.files.iter().fold((0, 0), |(add, del), file| {
-            (
-                add + u64::from(file.entry.additions),
-                del + u64::from(file.entry.deletions),
-            )
-        })
+        self.files
+            .iter()
+            .filter(|file| {
+                !self
+                    .alternates
+                    .contains(&self.groups[file.group].source.source_id)
+            })
+            .fold((0, 0), |(add, del), file| {
+                (
+                    add + u64::from(file.entry.additions),
+                    del + u64::from(file.entry.deletions),
+                )
+            })
     }
 
-    /// Viewed progress across the whole review (`O(1)`).
+    /// Viewed progress across the whole review, alternates left out (`O(groups)`).
     #[must_use]
-    pub const fn viewed_progress(&self) -> ViewedProgress {
-        ViewedProgress {
-            viewed: self.viewed_count,
-            total: self.files.len(),
-        }
+    pub fn viewed_progress(&self) -> ViewedProgress {
+        let (viewed, total) = self
+            .groups
+            .iter()
+            .filter(|group| self.alternates.contains(&group.source.source_id))
+            .fold(
+                (self.viewed_count, self.files.len()),
+                |(viewed, total), group| {
+                    (
+                        viewed.saturating_sub(group.viewed),
+                        total.saturating_sub(group.files.len()),
+                    )
+                },
+            );
+        ViewedProgress { viewed, total }
     }
 
     // ----------------------------------------------------------------------------------------

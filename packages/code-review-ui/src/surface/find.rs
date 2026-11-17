@@ -604,7 +604,7 @@ impl ReviewSurface {
         state.flat_files = self.file_view.flat_choice;
         state.uncommitted_marks = self.file_view.uncommitted_marks;
         state.show_ignored = self.file_view.show_ignored;
-        state.all_stack_layers = self.stack_view == super::stack::StackView::AllLayers;
+        state.set_stack_view(self.stack_view);
         state.conversation_seen.clone_from(&self.talk.seen);
         if let Some(review) = &self.review {
             state.collapsed_files.clear();

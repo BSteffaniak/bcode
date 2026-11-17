@@ -1,24 +1,30 @@
-//! The stack rail and layer stepping.
+//! The stack rail, layer stepping, and the three ways a stack shows.
 //!
+//! * A stack review holds its stack two ways (see `reconcile`): one source per layer and one
+//!   whole-stack source. The view picks which one shows; the other is left out of the document as
+//!   an alternate ([`ReviewDocument::set_alternate_sources`]): hidden, and not counted in totals
+//!   or viewed progress.
 //! * The rail is a BMUX `tab_bar` row under the header, shown when the review has stack or
-//!   stack-layer sources: one tab per such source group (`#101 Title`, its position in the
-//!   stack, viewed progress cells and `viewed/files`, and its draft threads). The tab of the
-//!   layer the cursor is in is selected. Labels degrade as the row narrows: full, then compact
+//!   stack-layer sources: one tab per layer (`#101 Title`, its position in the stack, viewed
+//!   progress cells and `viewed/files`, and its draft threads), then one for the whole stack. The
+//!   tab the cursor is in is selected. Labels degrade as the row narrows: full, then compact
 //!   (`#101 2/5 ●1`), then the numbers only; tabs that still do not fit are cut by the bar.
 //! * `.`/`,` (and clicks) step to the next/previous layer. Leaving a layer remembers the cursor
 //!   in it; entering one returns to its remembered position (else its header). The positions
-//!   are kept in the workspace's `presentation.layer_positions`.
-//! * A step-through review (two or more stack-layer sources) shows one layer at a time by
-//!   default: the document is focused on the current layer ([`ReviewDocument::set_focus`]), so
-//!   the diff and the file panel hold that pull request alone. `shift+o` switches to every layer
-//!   in one document, where each layer starts with a banner, the file panel keeps only the
-//!   current layer's group open, and a strip under the rail names the layer the cursor is in.
-//!   The choice is kept in `presentation.all_stack_layers`.
+//!   are kept in the workspace's `presentation.layer_positions`. Entering a layer from the
+//!   whole-stack view shows that layer alone; clicking the whole-stack tab shows the whole stack.
+//! * Views, cycled by `shift+o`: one layer at a time (the default: the document is focused on
+//!   the current layer with [`ReviewDocument::set_focus`], so the diff and the file panel hold
+//!   that pull request alone); every layer in one document, where each layer starts with a
+//!   banner, the file panel keeps only the current layer's group open, and a strip under the rail
+//!   names the layer the cursor is in; and the whole stack as one diff, labeled by layer. The
+//!   choice is kept in `presentation.stack_view`.
 //!
 //! [`ReviewDocument::set_focus`]: bcode_code_review::document::ReviewDocument::set_focus
+//! [`ReviewDocument::set_alternate_sources`]: bcode_code_review::document::ReviewDocument::set_alternate_sources
 
 use super::ReviewSurface;
-use bcode_code_review::document::{FileRef, ItemKey, ReviewItem};
+use bcode_code_review::document::{FileKey, FileRef, ItemKey, ReviewItem};
 use bcode_code_review_models::ReviewSourceKind;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
@@ -30,6 +36,7 @@ use bmux_tui_components::status_bar::StatusSeverity;
 use bmux_tui_components::tab_bar::{TabBar, TabBarComponent, TabBarPolicy, TabItem};
 use bmux_tui_components::virtual_list::AnchorPolicy;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Layout id of the rail.
 pub const RAIL_ID: &str = "review.stack_rail";
@@ -46,44 +53,154 @@ pub struct RailEntry {
     pub home: ItemKey,
     /// Full, compact, and minimal labels.
     pub labels: [Line; 3],
+    /// Whether the tab stands for the whole stack rather than one layer.
+    pub whole: bool,
 }
 
-/// How a step-through stack review is shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StackView {
-    /// One layer at a time.
-    #[default]
-    OneLayer,
-    /// Every layer in one document, divided by banners.
-    AllLayers,
+/// How a stack review is shown: one layer at a time, every layer in one document divided by
+/// banners, or the whole stack as one diff labeled by layer.
+pub use bcode_code_review_models::ReviewStackView as StackView;
+
+/// What `shift+o` names `view`.
+const fn describe(view: StackView) -> &'static str {
+    match view {
+        StackView::OneLayer => "one pull request at a time",
+        StackView::AllLayers => "every pull request of the stack",
+        StackView::Whole => "the whole stack as one diff",
+    }
+}
+
+/// A review's stack sources, by the way they show the stack.
+#[derive(Debug, Default)]
+struct StackGroups {
+    /// Stack-layer sources, in document order.
+    layers: Vec<String>,
+    /// Whole-stack sources.
+    whole: Vec<String>,
+}
+
+impl StackGroups {
+    /// The views these sources can show, in `shift+o` order.
+    fn views(&self) -> Vec<StackView> {
+        let mut views = Vec::new();
+        if !self.layers.is_empty() {
+            views.push(StackView::OneLayer);
+        }
+        if self.layers.len() >= 2 {
+            views.push(StackView::AllLayers);
+        }
+        if !self.whole.is_empty() {
+            views.push(StackView::Whole);
+        }
+        views
+    }
+
+    /// `wanted` when these sources can show it, else the closest view they can.
+    fn effective(&self, wanted: StackView) -> Option<StackView> {
+        let views = self.views();
+        if views.contains(&wanted) {
+            return Some(wanted);
+        }
+        match wanted {
+            StackView::AllLayers if views.contains(&StackView::OneLayer) => {
+                Some(StackView::OneLayer)
+            }
+            _ => views.first().copied(),
+        }
+    }
+
+    /// Sources left out as alternates in `view`.
+    fn alternates(&self, view: StackView) -> BTreeSet<String> {
+        let hidden = match view {
+            StackView::Whole => &self.layers,
+            // Without layers the whole stack is all there is to show.
+            StackView::OneLayer | StackView::AllLayers if self.layers.is_empty() => {
+                return BTreeSet::new();
+            }
+            StackView::OneLayer | StackView::AllLayers => &self.whole,
+        };
+        hidden.iter().cloned().collect()
+    }
 }
 
 impl ReviewSurface {
-    /// Whether the review steps through a stack: two or more stack-layer groups.
-    pub(super) fn steps_through_stack(&self) -> bool {
-        self.review.as_ref().is_some_and(|review| {
+    /// The review's stack sources: layers and whole stacks.
+    fn stack_groups(&self) -> StackGroups {
+        let mut groups = StackGroups::default();
+        let Some(review) = self.review.as_ref() else {
+            return groups;
+        };
+        for group in review.doc.groups() {
+            let Some(stack) = group.stack else {
+                continue;
+            };
+            let list = if stack.whole {
+                &mut groups.whole
+            } else {
+                &mut groups.layers
+            };
+            if !list.contains(&group.source.source_id) {
+                list.push(group.source.source_id.clone());
+            }
+        }
+        groups
+    }
+
+    /// The view the stack shows: the chosen one when the review can show it, else the closest.
+    pub(super) fn shown_stack_view(&self) -> Option<StackView> {
+        self.stack_groups().effective(self.stack_view)
+    }
+
+    /// The pull request numbers of the stack's layer sources, bottom first (shown or not).
+    pub(super) fn stack_layer_numbers(&self) -> Vec<u64> {
+        self.review.as_ref().map_or_else(Vec::new, |review| {
             review
                 .doc
                 .groups()
-                .filter(|group| group.stack.is_some_and(|stack| !stack.whole))
-                .count()
-                >= 2
+                .filter_map(|group| {
+                    let stack = group.stack.filter(|stack| !stack.whole)?;
+                    stack.stack.layers.last().map(|layer| layer.number)
+                })
+                .collect()
         })
     }
 
-    /// Show the stack as [`Self::stack_view`] says: focus the document on the current layer (the
-    /// one the cursor is in, else the last entered, else the first), or show every layer with
-    /// only the current layer's file group open.
+    /// Whether the review can show its stack as `view`.
+    pub(super) fn can_show_stack_as(&self, view: StackView) -> bool {
+        self.stack_groups().views().contains(&view)
+    }
+
+    /// Whether source `source_id` is left out because the stack shows another way.
+    pub(super) fn source_shows_stack_otherwise(&self, source_id: &str) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.doc.source_alternate(source_id))
+    }
+
+    /// Whether the review steps through a stack: two or more stack-layer groups.
+    pub(super) fn steps_through_stack(&self) -> bool {
+        self.stack_groups().layers.len() >= 2
+    }
+
+    /// Show the stack as [`Self::stack_view`] says: the whole-stack diff, or its layers with the
+    /// document focused on the current layer (the one the cursor is in, else the last entered,
+    /// else the first) or every layer with only the current layer's file group open.
     pub(super) fn apply_stack_view(&mut self) {
         self.show_stack_layer(None);
     }
 
     /// [`Self::apply_stack_view`] on layer `wanted` (a workspace source id), else the current one.
     pub(super) fn show_stack_layer(&mut self, wanted: Option<&str>) {
-        if !self.steps_through_stack() {
+        let groups = self.stack_groups();
+        let Some(view) = groups.effective(self.stack_view) else {
             return;
-        }
-        let entries = self.rail_entries();
+        };
+        let alternates = groups.alternates(view);
+        let entries: Vec<RailEntry> = self
+            .rail_entries()
+            .into_iter()
+            .filter(|entry| !entry.whole)
+            .collect();
         let current = wanted
             .and_then(|wanted| entries.iter().position(|entry| entry.source_id == wanted))
             .or_else(|| self.current_layer(&entries))
@@ -94,51 +211,101 @@ impl ReviewSurface {
                     .position(|entry| &entry.source_id == remembered)
             })
             .unwrap_or(0);
-        let Some(target) = entries.get(current) else {
-            return;
-        };
-        let source = target.source_id.clone();
-        let home = target.home.clone();
-        let one_layer = self.stack_view == StackView::OneLayer;
+        let target = (view != StackView::Whole)
+            .then(|| entries.get(current))
+            .flatten()
+            .map(|entry| (entry.source_id.clone(), entry.home.clone()));
         let theme = self.theme;
         let file_view = self.file_view;
         let Some(review) = self.review.as_mut() else {
             return;
         };
         let cursor = review.cursor.clone();
-        if review.doc.set_focus(one_layer.then_some(source.as_str())) {
+        let focus = match (&target, view) {
+            (Some((source, _)), StackView::OneLayer) => Some(source.as_str()),
+            _ => None,
+        };
+        let swapped = review.doc.set_alternate_sources(alternates);
+        let focused = review.doc.set_focus(focus);
+        if swapped {
+            // The sources shown changed: compare the ones now shown.
+            self.comparing.layers_moved();
+        }
+        if swapped || focused {
             review.note_splices();
+            review.totals = review.doc.totals();
             review.rebuild_files(&theme, file_view);
+            // Stay on the cursor's item when it still shows, else on the same file in the
+            // sources now shown, else on the shown layer's home (or the document's start).
+            let same_file = cursor
+                .as_ref()
+                .and_then(ItemKey::file)
+                .map(|file| file.path.clone());
+            let shown_sources: Vec<String> = match (&target, view) {
+                (Some((source, _)), StackView::OneLayer) => vec![source.clone()],
+                (_, StackView::Whole) => groups.whole,
+                // The layer that last touched the file, of every layer shown.
+                _ => groups.layers.into_iter().rev().collect(),
+            };
             let landing = cursor
                 .filter(|key| review.doc.index_of(key).is_some())
-                .unwrap_or(home);
-            if let Some(index) = review.doc.index_of(&landing) {
-                review.set_cursor(index, AnchorPolicy::ItemTopAtTop);
-            }
+                .or_else(|| {
+                    let path = same_file?;
+                    shown_sources.iter().find_map(|source| {
+                        let key = ItemKey::FileHeader(Arc::new(FileKey::new(
+                            source.clone(),
+                            None,
+                            path.clone(),
+                        )));
+                        review.doc.index_of(&key).map(|_| key)
+                    })
+                })
+                .or_else(|| target.as_ref().map(|(_, home)| home.clone()));
+            let index = landing
+                .and_then(|key| review.doc.index_of(&key))
+                .unwrap_or(0);
+            review.set_cursor(index, AnchorPolicy::ItemTopAtTop);
         }
-        review.open_only_group(&source);
-        self.rail_layer = Some(source);
+        if let Some((source, _)) = target {
+            review.open_only_group(&source);
+            self.rail_layer = Some(source);
+        }
     }
 
-    /// Switch between one layer at a time and every layer.
+    /// Switch to the next way of showing the stack: one layer at a time, every layer, then the
+    /// whole stack as one diff (skipping the ones the review cannot show).
     pub(super) fn toggle_stack_view(&mut self) {
-        if !self.steps_through_stack() {
+        let views = self.stack_groups().views();
+        if views.len() < 2 {
             self.set_status(
-                "only a review that steps through a stack has layers to show one at a time",
+                "only a stack review has other ways to show the stack",
                 StatusSeverity::Info,
             );
             return;
         }
-        self.stack_view = match self.stack_view {
-            StackView::OneLayer => StackView::AllLayers,
-            StackView::AllLayers => StackView::OneLayer,
-        };
+        let shown = self.shown_stack_view().unwrap_or_default();
+        let next = views
+            .iter()
+            .position(|view| *view == shown)
+            .map_or(views[0], |index| views[(index + 1) % views.len()]);
+        self.set_stack_view(next);
+    }
+
+    /// Show the stack as `view`, saying so (and what `shift+o` shows next).
+    pub(super) fn set_stack_view(&mut self, view: StackView) {
+        self.stack_view = view;
         self.apply_stack_view();
         self.apply_compare_filter();
-        let text = match self.stack_view {
-            StackView::OneLayer => "one pull request at a time (shift+o: all)",
-            StackView::AllLayers => "every pull request of the stack (shift+o: one at a time)",
-        };
+        let views = self.stack_groups().views();
+        let after = views
+            .iter()
+            .position(|candidate| *candidate == view)
+            .map(|index| views[(index + 1) % views.len()])
+            .filter(|after| *after != view);
+        let text = after.map_or_else(
+            || describe(view).to_owned(),
+            |after| format!("{} (shift+o: {})", describe(view), describe(after)),
+        );
         self.set_status(text, StatusSeverity::Info);
         self.persist_presentation(true);
     }
@@ -162,22 +329,35 @@ impl ReviewSurface {
         if group.file_count == 0 || group.viewed < group.file_count {
             return;
         }
-        let entries = self.rail_entries();
-        let position = entries
+        let entries: Vec<RailEntry> = self
+            .rail_entries()
+            .into_iter()
+            .filter(|entry| !entry.whole)
+            .collect();
+        let Some(position) = entries
             .iter()
-            .position(|entry| entry.source_id == file.source_id);
-        let text = match position {
-            Some(index) if index + 1 < entries.len() => format!(
+            .position(|entry| entry.source_id == file.source_id)
+        else {
+            // The whole stack: its files are every layer's.
+            self.set_status(
+                "every file of the whole stack is viewed",
+                StatusSeverity::Success,
+            );
+            return;
+        };
+        let text = if position + 1 < entries.len() {
+            format!(
                 "every file of this pull request is viewed; . for the next ({} of {})",
-                index + 2,
+                position + 2,
                 entries.len()
-            ),
-            _ => "every file of the last pull request is viewed".to_owned(),
+            )
+        } else {
+            "every file of the last pull request is viewed".to_owned()
         };
         self.set_status(text, StatusSeverity::Success);
     }
 
-    /// Rail entries: one per stack or stack-layer source group, in document order.
+    /// Rail entries: one per stack-layer source group, then the whole stack's, in document order.
     pub(super) fn rail_entries(&self) -> Vec<RailEntry> {
         let Some(review) = self.review.as_ref() else {
             return Vec::new();
@@ -269,6 +449,7 @@ impl ReviewSurface {
             entries.push(RailEntry {
                 source_id,
                 home,
+                whole: stack.whole,
                 labels: [
                     Line::from_spans(full),
                     Line::from_spans(compact),
@@ -309,7 +490,15 @@ impl ReviewSurface {
     /// Index of the rail entry the cursor is in.
     pub(super) fn current_layer(&self, entries: &[RailEntry]) -> Option<usize> {
         let source = self.cursor_source()?;
-        entries.iter().position(|entry| entry.source_id == source)
+        let found = entries.iter().position(|entry| entry.source_id == source);
+        // Layers do not show with the whole stack: a layer found is only the one last entered.
+        if self.shown_stack_view() == Some(StackView::Whole)
+            && found.is_none_or(|index| !entries[index].whole)
+            && let Some(whole) = entries.iter().position(|entry| entry.whole)
+        {
+            return Some(whole);
+        }
+        found
     }
 
     /// The source the cursor is in, else the layer last entered.
@@ -323,12 +512,28 @@ impl ReviewSurface {
     }
 
     /// Step to the next or previous layer (wrapping), remembering the position in the one left.
+    /// From the whole-stack view, the layer last entered (else the first) shows alone.
     pub(super) fn step_layer(&mut self, forward: bool) {
         let entries = self.rail_entries();
-        if entries.is_empty() {
+        let layers: Vec<usize> = (0..entries.len())
+            .filter(|index| !entries[*index].whole)
+            .collect();
+        if layers.is_empty() {
             self.set_status("this review has no stack layers", StatusSeverity::Info);
             return;
         }
+        let current = self.current_layer(&entries);
+        if current.is_some_and(|index| entries[index].whole) {
+            let remembered = self.rail_layer.as_ref().and_then(|layer| {
+                layers
+                    .iter()
+                    .copied()
+                    .find(|index| &entries[*index].source_id == layer)
+            });
+            self.enter_layer(&entries, current, remembered.unwrap_or(layers[0]));
+            return;
+        }
+        let entries: Vec<RailEntry> = layers.iter().map(|index| entries[*index].clone()).collect();
         let current = self.current_layer(&entries);
         let next = match current {
             Some(index) if forward => (index + 1) % entries.len(),
@@ -357,6 +562,16 @@ impl ReviewSurface {
         {
             self.layer_positions
                 .insert(current.source_id.clone(), persisted);
+        }
+        if target.whole {
+            // The whole-stack tab shows the whole stack as one diff.
+            self.set_stack_view(StackView::Whole);
+            return;
+        }
+        if self.shown_stack_view() == Some(StackView::Whole) {
+            // A layer entered from the whole stack shows alone.
+            self.stack_view = StackView::OneLayer;
+            self.apply_compare_filter();
         }
         self.rail_layer = Some(target.source_id.clone());
         // Show the entered layer (alone, or with only its file group open).
@@ -392,7 +607,7 @@ impl ReviewSurface {
 
     /// Whether the strip naming the cursor's layer shows: every layer in one document.
     pub(super) fn shows_layer_strip(&self) -> bool {
-        self.stack_view == StackView::AllLayers && self.steps_through_stack()
+        self.shown_stack_view() == Some(StackView::AllLayers) && self.steps_through_stack()
     }
 
     /// Paint the strip naming the layer the cursor is in on `area` (one row): its position,

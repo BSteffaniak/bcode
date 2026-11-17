@@ -268,7 +268,12 @@ fn a_restacked_stack_reopens_with_the_banner_its_badges_and_rebased_layers_colla
         "{}",
         screen.text()
     );
-    assert!(screen.contains("○ rebased"), "{}", screen.text());
+    // Rebased-only layers say so on their tabs.
+    let (rail, _) = scenario.surface().review().unwrap().rail();
+    assert!(
+        rail.iter().filter(|tab| tab.contains("○ rebased")).count() == 2,
+        "{rail:?}"
+    );
     // The new file of the edited layer is new since the baseline.
     let bottom = source_of(doc, 101);
     let edited = FileKey::new(bottom.clone(), None, "restacked.txt");

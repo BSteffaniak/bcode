@@ -657,16 +657,22 @@ impl ReviewApp {
         title: String,
         sources: Vec<ReviewSourceKind>,
         show_ignored: Option<bool>,
+        whole_stack: bool,
         host: &UiContext,
     ) {
         let draft = transient_workspace(self.repo.clone(), Some(title), sources);
         let (services, repo) = (self.services.clone(), self.repo.clone());
         let label = format!("Creating “{}”…", draft.title);
-        let presentation =
-            show_ignored.map(|show| bcode_code_review_models::ReviewPresentationState {
-                show_ignored: Some(show),
+        let presentation = (show_ignored.is_some() || whole_stack).then(|| {
+            let mut state = bcode_code_review_models::ReviewPresentationState {
+                show_ignored,
                 ..bcode_code_review_models::ReviewPresentationState::default()
-            });
+            };
+            if whole_stack {
+                state.set_stack_view(bcode_code_review_models::ReviewStackView::Whole);
+            }
+            state
+        });
         self.run_opening(label, host, async move {
             create_workspace(services, repo, draft.title, draft.sources, presentation).await
         });
@@ -722,8 +728,9 @@ impl ReviewApp {
                 title,
                 sources,
                 show_ignored,
+                whole_stack,
             } => {
-                self.create(title, sources, show_ignored, host);
+                self.create(title, sources, show_ignored, whole_stack, host);
                 Action::Redraw
             }
         }

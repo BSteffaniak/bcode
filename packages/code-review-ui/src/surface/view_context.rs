@@ -56,15 +56,12 @@ impl ReviewSurface {
         });
         if self.steps_through_stack() {
             view.stack = Some(StackView {
-                layers: self
-                    .layer_sources()
-                    .iter()
-                    .map(|layer| layer.number)
-                    .collect(),
+                layers: self.stack_layer_numbers(),
                 current: self.current_layer_number(),
-                view: match self.stack_view {
+                view: match self.shown_stack_view().unwrap_or_default() {
                     super::stack::StackView::OneLayer => "one_pr",
                     super::stack::StackView::AllLayers => "all_prs",
+                    super::stack::StackView::Whole => "whole",
                 }
                 .to_owned(),
             });

@@ -318,7 +318,7 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.stack_overlaps", scope = "code-review", description = "Stack: files several layers change", defaults = [
     ] },
-    { id = "bcode.code_review.stack_view", scope = "code-review", description = "Stack: one pull request at a time, or every pull request", defaults = [
+    { id = "bcode.code_review.stack_view", scope = "code-review", description = "Stack: one pull request at a time, every pull request, or the whole stack as one diff", defaults = [
         "shift+o",
     ] },
     { id = "bcode.code_review.dismiss_notifications", scope = "code-review", description = "Dismiss notifications", defaults = [

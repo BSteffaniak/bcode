@@ -125,6 +125,12 @@ impl ReviewSurface {
             return false;
         };
         self.rail_layer = Some(source_id.to_owned());
+        if self.shown_stack_view() == Some(super::stack::StackView::Whole) {
+            // A layer picked from the whole stack shows alone.
+            self.stack_view = super::stack::StackView::OneLayer;
+            self.apply_compare_filter();
+            self.persist_presentation(true);
+        }
         self.show_stack_layer(Some(source_id));
         let Some(review) = self.review.as_mut() else {
             return false;

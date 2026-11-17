@@ -121,7 +121,7 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
         descriptor(
             SET_COMPARISON,
             ClientToolPolicy::ReadOnly,
-            "Change the comparison of the review on screen, as the Compare menu (b) does: what changes are shown since (baseline: off = the full change, last_looked, previous_push, ago with ago_minutes, between with from_ms/to_ms, pushes with from_push/to_push = the stack just before push from_push compared with the stack after push to_push (pushes are numbered from 1, oldest first, as current_view lists them), stack_at with at_ms = every layer as it was then), the view (full = whole change with what is new marked, changes = only what changed), only pull requests with real changes, showing the files the comparison hides, one pull request or all of them, versions vN..vM of one pull request, and how new lines are marked. Returns the comparison as it is now (it may still be computing).",
+            "Change the comparison of the review on screen, as the Compare menu (b) does: what changes are shown since (baseline: off = the full change, last_looked, previous_push, ago with ago_minutes, between with from_ms/to_ms, pushes with from_push/to_push = the stack just before push from_push compared with the stack after push to_push (pushes are numbered from 1, oldest first, as current_view lists them), stack_at with at_ms = every layer as it was then), the view (full = whole change with what is new marked, changes = only what changed), only pull requests with real changes, showing the files the comparison hides, one pull request, all of them, or the whole stack as one diff, versions vN..vM of one pull request, and how new lines are marked. Returns the comparison as it is now (it may still be computing).",
             &json!({
                 "baseline": {"type": "string", "enum": ["off", "last_looked", "previous_push", "ago", "between", "pushes", "stack_at"]},
                 "ago_minutes": {"type": "integer", "minimum": 1},
@@ -134,6 +134,7 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
                 "only_changed": {"type": "boolean"},
                 "show_hidden_files": {"type": "boolean"},
                 "all_layers": {"type": "boolean", "description": "Every pull request of the stack at once (false: one at a time)."},
+                "stack_view": {"type": "string", "enum": ["one_pr", "all_prs", "whole"], "description": "How a stack shows: one pull request at a time, every pull request, or the whole stack as one diff."},
                 "versions": {
                     "type": "object",
                     "properties": {

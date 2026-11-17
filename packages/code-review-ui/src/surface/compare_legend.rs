@@ -118,7 +118,8 @@ impl ReviewSurface {
             action: Some(LegendAction::OpenMenu),
         });
         let sources = self.panel_sources();
-        let every_layer = self.stack_view == StackView::AllLayers && self.steps_through_stack();
+        let every_layer =
+            self.shown_stack_view() == Some(StackView::AllLayers) && self.steps_through_stack();
         match sources.as_slice() {
             [source] if !every_layer => rows.extend(self.source_legend(source)),
             _ => rows.extend(self.sources_legend()),
@@ -221,7 +222,7 @@ impl ReviewSurface {
             return None;
         }
         let pulls = plural(filtered, "pull request", "pull requests");
-        let text = if self.stack_view == StackView::AllLayers {
+        let text = if self.shown_stack_view() == Some(StackView::AllLayers) {
             format!("{pulls} hidden: no real changes ")
         } else {
             format!("{pulls} without real changes skipped ")

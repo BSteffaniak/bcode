@@ -345,7 +345,7 @@ value that is not known yet says so (`computing`, `not loaded`).
 screen: review                      # home | wizard | review | opening
 repo: bcode  /Users/me/src/bcode
 review: id=rv_7f3c  title="Retry backoff"  kind=stack_step_through  saved=yes
-  # kind: stack_step_through | whole_stack | pull_request | branch | current_branch | range
+  # kind: stack | stack_step_through | whole_stack | pull_request | branch | current_branch | range
   #       | commits | commit | working_tree | staged | unstaged | files | mixed
 sources: 5  #101 feat/retry-a@3e1c2a9  #102 feat/retry-b@77ab012  #103 feat/retry-c@91c0d4e  +2 (code_review.summary)
 stack: layers=#101,#102,#103,#104,#105  current=#103 (3/5)  view=one_pr   # one_pr | all_prs

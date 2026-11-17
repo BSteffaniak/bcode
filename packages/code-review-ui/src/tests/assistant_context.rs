@@ -28,7 +28,8 @@ fn a_stack_step_through_with_a_comparison_is_described_and_follows_every_move() 
             review.kind.as_str(),
             review.sources.total
         ),
-        (Some(id.as_str()), "stack_step_through", 3)
+        // Its layers and the whole stack, to switch between.
+        (Some(id.as_str()), "stack", 4)
     );
     let stack = review.stack.as_ref().expect("stack");
     assert_eq!(stack.layers, vec![101, 102, 103]);
@@ -65,7 +66,7 @@ fn a_stack_step_through_with_a_comparison_is_described_and_follows_every_move() 
     let view = context.view_text();
     for expected in [
         "screen: review",
-        "kind=stack_step_through",
+        "kind=stack ",
         "stack: layers=#101,#102,#103",
         "view=one_pr",
         "comparison: baseline=last_looked  view=full",

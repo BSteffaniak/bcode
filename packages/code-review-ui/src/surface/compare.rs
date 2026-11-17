@@ -514,7 +514,8 @@ async fn record_and_keep(
 
 impl ReviewSurface {
     /// The review's pull requests: step-through stack-layer sources (by their top layer) and
-    /// single pull request sources.
+    /// single pull request sources. Sources left out because the stack shows another way are
+    /// not compared until they show.
     pub(super) fn layer_sources(&self) -> Vec<LayerSource> {
         let Some(review) = self.review.as_ref() else {
             return Vec::new();
@@ -522,7 +523,7 @@ impl ReviewSurface {
         review
             .doc
             .groups()
-            .filter(|group| !group.loading && group.source.part.is_none())
+            .filter(|group| !group.loading && !group.alternate && group.source.part.is_none())
             .filter_map(|group| {
                 let source_id = group.source.source_id.clone();
                 let (provider, repository, kind_number) = self.pull_scope_of(&source_id)?;
@@ -595,6 +596,7 @@ impl ReviewSurface {
             .groups()
             .filter(|group| {
                 !group.loading
+                    && !group.alternate
                     && group.source.part.is_none()
                     && group.source.mode == ResolvedSourceMode::Diff
                     && !layers.contains(&group.source.source_id)
@@ -1267,7 +1269,7 @@ impl ReviewSurface {
     /// Leave filtered sources out of the document when every layer shows in it (one layer at a
     /// time, the filter only changes which layers `.`/`,` visit).
     pub(super) fn apply_compare_filter(&mut self) {
-        let filtered = if self.stack_view == super::stack::StackView::AllLayers {
+        let filtered = if self.shown_stack_view() == Some(super::stack::StackView::AllLayers) {
             self.compare_filtered()
         } else {
             BTreeSet::new()

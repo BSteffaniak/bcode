@@ -298,7 +298,7 @@ review in the app once.
 
 | Tool | Access | What it does |
 |---|---|---|
-| `code_review.list_reviews` | read | Saved reviews of the repository, most recently updated first: id, title, kind (`stack_step_through`, `whole_stack`, `pull_request`, `branch`, `range`, `working_tree`, ...), source labels, pull request numbers, viewed files, archived, created and updated times. `include_archived`, `query` (title, kind, label or pull request number). |
+| `code_review.list_reviews` | read | Saved reviews of the repository, most recently updated first: id, title, kind (`stack` (layers and the whole stack), `stack_step_through`, `whole_stack`, `pull_request`, `branch`, `range`, `working_tree`, ...), source labels, pull request numbers, viewed files, archived, created and updated times. `include_archived`, `query` (title, kind, label or pull request number). |
 | `code_review.summary` | read | Title, sources and the revisions they resolve to, stack layers, files and lines, viewed files, threads, suggestions. |
 | `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed; `truncated` first names sources cut at `files.max_files`. |
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
@@ -357,7 +357,7 @@ and what is on screen now (`current_view`'s sections `screen`, `review`, `stack`
 | `bcode.code-review.current_view` | read-only | The live screen (see What it knows). |
 | `bcode.code-review.find_pull_requests` | read-only | Open pull requests chained into stacks, newest first, each layer with its branches and update time and each stack with a `create_review_source` for `code_review.create_review`. `filter`: `mine` (a layer's branch is a local branch: your own work), `review_requested`, `current_branch`, `all`; `query`; `limit` (10, at most 50). |
 | `bcode.code-review.go_to` | read-only | Moves within the review on screen to a `layer` (pull request number or source id), a `path` and `line` (`side`), a `thread`, or a `version` of the layer (its whole change as it was then, read-only where it differs from now), as the keys do. Another review's place fails, naming `open_review`. |
-| `bcode.code-review.set_comparison` | read-only | Any Compare menu choice: `baseline` (`off`, `last_looked`, `previous_push`, `ago` with `ago_minutes`, `between` with `from_ms`/`to_ms`, `pushes` with `from_push`/`to_push` as the push timeline picks them, `stack_at` with `at_ms`), `view` (`full`, `changes`), `only_changed`, `show_hidden_files`, `all_layers`, `versions` (`number`, `from`, `to`: vN to vM of one pull request), `mark_style`, `word_marks`, `seen_hunks`, `removed_inline`. Every argument is checked first: one bad argument changes nothing. Pushes and versions need the stack history; while it loads the call asks to be repeated. |
+| `bcode.code-review.set_comparison` | read-only | Any Compare menu choice: `baseline` (`off`, `last_looked`, `previous_push`, `ago` with `ago_minutes`, `between` with `from_ms`/`to_ms`, `pushes` with `from_push`/`to_push` as the push timeline picks them, `stack_at` with `at_ms`), `view` (`full`, `changes`), `only_changed`, `show_hidden_files`, `all_layers`, `stack_view` (`one_pr`, `all_prs`, `whole`), `versions` (`number`, `from`, `to`: vN to vM of one pull request), `mark_style`, `word_marks`, `seen_hunks`, `removed_inline`. Every argument is checked first: one bad argument changes nothing. Pushes and versions need the stack history; while it loads the call asks to be repeated. |
 | `bcode.code-review.set_view` | read-only | `layout` (`unified`, `side_by_side`), `wrap`, `hide_resolved_threads`, `hide_viewed_files`, `file_list` (`tree`, `flat`), `files_panel`, `threads_panel`, `fold_files`, `fold_threads`. |
 | `bcode.code-review.refresh` | read-only | Reloads home, or checks the review on screen for changes (`r`). |
 | `bcode.code-review.open_review` | mutating | Opens a saved review of the repository (`review`), optionally at a `layer`, `path`, `line`, `thread` or `version` once it loaded; or `screen = "home"`, or `"new_review"` (the wizard, filled in with `title` and `sources` as `create_review` takes them, at its last step for you to confirm). The review on screen is left through its close path first. |
@@ -490,24 +490,39 @@ a review records where it was left without making it updated.
 
 ### Stacks of pull requests
 
-A review that steps through a stack (one source per pull request, "Step through every layer")
-shows one pull request at a time by default. The diff and the file panel hold only the current
-pull request, under a banner with its position in the stack, number, title, branches, files,
-and viewed count. `.` and `,` (or a click on the rail's tabs) move to the next and previous pull
-request, each returning to where it was left; viewing a pull request's last file says so and
-points to the next one.
+A stack review holds the stack two ways: one source per pull request (each against its parent)
+and one whole-stack source (trunk to the top pull request, one diff labeled by layer). The
+wizard's "Step through every layer" and "Whole stack" create the same sources and differ only in
+the view the review starts with; a review saved with only one of the two (by an earlier version,
+`bcode review stack`, or `code_review.create_review`) gets the other when its stack is confirmed,
+without a notice. Unsaved reviews keep their viewed state across that change.
 
-`shift+o` (also in the command palette) switches to every pull request in one document: each
-starts with its banner, the file panel groups files under one row per pull request with only
-the current one open, and a strip under the rail names the pull request the cursor is in. The
-choice is kept with the review. A whole-stack review (one source for the entire stack) is one
-diff labeled by layer and is not affected.
+`shift+o` (also in the command palette) cycles through three views, kept with the review:
 
-**When the stack changes.** A step-through review saves one source per layer. After a restack,
+* **One pull request at a time** (the default for step-through). The diff and the file panel
+  hold only the current pull request, under a banner with its position in the stack, number,
+  title, branches, files, and viewed count. `.` and `,` (or a click on the rail's tabs) move to
+  the next and previous pull request, each returning to where it was left; viewing a pull
+  request's last file says so and points to the next one.
+* **Every pull request** in one document: each starts with its banner, the file panel groups
+  files under one row per pull request with only the current one open, and a strip under the
+  rail names the pull request the cursor is in.
+* **The whole stack as one diff**, labeled by the layer that introduced each line.
+
+The rail has one tab per pull request and, last, one for the whole stack: clicking a pull
+request's tab (or `.`/`,`, or picking a layer from "Through the stack") from the whole stack
+shows that pull request alone, and clicking the whole-stack tab shows the whole stack. Switching
+keeps the cursor on the same file when the new view has it. The representation not on screen is
+left out of the header's totals and viewed progress, and is not compared until it shows. Viewed
+marks and comments belong to the representation they were made in; comments on the whole stack
+publish to the pull request that introduced their lines.
+
+**When the stack changes.** A stack review saves one source per layer. After a restack,
 layers whose pull requests were closed or merged are not errors: once the stack is read again
 (from a layer still open), the review's layers are matched to it. Layers that left are removed
 and new layers are added in stack order (existing ones keep their position, comments and
-viewed state), the review is saved and opened again, and one notice says what changed ("The
+viewed state), the whole-stack source follows the stack's top, the review is saved and opened
+again, and one notice says what changed ("The
 stack changed: #1 closed or merged (removed); #3 added"). If no layer is left to read the stack
 from, one notice names the closed layers. Failures name sources by their labels.
 

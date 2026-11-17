@@ -188,7 +188,7 @@ pub struct StackView {
     /// The current layer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<u64>,
-    /// `one_pr` or `all_prs`.
+    /// `one_pr`, `all_prs`, or `whole` (the whole stack as one diff).
     pub view: String,
 }
 
@@ -381,7 +381,7 @@ pub struct ReviewView {
     pub scope_id: String,
     /// Title.
     pub title: String,
-    /// Kind (`stack_step_through`, `whole_stack`, `pull_request`, `branch`, `current_branch`,
+    /// Kind (`stack`, `stack_step_through`, `whole_stack`, `pull_request`, `branch`, `current_branch`,
     /// `range`, `commits`, `commit`, `last_commit`, `working_tree`, `staged`, `unstaged`,
     /// `files`, `mixed`, `loading`).
     pub kind: String,

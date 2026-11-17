@@ -46,8 +46,11 @@ pub const fn source_kind_name(kind: &ReviewSourceKind) -> &'static str {
     }
 }
 
-/// A review's kind from its sources: `stack_step_through` (two or more stack layers),
-/// `whole_stack`, `pull_request`, a source kind name for one other source, `mixed` or `empty`.
+/// A review's kind from its sources.
+///
+/// `stack` (a stack held both as its layers and as one whole-stack diff), `stack_step_through`
+/// (two or more stack layers), `whole_stack`, `pull_request`, a source kind name for one other
+/// source, `mixed` or `empty`.
 #[must_use]
 pub fn review_kind(sources: &[bcode_code_review_models::ReviewSource]) -> String {
     let included: Vec<&ReviewSourceKind> = sources
@@ -59,6 +62,13 @@ pub fn review_kind(sources: &[bcode_code_review_models::ReviewSource]) -> String
         .iter()
         .filter(|kind| matches!(kind, ReviewSourceKind::StackLayer { .. }))
         .count();
+    let whole = included
+        .iter()
+        .filter(|kind| matches!(kind, ReviewSourceKind::Stack { .. }))
+        .count();
+    if layers >= 1 && whole >= 1 && layers + whole == included.len() {
+        return "stack".to_owned();
+    }
     if layers >= 2 && layers == included.len() {
         return "stack_step_through".to_owned();
     }
@@ -76,18 +86,21 @@ pub fn review_kind(sources: &[bcode_code_review_models::ReviewSource]) -> String
     }
 }
 
-/// The pull request numbers a review's sources name, in source order.
+/// The pull request numbers a review's sources name, in source order, each once (a stack's
+/// whole-stack source names its top layer again).
 #[must_use]
 pub fn pull_request_numbers(sources: &[bcode_code_review_models::ReviewSource]) -> Vec<u64> {
-    sources
-        .iter()
-        .filter_map(|source| match &source.kind {
-            ReviewSourceKind::PullRequest { number, .. }
-            | ReviewSourceKind::StackLayer { number, .. }
-            | ReviewSourceKind::Stack { top: number, .. } => Some(*number),
-            _ => None,
-        })
-        .collect()
+    let mut numbers = Vec::new();
+    for source in sources {
+        if let ReviewSourceKind::PullRequest { number, .. }
+        | ReviewSourceKind::StackLayer { number, .. }
+        | ReviewSourceKind::Stack { top: number, .. } = &source.kind
+            && !numbers.contains(number)
+        {
+            numbers.push(*number);
+        }
+    }
+    numbers
 }
 
 /// A saved review as listed for agents.

@@ -175,6 +175,9 @@ pub enum WizardOutcome {
         /// Whether its folder, glob and repository sources list ignored files, when a path
         /// picker chose differently from the configured default.
         show_ignored: Option<bool>,
+        /// Whether the review starts showing its stack as one whole-stack diff rather than one
+        /// pull request at a time.
+        whole_stack: bool,
     },
     /// Save the edited sources of the review being edited.
     Update {
@@ -362,6 +365,8 @@ pub struct Wizard {
     /// The stack (by the pull request it was resolved for) whose over-limit warning was
     /// dismissed.
     stack_limit_dismissed: Option<u64>,
+    /// How a stack review created here starts showing its stack.
+    stack_start: bcode_code_review_models::ReviewStackView,
     /// The stack being resolved (by its pull request) as discovery sees it: shown, marked as
     /// unconfirmed, until the provider answers.
     provisional: Option<(u64, Vec<ProvisionalLayer>)>,
@@ -426,6 +431,7 @@ impl Wizard {
             action_keys: BTreeMap::new(),
             pending_items: true,
             stack_limit_dismissed: None,
+            stack_start: bcode_code_review_models::ReviewStackView::OneLayer,
             provisional: None,
             link: crate::assistant::ScreenLink::default(),
             ignored: IgnoredChoice::default(),
@@ -1336,7 +1342,20 @@ impl Wizard {
     }
 
     fn default_title(&self) -> String {
-        if let [only] = self.sources.as_slice() {
+        let stack_only = self.sources.iter().all(|source| {
+            matches!(
+                source.kind,
+                ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+            )
+        });
+        let mut whole = self
+            .sources
+            .iter()
+            .filter(|source| matches!(source.kind, ReviewSourceKind::Stack { .. }));
+        if let (true, Some(stack), None) = (stack_only, whole.next(), whole.next()) {
+            // One stack, held as its layers and as a whole: named as the stack.
+            stack.label.clone()
+        } else if let [only] = self.sources.as_slice() {
             only.label.clone()
         } else {
             let sources: Vec<ReviewSource> = self
@@ -2263,29 +2282,36 @@ impl Wizard {
                     )
                 };
                 let sources = match id {
-                    "whole" => {
+                    // Either way the review holds the stack both as its layers and as one
+                    // whole-stack diff, to switch between; the choice is where it starts.
+                    "whole" | "step" => {
                         let Some(top) = stack.layers.last() else {
                             return WizardOutcome::Ignored;
                         };
-                        vec![(
-                            ReviewSourceKind::Stack {
-                                provider: provider.clone(),
-                                repository: repository.clone(),
-                                top: top.pull.number,
-                            },
-                            format!(
-                                "Stack #{} · {} ({} layers)",
-                                top.pull.number,
-                                top.pull.title,
-                                stack.layers.len()
-                            ),
-                        )]
+                        self.stack_start = if id == "whole" {
+                            bcode_code_review_models::ReviewStackView::Whole
+                        } else {
+                            bcode_code_review_models::ReviewStackView::OneLayer
+                        };
+                        stack
+                            .layers
+                            .iter()
+                            .map(|entry| layer(entry.pull.number, &entry.pull.title))
+                            .chain(std::iter::once((
+                                ReviewSourceKind::Stack {
+                                    provider: provider.clone(),
+                                    repository: repository.clone(),
+                                    top: top.pull.number,
+                                },
+                                format!(
+                                    "Stack #{} · {} ({} layers)",
+                                    top.pull.number,
+                                    top.pull.title,
+                                    stack.layers.len()
+                                ),
+                            )))
+                            .collect()
                     }
-                    "step" => stack
-                        .layers
-                        .iter()
-                        .map(|entry| layer(entry.pull.number, &entry.pull.title))
-                        .collect(),
                     other => {
                         let Some(entry) = other
                             .strip_prefix("layer-")
@@ -2333,6 +2359,8 @@ impl Wizard {
                             .map(|source| source.kind.clone())
                             .collect(),
                         show_ignored: self.ignored_choice(),
+                        whole_stack: self.stack_start
+                            == bcode_code_review_models::ReviewStackView::Whole,
                     };
                 }
                 "add" => {
