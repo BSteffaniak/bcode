@@ -386,7 +386,11 @@ fn a_review_without_a_guide_says_how_to_get_one() {
         "{}",
         screen.text()
     );
-    assert!(screen.contains("walk you through it"), "{}", screen.text());
+    assert!(
+        screen.contains("Ask the review assistant"),
+        "{}",
+        screen.text()
+    );
     setup.scenario.key("alt+down");
     let screen = stable(&mut setup.scenario);
     assert!(
