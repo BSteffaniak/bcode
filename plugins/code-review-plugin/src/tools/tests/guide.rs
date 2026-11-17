@@ -280,6 +280,55 @@ fn blank_arguments_never_hide_the_paths_a_call_reads() {
 }
 
 #[test]
+fn a_call_naming_more_paths_than_are_declared_is_refused() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let mut citations: Vec<Value> = (0..200)
+        .map(|index| json!({"path": format!("src/f{index}.rs"), "start_line": 1, "end_line": 1}))
+        .collect();
+    let at_cap = json!({"guide_id": "g", "ops": [{"op": "put_section", "id": "s1", "citations": citations}]});
+    assert!(
+        harness
+            .prepare_raw("code_review.guide.write", &at_cap, SESSION)
+            .error
+            .is_none(),
+        "200 paths are declared"
+    );
+    citations.push(json!({"path": "src/.env", "start_line": 1, "end_line": 1}));
+    let over = json!({"guide_id": "g", "ops": [{"op": "put_section", "id": "s1", "citations": citations}]});
+    let refused = harness.prepare_raw("code_review.guide.write", &over, SESSION);
+    assert!(
+        refused.error.is_some(),
+        "the 201st path is refused, not left undeclared"
+    );
+    let paths: Vec<String> = (0..201).map(|index| format!("src/f{index}.rs")).collect();
+    assert!(
+        harness
+            .prepare_raw(
+                "code_review.search_code",
+                &json!({"query": "x", "paths": paths}),
+                SESSION
+            )
+            .error
+            .is_some()
+    );
+
+    let section: Vec<Value> = (0..101)
+        .map(|_| json!({"path": "src/lib.rs", "start_line": 1, "end_line": 1}))
+        .collect();
+    let checked = harness.call(
+        "code_review.guide.check",
+        &json!({"section": {"id": "s1", "citations": section}}),
+        SESSION,
+    );
+    assert!(
+        checked.is_error && checked.output.contains("at most 100 citations"),
+        "a section's citations count toward the check's cap: {}",
+        checked.output
+    );
+}
+
+#[test]
 fn a_guide_is_started_written_read_checked_and_exported() {
     let mut harness = Harness::new();
     harness.bind(SESSION);

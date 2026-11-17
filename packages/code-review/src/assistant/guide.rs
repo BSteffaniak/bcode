@@ -1112,9 +1112,12 @@ impl ReviewTools<'_> {
                 "pass `citations` or `section` to check".to_owned(),
             ));
         }
-        if citations.len() > MAX_CHECK_CITATIONS {
+        let section_citations = section.as_ref().map_or(0, |section| {
+            batch_citations(&[GuideOp::PutSection(section.clone())]).len()
+        });
+        if citations.len() + section_citations > MAX_CHECK_CITATIONS {
             return Err(AssistantError::Invalid(format!(
-                "at most {MAX_CHECK_CITATIONS} citations per check"
+                "at most {MAX_CHECK_CITATIONS} citations per check, counting the section's"
             )));
         }
         let pinned = if guide_id.is_some() || !self.guides(review)?.is_empty() {

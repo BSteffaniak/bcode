@@ -381,6 +381,7 @@ fn citation_paths(name: &str, parsed: &GuideArguments) -> Result<Vec<String>, St
 ///
 /// * A message for arguments or operations that cannot be read.
 /// * A message for a path that leaves the repository.
+/// * A message for a call naming more than [`MAX_DECLARED_PATHS`] paths.
 pub fn declared(
     name: &str,
     root: &Path,
@@ -425,7 +426,12 @@ pub fn declared(
         }
         _ => {}
     }
-    paths.truncate(MAX_DECLARED_PATHS);
+    if paths.len() > MAX_DECLARED_PATHS {
+        return Err(format!(
+            "a call reads at most {MAX_DECLARED_PATHS} distinct paths; this one names {}; split it",
+            paths.len()
+        ));
+    }
     let operations = if paths.is_empty() {
         Vec::new()
     } else {
