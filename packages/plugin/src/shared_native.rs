@@ -271,9 +271,16 @@ impl SharedNative {
         role: bmux_plugin_sdk::definition::ComponentRole,
     ) -> Result<Self, PluginLoadError> {
         host.validate(&manifest.id)?;
+        // A dynamic artifact's plug-rt binds to the reactor current at load time.
+        // Bind it to this activation's selected lifecycle reactor, never to
+        // whichever runtime the caller happens to be polled on.
+        let reactor = host.driver.runtime_handle();
+        let entered = reactor.enter();
         // SAFETY: Product native loading is explicitly trusted, as with the prior loader.
         let artifact = unsafe { bmux_plugin::NativePluginLoader::load_definition_artifact(path) }
-            .map_err(|_| error(&manifest.id, "shared_native_load"))?;
+            .map_err(|_| error(&manifest.id, "shared_native_load"));
+        drop(entered);
+        let artifact = artifact?;
         if artifact.metadata().plugin_id != manifest.id {
             return Err(PluginLoadError::ManifestIdMismatch {
                 file_id: manifest.id.clone(),
