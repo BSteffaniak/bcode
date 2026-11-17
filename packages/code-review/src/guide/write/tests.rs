@@ -389,3 +389,51 @@ fn status_is_set_and_area_results_go_to_their_own_write() {
     .expect_err("area results are not version writes");
     assert_eq!(errors[0].code, INVALID_OP);
 }
+
+#[test]
+fn a_narrow_writer_never_replaces_a_citation_other_sections_use() {
+    let mut version = written();
+    let shared = version.citations["c2"].clone();
+    let mode = GrantMode::Expand {
+        section_id: "s3.1".to_owned(),
+    };
+    let outcome = run(
+        &mut version,
+        &mode,
+        json!([{"op": "add_expansion", "under": "s3.1", "title": "Refill", "body": "See [[1]].",
+                "citations": [{"id": "c2", "path": "net/budget.rs", "start_line": 50, "end_line": 52, "quote": "wrong"}]}]),
+    )
+    .expect("expand");
+    assert_eq!(version.citations["c2"], shared, "c2 is left as it was");
+    let stored = &outcome.citations[0].id;
+    assert_ne!(stored, "c2", "the expansion's citation is stored apart");
+    assert_eq!(version.citations[stored].excerpt, "wrong");
+    let expansion = version.section("s3.1.x1").expect("expansion");
+    assert_eq!(expansion.citations, [stored.clone()]);
+
+    let outcome = run(
+        &mut version,
+        &mode,
+        json!([{"op": "add_expansion", "under": "s3.1", "title": "Refill again",
+                "citations": [{"id": "c2", "path": "net/budget.rs", "start_line": 50, "end_line": 52, "quote": "fn refill"}]}]),
+    )
+    .expect("expand");
+    assert_eq!(
+        outcome.citations[0].id, "c2",
+        "a citation saying the same is shared"
+    );
+
+    let outcome = run(
+        &mut version,
+        &GrantMode::Generate,
+        json!([{"op": "put_section", "id": "s4", "citations": [
+            {"id": "c2", "path": "net/budget.rs", "start_line": 50, "end_line": 52, "quote": "fn refill()"}
+        ]}]),
+    )
+    .expect("generate");
+    assert_eq!(outcome.citations[0].id, "c2");
+    assert_eq!(
+        version.citations["c2"].excerpt, "fn refill()",
+        "the version's writer replaces it"
+    );
+}

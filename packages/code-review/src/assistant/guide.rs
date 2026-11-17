@@ -924,6 +924,7 @@ impl ReviewTools<'_> {
             outline: &mut area.outline,
             citations: &mut area.citations,
             retired: &mut retired,
+            replace_citations: true,
         };
         if let Err((code, message)) = apply_area_sections(&mut doc, sections, &checks, &mut outcome)
         {

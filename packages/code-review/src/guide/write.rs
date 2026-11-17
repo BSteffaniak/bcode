@@ -401,6 +401,10 @@ pub struct Doc<'a> {
     pub citations: &'a mut BTreeMap<String, Citation>,
     /// Retired section ids.
     pub retired: &'a mut Vec<String>,
+    /// Whether an inline citation naming a stored id at the same lines replaces the stored
+    /// citation (writers of a whole version or area). A narrower writer leaves it as it is, for
+    /// other sections cite it too, and stores a different one under a free id.
+    pub replace_citations: bool,
 }
 
 /// Apply `ops` to `version` as `writer`; `checks` are the results of checking
@@ -604,6 +608,7 @@ fn apply_one(
         outline: &mut version.outline,
         citations: &mut version.citations,
         retired: &mut version.retired_sections,
+        replace_citations: matches!(writer.mode, GrantMode::Generate | GrantMode::Restructure),
     };
     match op {
         GuideOp::SetOutline { sections } => set_outline(&mut doc, sections, restructure)?,
@@ -976,8 +981,17 @@ fn set_outline(doc: &mut Doc<'_>, sections: &[OutlineInput], restructure: bool) 
     Ok(())
 }
 
+/// Whether `a` and `b` say the same about the same lines: the same text, revision and outcome.
+fn same_evidence(a: &Citation, b: &Citation) -> bool {
+    a.quote_hash == b.quote_hash
+        && a.excerpt == b.excerpt
+        && a.revision == b.revision
+        && a.relation == b.relation
+        && std::mem::discriminant(&a.verification) == std::mem::discriminant(&b.verification)
+}
+
 /// Store one checked inline citation, under the id wanted when it is free (or names the same
-/// lines), else the next free `c<n>`.
+/// lines, and the writer may replace it or it says the same), else the next free `c<n>`.
 fn store_citation(
     doc: &mut Doc<'_>,
     wanted: Option<&str>,
@@ -986,21 +1000,31 @@ fn store_citation(
     outcome: &mut ApplyOutcome,
 ) -> Result<String, (&'static str, String)> {
     let mut citation = check.citation.clone();
-    let id = if let Some(id) = wanted.map(str::trim).filter(|id| !id.is_empty()) {
-        check_id(id, "citation")?;
-        if let Some(existing) = doc.citations.get(id) {
-            let same = existing.path == citation.path
-                && existing.side == citation.side
-                && existing.lines == citation.lines
-                && existing.source_id == citation.source_id;
-            if !same {
-                return Err(invalid(format!(
-                    "citation id {id} is already {}:{}-{}; cite it as \"{id}\" or leave out the id",
-                    existing.path, existing.lines.start, existing.lines.end
-                )));
+    let wanted = match wanted.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            check_id(id, "citation")?;
+            match doc.citations.get(id) {
+                Some(existing) => {
+                    let same = existing.path == citation.path
+                        && existing.side == citation.side
+                        && existing.lines == citation.lines
+                        && existing.source_id == citation.source_id;
+                    if !same {
+                        return Err(invalid(format!(
+                            "citation id {id} is already {}:{}-{}; cite it as \"{id}\" or leave out the id",
+                            existing.path, existing.lines.start, existing.lines.end
+                        )));
+                    }
+                    (doc.replace_citations || same_evidence(existing, &citation))
+                        .then(|| id.to_owned())
+                }
+                None => Some(id.to_owned()),
             }
         }
-        id.to_owned()
+        None => None,
+    };
+    let id = if let Some(id) = wanted {
+        id
     } else {
         let mut next = doc.citations.len() + 1;
         loop {

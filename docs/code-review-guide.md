@@ -332,6 +332,12 @@ takeover.
 A refused operation returns its index, the code `outside_grant`, and a sentence telling the model
 what it may do instead.
 
+An inline citation that names a stored citation id at the same lines replaces the stored
+citation only for a `Generate` or `Restructure` writer (or an area's writer, in its area). Any
+narrower writer leaves the stored citation as it is, since other sections cite it, and its own
+citation is stored under a free id unless it says the same (text, revision, relation and
+outcome), in which case the id is shared.
+
 ### Permissions
 
 * Guide writes (`code_review.guide.start`, `code_review.guide.write`) change only a versioned,
