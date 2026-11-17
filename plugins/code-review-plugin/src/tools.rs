@@ -19,6 +19,13 @@
 //! * Writes (`add_comment`, `reply`, `resolve_thread`, `mark_viewed`, `suggest_change`) are
 //!   mutating and ask by default. `reply` and `resolve_thread` change local threads only and
 //!   refuse a pull request thread.
+//! * `search_code`, `diff_hunks` and `related_files` read code at the review's pinned revisions
+//!   (`filesystem.grep` reads the working tree); they are read-only and declare the paths they
+//!   read (`search_code` its path globs, or the repository when it names none).
+//! * Guide tools (`guide.start`, `guide.write`) change only a versioned guide of the review: they
+//!   are allowed by default like reads, under their own permission category `code_review.guide`,
+//!   which users can set to ask. They declare the files they read (context files, cited files).
+//!   `guide.get`, `guide.check`, `guide.plan` and `guide.export` are read-only.
 //! * `publish` sends the review out of the repository and asks by default. An `output_path`
 //!   must be relative to the session's working directory and stay inside it; the publish also
 //!   declares that file as a write, so write path rules apply and the prompt names it.
@@ -29,6 +36,7 @@
 use bcode_code_review::assistant::{
     AssistantError, Location, PullThreadQuery, ReviewRef, ReviewTools, Side,
 };
+use bcode_code_review::guide::config::GuideConfig;
 use bcode_code_review::viewed::ViewedReset;
 use bcode_code_review::{CodeReviewConfig, ReviewData, ReviewStore};
 use bcode_code_review_models::{
@@ -53,6 +61,8 @@ pub const CATEGORY_READ: &str = "code_review.read";
 pub const CATEGORY_WRITE: &str = "code_review.write";
 /// Permission category of the tools that send the review out.
 pub const CATEGORY_PUBLISH: &str = "code_review.publish";
+/// Permission category of the tools that write guided-review guides.
+pub const CATEGORY_GUIDE: &str = "code_review.guide";
 /// Bytes of tool output returned at most.
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 /// Items one batch tool call takes at most.
@@ -67,6 +77,9 @@ pub enum Access {
     Write,
     /// Sends it out of the repository.
     Publish,
+    /// Writes one of its guided-review guides: a derived, versioned artifact, allowed by
+    /// default like a read.
+    Guide,
 }
 
 /// One review tool.
@@ -178,7 +191,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.file_content",
         access: Access::Read,
-        description: "Read a file of the review at its head (new side) or base (old side) revision, as numbered lines.",
+        description: "Read a file of the review at its head (new side) or base (old side) revision, or at an earlier version the review knows (`revision`: a commit id of a recorded pull request version or a guide's pinned head), as numbered lines.",
         schema: || {
             with_review(
                 json!({
@@ -187,6 +200,7 @@ const SPECS: &[Spec] = &[
                     "start_line": {"type": "integer", "minimum": 1, "description": "First line (default 1)."},
                     "count": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Lines to return (default 400)."},
                     "source": {"type": "string", "description": "Source id, when the file is in several sources."},
+                    "revision": {"type": "string", "description": "head (default, with side), base, or a commit id the review knows: one of its sources' revisions, a recorded version of its pull requests, or a guide's pinned head. Arbitrary refs are refused."},
                 }),
                 &["path"],
             )
@@ -421,6 +435,60 @@ const SPECS: &[Spec] = &[
         },
     },
     Spec {
+        name: "code_review.search_code",
+        access: Access::Read,
+        description: "Search the code at the revisions the review shows (a pull request's head, a commit; filesystem.grep reads the working tree instead): text, whole word, regular expression, or symbol (definitions in Rust, Python, JavaScript/TypeScript and Go, then other uses). Each match says whether its file is in the review and how the line relates to it (changed, hunk_context, unchanged, in_review, outside_review). Bounded; says when cut.",
+        schema: guide::search_schema,
+    },
+    Spec {
+        name: "code_review.diff_hunks",
+        access: Access::Read,
+        description: "Show only the hunks of one file's diff that overlap a line range (all hunks without one), as numbered lines: the precise companion of code_review.file_diff for checking and citing lines.",
+        schema: guide::hunks_schema,
+    },
+    Spec {
+        name: "code_review.related_files",
+        access: Access::Read,
+        description: "Find files related to one file at the review's head: its tests (by naming convention), callers (files that import or use its module), configuration and docs that mention it; each with why it matched and whether it is in the review.",
+        schema: guide::related_schema,
+    },
+    Spec {
+        name: "code_review.guide.start",
+        access: Access::Guide,
+        description: "Start a guided walkthrough of the review (a guide), a new version of one, or resume writing a version. Pins the revisions the review shows now; an `outline` appears at once as planned sections. Returns the guide id, version, revision, the template's required sections, and the repository's guide context (configured files and notes). Then write sections with code_review.guide.write. Call code_review.guide.plan first to size the review.",
+        schema: guide::start_schema,
+    },
+    Spec {
+        name: "code_review.guide.write",
+        access: Access::Guide,
+        description: "Write a guide version in one atomic batch of operations (set_outline, put_section, add_expansion, promote, discard, remove_section, move_section, record_checks, area_result, set_status). Cite lines with inline citations carrying a `quote`: each is checked at the guide's pinned revisions and assigned an id (or adjusted when the quote is found once elsewhere); citations with problems are kept and reported (with `strict`, nothing is written). Operations outside this conversation's grant are refused with outside_grant and nothing is written. Returns the new revision, sections written, each citation's status and problems, and lint.",
+        schema: guide::write_schema,
+    },
+    Spec {
+        name: "code_review.guide.get",
+        access: Access::Read,
+        description: "Read a guide: outline, section bodies, citations, and on request freshness (whether each citation still holds at the review's current revisions, and the stale sections), fan-out areas, ask threads, versions, reviewed marks. Without guide_id, uses the review's only guide or lists its guides. Bounded; names what was cut.",
+        schema: guide::get_schema,
+    },
+    Spec {
+        name: "code_review.guide.check",
+        access: Access::Read,
+        description: "Check citations, or a whole section as put_section would write it, against a guide's pinned revisions without writing anything: each citation's status, problems with a fix (moved quote, close match, path suggestions, symbol definitions), and the section's lint. Use it to self-correct before writing.",
+        schema: guide::check_schema,
+    },
+    Spec {
+        name: "code_review.guide.plan",
+        access: Access::Read,
+        description: "Plan a guide of the review: size (files, changed lines, layers, packages), the recommended strategy (one agent, per layer, or areas) with its partition and cost estimate inputs, what the depth asks for, the template's sections, and the repository's guide context. Deterministic.",
+        schema: guide::plan_schema,
+    },
+    Spec {
+        name: "code_review.guide.export",
+        access: Access::Read,
+        description: "Render a guide version as markdown with numbered citations: pull request sources as permalinks, others as path:lines @ short sha, verification as text. To write it to a file, use code_review.publish or the review app.",
+        schema: guide::export_schema,
+    },
+    Spec {
         name: "code_review.publish",
         access: Access::Publish,
         description: "Preview or publish the review's comments with a built-in publisher: local_markdown (default), markdown_file, or json_file. Publishing to a forge such as GitHub is done from the review app.",
@@ -472,18 +540,23 @@ pub fn invoke_service(data: &mut ReviewData, context: &NativeServiceContext) -> 
                 |tool| ToolDiscoveryPolicy::new(access(&tool.name) == Some(Access::Read)),
             ))
         }
-        OP_PREPARE_TOOL => prepare_tool_service_response(request, definitions(), prepare),
+        OP_PREPARE_TOOL => {
+            let settings = context
+                .config_or_default::<ToolSettings>()
+                .unwrap_or_default();
+            let (guide, _) = GuideConfig::from_value(settings.guide.as_ref());
+            prepare_tool_service_response(request, definitions(), |request, definition| {
+                prepare(request, definition, &guide)
+            })
+        }
         OP_INVOKE_TOOL => match request.payload_json::<ToolInvocationRequest>() {
             Ok(invocation) => {
                 let config = context.config_or_default::<CodeReviewConfig>();
                 let settings = context.config_or_default::<ToolSettings>();
                 let response = match (config, settings) {
-                    (Ok(config), Ok(settings)) => invoke(
-                        data,
-                        &ReviewStore::new(config),
-                        settings.viewed_reset,
-                        &invocation,
-                    ),
+                    (Ok(config), Ok(settings)) => {
+                        invoke(data, &ReviewStore::new(config), &settings, &invocation)
+                    }
                     (Err(error), _) | (_, Err(error)) => failure(&format!(
                         "the code review configuration is invalid: {error}"
                     )),
@@ -504,6 +577,9 @@ pub fn invoke_service(data: &mut ReviewData, context: &NativeServiceContext) -> 
 struct ToolSettings {
     #[serde(default)]
     viewed_reset: ViewedReset,
+    /// The `guide` table, read entry by entry (see [`GuideConfig::from_value`]).
+    #[serde(default)]
+    guide: Option<Value>,
 }
 
 /// Where an invocation runs: carried from preparation to invocation.
@@ -517,6 +593,9 @@ pub struct Descriptor {
     /// Where `publish` writes, resolved inside the working directory during preparation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
+    /// The guide context files the call declared, which it alone may read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<guide::DeclaredContextPaths>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +609,7 @@ struct WorkspaceContext {
 fn prepare(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
+    guide_config: &GuideConfig,
 ) -> Result<ToolPolicyPreparation, String> {
     let access = access(&definition.name)
         .ok_or_else(|| format!("unknown review tool {}", definition.name))?;
@@ -559,12 +639,37 @@ fn prepare(
         }
         _ => None,
     };
+    let mut context = None;
     let (requires_permission, operation, category) = match access {
+        Access::Read | Access::Guide if guide::TOOLS.contains(&definition.name.as_str()) => {
+            let root = repository_root(&workspace.working_directory);
+            let (resources, declared) = guide::declared(
+                &definition.name,
+                &root,
+                &request.invocation.arguments,
+                guide_config,
+            )?;
+            context = declared;
+            let operation = if resources.is_empty() {
+                ToolPolicyOperation::ReadOnly
+            } else {
+                let mut operations = vec![ToolPolicyOperation::ReadOnly];
+                operations.extend(resources);
+                ToolPolicyOperation::Compound { operations }
+            };
+            let category = if access == Access::Guide {
+                CATEGORY_GUIDE
+            } else {
+                CATEGORY_READ
+            };
+            (false, operation, category)
+        }
         Access::Read => (
             false,
             read_operation(&definition.name, &workspace.working_directory, &arguments)?,
             CATEGORY_READ,
         ),
+        Access::Guide => (false, ToolPolicyOperation::ReadOnly, CATEGORY_GUIDE),
         Access::Write => (true, ToolPolicyOperation::Mutating, CATEGORY_WRITE),
         Access::Publish => (
             true,
@@ -588,6 +693,7 @@ fn prepare(
         session_id: workspace.workspace_id,
         working_directory: workspace.working_directory,
         output_path,
+        context,
     };
     Ok(ToolPolicyPreparation::new(requires_permission, operation)
         .with_identity(ToolPolicyIdentity {
@@ -626,8 +732,7 @@ fn read_operation(
             match arguments.path.as_deref().filter(|path| !path.is_empty()) {
                 // Review paths are relative to the repository root.
                 Some(path) => {
-                    let root = git(working_directory, &["rev-parse", "--show-toplevel"])
-                        .map_or_else(|| working_directory.to_path_buf(), PathBuf::from);
+                    let root = repository_root(working_directory);
                     Some(ToolPolicyOperation::Read {
                         paths: vec![inside(&root, path, "path")?.display().to_string()],
                     })
@@ -645,6 +750,12 @@ fn read_operation(
             operations: vec![ToolPolicyOperation::ReadOnly, resource],
         }
     }))
+}
+
+/// The repository root of `working_directory` (itself when it is not in a repository).
+fn repository_root(working_directory: &std::path::Path) -> PathBuf {
+    git(working_directory, &["rev-parse", "--show-toplevel"])
+        .map_or_else(|| working_directory.to_path_buf(), PathBuf::from)
 }
 
 /// The web address of the repository's `origin`, or GitHub's when it has none.
@@ -676,6 +787,7 @@ struct Arguments {
     max_lines: Option<u32>,
     start_line: Option<u32>,
     count: Option<u32>,
+    revision: Option<String>,
     include_resolved: Option<bool>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -841,14 +953,37 @@ fn without_blanks(value: Value) -> Value {
 fn invoke(
     data: &ReviewData,
     store: &ReviewStore,
-    reset: ViewedReset,
+    settings: &ToolSettings,
     invocation: &ToolInvocationRequest,
 ) -> ToolInvocationResponse {
+    let reset = settings.viewed_reset;
     let descriptor =
         match serde_json::from_value::<Descriptor>(invocation.preparation_descriptor.clone()) {
             Ok(descriptor) => descriptor,
             Err(error) => return failure(&format!("invalid review tool descriptor: {error}")),
         };
+    if guide::TOOLS.contains(&invocation.name.as_str()) {
+        data.evict_idle();
+        let (config, problems) = GuideConfig::from_value(settings.guide.as_ref());
+        return match guide::run(
+            data,
+            store,
+            &invocation.name,
+            &descriptor,
+            without_blanks(invocation.arguments.clone()),
+            &config,
+            &problems,
+        ) {
+            Ok(answer) => ToolInvocationResponse {
+                output: bounded(answer.output),
+                is_error: answer.is_error,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            },
+            Err(error) => failure(&format!("{} ({})", error, error.code())),
+        };
+    }
     let mut arguments =
         match serde_json::from_value::<Arguments>(without_blanks(invocation.arguments.clone())) {
             Ok(arguments) => arguments,
@@ -899,14 +1034,7 @@ fn run(
             arguments.context,
             arguments.max_lines,
         ),
-        "code_review.file_content" => tools.file_content(
-            &review,
-            Arguments::required(arguments.path.as_ref(), "path")?,
-            arguments.source.as_deref(),
-            arguments.side.unwrap_or_default(),
-            arguments.start_line,
-            arguments.count,
-        ),
+        "code_review.file_content" => file_content(&mut tools, &review, arguments),
         "code_review.list_threads" => encode(&tools.threads(&review, &arguments.thread_query())?),
         "code_review.get_thread" => encode(&tools.thread(
             &review,
@@ -980,6 +1108,36 @@ fn run(
             "unknown review tool {name}"
         ))),
     }
+}
+
+/// `code_review.file_content`: at the head or base, or at a revision the review knows.
+fn file_content(
+    tools: &mut ReviewTools<'_>,
+    review: &bcode_code_review::assistant::OpenReview,
+    arguments: &Arguments,
+) -> Result<String, AssistantError> {
+    let path = Arguments::required(arguments.path.as_ref(), "path")?;
+    let side = match arguments.revision.as_deref().map(str::trim) {
+        None | Some("" | "head") => arguments.side.unwrap_or_default(),
+        Some("base") => Side::Old,
+        Some(revision) => {
+            return tools.file_content_at(
+                review,
+                path,
+                revision,
+                arguments.start_line,
+                arguments.count,
+            );
+        }
+    };
+    tools.file_content(
+        review,
+        path,
+        arguments.source.as_deref(),
+        side,
+        arguments.start_line,
+        arguments.count,
+    )
 }
 
 /// The review a tool acts on: the one named by `review`, else the session's.
@@ -1304,5 +1462,6 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 
 use bcode_code_review::assistant::create;
 
+mod guide;
 #[cfg(test)]
 mod tests;

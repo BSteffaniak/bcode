@@ -18,6 +18,7 @@
 pub mod code;
 pub mod create;
 pub mod fit;
+pub mod guide;
 pub mod manage;
 pub mod offline;
 pub mod pull_threads;
@@ -92,6 +93,14 @@ pub enum AssistantError {
     /// The arguments cannot be used.
     #[error("{0}")]
     Invalid(String),
+    /// The operation is refused, with a code saying why (a guide grant that does not allow it).
+    #[error("{message}")]
+    Refused {
+        /// Machine-readable code.
+        code: &'static str,
+        /// One actionable sentence.
+        message: String,
+    },
     /// Stored review state could not be read or written.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -108,6 +117,7 @@ impl AssistantError {
             Self::NotBound(_) => ERROR_NOT_BOUND,
             Self::NotFound(_) => ERROR_NOT_FOUND,
             Self::Invalid(_) => ERROR_INVALID,
+            Self::Refused { code, .. } => code,
             Self::Store(_) => "store_failed",
             Self::Data(error) => error.code(),
         }

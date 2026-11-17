@@ -394,7 +394,9 @@ mod tests {
     fn listings_keep_only_what_is_accepted() {
         let (fixture, head) = repo();
         let (paths, total) = list_paths(fixture.root(), &RevisionRef::commit(&head), 10, |path| {
-            path.ends_with(".rs")
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension == "rs")
         })
         .expect("list");
         assert_eq!(total, 2);

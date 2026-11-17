@@ -61,9 +61,11 @@ pub struct GuideContext {
     pub problems: Vec<String>,
 }
 
-/// The repository-relative files the configuration names: its context files, then the files
-/// under its context directories as the working tree lists them (tracked and untracked, not
-/// ignored), at most [`MAX_CONTEXT_FILES`], without repeats; and what could not be used.
+/// The repository-relative files the configuration names, and what could not be used.
+///
+/// These are its context files, then the files under its context directories as the working
+/// tree lists them (tracked and untracked, not ignored), at most [`MAX_CONTEXT_FILES`], without
+/// repeats.
 #[must_use]
 pub fn context_paths(repo_root: &Path, config: &GuideConfig) -> (Vec<String>, Vec<String>) {
     let mut paths: Vec<String> = Vec::new();
@@ -130,9 +132,10 @@ fn confined(entry: &str) -> Option<String> {
     Some(path.to_owned())
 }
 
-/// Read the context: `paths` (from [`context_paths`], as the call declared them) from the
-/// working tree or, with `context_at = "head"`, at `head`; at most `max_context_bytes` of
-/// content in all, files past the bound listed with their sizes only.
+/// Read the context: `paths` (from [`context_paths`], as the call declared them).
+///
+/// Files are read from the working tree or, with `context_at = "head"`, at `head`; at most
+/// `max_context_bytes` of content in all, files past the bound listed with their sizes only.
 #[must_use]
 pub fn read_context(
     data: &ReviewData,
@@ -151,10 +154,10 @@ pub fn read_context(
     let mut digest = Sha256::new();
     let mut files = Vec::with_capacity(paths.len());
     for path in paths.iter().take(MAX_CONTEXT_FILES) {
-        let read = match at_head {
-            Some(revision) => read_at(data, repo_root, revision, path, remaining),
-            None => read_worktree(repo_root, path, remaining),
-        };
+        let read = at_head.map_or_else(
+            || read_worktree(repo_root, path, remaining),
+            |revision| read_at(data, repo_root, revision, path, remaining),
+        );
         let file = match read {
             Ok(Some((bytes, content, truncated))) => {
                 remaining = remaining.saturating_sub(content.len());
@@ -225,13 +228,13 @@ fn read_worktree(repo_root: &Path, path: &str, room: usize) -> ContextRead {
         return Err("not a file".to_owned());
     }
     // A symbolic link must not lead the read outside the repository.
-    let root = repo_root
+    let canonical_root = repo_root
         .canonicalize()
         .map_err(|error| format!("the repository cannot be resolved: {error}"))?;
     let resolved = full
         .canonicalize()
         .map_err(|error| format!("cannot be resolved: {error}"))?;
-    if !resolved.starts_with(&root) {
+    if !resolved.starts_with(&canonical_root) {
         return Err("leads outside the repository".to_owned());
     }
     let bytes = metadata.len();

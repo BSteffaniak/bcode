@@ -50,7 +50,8 @@ build_tools = [
     "harness.result",
     "harness.respond",
     "harness.interrupt",
-    # Offered by the code review plugin: reads, navigation, review changes and publishing.
+    # Offered by the code review plugin: reads, navigation, review changes, publishing, code
+    # reads at pinned revisions, and guided-review guides.
     "code_review.list_reviews",
     "code_review.find_paths",
     "code_review.summary",
@@ -72,6 +73,15 @@ build_tools = [
     "code_review.create_review",
     "code_review.update_review",
     "code_review.delete_review",
+    "code_review.search_code",
+    "code_review.diff_hunks",
+    "code_review.related_files",
+    "code_review.guide.start",
+    "code_review.guide.write",
+    "code_review.guide.get",
+    "code_review.guide.check",
+    "code_review.guide.plan",
+    "code_review.guide.export",
 ]
 # These tools mutate only the authenticated active run. Application policy, ownership,
 # exact-candidate publication, execution ceilings and downstream tool permissions still apply.
@@ -110,6 +120,8 @@ plan_disabled_tools = [
     "code_review.create_review",
     "code_review.update_review",
     "code_review.delete_review",
+    "code_review.guide.start",
+    "code_review.guide.write",
 ]
 
 [runtime]

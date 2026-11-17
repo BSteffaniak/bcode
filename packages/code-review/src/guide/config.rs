@@ -357,7 +357,7 @@ mod tests {
     fn an_absent_table_is_the_defaults() {
         let (config, problems) = GuideConfig::from_value(None);
         assert_eq!(config, GuideConfig::default());
-        assert!(problems.is_empty());
+        assert_eq!(problems, Vec::<String>::new());
     }
 
     #[test]

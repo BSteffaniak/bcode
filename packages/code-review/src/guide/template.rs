@@ -184,9 +184,10 @@ fn built_in(name: &str) -> Option<ResolvedTemplate> {
     })
 }
 
-/// The template `name` (the configured default when `None`; `explain` instead of `default`
-/// for a review without a diff), resolved through its extends chain, with the configuration's
-/// `required_sections` applied to the default template.
+/// The template `name`, resolved through its extends chain.
+///
+/// Without a name it is the configured default (`explain` instead of `default` for a review
+/// without a diff). The configuration's `required_sections` apply to the default template.
 ///
 /// # Errors
 ///
@@ -236,7 +237,7 @@ pub fn resolve_template(
         base.required_sections.clone_from(required);
     }
     for (name, configured) in chain.into_iter().rev() {
-        base.name = name.to_owned();
+        name.clone_into(&mut base.name);
         if let Some(required) = &configured.required_sections {
             base.required_sections.clone_from(required);
         }

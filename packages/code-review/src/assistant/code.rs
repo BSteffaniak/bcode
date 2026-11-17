@@ -235,105 +235,16 @@ impl ReviewTools<'_> {
             .hunks)
     }
 
-    /// Search the code at one of the review's pinned revisions.
-    ///
-    /// # Errors
-    ///
-    /// * [`AssistantError::Invalid`] for an empty query, a symbol that is not an identifier, an
-    ///   invalid regular expression, or a path pattern leaving the repository.
-    /// * [`AssistantError::NotFound`] for an unknown source.
-    /// * [`AssistantError::Data`] when the repository cannot be read.
-    pub fn search_code(
+    /// Each match with whether its file is in the review and how its line relates to the
+    /// diff of source `index`.
+    fn relate_hits(
         &self,
         review: &OpenReview,
-        search: &CodeSearch,
-    ) -> Result<SearchView, AssistantError> {
-        let query = search.query.trim();
-        if query.is_empty() {
-            return Err(AssistantError::Invalid("`query` is required".to_owned()));
-        }
-        let index = Self::pick_source(review, search.source.as_deref(), search.side)?;
+        index: usize,
+        side: Side,
+        found: Matches,
+    ) -> Result<Vec<SearchHitView>, AssistantError> {
         let resolved = &review.resolved[index];
-        let revision = match search.side {
-            Side::New => resolved.head.clone(),
-            Side::Old => resolved.base.clone(),
-        };
-        let max = search
-            .max
-            .unwrap_or(DEFAULT_SEARCH_HITS)
-            .clamp(1, MAX_SEARCH_HITS);
-        let base = GrepQuery {
-            pattern: query,
-            mode: GrepMode::Fixed,
-            ignore_case: search.ignore_case,
-            paths: &search.paths,
-        };
-        let run = |query: &GrepQuery<'_>, max: usize| {
-            grep::grep(&review.repo_root, &revision, query, max).map_err(|error| match error {
-                crate::DataError::Git(message) => {
-                    AssistantError::Invalid(format!("the search failed: {message}"))
-                }
-                other => AssistantError::Data(other),
-            })
-        };
-        let mut found: Vec<(GrepHit, Option<&'static str>)> = Vec::new();
-        let truncated;
-        match search.mode {
-            SearchMode::Text | SearchMode::Word | SearchMode::Regex => {
-                let mode = match search.mode {
-                    SearchMode::Word => GrepMode::Word,
-                    SearchMode::Regex => GrepMode::Regex,
-                    _ => GrepMode::Fixed,
-                };
-                let (hits, more) = run(&GrepQuery { mode, ..base }, max)?;
-                truncated = more;
-                found.extend(hits.into_iter().map(|hit| (hit, None)));
-            }
-            SearchMode::Symbol => {
-                if !grep::is_identifier(query) {
-                    return Err(AssistantError::Invalid(format!(
-                        "a symbol search takes one identifier (letters, digits, _), not {query:?}; use mode text or regex"
-                    )));
-                }
-                let pattern = grep::definition_pattern(query);
-                let (definitions, more) = run(
-                    &GrepQuery {
-                        pattern: &pattern,
-                        mode: GrepMode::Regex,
-                        ..base
-                    },
-                    max,
-                )?;
-                let mut cut = more;
-                let seen: BTreeSet<(String, u32)> = definitions
-                    .iter()
-                    .map(|hit| (hit.path.clone(), hit.line))
-                    .collect();
-                let room = max - definitions.len();
-                found.extend(definitions.into_iter().map(|hit| (hit, Some("definition"))));
-                if room > 0 {
-                    let (references, more) = run(
-                        &GrepQuery {
-                            mode: GrepMode::Word,
-                            ..base
-                        },
-                        room + seen.len(),
-                    )?;
-                    let references: Vec<GrepHit> = references
-                        .into_iter()
-                        .filter(|hit| !seen.contains(&(hit.path.clone(), hit.line)))
-                        .collect();
-                    cut |= more || references.len() > room;
-                    found.extend(
-                        references
-                            .into_iter()
-                            .take(room)
-                            .map(|hit| (hit, Some("reference"))),
-                    );
-                }
-                truncated = cut;
-            }
-        }
         let listing = self.listing(review)?;
         let diff_files: BTreeMap<&str, &ReviewIndexEntry> = listing
             .entries
@@ -341,7 +252,7 @@ impl ReviewTools<'_> {
             .filter(|(owner, _)| *owner == index)
             .map(|(_, entry)| (entry.path.as_str(), entry))
             .collect();
-        let line_side = match search.side {
+        let line_side = match side {
             Side::New => ReviewLineSide::New,
             Side::Old => ReviewLineSide::Old,
         };
@@ -385,6 +296,38 @@ impl ReviewTools<'_> {
                 relation,
             });
         }
+        Ok(hits)
+    }
+
+    /// Search the code at one of the review's pinned revisions.
+    ///
+    /// # Errors
+    ///
+    /// * [`AssistantError::Invalid`] for an empty query, a symbol that is not an identifier, an
+    ///   invalid regular expression, or a path pattern leaving the repository.
+    /// * [`AssistantError::NotFound`] for an unknown source.
+    /// * [`AssistantError::Data`] when the repository cannot be read.
+    pub fn search_code(
+        &self,
+        review: &OpenReview,
+        search: &CodeSearch,
+    ) -> Result<SearchView, AssistantError> {
+        let query = search.query.trim();
+        if query.is_empty() {
+            return Err(AssistantError::Invalid("`query` is required".to_owned()));
+        }
+        let index = Self::pick_source(review, search.source.as_deref(), search.side)?;
+        let resolved = &review.resolved[index];
+        let revision = match search.side {
+            Side::New => resolved.head.clone(),
+            Side::Old => resolved.base.clone(),
+        };
+        let max = search
+            .max
+            .unwrap_or(DEFAULT_SEARCH_HITS)
+            .clamp(1, MAX_SEARCH_HITS);
+        let (found, truncated) = find_matches(&review.repo_root, &revision, search, query, max)?;
+        let hits = self.relate_hits(review, index, search.side, found)?;
         let note = if truncated {
             Some(format!(
                 "more than {max} matches; narrow the query or pass `paths`"
@@ -466,11 +409,11 @@ impl ReviewTools<'_> {
         let mut kept = Vec::new();
         let total = overlapping.len();
         for hunk in overlapping {
-            let size = u32::try_from(hunk.lines.len()).unwrap_or(u32::MAX);
-            if shown > 0 && shown.saturating_add(size) > MAX_HUNK_LINES {
+            let hunk_lines = u32::try_from(hunk.lines.len()).unwrap_or(u32::MAX);
+            if shown > 0 && shown.saturating_add(hunk_lines) > MAX_HUNK_LINES {
                 break;
             }
-            shown = shown.saturating_add(size);
+            shown = shown.saturating_add(hunk_lines);
             kept.push(hunk);
         }
         let kept_count = kept.len();
@@ -519,127 +462,31 @@ impl ReviewTools<'_> {
             kinds
         };
         let name = module_name(path);
-        let file_name = path.rsplit('/').next().unwrap_or(path).to_owned();
         let listing = self.listing(review)?;
         let mut files: Vec<RelatedFile> = Vec::new();
         let mut truncated = false;
-        let mut cut = false;
-        let mut push = |files: &mut Vec<RelatedFile>, found: String, kind, why: String| {
-            if found == path || files.iter().any(|file| file.path == found) {
-                return;
-            }
-            if files.len() >= max {
-                truncated = true;
-                return;
-            }
-            files.push(RelatedFile {
-                in_review: listing.paths.contains(&found),
-                path: found,
-                kind,
-                why,
-            });
-        };
-        let repo = &review.repo_root;
         for kind in kinds {
-            match kind {
-                RelatedKind::Tests => {
-                    let (candidates, _) =
-                        grep::list_paths(repo, &revision, MAX_TEST_CANDIDATES, |candidate| {
-                            candidate.contains(name.as_str())
-                        })?;
-                    for candidate in candidates {
-                        if let Some(why) = test_reason(path, &name, &candidate) {
-                            push(&mut files, candidate, RelatedKind::Tests, why);
-                        }
-                    }
+            let (found, more) =
+                related_of_kind(&review.repo_root, &revision, path, &name, kind, max)?;
+            truncated |= more;
+            for (found, why) in found {
+                if found == path || files.iter().any(|file| file.path == found) {
+                    continue;
                 }
-                RelatedKind::Callers => {
-                    let escaped = grep::escape_regex(&name);
-                    let pattern = format!(
-                        "(^|[^A-Za-z0-9_])(use|mod|import|from|require|include)[^A-Za-z0-9_].*(^|[^A-Za-z0-9_])({escaped})([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_]){escaped}::"
-                    );
-                    let (found, more) = grep::grep_files(
-                        repo,
-                        &revision,
-                        &GrepQuery {
-                            pattern: &pattern,
-                            mode: GrepMode::Regex,
-                            ignore_case: false,
-                            paths: &[],
-                        },
-                        max + 1,
-                    )?;
-                    cut |= more;
-                    for found in found {
-                        push(
-                            &mut files,
-                            found,
-                            RelatedKind::Callers,
-                            format!("imports or uses `{name}`"),
-                        );
-                    }
+                if files.len() >= max {
+                    truncated = true;
+                    break;
                 }
-                RelatedKind::Config => {
-                    let names = name_variants(&name);
-                    let pattern = format!(
-                        "(^|[^A-Za-z0-9_-])({})([^A-Za-z0-9_-]|$)",
-                        names
-                            .iter()
-                            .map(|name| grep::escape_regex(name))
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    );
-                    let globs: Vec<String> = ["**/*.toml", "**/*.yaml", "**/*.yml", "**/*.json"]
-                        .map(str::to_owned)
-                        .to_vec();
-                    let (found, more) = grep::grep_files(
-                        repo,
-                        &revision,
-                        &GrepQuery {
-                            pattern: &pattern,
-                            mode: GrepMode::Regex,
-                            ignore_case: false,
-                            paths: &globs,
-                        },
-                        max + 1,
-                    )?;
-                    cut |= more;
-                    for found in found {
-                        push(
-                            &mut files,
-                            found,
-                            RelatedKind::Config,
-                            format!("mentions `{}`", names.join("` or `")),
-                        );
-                    }
-                }
-                RelatedKind::Docs => {
-                    let globs = vec!["**/*.md".to_owned()];
-                    let (found, more) = grep::grep_files(
-                        repo,
-                        &revision,
-                        &GrepQuery {
-                            pattern: &file_name,
-                            mode: GrepMode::Fixed,
-                            ignore_case: false,
-                            paths: &globs,
-                        },
-                        max + 1,
-                    )?;
-                    cut |= more;
-                    for found in found {
-                        push(
-                            &mut files,
-                            found,
-                            RelatedKind::Docs,
-                            format!("mentions {file_name}"),
-                        );
-                    }
-                }
+                files.push(RelatedFile {
+                    in_review: listing.paths.contains(&found),
+                    path: found,
+                    kind,
+                    why,
+                });
             }
         }
         Ok(RelatedView {
-            truncated: truncated || cut,
+            truncated,
             path: path.to_owned(),
             revision: revision_label(&revision, &label_of(review, index), Side::New),
             name,
@@ -814,6 +661,16 @@ impl ReviewTools<'_> {
                 known.extend(version.base_oid);
             }
         }
+        self.guide_revisions(review, &mut known)?;
+        Ok(known)
+    }
+
+    /// Add the commit ids the review's guide versions are pinned to.
+    fn guide_revisions(
+        &self,
+        review: &OpenReview,
+        known: &mut BTreeSet<String>,
+    ) -> Result<(), AssistantError> {
         let (target, scope) = review.scope();
         let guides = self.store.list_guides(&ListReviewGuidesRequest {
             repo_path: review.repo_root.clone(),
@@ -850,8 +707,183 @@ impl ReviewTools<'_> {
                 }
             }
         }
-        Ok(known)
+        Ok(())
     }
+}
+
+/// Files of `kind` related to `path` (module `name`) at `revision`, with why each matched, and
+/// whether a search was cut at `max`.
+fn related_of_kind(
+    repo: &std::path::Path,
+    revision: &RevisionRef,
+    path: &str,
+    name: &str,
+    kind: RelatedKind,
+    max: usize,
+) -> Result<(Vec<(String, String)>, bool), AssistantError> {
+    let search = |pattern: &str, mode: GrepMode, globs: &[String]| {
+        grep::grep_files(
+            repo,
+            revision,
+            &GrepQuery {
+                pattern,
+                mode,
+                ignore_case: false,
+                paths: globs,
+            },
+            max + 1,
+        )
+    };
+    Ok(match kind {
+        RelatedKind::Tests => {
+            let (candidates, _) =
+                grep::list_paths(repo, revision, MAX_TEST_CANDIDATES, |candidate| {
+                    candidate.contains(name)
+                })?;
+            let tests = candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    test_reason(path, name, &candidate).map(|why| (candidate, why))
+                })
+                .collect();
+            (tests, false)
+        }
+        RelatedKind::Callers => {
+            let escaped = grep::escape_regex(name);
+            let pattern = format!(
+                "(^|[^A-Za-z0-9_])(use|mod|import|from|require|include)[^A-Za-z0-9_].*(^|[^A-Za-z0-9_])({escaped})([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_]){escaped}::"
+            );
+            let (found, more) = search(&pattern, GrepMode::Regex, &[])?;
+            let why = format!("imports or uses `{name}`");
+            (
+                found
+                    .into_iter()
+                    .map(|found| (found, why.clone()))
+                    .collect(),
+                more,
+            )
+        }
+        RelatedKind::Config => {
+            let names = name_variants(name);
+            let pattern = format!(
+                "(^|[^A-Za-z0-9_-])({})([^A-Za-z0-9_-]|$)",
+                names
+                    .iter()
+                    .map(|name| grep::escape_regex(name))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            );
+            let globs = ["**/*.toml", "**/*.yaml", "**/*.yml", "**/*.json"].map(str::to_owned);
+            let (found, more) = search(&pattern, GrepMode::Regex, &globs)?;
+            let why = format!("mentions `{}`", names.join("` or `"));
+            (
+                found
+                    .into_iter()
+                    .map(|found| (found, why.clone()))
+                    .collect(),
+                more,
+            )
+        }
+        RelatedKind::Docs => {
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            let (found, more) = search(file_name, GrepMode::Fixed, &["**/*.md".to_owned()])?;
+            let why = format!("mentions {file_name}");
+            (
+                found
+                    .into_iter()
+                    .map(|found| (found, why.clone()))
+                    .collect(),
+                more,
+            )
+        }
+    })
+}
+
+/// Matching lines, each with its kind for a symbol search.
+type Matches = Vec<(GrepHit, Option<&'static str>)>;
+
+/// Lines matching `search` at `revision`, at most `max` (definitions first, then references,
+/// for a symbol search), and whether there were more.
+fn find_matches(
+    repo_root: &std::path::Path,
+    revision: &RevisionRef,
+    search: &CodeSearch,
+    query: &str,
+    max: usize,
+) -> Result<(Matches, bool), AssistantError> {
+    let base = GrepQuery {
+        pattern: query,
+        mode: GrepMode::Fixed,
+        ignore_case: search.ignore_case,
+        paths: &search.paths,
+    };
+    let run = |query: &GrepQuery<'_>, max: usize| {
+        grep::grep(repo_root, revision, query, max).map_err(|error| match error {
+            crate::DataError::Git(message) => {
+                AssistantError::Invalid(format!("the search failed: {message}"))
+            }
+            other => AssistantError::Data(other),
+        })
+    };
+    let mut found: Vec<(GrepHit, Option<&'static str>)> = Vec::new();
+    let truncated;
+    match search.mode {
+        SearchMode::Text | SearchMode::Word | SearchMode::Regex => {
+            let mode = match search.mode {
+                SearchMode::Word => GrepMode::Word,
+                SearchMode::Regex => GrepMode::Regex,
+                _ => GrepMode::Fixed,
+            };
+            let (lines, cut) = run(&GrepQuery { mode, ..base }, max)?;
+            truncated = cut;
+            found.extend(lines.into_iter().map(|hit| (hit, None)));
+        }
+        SearchMode::Symbol => {
+            if !grep::is_identifier(query) {
+                return Err(AssistantError::Invalid(format!(
+                    "a symbol search takes one identifier (letters, digits, _), not {query:?}; use mode text or regex"
+                )));
+            }
+            let pattern = grep::definition_pattern(query);
+            let (definitions, more) = run(
+                &GrepQuery {
+                    pattern: &pattern,
+                    mode: GrepMode::Regex,
+                    ..base
+                },
+                max,
+            )?;
+            let mut cut = more;
+            let seen: BTreeSet<(String, u32)> = definitions
+                .iter()
+                .map(|hit| (hit.path.clone(), hit.line))
+                .collect();
+            let room = max - definitions.len();
+            found.extend(definitions.into_iter().map(|hit| (hit, Some("definition"))));
+            if room > 0 {
+                let (references, more) = run(
+                    &GrepQuery {
+                        mode: GrepMode::Word,
+                        ..base
+                    },
+                    room + seen.len(),
+                )?;
+                let references: Vec<GrepHit> = references
+                    .into_iter()
+                    .filter(|hit| !seen.contains(&(hit.path.clone(), hit.line)))
+                    .collect();
+                cut |= more || references.len() > room;
+                found.extend(
+                    references
+                        .into_iter()
+                        .take(room)
+                        .map(|hit| (hit, Some("reference"))),
+                );
+            }
+            truncated = cut;
+        }
+    }
+    Ok((found, truncated))
 }
 
 /// The pull request number of a source kind, for pull request and stack layer sources.

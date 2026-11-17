@@ -46,7 +46,7 @@ fn checks(ops: &[GuideOp]) -> Vec<CitationCheck> {
                 revision: RevisionRef::commit("0".repeat(40)),
                 blob_oid: None,
                 quote_hash: "h".to_owned(),
-                excerpt: request.quote.clone().unwrap_or_default(),
+                excerpt: request.quote.unwrap_or_default(),
                 relation: CitationRelation::Changed,
                 verification: Verification::Verified {
                     at_ms: 1,

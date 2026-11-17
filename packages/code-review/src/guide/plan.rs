@@ -149,7 +149,6 @@ pub fn plan(
     let depth = depth.unwrap_or(config.depth);
     let changed_lines: u64 = input.files.iter().map(|file| file.changed_lines).sum();
     let layers = input.layers.len().max(1);
-    let clusters_at_root = clusters(&input.files, &input.package_roots, 0);
     let metrics = PlanMetrics {
         files: input.files.len(),
         changed_lines,
@@ -162,46 +161,17 @@ pub fn plan(
             .len(),
         context_bytes: input.context_bytes,
     };
-    let small = input.files.len() <= config.single_max_files
-        && changed_lines <= config.single_max_lines
-        && layers <= 2;
-    let choice = strategy.unwrap_or(config.strategy);
-    let (strategy, reason) = match choice {
-        StrategyChoice::Single => (GuideStrategy::Single, "one agent, as asked".to_owned()),
-        StrategyChoice::FanOut if input.layers.len() >= 2 => (
-            GuideStrategy::PerLayer,
-            "one child per layer, as asked".to_owned(),
-        ),
-        StrategyChoice::FanOut => (GuideStrategy::Areas, "area children, as asked".to_owned()),
-        StrategyChoice::Auto if small => (
-            GuideStrategy::Single,
-            format!(
-                "{} files and {changed_lines} changed lines in {layers} layer(s) fit one agent (at most {} files, {} lines, 2 layers)",
-                input.files.len(),
-                config.single_max_files,
-                config.single_max_lines
-            ),
-        ),
-        StrategyChoice::Auto if input.layers.len() >= 3 => (
-            GuideStrategy::PerLayer,
-            format!(
-                "a stack stepped through {} layers: one child writes each layer's guide, then the stack guide links them",
-                input.layers.len()
-            ),
-        ),
-        StrategyChoice::Auto => (
-            GuideStrategy::Areas,
-            format!(
-                "{} files and {changed_lines} changed lines are more than one agent covers well; area children each write one part",
-                input.files.len()
-            ),
-        ),
-    };
+    let (strategy, reason) = choose(
+        input,
+        config,
+        strategy.unwrap_or(config.strategy),
+        changed_lines,
+    );
     let areas = match strategy {
         GuideStrategy::Single => Vec::new(),
         GuideStrategy::PerLayer => layer_areas(input),
         GuideStrategy::Areas => {
-            let mut grouped = clusters_at_root;
+            let mut grouped = clusters(&input.files, &input.package_roots, 0);
             let mut level = 0;
             while grouped.len() == 1 && level < MAX_CLUSTER_DEPTH {
                 level += 1;
@@ -249,6 +219,50 @@ pub fn plan(
         },
         areas,
         guidance: guidance(depth, input.without_diff),
+    }
+}
+
+/// The strategy `choice` comes to for `input`, and why.
+fn choose(
+    input: &PlanInput,
+    config: &GuideConfig,
+    choice: StrategyChoice,
+    changed_lines: u64,
+) -> (GuideStrategy, String) {
+    let layers = input.layers.len().max(1);
+    let small = input.files.len() <= config.single_max_files
+        && changed_lines <= config.single_max_lines
+        && layers <= 2;
+    match choice {
+        StrategyChoice::Single => (GuideStrategy::Single, "one agent, as asked".to_owned()),
+        StrategyChoice::FanOut if input.layers.len() >= 2 => (
+            GuideStrategy::PerLayer,
+            "one child per layer, as asked".to_owned(),
+        ),
+        StrategyChoice::FanOut => (GuideStrategy::Areas, "area children, as asked".to_owned()),
+        StrategyChoice::Auto if small => (
+            GuideStrategy::Single,
+            format!(
+                "{} files and {changed_lines} changed lines in {layers} layer(s) fit one agent (at most {} files, {} lines, 2 layers)",
+                input.files.len(),
+                config.single_max_files,
+                config.single_max_lines
+            ),
+        ),
+        StrategyChoice::Auto if input.layers.len() >= 3 => (
+            GuideStrategy::PerLayer,
+            format!(
+                "a stack stepped through {} layers: one child writes each layer's guide, then the stack guide links them",
+                input.layers.len()
+            ),
+        ),
+        StrategyChoice::Auto => (
+            GuideStrategy::Areas,
+            format!(
+                "{} files and {changed_lines} changed lines are more than one agent covers well; area children each write one part",
+                input.files.len()
+            ),
+        ),
     }
 }
 
@@ -432,7 +446,7 @@ mod tests {
         };
         let plan = plan(&input, &GuideConfig::default(), None, None);
         assert_eq!(plan.strategy, GuideStrategy::Single);
-        assert!(plan.areas.is_empty());
+        assert_eq!(plan.areas, Vec::new());
         assert!(!plan.estimate.needs_confirmation);
         assert!(!plan.verifier, "standard depth has no verifier by default");
     }

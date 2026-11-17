@@ -451,7 +451,7 @@ pub fn apply(
     if !errors.is_empty() {
         return Err(errors);
     }
-    prune_citations(&mut work.outline, &mut work.citations);
+    prune_citations(&work.outline, &mut work.citations);
     work.updated_at_ms = writer.now_ms;
     *version = work;
     Ok(outcome)
@@ -986,32 +986,29 @@ fn store_citation(
     outcome: &mut ApplyOutcome,
 ) -> Result<String, (&'static str, String)> {
     let mut citation = check.citation.clone();
-    let id = match wanted.map(str::trim).filter(|id| !id.is_empty()) {
-        Some(id) => {
-            check_id(id, "citation")?;
-            if let Some(existing) = doc.citations.get(id) {
-                let same = existing.path == citation.path
-                    && existing.side == citation.side
-                    && existing.lines == citation.lines
-                    && existing.source_id == citation.source_id;
-                if !same {
-                    return Err(invalid(format!(
-                        "citation id {id} is already {}:{}-{}; cite it as \"{id}\" or leave out the id",
-                        existing.path, existing.lines.start, existing.lines.end
-                    )));
-                }
+    let id = if let Some(id) = wanted.map(str::trim).filter(|id| !id.is_empty()) {
+        check_id(id, "citation")?;
+        if let Some(existing) = doc.citations.get(id) {
+            let same = existing.path == citation.path
+                && existing.side == citation.side
+                && existing.lines == citation.lines
+                && existing.source_id == citation.source_id;
+            if !same {
+                return Err(invalid(format!(
+                    "citation id {id} is already {}:{}-{}; cite it as \"{id}\" or leave out the id",
+                    existing.path, existing.lines.start, existing.lines.end
+                )));
             }
-            id.to_owned()
         }
-        None => {
-            let mut next = doc.citations.len() + 1;
-            loop {
-                let candidate = format!("c{next}");
-                if !doc.citations.contains_key(&candidate) {
-                    break candidate;
-                }
-                next += 1;
+        id.to_owned()
+    } else {
+        let mut next = doc.citations.len() + 1;
+        loop {
+            let candidate = format!("c{next}");
+            if !doc.citations.contains_key(&candidate) {
+                break candidate;
             }
+            next += 1;
         }
     };
     citation.id.clone_from(&id);
@@ -1102,25 +1099,22 @@ fn resolve_findings<'c>(
                 ids.push(id);
             }
         }
-        let id = match finding
+        let id = if let Some(id) = finding
             .id
             .as_deref()
             .map(str::trim)
             .filter(|id| !id.is_empty())
         {
-            Some(id) => {
-                check_id(id, "finding")?;
-                id.to_owned()
-            }
-            None => {
-                let mut next = used.len() + 1;
-                loop {
-                    let candidate = format!("f{next}");
-                    if !used.contains(&candidate) {
-                        break candidate;
-                    }
-                    next += 1;
+            check_id(id, "finding")?;
+            id.to_owned()
+        } else {
+            let mut next = used.len() + 1;
+            loop {
+                let candidate = format!("f{next}");
+                if !used.contains(&candidate) {
+                    break candidate;
                 }
+                next += 1;
             }
         };
         used.insert(id.clone());
@@ -1148,6 +1142,7 @@ fn rewrite_tokens(body: &str, listed: &[String]) -> Result<String, (&'static str
             return Ok(out);
         };
         let token = &after[..end];
+        out.push_str("[[");
         if let Ok(position) = token.trim().parse::<usize>() {
             let id = listed.get(position.wrapping_sub(1)).ok_or_else(|| {
                 invalid(format!(
@@ -1155,14 +1150,11 @@ fn rewrite_tokens(body: &str, listed: &[String]) -> Result<String, (&'static str
                     listed.len()
                 ))
             })?;
-            out.push_str("[[");
             out.push_str(id);
-            out.push_str("]]");
         } else {
-            out.push_str("[[");
             out.push_str(token);
-            out.push_str("]]");
         }
+        out.push_str("]]");
         rest = &after[end + 2..];
     }
     out.push_str(rest);
@@ -1277,29 +1269,25 @@ fn add_expansion(
 ) -> OpResult {
     let parent = find_section(doc.outline, &write.under)
         .ok_or_else(|| invalid(format!("no section {}", write.under)))?;
-    let id = match write
+    let id = if let Some(id) = write
         .id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        Some(id) => {
-            if find_section(doc.outline, id).is_some() {
-                return Err(invalid(format!("section {id} exists; choose another id")));
-            }
-            id.to_owned()
+        if find_section(doc.outline, id).is_some() {
+            return Err(invalid(format!("section {id} exists; choose another id")));
         }
-        None => {
-            let mut next = parent.children.len() + 1;
-            loop {
-                let candidate = format!("{}.x{next}", write.under);
-                if find_section(doc.outline, &candidate).is_none()
-                    && !doc.retired.contains(&candidate)
-                {
-                    break candidate;
-                }
-                next += 1;
+        id.to_owned()
+    } else {
+        let mut next = parent.children.len() + 1;
+        loop {
+            let candidate = format!("{}.x{next}", write.under);
+            if find_section(doc.outline, &candidate).is_none() && !doc.retired.contains(&candidate)
+            {
+                break candidate;
             }
+            next += 1;
         }
     };
     let section = SectionWrite {
@@ -1347,7 +1335,7 @@ pub fn body_tokens(body: &str) -> Vec<String> {
 }
 
 /// Drop citations nothing uses any more (no section, finding, check, or body token).
-fn prune_citations(outline: &mut [Section], citations: &mut BTreeMap<String, Citation>) {
+fn prune_citations(outline: &[Section], citations: &mut BTreeMap<String, Citation>) {
     let mut used: BTreeSet<String> = BTreeSet::new();
     for section in all_sections(outline) {
         used.extend(section.cited_ids().into_iter().map(str::to_owned));

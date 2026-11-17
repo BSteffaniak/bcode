@@ -19,19 +19,30 @@ struct Harness {
     fixture: GitFixture,
     state: tempfile::TempDir,
     plugin: crate::CodeReviewPlugin,
+    /// The plugin's `guide` table.
+    guide: Option<Value>,
 }
 
 impl Harness {
     fn new() -> Self {
+        Self::with_fixture(GitFixture::generate(FixtureSpec::small()))
+    }
+
+    fn with_fixture(fixture: GitFixture) -> Self {
         Self {
-            fixture: GitFixture::generate(FixtureSpec::small()),
+            fixture,
             state: tempfile::tempdir().expect("state"),
             plugin: crate::CodeReviewPlugin::default(),
+            guide: None,
         }
     }
 
     fn config(&self) -> Value {
-        json!({ "state_dir": self.state.path() })
+        let mut config = json!({ "state_dir": self.state.path() });
+        if let Some(guide) = &self.guide {
+            config["guide"] = guide.clone();
+        }
+        config
     }
 
     fn store(&self) -> ReviewStore {
@@ -1644,3 +1655,5 @@ fn create_review_can_list_ignored_files_and_find_paths_flags_weak_matches() {
         "the assistant reads the review as the app lists it: {files}"
     );
 }
+
+mod guide;

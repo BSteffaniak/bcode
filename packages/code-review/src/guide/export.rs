@@ -47,9 +47,11 @@ pub fn render_markdown(version: &GuideVersion, options: &ExportOptions<'_>) -> S
         let heads: Vec<String> = version
             .heads
             .values()
-            .map(|head| match head.head.commit_oid() {
-                Some(oid) => format!("{} @ {}", head.label, short(oid)),
-                None => format!("{} ({})", head.label, live_name(&head.head)),
+            .map(|head| {
+                head.head.commit_oid().map_or_else(
+                    || format!("{} ({})", head.label, live_name(&head.head)),
+                    |oid| format!("{} @ {}", head.label, short(oid)),
+                )
             })
             .collect();
         let _ = writeln!(out, "_Pinned to {}._\n", heads.join(", "));
