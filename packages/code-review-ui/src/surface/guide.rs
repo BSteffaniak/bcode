@@ -613,10 +613,10 @@ impl ReviewSurface {
     /// current revision, or the lines as cited at the revision they were cited at (also when the
     /// source is no longer in the review).
     fn peek_place(&self, target: &CiteTarget) -> (RevisionRef, ReviewLineInterval) {
-        let current = target
-            .moved()
-            .then(|| self.review.as_ref())
-            .flatten()
+        let current = self
+            .review
+            .as_ref()
+            .filter(|_| target.moved())
             .and_then(|review| {
                 let mut groups = review.doc.groups();
                 match target.source_id.as_deref() {

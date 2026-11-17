@@ -853,6 +853,41 @@ fn unsaved_reviews_keep_their_viewed_files_per_target() {
     assert_eq!(viewed(&scenario), 0, "the unsaved scope no longer has it");
 }
 
+/// Store a complete guide `guide-1` under `scope`.
+fn seed_guide(backend: &TestBackend, scope: &crate::notes::NoteScope) {
+    let _ = backend.call_now(bcode_code_review_models::CreateReviewGuideRequest {
+        repo_path: scope.repo_path.clone(),
+        target: scope.target.clone(),
+        scope: scope.scope.clone(),
+        guide: bcode_code_review_models::ReviewGuide {
+            guide_id: "guide-1".to_owned(),
+            review_key: String::new(),
+            scope: bcode_code_review_models::GuideScope::Review,
+            parent_guide_id: None,
+            title: "Walkthrough".to_owned(),
+            current_version: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            archived_at_ms: None,
+        },
+        version: bcode_code_review_models::GuideVersion {
+            guide_id: "guide-1".to_owned(),
+            version: 1,
+            schema_version: bcode_code_review_models::REVIEW_GUIDE_SCHEMA_VERSION,
+            heads: std::collections::BTreeMap::new(),
+            based_on: None,
+            origin: bcode_code_review_models::GuideOrigin::default(),
+            status: bcode_code_review_models::GuideStatus::Complete,
+            generation: None,
+            outline: Vec::new(),
+            citations: std::collections::BTreeMap::new(),
+            retired_sections: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        },
+    });
+}
+
 /// Saving an unsaved review moves every viewed mark, threads included, and its guides out of the
 /// unsaved scope: reopening the same target unsaved starts with nothing viewed and no guide.
 #[test]
@@ -898,37 +933,7 @@ fn saving_an_unsaved_review_leaves_no_viewed_threads_or_guides_behind() {
             .map(|record| record.guide.guide_id)
             .collect::<Vec<_>>()
     };
-    let _ = backend.call_now(bcode_code_review_models::CreateReviewGuideRequest {
-        repo_path: unsaved.repo_path.clone(),
-        target: unsaved.target.clone(),
-        scope: unsaved.scope.clone(),
-        guide: bcode_code_review_models::ReviewGuide {
-            guide_id: "guide-1".to_owned(),
-            review_key: String::new(),
-            scope: bcode_code_review_models::GuideScope::Review,
-            parent_guide_id: None,
-            title: "Walkthrough".to_owned(),
-            current_version: 1,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            archived_at_ms: None,
-        },
-        version: bcode_code_review_models::GuideVersion {
-            guide_id: "guide-1".to_owned(),
-            version: 1,
-            schema_version: bcode_code_review_models::REVIEW_GUIDE_SCHEMA_VERSION,
-            heads: std::collections::BTreeMap::new(),
-            based_on: None,
-            origin: bcode_code_review_models::GuideOrigin::default(),
-            status: bcode_code_review_models::GuideStatus::Complete,
-            generation: None,
-            outline: Vec::new(),
-            citations: std::collections::BTreeMap::new(),
-            retired_sections: Vec::new(),
-            created_at_ms: 1,
-            updated_at_ms: 1,
-        },
-    });
+    seed_guide(&backend, &unsaved);
     assert_eq!(guides(&unsaved), ["guide-1"]);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

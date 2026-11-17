@@ -869,20 +869,22 @@ fn a_peek_of_moved_lines_shows_them_where_they_are_now() {
     );
 }
 
+/// Give section `id` of `sections` (at any depth) `body`.
+fn set_body(sections: &mut [Section], id: &str, body: &str) {
+    for section in sections {
+        if section.id == id {
+            body.clone_into(&mut section.body);
+        }
+        set_body(&mut section.children, id, body);
+    }
+}
+
 #[test]
 fn a_section_body_shows_as_markdown_with_its_badges() {
     let (setup, _, _fixture) = guided(150, 40);
     let mut guide = setup.scenario.surface().guide().expect("guide").clone();
     let current = guide.current().expect("a section").id.clone();
     let body = "Uses **a token bucket** [[c1]]:\n\n- refills on `success`\n- 変更 drains on failure [[c2]]";
-    fn set_body(sections: &mut [Section], id: &str, body: &str) {
-        for section in sections {
-            if section.id == id {
-                body.clone_into(&mut section.body);
-            }
-            set_body(&mut section.children, id, body);
-        }
-    }
     set_body(&mut guide.version.outline, &current, body);
     let theme = ReviewTheme::derive(None, IconStyle::Unicode);
     let model = panel::build_model(

@@ -227,6 +227,38 @@ fn text_width(line: &Line) -> u16 {
     u16::try_from(line.width()).unwrap_or(u16::MAX)
 }
 
+/// The header's right-hand parts with their widths, in display order.
+fn right_parts(
+    model: &HeaderModel,
+    width: u16,
+    theme: &ReviewTheme,
+    items: &[MenuItem],
+) -> Vec<(HeaderPart, u16)> {
+    let guide_label = model.guide.clone().unwrap_or_default();
+    vec![
+        (
+            HeaderPart::Guide,
+            component_width(&chip(&guide_label), width),
+        ),
+        (HeaderPart::Totals, text_width(&model.totals_line(theme))),
+        (
+            HeaderPart::Viewed,
+            text_width(&Line::raw(model.viewed_text())),
+        ),
+        (HeaderPart::Progress, PROGRESS_CELLS),
+        (
+            HeaderPart::Threads,
+            text_width(&Line::raw(model.threads_text())),
+        ),
+        (
+            HeaderPart::Drafts,
+            text_width(&Line::raw(model.drafts_text())),
+        ),
+        (HeaderPart::Mode, text_width(&Line::raw(model.mode_text()))),
+        (HeaderPart::Publish, publish_button(items, theme).width()),
+    ]
+}
+
 /// Place the header parts in a row of `width` cells.
 #[must_use]
 pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> HeaderPlan {
@@ -250,29 +282,7 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
             left.push((part, component_width(&chip(source), width)));
         }
     }
-    let guide_label = model.guide.clone().unwrap_or_default();
-    let right: Vec<(HeaderPart, u16)> = vec![
-        (
-            HeaderPart::Guide,
-            component_width(&chip(&guide_label), width),
-        ),
-        (HeaderPart::Totals, text_width(&model.totals_line(theme))),
-        (
-            HeaderPart::Viewed,
-            text_width(&Line::raw(model.viewed_text())),
-        ),
-        (HeaderPart::Progress, PROGRESS_CELLS),
-        (
-            HeaderPart::Threads,
-            text_width(&Line::raw(model.threads_text())),
-        ),
-        (
-            HeaderPart::Drafts,
-            text_width(&Line::raw(model.drafts_text())),
-        ),
-        (HeaderPart::Mode, text_width(&Line::raw(model.mode_text()))),
-        (HeaderPart::Publish, publish_button(&items, theme).width()),
-    ];
+    let right = right_parts(model, width, theme, &items);
     let title = text_width(&Line::raw(format!(" {}", model.title)));
     let mut shown: Vec<HeaderPart> = left
         .iter()
@@ -380,18 +390,8 @@ pub fn paint_header(
                     theme.tiers.strong,
                 )]),
             ),
-            HeaderPart::Chip(index) => {
-                if let Some(source) = model.sources.get(*index) {
-                    cx.paint_component(&chip(source).styles(theme.badges), rect);
-                }
-            }
-            HeaderPart::MoreChips => {
-                cx.paint_component(
-                    &chip(&more)
-                        .severity(BadgeSeverity::Muted)
-                        .styles(theme.badges),
-                    rect,
-                );
+            HeaderPart::Chip(_) | HeaderPart::MoreChips | HeaderPart::Guide => {
+                paint_chip(model, *part, &more, theme, rect, cx);
             }
             HeaderPart::Totals => text(cx, model.totals_line(theme)),
             HeaderPart::Viewed => text(
@@ -445,12 +445,28 @@ pub fn paint_header(
             HeaderPart::Publish => {
                 publish_button(&items, theme).paint(PUBLISH_ID, rect, publish, cx);
             }
-            HeaderPart::Guide => {
-                if let Some(label) = &model.guide {
-                    cx.paint_component(&chip(label).styles(theme.badges), rect);
-                }
-            }
         }
+    }
+}
+
+/// Paint the header's pill `part` (a source, the `+N` pill reading `more`, or the guide) at
+/// `rect`.
+fn paint_chip(
+    model: &HeaderModel,
+    part: HeaderPart,
+    more: &str,
+    theme: &ReviewTheme,
+    rect: Rect,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let pill = match part {
+        HeaderPart::Chip(index) => model.sources.get(index).map(|source| chip(source)),
+        HeaderPart::MoreChips => Some(chip(more).severity(BadgeSeverity::Muted)),
+        HeaderPart::Guide => model.guide.as_deref().map(chip),
+        _ => None,
+    };
+    if let Some(pill) = pill {
+        cx.paint_component(&pill.styles(theme.badges), rect);
     }
 }
 

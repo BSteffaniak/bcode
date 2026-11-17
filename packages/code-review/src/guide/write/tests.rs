@@ -409,7 +409,7 @@ fn a_narrow_writer_never_replaces_a_citation_other_sections_use() {
     assert_ne!(stored, "c2", "the expansion's citation is stored apart");
     assert_eq!(version.citations[stored].excerpt, "wrong");
     let expansion = version.section("s3.1.x1").expect("expansion");
-    assert_eq!(expansion.citations, [stored.clone()]);
+    assert_eq!(expansion.citations, std::slice::from_ref(stored));
 
     let outcome = run(
         &mut version,

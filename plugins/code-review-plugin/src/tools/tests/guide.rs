@@ -933,7 +933,7 @@ fn a_citation_heavy_guide_reads_as_whole_json_within_the_output_bound() {
         .store()
         .update_guide_version(
             harness.fixture.root(),
-            guide.clone(),
+            guide,
             None,
             None,
             move |version| -> Result<(), String> {

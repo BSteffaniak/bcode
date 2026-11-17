@@ -247,7 +247,7 @@ impl ReviewSurface {
     }
 
     /// The answer of a `guide_show` call that waited for its guide to be read, once it has one.
-    pub fn take_guide_show_answer(&mut self) -> Option<Result<String, String>> {
+    pub const fn take_guide_show_answer(&mut self) -> Option<Result<String, String>> {
         self.guide.show_answer.take()
     }
 
