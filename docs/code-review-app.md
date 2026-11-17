@@ -302,7 +302,16 @@ review in the app once.
 | `code_review.summary` | read | Title, sources and the revisions they resolve to, stack layers, files and lines, viewed files, threads, suggestions. |
 | `code_review.list_files` | read | Files with status, added and removed lines, and whether each is viewed; `truncated` first names sources cut at `files.max_files`. |
 | `code_review.file_diff` | read | One file's diff as numbered lines with hunk headers (`context`, `max_lines`). |
-| `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). |
+| `code_review.file_content` | read | A file at the head (`side = "new"`) or base (`"old"`) revision, numbered (`start_line`, `count`). `revision` reads it instead at `head`, `base`, or a commit id the review knows (its sources' revisions, its stacks' layers, the recorded versions of its pull requests, or a guide's pinned heads); other refs are refused. |
+| `code_review.search_code` | read | Searches the code at the revisions the review shows (`filesystem.grep` reads the working tree instead): `query` as `text`, `word`, `regex` (POSIX extended), or `symbol` (definitions in Rust, Python, JavaScript/TypeScript and Go, then other uses). `paths` globs, `side`, `source`, `max` (100, at most 200), `ignore_case`. Each match says whether its file is in the review and how its line relates to it (`changed`, `hunk_context`, `unchanged`, `in_review`, `outside_review`). |
+| `code_review.diff_hunks` | read | Only the hunks of one file's diff that overlap `start_line`..`end_line` on `side` (every hunk without a range), numbered like `file_diff`. |
+| `code_review.related_files` | read | Files related to one file at the head of its source: `tests` (naming conventions), `callers` (files that import or use its module), `config` (TOML, YAML and JSON files naming it), `docs` (markdown naming it); each with why it matched and whether it is in the review. |
+| `code_review.guide.start` | guide | Starts a guided walkthrough of the review, a new version of one, or resumes a version (`mode`); pins the revisions on screen. See [Guided review](code-review-guide.md). |
+| `code_review.guide.write` | guide | Writes a guide version in one atomic batch of operations, checking inline citations; refused operations write nothing. |
+| `code_review.guide.get` | read | Reads a guide (outline, bodies, citations, freshness, areas, threads, versions, marks), bounded with named cuts. |
+| `code_review.guide.check` | read | Checks citations or a section without writing. |
+| `code_review.guide.plan` | read | Sizes the review and recommends one agent or a fan-out, with the template and context. |
+| `code_review.guide.export` | read | Renders a guide version as markdown with numbered citations. |
 | `code_review.list_threads` | read | The review's local threads (location, kind, severity, resolved, comments), pending suggestions, and a page of its pull requests' threads (`origin = "pull_request"`: pull request, authors, the first and latest comments, resolved, outdated, where each was written and where the review shows it). `include_resolved`, `path` (the file a thread was written on or is shown on, matched whole), `offset`, `limit` (50, at most 100); the page has `total`, `next_offset`, and how many resolved threads it left out. |
 | `code_review.get_thread` | read | One thread in full by `thread_id`: a local thread, or a pull request thread with its comments in order, links, and the diff hunk it was written on. |
 | `code_review.pull_request` | read, web | The pull request behind the review (by its pull request sources, else its branch): title, state, branches, review decision, CI checks, via the GitHub CLI with the user's credentials. |
@@ -379,7 +388,14 @@ dock (or the AI card) as above. The plan agent has the writes and `publish` turn
 calls also declare the resources they touch, so the path and web rules apply to them as well:
 
 * `file_diff` and `file_content` declare the file they read (resolved in the repository), so
-  read rules such as `[permission.read] "**/.env" = "deny"` deny them too.
+  read rules such as `[permission.read] "**/.env" = "deny"` deny them too. `diff_hunks` and
+  `related_files` declare their file, `search_code` its `paths` globs (or the repository when it
+  names none), `guide.write` and `guide.check` the files their citations name, and
+  `guide.start` and `guide.plan` the configured context files.
+* Guide tools (`guide.start`, `guide.write`) only change the review's guides, a derived and
+  versioned artifact: they are allowed by default, under the permission category
+  `code_review.guide`; set `"code_review.guide.write" = "ask"` to be asked. They are offered to
+  the `build` agent, not `plan`.
 * `pull_request` declares the repository's web address (its `origin` on GitHub), so web rules
   decide it; without a web rule that allows the address it asks. An exact-name `allow` alone
   does not skip the prompt; allow the address with a web rule instead.

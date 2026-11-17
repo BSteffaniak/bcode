@@ -65,8 +65,9 @@ planning live in `bcode_code_review::guide`.
   depth, template, directions, and a digest of the context used), its `status` (planning,
   generating, synthesizing, verifying, complete, failed, cancelled, superseded), optional
   `generation` progress (areas and their child sessions, tokens used), the `outline` (a tree of
-  sections), and the `citations` its sections share.
-* **`Section`**: a stable id (`s3`, `s3.1`, never reused within a guide), a kind (purpose, scope,
+  sections), the `citations` its sections share, and the ids of sections removed from it
+  (`retired_sections`, never used again in it).
+* **`Section`**: a stable id (`s3`, `s3.1`, never reused within its version), a kind (purpose, scope,
   reading order, step, topic, findings, layer link, expansion, note), a title, a markdown body
   with citation tokens `[[c7]]`, findings, citation ids in reading order, child sections, a state
   (planned, written, or provisional from an expand or ask), and verifier checks.
@@ -96,8 +97,8 @@ Per version or area: 200 sections, 1,000 citations, and 1 MiB of document JSON. 
 questions: 16 KiB. Writes over a bound are rejected with the bound named. The store also rejects
 structurally inconsistent documents: empty or duplicate section and finding ids, citation keys
 that differ from their citation's id, and sections, findings, or checks that cite an unknown
-citation id. That a section id is never reused within a guide is the write tool's to enforce,
-since it alone sees the edit history.
+citation id, and sections that use an id retired from the version. The write tool retires the
+ids of the sections it removes (with their children).
 
 ### Storage
 
@@ -174,8 +175,8 @@ sentence, and a structured suggestion.
 The checks are written against a small read interface, `CitationReader` (sources, diff files,
 hunks, file lines, path suggestions, symbol sites), so they are deterministic and tested without a
 repository. `ReviewDataReader` implements it over the review data layer, reading each listing and
-file once per batch; its symbol sites come from the code search tool once that exists, and until
-then a missing quote offers no symbol suggestions. Files over 200,000 lines, binary files, and
+file once per batch; its symbol sites are the symbol's definitions found by the code search at
+the cited revision (at most five). Files over 200,000 lines, binary files, and
 read errors are reported as `unreadable`.
 
 ## Freshness
@@ -205,35 +206,107 @@ pinned and current commits, range and quote hash), so repeated reads stay bounde
 ### Plugin tools (`code_review.*`)
 
 Everything that reads or writes durable guide data, or repository content at pinned revisions, is
-a code review plugin tool, so any session can use it under Bcode policy.
+a code review plugin tool, so any session can use it under Bcode policy. Each acts on the review
+the session is bound to, or the saved review named by `review`. The operations live in
+`bcode_code_review::assistant::guide` and `::code`; the plugin adapts arguments and declares
+what each call reads.
 
-* `code_review.guide.start` pins the heads from the session's binding and creates the guide or a
-  new version with status generating. An optional planned outline creates planned skeleton
-  sections straight away. It returns the guide id, version, heads, the grant, the resolved
-  context, and the template's required sections.
-* `code_review.guide.write` applies a batch of operations atomically against one row revision:
-  `set_outline`, `put_section`, `add_expansion`, `promote`, `discard`, `remove_section`,
-  `move_section`, `record_checks`, `area_result`, `set_status`. Citations are inline objects
-  (checked and assigned ids) or existing ids. It returns the new revision, sections written,
-  per-citation status and problems, and lint (missing required sections, citation tokens without
-  citations, sections without citations, boilerplate in adaptive sections).
-* `code_review.guide.get` reads a guide (outline, bodies, citations, freshness, areas, threads,
-  versions), bounded at 128 KiB with named cuts.
-* `code_review.guide.check` checks citations or a section without writing anything.
-* `code_review.guide.plan` returns size metrics, the recommended strategy and partition, cost
-  estimate inputs, the template's sections, and the resolved context.
-* `code_review.guide.export` renders markdown with numbered citations: pull request sources as
-  permalinks, others as `path:12-40 @ <short sha>`, verification as text.
-* General reads at the review's pinned revisions: `code_review.search_code` (`git grep` at the
-  head; text, word, regex, or symbol mode; each hit tagged with its relation to the review),
-  `code_review.diff_hunks` (only the hunks overlapping a range), `code_review.related_files`
-  (tests, callers, configuration, docs, each with why it matched), and a `revision` argument on
-  `code_review.file_content` limited to versions the stack timeline knows.
+`code_review.guide.start` (guide write)
+* Arguments: `guide_id`, `scope` (`{kind: review | stack | layer | since, layer, baseline}`),
+  `mode` (`new` | `new_version` | `resume`), `version` (to resume, or to base a new version on),
+  `copy` (a new version starts with a copy of its base's sections), `title`, `depth`,
+  `strategy` (`single` | `per_layer` | `areas`, recorded with the version), `template`,
+  `directions`, `outline` (planned sections: `{id, kind, key, title, children}`).
+* `new` creates a guide of the scope, or a new version when the scope already has one;
+  `new_version` forks the next version and makes it current; `resume` sets a version back to
+  generating and makes the calling session its writer.
+* Pins the heads the review's sources resolve to now (the first part of a source that resolves
+  to several), records the origin (session, depth, strategy, template, directions, context
+  digest), and plans the outline with `set_outline`.
+* Returns `{message, guide_id, title, version, revision, status, based_on, heads, grant,
+  outline, template: {name, required_sections, sections, adaptive_sections}, context, next}`.
+
+`code_review.guide.write` (guide write)
+* Arguments: `guide_id`, `version` (default: the version the session's grant names, else the
+  current one), `expected_revision`, `strict`, and `ops` (1 to 50), applied in order, all or
+  none:
+  * `set_outline {sections}`: the whole tree. New ids become planned sections; existing
+    sections keep their content (a planned section's kind and title may change). Sections left
+    out are removed and their ids retired.
+  * `put_section {id, parent, after, kind, key, title, body, citations, findings}`: creates a
+    section (kind and title required) or changes the fields given; a planned section becomes
+    written. `kind` is `purpose`, `scope`, `reading_order`, `step`, `findings`, `note`, `topic`
+    with `key`, or a catalog or template key such as `risks`.
+  * `add_expansion {under, id, title, body, citations, findings}`: a provisional expansion
+    (`<under>.x<n>` by default), from an ask when the grant is `Ask`.
+  * `promote {section}`, `discard {section}` (provisional sections only), `remove_section {id}`,
+    `move_section {id, parent, after}`.
+  * `record_checks {section, checks: [{claim, status, note, citations}]}`: replaces the
+    section's claim checks, recorded with the calling session.
+  * `area_result {area_id, sections, status, message}`: writes one fan-out area's row; sent
+    alone.
+  * `set_status {status: generating | complete | failed | cancelled, message}`.
+* Citations are inline objects `{id, source | layer, path, side, start_line, end_line, quote,
+  symbol, relation_hint}` (checked at the version's pinned heads and stored under the id
+  wanted when it is free or names the same lines, else the next free `c<n>`) or existing ids.
+  Finding citations may also be positions (from 1) in the operation's `citations`. Body tokens
+  are `[[c7]]` or `[[2]]` (the operation's second citation, rewritten to its id). Citations
+  nothing uses any more are dropped.
+* Returns `{written: true, guide_id, version, revision, status, sections_written, citations:
+  [{id, op_index, status, path, side, lines, relation, problems, warnings}], lint}`. A refusal
+  is an error result with `written: false` and either `errors: [{op_index, code, message}]`
+  (`outside_grant`, `invalid_op`), or `code`: `citation_problems` (strict, with every check),
+  `conflict` (with `current_revision`), or `invalid_document` (a bound or structure the store
+  refused). Nothing is written on a refusal.
+* Lint: `missing_required` (template sections), `planned_unwritten` (once complete),
+  `unknown_citation_token`, `uncited_section` (written steps, topics, findings sections and
+  expansions), `boilerplate` (an adaptive section that says only that there is nothing to say).
+
+`code_review.guide.get` (read)
+* Arguments: `guide_id` (default the review's only unarchived guide; with none or several, the
+  review's guides are listed), `version`, `sections` (bodies of only these), `include`
+  (`outline`, `bodies`, `citations` by default; also `freshness`, `areas`, `threads`,
+  `versions`, `marks`).
+* Fits 120 KiB of JSON: the outline is always whole; section bodies and then citations that do
+  not fit are left out and named in `cut`, as are large areas, threads, versions or marks.
+
+`code_review.guide.check` (read)
+* Arguments: `guide_id`, `version`, `citations` (at most 100), `section` (as `put_section`
+  would write it). Checks against the guide's pinned heads (the review's current heads when it
+  has no guide); a section is applied to a scratch copy and linted. Nothing is written.
+
+`code_review.guide.plan` (read)
+* Arguments: `strategy` (`auto` | `single` | `fan_out`), `depth`, `template`.
+* Returns `{plan: {strategy, reason, depth, verifier, metrics, areas, max_parallel, estimate,
+  guidance}, template, context}` (see [Orchestration](#orchestration)).
+
+`code_review.guide.export` (read)
+* Arguments: `guide_id`, `version`, `format` (`markdown` only), `sections`,
+  `include_unverified` (default true), `links` (`permalink` | `relative`).
+* Returns markdown (see [Export](#export)).
+
+General reads at the review's pinned revisions:
+* `code_review.search_code {query, mode: text | word | regex | symbol, paths, side, source, max,
+  ignore_case}`: `git grep` at the head (or base) of a source (the newest head by default; the
+  working tree or index for those heads), stopped past `max` (100, at most 200). A symbol search
+  finds definitions with per-language patterns, then other uses as a word. Each hit carries
+  `in_review` and `relation`.
+* `code_review.diff_hunks {path, source, side, start_line, end_line, context}`: the hunks
+  overlapping the range, numbered.
+* `code_review.related_files {path, kinds: [tests, callers, config, docs], source, max}`: at the
+  head of the file's source, each with why it matched.
+* `code_review.file_content` takes `revision`: `head`, `base`, or a commit id (at least seven hex
+  digits) among the review's sources, stack layers, recorded pull request versions, and guide
+  heads.
 
 ### Grants
 
 Each write operation is checked against the session's `GuideGrant`, recorded in its review
-binding:
+binding (`guide_grant`, set by the app). A grant names a guide and a version (the guide's current
+one when absent) and applies only to that version. Without a grant for the guide, a session may
+write, as `Generate`, only the versions whose origin is that session; `guide.start` with
+`resume` makes a session a version's writer. Starting or resuming versions of a guide is refused
+when the session's grant for it is narrower than `Generate`.
 
 | Grant | Allowed operations |
 |---|---|
@@ -242,7 +315,7 @@ binding:
 | `Refresh{ids}` | `put_section` on those sections |
 | `Verify` | `record_checks` |
 | `Area{a}` | `area_result` for `a` |
-| `Generate` | everything on its own version |
+| `Generate` | everything on its own version, except moving or removing written sections (and leaving them out of `set_outline`) |
 | `Restructure` | everything, including moving and removing written sections |
 
 A refused operation returns its index, the code `outside_grant`, and a sentence telling the model
@@ -250,9 +323,15 @@ what it may do instead.
 
 ### Permissions
 
-* Guide writes (`code_review.guide.*`) change only a versioned, derived artifact. They are
-  allowed by default like reads, under their own permission category `code_review.guide`, which
-  users can set to ask.
+* Guide writes (`code_review.guide.start`, `code_review.guide.write`) change only a versioned,
+  derived artifact. They are allowed by default like reads (a read-only policy operation that
+  does not require permission), under their own permission category `code_review.guide`; an
+  exact-name rule such as `"code_review.guide.write" = "ask"` asks. The `build` agent is offered
+  them; the read-only `plan` agent is not.
+* Every guide call declares what it reads, so read rules apply: `guide.write` and `guide.check`
+  the files their citations name, `guide.start` and `guide.plan` the configured context files
+  (an invocation reads only the context files its preparation declared), `search_code` its
+  path globs or the repository.
 * Fanning out to child sessions spends money: the `guide_fan_out` action asks unless allowed, or
   unless the reviewer started it from the panel.
 * Publishing always asks.
@@ -266,11 +345,20 @@ and counts of reviewed, verified and stale sections.
 
 ## Orchestration
 
-`guide::plan` is deterministic. With `strategy = "auto"`: small reviews (by changed lines, files
-and layers) get one streamed agent; a stepped stack of three or more layers gets per-layer
-children whose layer guides a stack guide links; anything else gets area children, clustered by
-package root and top directory and balanced by changed lines. `depth` (brief, standard, deep)
-adjusts sections, context reach, and whether a verifier pass runs.
+`guide::plan` is deterministic. With `strategy = "auto"`: a review within `single_max_files`,
+`single_max_lines` and two layers gets one streamed agent; a stack stepped through three or more
+layers gets per-layer children whose layer guides a stack guide links; anything else gets area
+children. Areas cluster the changed files by package root (the nearest directory holding a
+`Cargo.toml`, `package.json` or `pyproject.toml` at the newest head; the repository root does not
+count) or else by top directory, go up to three directory levels deeper when everything falls in
+one cluster, and pack the clusters into at most `max_children` areas, largest first into the
+lightest. A forced `single` is one agent; a forced `fan_out` is per layer for a stack of two or
+more stepped layers, else areas. `depth` (brief, standard, deep) adjusts what the guide covers
+(given as `guidance`), and `verify` decides the verifier (`deep`: only for deep guides).
+
+The estimate is made from the changed lines (60 bytes each), the context bytes, four bytes per
+token, a depth factor (1, 1.5, 2.5), 20,000 tokens for the writer and 30,000 per child; a fan-out
+whose estimate passes `confirm_above_tokens` needs confirmation.
 
 * **Streaming.** The writer calls `start` with a planned outline, then one `write` per section.
   Each finished call reaches the review app through tool reflection, which reloads just that
@@ -365,22 +453,41 @@ sections = [{ key = "threat_model", title = "Threat model",
               when = ["auth", "crypto", "**/permissions/**"] }]
 ```
 
-Configuration layers as usual (global, then project). Context files and directories are confined
-to the repository and read as `Read` operations, so path rules apply; invalid entries are reported
-and defaults used.
+Configuration layers as usual (global, then project). Each entry is read on its own
+(`guide::config`): an invalid one, or an unknown key, is reported and its default used, so one
+typo never disables guides. Bounds: 64 context files and directories, 64 context files read in
+all (a directory's files as the working tree lists them, tracked and untracked, not ignored),
+1 MiB of context content, 16 KiB of notes, 64 templates of 32 sections each.
+
+Context files and directories are confined to the repository (relative paths, no `..`, and a
+symbolic link must not lead outside it) and declared as reads, so path rules apply. Files are read
+from the working tree, or at the review's newest head with `context_at = "head"`, up to
+`max_context_bytes`; files past the bound are listed with their sizes only. The context's SHA-256
+digest (files, notes, and template) is stored in the version's origin.
+
+Templates resolve through `extends` (at most eight deep, without loops) to a built-in one:
+`default` (purpose, scope, reading order required), `explain` (the default for a review without a
+diff; adds architecture, entry points, invariants, risks), and `freeform` (purpose required). The
+configuration's `required_sections` apply to the default template.
 
 ## Export
 
-A guide can be copied or exported as markdown with numbered citations. Writing a file goes
-through the markdown file publisher with an output path inside the repository, so write-path rules
-apply.
+A guide can be copied or exported as markdown (`code_review.guide.export`): a `# title · vN`
+heading, the pinned heads, numbered sections (planned ones say they are not written yet;
+provisional ones are marked), findings as bullets, and citations numbered by first use and listed
+at the end with side, relation and verification as text. A citation of a GitHub pull request,
+stack layer or stack source at a commit links to its permalink; repository context links through
+the review's only forge repository when it has one; others render as `path:12-40 @ <short sha>`
+(or name the working tree or index). Without `include_unverified`, unverified citations and
+their tokens are left out. Writing a file goes through the markdown file publisher with an output
+path inside the repository, so write-path rules apply.
 
 ## Status
 
 | Phase | Scope | Built |
 |---|---|---|
 | P1 | Models, store, citation checks, freshness | Yes |
-| P2 | Plugin tools, grants in the review assistant binding, configuration and context | No |
+| P2 | Plugin tools, grants in the review assistant binding, configuration and context | Yes |
 | P3 | Read-only guide panel, diff markers, navigation | No |
 | P4 | Single-agent generation from the assistant, guide card, tab fallback | No |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | No |
