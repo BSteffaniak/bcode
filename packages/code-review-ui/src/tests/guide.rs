@@ -379,7 +379,11 @@ fn guide_panel_sits_beside_or_under_the_document_and_follows_resizes() {
     setup.scenario.resize(170, 40);
     let screen = stable(&mut setup.scenario);
     assert!(area(&setup.scenario, GUIDE_PANE_ID).is_some());
-    assert!(!screen.row_text(0).contains("Guide 1/6"), "{}", screen.text());
+    assert!(
+        !screen.row_text(0).contains("Guide 1/6"),
+        "{}",
+        screen.text()
+    );
 }
 
 #[test]
@@ -631,7 +635,8 @@ fn panel_screen(model: &crate::guide::PanelModel, beside: bool, width: u16, heig
     let theme = ReviewTheme::derive(None, IconStyle::Unicode);
     let scroll = Cell::new(0);
     let clicks: RefCell<Vec<PanelClick>> = RefCell::new(Vec::new());
-    let view = GuidePanelView::new("guide", model, &theme, beside, &scroll, &clicks);
+    let split = RefCell::new(panel::split_state());
+    let view = GuidePanelView::new("guide", model, &theme, beside, &scroll, &clicks, &split);
     paint(width, height, |area, cx| {
         let node = view.layout(
             Constraints::tight(Size::new(area.width, area.height)),
@@ -906,5 +911,55 @@ fn a_section_body_shows_as_markdown_with_its_badges() {
                 "{width} row {y}: {row:?}"
             );
         }
+    }
+}
+
+#[test]
+fn dragging_the_rule_resizes_the_outline_within_its_limits() {
+    use bmux_tui::event::{MouseButton, MouseEventKind};
+    let (mut setup, _, _fixture) = guided(170, 40);
+    setup.scenario.key("alt+g");
+    let screen = stable(&mut setup.scenario);
+    let outline_rows = |screen: &Screen| {
+        let mut rows: Vec<Rect> = guide_hits(screen)
+            .into_iter()
+            .filter(|(id, _)| id.contains(".row."))
+            .map(|(_, area)| area)
+            .collect();
+        rows.sort_by_key(|area| area.y);
+        rows
+    };
+    let rows = outline_rows(&screen);
+    assert_eq!(rows.len(), 6, "the whole outline shows: {}", screen.text());
+    let rule = rows[5].y + 1;
+    let x = rows[5].x + 2;
+    let drag = |setup: &mut Setup, from: u16, to: u16| {
+        setup
+            .scenario
+            .mouse(MouseEventKind::Down(MouseButton::Left), x, from);
+        setup
+            .scenario
+            .mouse(MouseEventKind::Drag(MouseButton::Left), x, to);
+        setup
+            .scenario
+            .mouse(MouseEventKind::Up(MouseButton::Left), x, to);
+        stable(&mut setup.scenario)
+    };
+    let screen = drag(&mut setup, rule, rule - 3);
+    let rows = outline_rows(&screen);
+    assert_eq!(rows.len(), 3, "the outline shrank: {}", screen.text());
+    // It never grows past its rows, however far the rule is dragged.
+    let rule = rows[2].y + 1;
+    let screen = drag(&mut setup, rule, rule + 20);
+    assert_eq!(outline_rows(&screen).len(), 6, "{}", screen.text());
+    // A resize keeps a dragged split within the panel.
+    setup.scenario.resize(120, 24);
+    let screen = stable(&mut setup.scenario);
+    let guide = area(&setup.scenario, GUIDE_PANE_ID).expect("guide");
+    for (id, hit) in guide_hits(&screen) {
+        assert!(
+            hit.bottom() <= guide.bottom() && hit.right() <= guide.right(),
+            "{id} {hit:?} outside {guide:?}"
+        );
     }
 }

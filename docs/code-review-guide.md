@@ -409,7 +409,10 @@ written through the plugin tools.
   Visibility and the sizes dragged are kept with the review's presentation state
   (`guide_panel_visible`, `guide_right_share`, `guide_bottom_share`).
   * Beside the document, the outline (numbers, titles, citation badges, and a state glyph) sits
-    above the current section; the outline scrolls to keep the current section in view.
+    above the current section; the outline scrolls to keep the current section in view. The
+    rule between them is the divider of a BMUX vertical panel group: dragging it resizes the
+    two (the outline at most its rows, the section at least three), two fifths for the outline
+    until dragged.
   * Under the document, the current section shows alone; its header says where it is (`3.1/9`).
   * Narrower than 24 columns, only the outline's numbers and titles show.
   * The current section shows its body as rendered markdown (citation tokens as badges, written
@@ -450,7 +453,6 @@ written through the plugin tools.
 * **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
   `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
   review theme's tiers.
-* **Not yet.** A draggable split between outline and section.
 
 ### Writing a guide from the assistant
 

@@ -5,7 +5,9 @@
 //! findings). [`GuidePanelView`] lays it out in the pane it is given:
 //!
 //! * Beside the document (and tall enough), the outline sits above the current section with a
-//!   rule between them; the outline scrolls to keep the current section in view.
+//!   rule between them; the outline scrolls to keep the current section in view. The rule is
+//!   the divider of a BMUX vertical panel group, so dragging it resizes the two within their
+//!   limits (the outline never taller than its rows, the section at least a few rows).
 //! * Under the document, only the current section shows; its header says where it is
 //!   (`3.1/9`).
 //! * Narrower than [`OUTLINE_ONLY_WIDTH`], only the outline shows, numbers and titles without
@@ -28,6 +30,10 @@ use bmux_tui::hit::HitRegion;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::text::{Line, Span, TextWrap, TextWrapGeometry, TrailingAlign, TrailingPlacement};
 use bmux_tui::text_width::display_width;
+use bmux_tui_components::panel_group::{
+    PanelDividerMode, PanelGroup, PanelGroupAxis, PanelGroupConstraints, PanelGroupOutcome,
+    PanelGroupPolicy, PanelGroupResizePolicy, PanelGroupState, PanelSize,
+};
 use std::cell::{Cell, RefCell};
 
 /// Narrower than this, the panel shows only the outline's numbers and titles.
@@ -197,6 +203,26 @@ pub struct GuidePanelView<'a> {
     /// Rows the current section is scrolled by.
     scroll: &'a Cell<u16>,
     clicks: &'a RefCell<Vec<PanelClick>>,
+    /// The split between the outline and the current section.
+    split: &'a RefCell<PanelGroupState>,
+}
+
+/// The split between the outline and the current section before it is dragged: two fifths for
+/// the outline.
+#[must_use]
+pub fn split_state() -> PanelGroupState {
+    PanelGroupState::new([PanelSize::Flex(2), PanelSize::Flex(3)])
+}
+
+/// The vertical group of the outline and the current section, its one-row divider the rule
+/// between them.
+const fn split_group() -> PanelGroup {
+    PanelGroup::new(PanelGroupAxis::Vertical)
+        .policy(PanelGroupPolicy {
+            resize: PanelGroupResizePolicy::live().preserving_flex(true),
+            ..PanelGroupPolicy::resize_only()
+        })
+        .divider_mode(PanelDividerMode::Gap)
 }
 
 impl<'a> GuidePanelView<'a> {
@@ -210,6 +236,7 @@ impl<'a> GuidePanelView<'a> {
         beside: bool,
         scroll: &'a Cell<u16>,
         clicks: &'a RefCell<Vec<PanelClick>>,
+        split: &'a RefCell<PanelGroupState>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -218,45 +245,56 @@ impl<'a> GuidePanelView<'a> {
             beside,
             scroll,
             clicks,
+            split,
         }
     }
 
-    fn geometry(&self, width: u16, height: u16) -> Geometry {
-        let mut top = 0;
-        let banner = self.model.banner.as_ref().filter(|_| height > 1).map(|_| {
-            top = 1;
-            0
-        });
+    /// The rows below the banner the outline and the current section share, when both show,
+    /// with the split's limits set for this outline.
+    fn split_area(&self, width: u16, height: u16) -> Option<Rect> {
+        let top = u16::from(self.model.banner.is_some() && height > 1);
         let rows = height.saturating_sub(top);
         let outline_rows = u16::try_from(self.model.outline.len()).unwrap_or(u16::MAX);
+        let combined = width >= OUTLINE_ONLY_WIDTH
+            && self.beside
+            && outline_rows > 0
+            && rows >= OUTLINE_AND_SECTION_HEIGHT;
+        if !combined {
+            return None;
+        }
+        self.split.borrow_mut().set_constraints([
+            PanelGroupConstraints::new(MIN_OUTLINE_ROWS.min(outline_rows), Some(outline_rows)),
+            PanelGroupConstraints::new(MIN_SECTION_ROWS, None),
+        ]);
+        Some(Rect::new(0, top, width, rows))
+    }
+
+    fn geometry(&self, width: u16, height: u16) -> Geometry {
+        let top = u16::from(self.model.banner.is_some() && height > 1);
+        let banner = (top == 1).then_some(0);
+        let rows = height.saturating_sub(top);
         let outline_only = width < OUTLINE_ONLY_WIDTH;
-        let combined =
-            !outline_only && self.beside && outline_rows > 0 && rows >= OUTLINE_AND_SECTION_HEIGHT;
-        let outline_height = if outline_only {
-            rows
-        } else if combined {
-            let share = (rows * 2 / 5).max(MIN_OUTLINE_ROWS);
-            outline_rows
-                .min(share)
-                .min(rows.saturating_sub(MIN_SECTION_ROWS + 1))
-        } else {
-            0
-        };
-        let outline = (outline_height > 0).then(|| {
+        let window = |outline_height: u16| {
             let current = self.model.current_row().unwrap_or(0);
             let visible = usize::from(outline_height);
             let max_first = self.model.outline.len().saturating_sub(visible);
-            let first = current.saturating_sub(visible / 2).min(max_first);
-            (top, outline_height, first)
-        });
-        let (rule, section) = if outline_only {
-            (None, None)
-        } else if combined {
-            let rule = top + outline_height;
-            let start = rule + 1;
-            (Some(rule), Some((start, height.saturating_sub(start))))
+            current.saturating_sub(visible / 2).min(max_first)
+        };
+        let (outline, rule, section) = if outline_only {
+            ((rows > 0).then(|| (top, rows, window(rows))), None, None)
+        } else if let Some(area) = self.split_area(width, height) {
+            let layout = split_group().layout(area, &self.split.borrow());
+            match (layout.panels.as_slice(), layout.dividers.first()) {
+                ([outline, section], Some(divider)) => (
+                    (outline.height > 0)
+                        .then(|| (outline.y, outline.height, window(outline.height))),
+                    Some(divider.y),
+                    Some((section.y, section.height)),
+                ),
+                _ => (None, None, Some((top, rows))),
+            }
         } else {
-            (None, Some((top, rows)))
+            (None, None, Some((top, rows)))
         };
         Geometry {
             banner,
@@ -536,6 +574,31 @@ impl Component for GuidePanelView<'_> {
         let (x, y) = cx.local_point(mouse.position);
         let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        // The rule between the outline and the section is the split's divider: a press on it
+        // and the drag that follows (wherever the pointer goes) resize the two.
+        if let Some(area) = self.split_area(width, height) {
+            let local = bmux_tui::event::MouseEvent {
+                position: bmux_tui::geometry::Point {
+                    x: u16::try_from(x.max(0)).unwrap_or(u16::MAX),
+                    y: u16::try_from(y.max(0)).unwrap_or(u16::MAX),
+                },
+                ..*mouse
+            };
+            let outcome = split_group().handle_event(
+                area,
+                &mut self.split.borrow_mut(),
+                &Event::Mouse(local),
+            );
+            match outcome {
+                PanelGroupOutcome::DividerDragStarted { .. }
+                | PanelGroupOutcome::Resized { .. }
+                | PanelGroupOutcome::DividerDragEnded { .. } => return EventOutcome::Handled,
+                PanelGroupOutcome::Redraw if mouse.kind != MouseEventKind::Move => {
+                    return EventOutcome::Handled;
+                }
+                _ => {}
+            }
+        }
         let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
             return EventOutcome::Ignored;
         };

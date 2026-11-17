@@ -79,6 +79,8 @@ pub(super) struct GuideUi {
     pub(super) scroll: Cell<u16>,
     /// Clicks the panel collected.
     pub(super) clicks: RefCell<Vec<PanelClick>>,
+    /// The split between the outline and the current section, as dragged.
+    pub(super) split: RefCell<bmux_tui_components::panel_group::PanelGroupState>,
     /// The context peek, when open.
     pub(super) peek: Option<Peek>,
     /// The guide load the next answer must come from.
@@ -126,6 +128,7 @@ impl GuideUi {
             pane: Cell::new(PaneState::new(Rect::default())),
             scroll: Cell::new(0),
             clicks: RefCell::new(Vec::new()),
+            split: RefCell::new(crate::guide::panel::split_state()),
             peek: None,
             generation: 0,
             prefer: None,

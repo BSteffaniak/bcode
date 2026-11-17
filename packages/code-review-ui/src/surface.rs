@@ -4888,6 +4888,7 @@ impl ReviewSurface {
             placement != super::panels::SidePlacement::Bottom,
             &self.guide.scroll,
             &self.guide.clicks,
+            &self.guide.split,
         );
         Self::pane(GUIDE_PANE_ID, chrome, focused, &self.guide.pane, view)
     }

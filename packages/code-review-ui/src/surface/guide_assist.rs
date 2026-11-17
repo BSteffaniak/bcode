@@ -476,6 +476,7 @@ impl ReviewSurface {
             true,
             &self.guide.scroll,
             &self.guide.clicks,
+            &self.guide.split,
         );
         Column::new()
             .id("guide.tab.column")
