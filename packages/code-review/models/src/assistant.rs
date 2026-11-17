@@ -6,7 +6,7 @@
 //! and the revisions its sources resolved to when the app last bound it, so tools read exactly
 //! what the app shows, including sources only a review-source provider can resolve.
 
-use crate::{ResolvedReviewStack, ResolvedSource, ResolvedStackLayer, ReviewWorkspace};
+use crate::{GuideGrant, ResolvedReviewStack, ResolvedSource, ResolvedStackLayer, ReviewWorkspace};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -53,6 +53,11 @@ pub struct ReviewAssistantBinding {
     /// `workspace` keeps the review it was last attached to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detached_at_ms: Option<u64>,
+    /// What the session may change in one guided-review guide, as its app last granted it.
+    /// Without a grant, a session may write only the guide versions it started (see
+    /// `docs/code-review-guide.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_grant: Option<GuideGrant>,
 }
 
 impl ReviewAssistantBinding {
@@ -82,6 +87,8 @@ struct BindingRecord {
     started: Option<ReviewAssistantTag>,
     #[serde(default)]
     detached_at_ms: Option<u64>,
+    #[serde(default)]
+    guide_grant: Option<GuideGrant>,
 }
 
 impl From<BindingRecord> for ReviewAssistantBinding {
@@ -101,6 +108,7 @@ impl From<BindingRecord> for ReviewAssistantBinding {
             updated_at_ms: record.updated_at_ms,
             started: record.started,
             detached_at_ms: record.detached_at_ms,
+            guide_grant: record.guide_grant,
         }
     }
 }

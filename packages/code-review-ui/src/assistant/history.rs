@@ -350,6 +350,7 @@ mod tests {
             updated_at_ms: updated,
             started: None,
             detached_at_ms: None,
+            guide_grant: None,
         }
     }
 

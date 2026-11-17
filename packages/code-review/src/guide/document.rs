@@ -75,6 +75,9 @@ pub enum GuideDocumentError {
         /// The missing citation id.
         citation: String,
     },
+    /// A section uses an id retired from the version.
+    #[error("section id {0} was removed from this version and is not used again")]
+    RetiredSection(String),
     /// An id is empty.
     #[error("{0} has an empty id")]
     EmptyId(&'static str),
@@ -95,7 +98,14 @@ pub fn check_version(version: &GuideVersion) -> Result<(), GuideDocumentError> {
             found: version.schema_version,
         });
     }
-    check_document(&version.outline, &version.citations)
+    check_document(&version.outline, &version.citations)?;
+    if let Some(section) = all_sections(&version.outline)
+        .into_iter()
+        .find(|section| version.retired_sections.contains(&section.id))
+    {
+        return Err(GuideDocumentError::RetiredSection(section.id.clone()));
+    }
+    Ok(())
 }
 
 /// Check a fan-out area's document.
@@ -333,6 +343,7 @@ mod tests {
             generation: None,
             outline: vec![section("s1", &["c1"])],
             citations: citations(&["c1"]),
+            retired_sections: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
         }

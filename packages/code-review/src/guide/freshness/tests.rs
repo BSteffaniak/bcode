@@ -197,6 +197,7 @@ fn a_guide_stays_fresh_through_a_rebase_and_notices_edits_and_deletions() {
             checks: Vec::new(),
         }],
         citations: BTreeMap::from([("c1".to_owned(), cited)]),
+        retired_sections: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,
     };

@@ -148,6 +148,9 @@ pub struct GuideVersion {
     /// Citations shared by the sections, by id.
     #[serde(default)]
     pub citations: BTreeMap<String, Citation>,
+    /// Ids of sections removed from this version, which it never uses again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_sections: Vec<String>,
     /// When created, in milliseconds since the Unix epoch.
     pub created_at_ms: u64,
     /// When last changed, in milliseconds since the Unix epoch.
@@ -161,6 +164,7 @@ impl GuideVersion {
         GuideDocument {
             outline: self.outline.clone(),
             citations: self.citations.clone(),
+            retired_sections: self.retired_sections.clone(),
         }
     }
 
@@ -204,6 +208,9 @@ pub struct GuideDocument {
     /// Citations, by id.
     #[serde(default)]
     pub citations: BTreeMap<String, Citation>,
+    /// Ids of sections removed, which are never used again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_sections: Vec<String>,
 }
 
 /// One source's pinned revisions.

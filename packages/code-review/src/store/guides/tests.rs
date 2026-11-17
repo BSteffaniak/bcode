@@ -78,6 +78,7 @@ fn version(guide_id: &str) -> GuideVersion {
         generation: None,
         outline: vec![section("s1")],
         citations: BTreeMap::new(),
+        retired_sections: Vec::new(),
         created_at_ms: 0,
         updated_at_ms: 0,
     }

@@ -126,6 +126,7 @@ fn worker(role: &str, repo: &Path, state: &Path, run_for: Duration) -> Vec<Strin
                         updated_at_ms: 0,
                         started: None,
                         detached_at_ms: None,
+                        guide_grant: None,
                     },
                 })
                 .map(drop)

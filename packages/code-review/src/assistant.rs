@@ -135,6 +135,8 @@ pub struct OpenReview {
     pub stacks: Vec<ResolvedReviewStack>,
     /// The session the review was opened for, when it came from a binding.
     pub session_id: Option<String>,
+    /// What the session's binding lets it change in a guided-review guide.
+    pub guide_grant: Option<bcode_code_review_models::GuideGrant>,
 }
 
 impl OpenReview {
@@ -463,7 +465,7 @@ impl<'a> ReviewTools<'a> {
         repo_path: &Path,
         review: &ReviewRef,
     ) -> Result<OpenReview, AssistantError> {
-        let (mut workspace, resolved, stacks, session_id) = match review {
+        let (mut workspace, resolved, stacks, session_id, guide_grant) = match review {
             ReviewRef::Session(session_id) => {
                 let binding = self
                     .store
@@ -489,13 +491,14 @@ impl<'a> ReviewTools<'a> {
                     binding.resolved,
                     binding.stacks.to_stacks(),
                     Some(session_id.clone()),
+                    binding.guide_grant,
                 )
             }
             ReviewRef::Workspace(id) => {
                 let workspace = self.saved(repo_path, id)?.ok_or_else(|| {
                     AssistantError::NotFound(format!("no saved review has id {id}"))
                 })?;
-                (workspace, Vec::new(), Vec::new(), None)
+                (workspace, Vec::new(), Vec::new(), None, None)
             }
         };
         // Durable reviews are read again (their viewed state may have changed); unsaved ones
@@ -520,6 +523,7 @@ impl<'a> ReviewTools<'a> {
             resolved,
             stacks,
             session_id,
+            guide_grant,
         })
     }
 

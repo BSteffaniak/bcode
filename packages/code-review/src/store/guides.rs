@@ -226,6 +226,7 @@ fn version_from_row(row: &Row) -> Result<GuideVersionRecord, StoreError> {
                 .transpose()?,
             outline: document.outline,
             citations: document.citations,
+            retired_sections: document.retired_sections,
             created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
             updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
         },
@@ -316,10 +317,7 @@ impl VersionColumns {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
-            document: serde_json::to_string(&GuideDocument {
-                outline: version.outline.clone(),
-                citations: version.citations.clone(),
-            })?,
+            document: serde_json::to_string(&version.document())?,
         })
     }
 }
@@ -785,6 +783,7 @@ impl CodeReviewDb<'_> {
         let document = serde_json::to_string(&GuideDocument {
             outline: area.outline.clone(),
             citations: area.citations.clone(),
+            retired_sections: Vec::new(),
         })?;
         let now = now_ms();
         let Some(expected) = expected else {

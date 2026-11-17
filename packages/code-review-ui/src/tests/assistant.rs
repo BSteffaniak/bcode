@@ -668,6 +668,7 @@ fn the_history_lists_every_conversation_and_switches_to_the_one_searched() {
         updated_at_ms: 0,
         started: None,
         detached_at_ms: None,
+        guide_grant: None,
     };
     let _ = setup.backend.call_now(BindReviewAssistantRequest {
         repo_path: setup.other.repo_root.clone(),

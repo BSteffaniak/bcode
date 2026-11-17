@@ -148,6 +148,7 @@ impl Harness {
                     updated_at_ms: 0,
                     started: None,
                     detached_at_ms: None,
+                    guide_grant: None,
                 },
             })
             .expect("bind");
