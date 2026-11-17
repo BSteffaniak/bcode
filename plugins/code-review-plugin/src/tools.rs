@@ -630,9 +630,10 @@ fn prepare(
     }
     // Arguments the model got wrong fail at invocation with a clear message; here they only
     // decide which resources the call declares.
-    let arguments =
-        serde_json::from_value::<Arguments>(without_blanks(request.invocation.arguments.clone()))
-            .unwrap_or_default();
+    // Blank values are removed exactly as the invocation removes them, so what is declared
+    // here is what the invocation reads.
+    let cleaned = without_blanks(request.invocation.arguments.clone());
+    let arguments = serde_json::from_value::<Arguments>(cleaned.clone()).unwrap_or_default();
     let output_path = match (access, arguments.output_path.as_deref()) {
         (Access::Publish, Some(path)) if !path.is_empty() => {
             Some(inside(&workspace.working_directory, path, "output_path")?)
@@ -643,12 +644,8 @@ fn prepare(
     let (requires_permission, operation, category) = match access {
         Access::Read | Access::Guide if guide::TOOLS.contains(&definition.name.as_str()) => {
             let root = repository_root(&workspace.working_directory);
-            let (resources, declared) = guide::declared(
-                &definition.name,
-                &root,
-                &request.invocation.arguments,
-                guide_config,
-            )?;
+            let (resources, declared) =
+                guide::declared(&definition.name, &root, &cleaned, guide_config)?;
             context = declared;
             let operation = if resources.is_empty() {
                 ToolPolicyOperation::ReadOnly

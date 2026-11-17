@@ -346,15 +346,19 @@ fn parse_ops(ops: &[Value]) -> Result<Vec<GuideOp>, AssistantError> {
 }
 
 /// Paths of the inline citations of a write or check, as written.
-fn citation_paths(name: &str, arguments: &Value) -> Vec<String> {
-    let parsed: GuideArguments = serde_json::from_value(arguments.clone()).unwrap_or_default();
+///
+/// # Errors
+///
+/// * A message for operations that cannot be read: the invocation could not run them either,
+///   and their citations would otherwise go undeclared.
+fn citation_paths(name: &str, parsed: &GuideArguments) -> Result<Vec<String>, String> {
     let mut requests: Vec<CitationRequest> = match name {
-        "code_review.guide.write" => parse_ops(&parsed.ops)
-            .map(|ops| batch_citations(&ops))
-            .unwrap_or_default(),
+        "code_review.guide.write" => {
+            batch_citations(&parse_ops(&parsed.ops).map_err(|error| error.to_string())?)
+        }
         _ => parsed.citations.clone(),
     };
-    if let Some(section) = parsed.section {
+    if let Some(section) = parsed.section.clone() {
         requests.extend(batch_citations(&[GuideOp::PutSection(section)]));
     }
     let mut paths: Vec<String> = Vec::new();
@@ -363,14 +367,19 @@ fn citation_paths(name: &str, arguments: &Value) -> Vec<String> {
             paths.push(request.path);
         }
     }
-    paths
+    Ok(paths)
 }
 
 /// The resources a call of `name` declares besides being read-only (or a guide write), and the
 /// context files it may read.
 ///
+/// `arguments` are the ones the invocation receives (blank values already removed), so every
+/// path the invocation reads is one declared here. Arguments that cannot be read are refused
+/// rather than declaring nothing.
+///
 /// # Errors
 ///
+/// * A message for arguments or operations that cannot be read.
 /// * A message for a path that leaves the repository.
 pub fn declared(
     name: &str,
@@ -378,7 +387,8 @@ pub fn declared(
     arguments: &Value,
     config: &GuideConfig,
 ) -> Result<(Vec<ToolPolicyOperation>, Option<DeclaredContextPaths>), String> {
-    let parsed: GuideArguments = serde_json::from_value(arguments.clone()).unwrap_or_default();
+    let parsed: GuideArguments = serde_json::from_value(arguments.clone())
+        .map_err(|error| format!("invalid arguments: {error}"))?;
     let mut paths: Vec<String> = Vec::new();
     let mut context = None;
     match name {
@@ -397,7 +407,7 @@ pub fn declared(
             }
         }
         "code_review.guide.write" | "code_review.guide.check" => {
-            for path in citation_paths(name, arguments) {
+            for path in citation_paths(name, &parsed)? {
                 paths.push(inside(root, &path, "path")?.display().to_string());
             }
         }

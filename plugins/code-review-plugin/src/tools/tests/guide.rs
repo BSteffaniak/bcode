@@ -212,6 +212,74 @@ fn reads_declare_the_paths_they_read_so_deny_rules_apply() {
 }
 
 #[test]
+fn blank_arguments_never_hide_the_paths_a_call_reads() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let secret = harness
+        .fixture
+        .root()
+        .join("src/.env")
+        .display()
+        .to_string();
+    let cited = json!([{"path": "src/.env", "side": "", "start_line": 1, "end_line": 1}]);
+    for (tool, arguments) in [
+        (
+            "code_review.guide.write",
+            json!({"guide_id": "g", "strict": "", "ops": [{"op": "put_section", "id": "s1",
+            "citations": [{"path": "src/.env", "start_line": 1, "end_line": 3}]}]}),
+        ),
+        (
+            "code_review.guide.write",
+            json!({"guide_id": "g", "ops": [{"op": "put_section", "id": "s1", "citations": cited}]}),
+        ),
+        ("code_review.guide.check", json!({"citations": cited})),
+        (
+            "code_review.guide.check",
+            json!({"section": {"id": "s1", "citations": cited}, "version": ""}),
+        ),
+        (
+            "code_review.diff_hunks",
+            json!({"path": "src/.env", "side": ""}),
+        ),
+        (
+            "code_review.search_code",
+            json!({"query": "x", "mode": "", "paths": ["src/.env"]}),
+        ),
+    ] {
+        let operation =
+            harness.prepare(tool, &arguments, SESSION).authorization[0].metadata["operation"]
+                .to_string();
+        assert!(
+            operation.contains(&secret),
+            "{tool} {arguments}: {operation}"
+        );
+    }
+    for (tool, arguments) in [
+        (
+            "code_review.guide.write",
+            json!({"guide_id": "g", "strict": "yes", "ops": [{"op": "put_section", "id": "s1",
+            "citations": [{"path": "src/.env", "start_line": 1, "end_line": 1}]}]}),
+        ),
+        (
+            "code_review.guide.write",
+            json!({"guide_id": "g", "ops": [{"op": "no_such_op"}]}),
+        ),
+        (
+            "code_review.diff_hunks",
+            json!({"path": "src/.env", "side": "sideways"}),
+        ),
+    ] {
+        assert!(
+            harness
+                .prepare_raw(tool, &arguments, SESSION)
+                .error
+                .is_some(),
+            "{tool} {arguments}: unreadable arguments are refused, not declared as nothing"
+        );
+    }
+}
+
+#[test]
 fn a_guide_is_started_written_read_checked_and_exported() {
     let mut harness = Harness::new();
     harness.bind(SESSION);
