@@ -43,6 +43,15 @@ use bmux_tui::text::{Line, Span, Text};
 use bmux_tui_components::status_bar::StatusSeverity;
 use std::sync::Arc;
 
+/// What a `guide_show` call did at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuideShowOutcome {
+    /// It ran: what it did.
+    Done(String),
+    /// It waits for the guide it names to be read.
+    Waiting,
+}
+
 /// The message that asks the assistant for a walkthrough.
 pub const WALKTHROUGH: &str = "Walk me through this review.";
 /// The start of the message the reviewer finishes with directions.
@@ -182,7 +191,8 @@ impl ReviewSurface {
     // ----------------------------------------------------------------------------------------
 
     /// Run `bcode.code-review.guide_show`: open the guide and move through it as the keys do.
-    /// Returns what it did.
+    /// Returns what it did, or that it waits for the guide it names to be read; the answer then
+    /// comes from [`Self::take_guide_show_answer`].
     ///
     /// # Errors
     ///
@@ -192,7 +202,7 @@ impl ReviewSurface {
         &mut self,
         arguments: &GuideShowArguments,
         host: &UiContext,
-    ) -> Result<String, String> {
+    ) -> Result<GuideShowOutcome, String> {
         let shown = self
             .guide
             .state
@@ -206,11 +216,12 @@ impl ReviewSurface {
         if let Some(wanted) = wanted
             && shown.as_deref() != Some(wanted)
         {
-            // A guide just started may not be read yet: read the guides again either way.
+            // A guide just started may not be read yet: read the guides again either way, and
+            // answer once they are.
             self.guide.prefer = Some(Prefer::Guide(wanted.to_owned()));
             self.reload_guide();
-            self.guide.pending_show = Some(arguments.clone());
-            return Ok(format!("reading guide {wanted}; it shows once read"));
+            self.wait_for_guide_show(arguments);
+            return Ok(GuideShowOutcome::Waiting);
         }
         if shown.is_none() {
             return match &self.guide.state.load {
@@ -219,35 +230,61 @@ impl ReviewSurface {
                     .to_owned()),
                 GuideLoad::Failed(error) => Err(format!("the guide could not be read: {error}")),
                 GuideLoad::Idle | GuideLoad::Loading => {
-                    self.guide.pending_show = Some(arguments.clone());
-                    Ok("reading the guide; it shows once read".to_owned())
+                    self.wait_for_guide_show(arguments);
+                    Ok(GuideShowOutcome::Waiting)
                 }
             };
         }
         self.show_in_guide(arguments, host)
+            .map(GuideShowOutcome::Done)
     }
 
-    /// Run a `guide_show` call that waited for its guide to be read.
+    /// Hold `arguments` until the guide is read, in place of any call waiting before (whose
+    /// caller answers it as replaced) and of an answer nobody took.
+    fn wait_for_guide_show(&mut self, arguments: &GuideShowArguments) {
+        self.guide.pending_show = Some(arguments.clone());
+        self.guide.show_answer = None;
+    }
+
+    /// The answer of a `guide_show` call that waited for its guide to be read, once it has one.
+    pub fn take_guide_show_answer(&mut self) -> Option<Result<String, String>> {
+        self.guide.show_answer.take()
+    }
+
+    /// Run a `guide_show` call that waited for its guide to be read, and keep its answer: what
+    /// it showed, or that the review has no such guide.
     pub(super) fn run_pending_guide_show(&mut self, host: &UiContext) {
         if self.guide.state.loading || self.guide.state.load != GuideLoad::Ready {
+            if let GuideLoad::Failed(error) = &self.guide.state.load
+                && self.guide.pending_show.take().is_some()
+            {
+                self.guide.show_answer = Some(Err(format!("the guide could not be read: {error}")));
+            }
             return;
         }
         let Some(arguments) = self.guide.pending_show.take() else {
             return;
         };
-        let wanted = arguments.guide_id.as_deref();
+        let wanted = arguments
+            .guide_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty());
         let shown = self
             .guide
             .state
             .active
             .as_ref()
             .map(|active| active.guide.guide_id.as_str());
-        if shown.is_none() || wanted.is_some_and(|wanted| Some(wanted) != shown) {
-            return;
-        }
-        if let Err(error) = self.show_in_guide(&arguments, host) {
-            self.set_status(error, StatusSeverity::Warning);
-        }
+        let answer = match (wanted, shown) {
+            (_, None) => Err("this review has no guide yet; write one with \
+                 code_review.guide.plan, code_review.guide.start and code_review.guide.write"
+                .to_owned()),
+            (Some(wanted), Some(shown)) if wanted != shown => Err(format!(
+                "this review has no guide {wanted}; code_review.guide.get lists its guides"
+            )),
+            _ => self.show_in_guide(&arguments, host),
+        };
+        self.guide.show_answer = Some(answer);
     }
 
     /// `guide_show` on the guide on screen.

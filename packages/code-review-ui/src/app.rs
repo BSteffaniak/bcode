@@ -122,6 +122,8 @@ pub struct ReviewApp {
     tool_work: Arc<Mutex<Vec<ToolWork>>>,
     /// An `open_review` waiting for its review to load before moving to a place in it.
     awaiting: Option<Awaiting>,
+    /// A `guide_show` call waiting for the guide it names to be read.
+    awaiting_guide: Option<(tokio::sync::oneshot::Sender<ClientToolReply>, Instant)>,
     /// An assistant move waiting for the review on screen to close.
     leaving: Option<Leaving>,
     /// Whether the last frame showed the screen (the zoomed assistant covers it otherwise).
@@ -220,6 +222,7 @@ impl ReviewApp {
             button: None,
             tool_work: Arc::default(),
             awaiting: None,
+            awaiting_guide: None,
             leaving: None,
             screen_shown: true,
         };
@@ -1047,6 +1050,10 @@ impl ReviewApp {
                 self.open_for_tool(&arguments, reply, host);
                 return;
             }
+            actions::GUIDE_SHOW => {
+                self.guide_show_for_tool(&arguments, reply, host);
+                return;
+            }
             actions::REFRESH => match &mut self.route {
                 Route::Home => {
                     if let Some(home) = self.home.as_mut() {
@@ -1067,8 +1074,7 @@ impl ReviewApp {
             | actions::SET_VIEW
             | actions::COMPLETE_PASS
             | actions::PULL_REQUEST_REVIEW
-            | actions::PUBLISH
-            | actions::GUIDE_SHOW => self.review_tool(&tool, &arguments, host),
+            | actions::PUBLISH => self.review_tool(&tool, &arguments, host),
             other => Self::refused(
                 "unknown_tool",
                 format!("the review app has no tool {other}"),
@@ -1107,8 +1113,6 @@ impl ReviewApp {
             actions::PUBLISH => {
                 review.assistant_command(crate::surface::ReviewCommand::Publish, host)
             }
-            actions::GUIDE_SHOW => parse::<actions::GuideShowArguments>(arguments)
-                .and_then(|show| review.assistant_guide_show(&show, host)),
             _ => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -1133,6 +1137,76 @@ impl ReviewApp {
             Ok(done) => self.screen_answer(&done),
             Err(message) => Self::refused("refused", message),
         }
+    }
+
+    /// Run `guide_show`: answered at once, or once the guide it names was read (a guide just
+    /// started may not be yet), saying when the review has no such guide.
+    fn guide_show_for_tool(
+        &mut self,
+        arguments: &str,
+        reply: tokio::sync::oneshot::Sender<ClientToolReply>,
+        host: &UiContext,
+    ) {
+        let Route::Review(review) = &mut self.route else {
+            let _ = reply.send(Self::refused(
+                "no_review",
+                "no review is on screen; open one with bcode.code-review.open_review",
+            ));
+            return;
+        };
+        let arguments = if arguments.trim().is_empty() {
+            "{}"
+        } else {
+            arguments
+        };
+        let outcome = parse::<crate::assistant::actions::GuideShowArguments>(arguments)
+            .and_then(|show| review.assistant_guide_show(&show, host));
+        match outcome {
+            Ok(crate::surface::GuideShowOutcome::Done(done)) => {
+                let _ = reply.send(self.screen_answer(&done));
+            }
+            Ok(crate::surface::GuideShowOutcome::Waiting) => {
+                if let Some((earlier, _)) = self.awaiting_guide.replace((reply, Instant::now())) {
+                    let _ = earlier.send(Self::refused(
+                        "replaced",
+                        "a later guide_show replaced this one before its guide was read",
+                    ));
+                }
+            }
+            Err(message) => {
+                let _ = reply.send(Self::refused("refused", message));
+            }
+        }
+    }
+
+    /// Answer a waiting `guide_show` once the review has its answer, or once it waited too long
+    /// or the review was left. Returns whether it answered.
+    fn finish_guide_show(&mut self) -> bool {
+        let Some((reply, since)) = self.awaiting_guide.take() else {
+            return false;
+        };
+        let answer = match &mut self.route {
+            Route::Review(review) => review.take_guide_show_answer(),
+            _ => Some(Err(
+                "the review was left before its guide was read".to_owned()
+            )),
+        };
+        let answer = match answer {
+            Some(answer) => answer,
+            None if since.elapsed() > OPEN_WAIT => {
+                Err("the guide was not read in time; try again".to_owned())
+            }
+            None => {
+                self.awaiting_guide = Some((reply, since));
+                return false;
+            }
+        };
+        let answer = match answer {
+            Ok(done) => self.screen_answer(&done),
+            Err(message) => Self::refused("refused", message),
+        };
+        let _ = reply.send(answer);
+        true
     }
 
     /// Run `open_review`: answered at once, or once the review was read (and loaded, for a
@@ -1384,7 +1458,7 @@ impl ReviewApp {
             .lock()
             .map(|mut queue| std::mem::take(&mut *queue))
             .unwrap_or_default();
-        let mut changed = false;
+        let mut changed = self.finish_guide_show();
         for item in work {
             changed = true;
             let (result, target, reply) = match item {

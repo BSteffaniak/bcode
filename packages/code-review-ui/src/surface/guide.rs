@@ -92,6 +92,8 @@ pub(super) struct GuideUi {
     assessed: Vec<ResolvedSource>,
     /// A `guide_show` call waiting for the guide it names to be read.
     pub(super) pending_show: Option<crate::assistant::actions::GuideShowArguments>,
+    /// The answer of a `guide_show` call that waited, once it has one.
+    pub(super) show_answer: Option<Result<String, String>>,
     /// A guide jump happened since the app last asked (it then shows the assistant's Guide tab
     /// when the guide cannot dock).
     pub(super) stepped: bool,
@@ -130,6 +132,7 @@ impl GuideUi {
             reload_wanted: false,
             assessed: Vec::new(),
             pending_show: None,
+            show_answer: None,
             stepped: false,
             card: RefCell::new(None),
             tab_area: Cell::new(None),

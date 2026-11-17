@@ -594,3 +594,68 @@ fn stopping_a_turn_stops_every_guide_it_writes_and_no_other() {
         "another conversation's version is left to it"
     );
 }
+
+#[test]
+fn guide_show_answers_once_the_guide_it_names_is_read_or_known_missing() {
+    let mut setup = setup(170, 50, true);
+    setup.scenario.key("alt+g");
+    setup.settle();
+    setup.scenario.key("enter");
+    setup.settle();
+    let (session, _) = setup
+        .backend
+        .host()
+        .turns()
+        .last()
+        .cloned()
+        .expect("the walkthrough was sent");
+    let mut turn = Turn::new(&session, crate::surface::WALKTHROUGH);
+    turn.plan_and_start(&mut setup);
+    settle_until(&mut setup, "the guide is shown", |setup| {
+        setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .is_some()
+    });
+    writing_guide(
+        &setup,
+        "second",
+        bcode_code_review_models::GuideScope::Layer {
+            source_id: "elsewhere".to_owned(),
+        },
+        &session,
+    );
+    let ask = |setup: &mut Setup, arguments: &str| {
+        let mut reply =
+            setup
+                .backend
+                .host()
+                .call_client_tool(&session, actions::GUIDE_SHOW, arguments);
+        (0..20)
+            .find_map(|_| {
+                setup.settle();
+                reply.try_recv().ok()
+            })
+            .expect("guide_show answered")
+    };
+    let answer = ask(&mut setup, r#"{"guide_id":"bogus"}"#);
+    assert!(
+        matches!(&answer, ClientToolReply::Failed { message, .. } if message.contains("no guide bogus")),
+        "{answer:?}"
+    );
+    let answer = ask(&mut setup, r#"{"guide_id":"second"}"#);
+    assert!(
+        matches!(&answer, ClientToolReply::Completed(_)),
+        "{answer:?}"
+    );
+    assert_eq!(
+        setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .map(|active| active.guide.guide_id.clone())
+            .as_deref(),
+        Some("second")
+    );
+}

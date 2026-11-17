@@ -180,7 +180,7 @@ pub use conversation::{BarState, ConversationMessage, WatchCancel};
 pub use feed::FEED_SCOPE;
 pub use flows::Modal;
 pub use guide::{GUIDE_PANE_ID, GUIDE_SCOPE, PEEK_ID};
-pub use guide_assist::{GUIDE_TAB_VIEW_ID, WALKTHROUGH, WALKTHROUGH_DIRECTIONS};
+pub use guide_assist::{GUIDE_TAB_VIEW_ID, GuideShowOutcome, WALKTHROUGH, WALKTHROUGH_DIRECTIONS};
 pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
 
 pub use find::{SearchState, ThreadsFilter};

@@ -469,7 +469,9 @@ The review assistant writes a guide with one agent (see
 * **Guide tab.** Where the body has no room for the panel, the assistant panel's title row has
   `Chat` and `Guide` tabs and the Guide tab shows the guide, with its keys and clicks.
 * **`guide_show`** opens the guide and moves through it as the keys do; `current_view` reports
-  the guide.
+  the guide. A call naming a guide not on screen is answered once the review's guides are read
+  again (a guide just started may not be yet): with what it showed, or that the review has no
+  such guide.
 * **Stop** cancels the turn and marks every version of the review's guides that the session is
   still writing cancelled, on screen or not, with revision-checked writes that re-check the
   writer each attempt (a version another conversation resumed meanwhile is left to it), keeping
