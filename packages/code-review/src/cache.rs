@@ -62,6 +62,8 @@ const WRITE_TURN_WAIT: Duration = Duration::from_millis(50);
 const START_TURN_WAIT: Duration = Duration::from_millis(250);
 /// Longest a closing worker waits for its turn to write what it holds.
 const CLOSE_TURN_WAIT: Duration = Duration::from_secs(2);
+/// Expired entries dropped per quiet moment.
+const EXPIRE_CHUNK: usize = 500;
 /// Most writes held while the database is unavailable; past it, the oldest are dropped.
 const MAX_HELD: usize = 20_000;
 
@@ -331,9 +333,9 @@ impl Drop for ReviewCache {
 }
 
 /// Start the worker for the database at `path`: open it (rebuilding a file that is not a
-/// readable cache), migrate it, drop expired entries, then answer requests until every sender is
-/// gone. `None` when it cannot be opened at all; a cache other processes are using at the moment
-/// is opened when its turn comes.
+/// readable cache) and migrate it, then answer requests until every sender is gone, dropping
+/// expired entries in quiet moments. `None` when it cannot be opened at all; a cache other
+/// processes are using at the moment is opened when its turn comes.
 fn start(path: &Path) -> Option<Worker> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok()?;
@@ -391,8 +393,8 @@ struct Connection {
     path: PathBuf,
     turn: PathBuf,
     open: Option<Open>,
-    /// Whether expired and excess entries were dropped since this worker started.
-    maintained: bool,
+    /// Whether expired entries may remain from before this worker started.
+    expiring: bool,
     /// The file could be neither opened nor rebuilt.
     broken: bool,
 }
@@ -405,7 +407,7 @@ impl Connection {
             path: path.to_path_buf(),
             turn: PathBuf::from(turn),
             open: None,
-            maintained: false,
+            expiring: true,
             broken: false,
         }
     }
@@ -415,10 +417,8 @@ impl Connection {
     async fn database(&mut self, wait: Duration) -> Option<&dyn Database> {
         if self.open.is_none() {
             let turn = AccessTurn::take(&self.turn, wait).ok()??;
-            let database = open_or_rebuild(&self.path, !self.maintained).await;
-            match database {
+            match open_or_rebuild(&self.path).await {
                 Opened::Ready(database) => {
-                    self.maintained = true;
                     self.open = Some(Open {
                         database,
                         _turn: turn,
@@ -462,10 +462,9 @@ enum Opened {
     Broken,
 }
 
-/// Open the cache at `path`, rebuilding a file that is not a readable cache. With `maintain`,
-/// also drop expired entries and keep each kind to its size.
-async fn open_or_rebuild(path: &Path, maintain: bool) -> Opened {
-    match open_database(path, maintain).await {
+/// Open the cache at `path`, rebuilding a file that is not a readable cache.
+async fn open_or_rebuild(path: &Path) -> Opened {
+    match open_database(path).await {
         Ok(database) => Opened::Ready(database),
         Err(error) if is_lock_error(&error) => Opened::Locked,
         // Unreadable or from an incompatible version: start over.
@@ -475,14 +474,14 @@ async fn open_or_rebuild(path: &Path, maintain: bool) -> Opened {
                 file.push(suffix);
                 let _ = std::fs::remove_file(PathBuf::from(file));
             }
-            open_database(path, maintain)
+            open_database(path)
                 .await
                 .map_or(Opened::Broken, Opened::Ready)
         }
     }
 }
 
-async fn open_database(path: &Path, maintain: bool) -> Result<Box<dyn Database>, String> {
+async fn open_database(path: &Path) -> Result<Box<dyn Database>, String> {
     let database = switchy::database_connection::builder()
         .turso()
         .with_path(path)
@@ -513,25 +512,39 @@ async fn open_database(path: &Path, maintain: bool) -> Result<Box<dyn Database>,
         .run(database.as_ref())
         .await
         .map_err(|error| error.to_string())?;
-    if !maintain {
-        return Ok(database);
-    }
+    Ok(database)
+}
+
+/// Drop up to [`EXPIRE_CHUNK`] expired entries, then keep each kind to its size. `Ok(true)`
+/// once no expired entry is left.
+async fn expire_step(database: &dyn Database) -> Result<bool, DatabaseError> {
     let now = SystemTime::now();
     for kind in CacheKind::ALL {
         let expired = millis_of(now.checked_sub(kind.kept_for()).unwrap_or(UNIX_EPOCH));
-        database
-            .delete(TABLE)
+        let ids: Vec<DatabaseValue> = database
+            .select(TABLE)
+            .columns(&["id"])
             .filter(Box::new(where_eq("kind", kind.as_str())))
             .filter(Box::new(where_lt("written_ms", expired)))
-            .execute(database.as_ref())
-            .await
-            .map_err(|error| error.to_string())?;
-        // Kept to size here, off the way out (closing writes only what is held).
-        trim(database.as_ref(), kind, kind.max_entries())
-            .await
-            .map_err(|error| error.to_string())?;
+            .limit(EXPIRE_CHUNK)
+            .execute(database)
+            .await?
+            .iter()
+            .filter_map(|row| row.get("id"))
+            .collect();
+        if !ids.is_empty() {
+            database
+                .delete(TABLE)
+                .filter(Box::new(where_in("id", ids)))
+                .execute(database)
+                .await?;
+            return Ok(false);
+        }
     }
-    Ok(database)
+    for kind in CacheKind::ALL {
+        trim(database, kind, kind.max_entries()).await?;
+    }
+    Ok(true)
 }
 
 fn is_lock_error(message: &str) -> bool {
@@ -568,15 +581,17 @@ type Held = std::collections::VecDeque<(CacheKind, String, String)>;
 /// is written in a quiet moment, the kinds written to are trimmed to their size; closing only
 /// writes (the next open trims).
 ///
-/// The database is opened for a request and closed once nothing has arrived and nothing is held
-/// for [`WRITE_DELAY`], or after [`MAX_HOLD`], so other processes get their turns. A read whose
+/// Expired entries are dropped a chunk at a time in quiet moments after the worker starts, so a
+/// large cache never holds up the reads that open a review. The database is opened for a request
+/// and closed once nothing has arrived and nothing is held or left to expire for [`WRITE_DELAY`],
+/// or after [`MAX_HOLD`], so other processes get their turns. A read whose
 /// turn does not come within [`READ_TURN_WAIT`] is answered from the held writes alone; held
 /// writes whose turn does not come wait for a later quiet moment.
 async fn serve(connection: &mut Connection, incoming: mpsc::Receiver<Request>) {
     let mut held = Held::new();
     let mut grown = std::collections::BTreeSet::new();
     loop {
-        let request = if held.is_empty() && !connection.is_open() {
+        let request = if held.is_empty() && !connection.is_open() && !connection.expiring {
             incoming
                 .recv()
                 .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
@@ -600,8 +615,18 @@ async fn serve(connection: &mut Connection, incoming: mpsc::Receiver<Request>) {
                 let database = connection.database(READ_TURN_WAIT).await;
                 answer(database, read, &held).await;
             }
-            // Quiet with nothing held: give the turn back.
-            Err(mpsc::RecvTimeoutError::Timeout) if held.is_empty() => connection.close(),
+            // Quiet with nothing held: drop expired entries, then give the turn back.
+            Err(mpsc::RecvTimeoutError::Timeout) if held.is_empty() => {
+                if !connection.expiring {
+                    connection.close();
+                } else if let Some(database) = connection.database(WRITE_TURN_WAIT).await {
+                    // A failure leaves the rest for the next start.
+                    connection.expiring = !expire_step(database).await.unwrap_or(true);
+                } else {
+                    // Busy elsewhere: the next start drops them.
+                    connection.expiring = false;
+                }
+            }
             // Quiet: write a chunk, then look for reads again.
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let Some(database) = connection.database(WRITE_TURN_WAIT).await else {
@@ -861,15 +886,58 @@ mod tests {
             cache.put_many(CacheKind::Stack, &entries[100..]);
             // Another kind is not trimmed by this one's size.
             cache.put_many(CacheKind::Pull, &[("p".into(), "p".into())]);
-            // Closing writes what is held; opening trims what grew past its size.
+            // Closing writes what is held; the next start trims what grew past its size in its
+            // first quiet moment.
             cache.close();
         }
         let cache = ReviewCache::open(&path);
+        std::thread::sleep(WRITE_DELAY * 3);
         let kept = cache.get_prefixed(CacheKind::Stack, "");
         assert_eq!(kept.len(), max * 9 / 10);
         assert!(!kept.contains_key("000000") && !kept.contains_key("000099"));
         assert!(kept.contains_key(&format!("{:06}", max + 50)));
         assert_eq!(cache.get_prefixed(CacheKind::Pull, "").len(), 1);
+    }
+
+    #[test]
+    fn expired_entries_are_dropped_a_chunk_at_a_time_after_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.db");
+        let expired = EXPIRE_CHUNK * 2 + 10;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let database = open_database(&path).await.expect("open");
+                for (index, written_ms) in (0..expired)
+                    .map(|index| (index, 0_i64))
+                    .chain([(expired, millis_of(SystemTime::now()))])
+                {
+                    let key = format!("{index:06}");
+                    database
+                        .insert(TABLE)
+                        .value("id", id(CacheKind::Pull, &key))
+                        .value("kind", CacheKind::Pull.as_str())
+                        .value("key", key)
+                        .value("value", "v")
+                        .value("written_ms", written_ms)
+                        .execute(database.as_ref())
+                        .await
+                        .expect("insert");
+                }
+            });
+        let cache = ReviewCache::open(&path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while cache.get_prefixed(CacheKind::Pull, "").len() > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expired entries stayed"
+            );
+            std::thread::sleep(WRITE_DELAY);
+        }
+        let kept = cache.get_prefixed(CacheKind::Pull, "");
+        assert!(kept.contains_key(&format!("{expired:06}")));
     }
 
     #[test]
