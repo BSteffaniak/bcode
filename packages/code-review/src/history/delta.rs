@@ -8,7 +8,7 @@
 //! the diff from that replay commit to the current head. Results are content-addressed and kept
 //! in the on-disk cache.
 
-use super::compare::{replay_trees, trees_of};
+use super::compare::{Replay, replay_trees, trees_of};
 use super::present_commits;
 use crate::cache::{CacheKind, ReviewCache};
 use crate::data::DataError;
@@ -37,9 +37,6 @@ const REPLAY_ENV: [(&str, &str); 6] = [
     ("GIT_COMMITTER_EMAIL", "bcode-review@localhost"),
     ("GIT_COMMITTER_DATE", "@0 +0000"),
 ];
-
-/// Cached value of a conflicted replay.
-const CONFLICTED: &str = "conflicted";
 
 /// The commit wrapping `tree` (the change of `old_head`, from `old_fork`, replayed on
 /// `new_fork`), parented on `new_fork`: the same inputs always make the same commit.
@@ -76,8 +73,8 @@ pub fn replay_commit(
     Ok(String::from_utf8_lossy(&output).trim().to_owned())
 }
 
-/// Replay commits by `(old fork, new fork, old head)`; `None` when the replay conflicted.
-type Replays = BTreeMap<(String, String, String), Option<String>>;
+/// Replay commits and their unresolved paths by (old fork, new fork, old head).
+type Replays = BTreeMap<(String, String, String), Option<Replay>>;
 
 /// The replay of `(old fork, new fork, old head)`: its commit, or `None` when it conflicts.
 /// Cached; a cached commit git collected since is made again.
@@ -87,30 +84,24 @@ fn replays(
     wanted: &[(String, String, String)],
 ) -> Result<Replays, DataError> {
     let key = |(old_fork, new_fork, old_head): &(String, String, String)| {
-        format!("{old_fork} {new_fork} {old_head}")
+        format!("paths-v1 {old_fork} {new_fork} {old_head}")
     };
     let keys: Vec<String> = wanted.iter().map(key).collect();
     let cached = disk.get_many(CacheKind::Replay, &keys);
     let mut found = BTreeMap::new();
-    let mut commits = BTreeSet::new();
     for (triple, key) in wanted.iter().zip(&keys) {
-        match cached.get(key).map(|entry| entry.value.as_str()) {
-            Some(CONFLICTED) => {
-                found.insert(triple.clone(), None);
-            }
-            Some(commit) if git::validate_oid(commit).is_ok() => {
-                commits.insert(commit);
-                found.insert(triple.clone(), Some(commit.to_owned()));
-            }
-            _ => {}
+        if let Some(entry) = cached.get(key)
+            && let Ok(replay) = serde_json::from_str::<Option<Replay>>(&entry.value)
+            && replay
+                .as_ref()
+                .is_none_or(|r| git::validate_oid(&r.oid).is_ok())
+        {
+            found.insert(triple.clone(), replay);
         }
     }
+    let commits = found.values().flatten().map(|r| r.oid.as_str()).collect();
     let present = present_commits(root, &commits)?;
-    found.retain(|_, commit| {
-        commit
-            .as_ref()
-            .is_none_or(|commit| present.contains(commit))
-    });
+    found.retain(|_, replay| replay.as_ref().is_none_or(|r| present.contains(&r.oid)));
     let missing: Vec<(String, String, String)> = wanted
         .iter()
         .filter(|triple| !found.contains_key(*triple))
@@ -120,16 +111,14 @@ fn replays(
         .collect();
     let trees = replay_trees(root, &missing)?;
     let mut stored = Vec::new();
-    for (triple, tree) in missing.into_iter().zip(trees) {
-        let commit = match tree {
-            Some(tree) => Some(replay_commit(root, &tree, &triple.0, &triple.1, &triple.2)?),
-            None => None,
-        };
-        stored.push((
-            key(&triple),
-            commit.clone().unwrap_or_else(|| CONFLICTED.to_owned()),
-        ));
-        found.insert(triple, commit);
+    for (triple, mut replay) in missing.into_iter().zip(trees) {
+        if let Some(r) = &mut replay {
+            r.oid = replay_commit(root, &r.oid, &triple.0, &triple.1, &triple.2)?;
+        }
+        if let Ok(value) = serde_json::to_string(&replay) {
+            stored.push((key(&triple), value));
+        }
+        found.insert(triple, replay);
     }
     disk.put_many(CacheKind::Replay, &stored);
     Ok(found)
@@ -153,6 +142,7 @@ fn plan(pairs: &[LayerPair], present: &BTreeSet<String>, replayed: &Replays) -> 
             let head_to_head = Plan::From {
                 base: from.head_oid.clone(),
                 rebase_removed: false,
+                conflicts: BTreeSet::new(),
             };
             match (&from.fork_oid, &pair.to.fork_oid) {
                 // The same fork point: the old head is its own replay.
@@ -160,14 +150,16 @@ fn plan(pairs: &[LayerPair], present: &BTreeSet<String>, replayed: &Replays) -> 
                     Plan::From {
                         base: from.head_oid.clone(),
                         rebase_removed: true,
+                        conflicts: BTreeSet::new(),
                     }
                 }
                 (Some(old_fork), Some(new_fork)) => replayed
                     .get(&(old_fork.clone(), new_fork.clone(), from.head_oid.clone()))
                     .cloned()
                     .flatten()
-                    .map_or(head_to_head, |base| Plan::From {
-                        base,
+                    .map_or(head_to_head, |r| Plan::From {
+                        base: r.oid,
+                        conflicts: r.conflicts,
                         rebase_removed: true,
                     }),
                 _ => head_to_head,
@@ -183,6 +175,7 @@ enum Plan {
     From {
         base: String,
         rebase_removed: bool,
+        conflicts: BTreeSet<String>,
     },
 }
 
@@ -238,6 +231,7 @@ pub fn layer_deltas(
         if let Plan::From {
             base,
             rebase_removed: true,
+            ..
         } = plan
         {
             lookups.push(base);
@@ -259,16 +253,25 @@ pub fn layer_deltas(
             Plan::From {
                 base,
                 rebase_removed,
+                conflicts,
             } => {
                 let same_tree = rebase_removed
                     && trees
                         .next()
                         .is_some_and(|pair| matches!(pair, [Some(a), Some(b)] if a == b));
-                if same_tree {
+                if same_tree && conflicts.is_empty() {
                     delta(DeltaKind::RebasedOnly, Some(base), Vec::new())
                 } else {
                     let fork = pair.to.fork_oid.as_deref().filter(|_| rebase_removed);
-                    let files = delta_files(root, disk, fork, &base, &pair.to.head_oid)?;
+                    let mut files = delta_files(root, disk, fork, &base, &pair.to.head_oid)?;
+                    if !conflicts.is_empty() {
+                        files.retain(|f| !conflicts.contains(&f.path));
+                        files.extend(conflicts.into_iter().map(|path| DeltaFile {
+                            path,
+                            since: FileSince::ReplayConflict,
+                        }));
+                        files.sort_by(|a, b| a.path.cmp(&b.path));
+                    }
                     let kind = if rebase_removed {
                         DeltaKind::Changed
                     } else {

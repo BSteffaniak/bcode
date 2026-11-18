@@ -399,7 +399,11 @@ fn classify(
     let trees = compare::trees_of(root, &new_heads)?;
     for (((key, ..), replayed), tree) in replays.into_iter().zip(replayed).zip(trees) {
         let kind = match (replayed, tree) {
-            (Some(replayed), Some(tree)) if replayed == tree => ChangeKind::RebaseOnly,
+            (Some(replayed), Some(tree))
+                if replayed.conflicts.is_empty() && replayed.oid == tree =>
+            {
+                ChangeKind::RebaseOnly
+            }
             _ => ChangeKind::Content,
         };
         kinds.insert(key, kind);

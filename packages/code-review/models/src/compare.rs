@@ -270,6 +270,8 @@ pub enum FileSince {
     },
     /// Part of the baseline's change; not part of the current one.
     Dropped,
+    /// Replay conflicted here; show the full PR diff, without since-baseline counts.
+    ReplayConflict,
     /// Not known yet (the layer's comparison is still computing).
     Unknown,
 }

@@ -1132,6 +1132,7 @@ fn since_badge(since: Option<FileSince>, theme: &ReviewTheme) -> Option<Line> {
             };
             format!("{delta}+{added}{minus}{removed}")
         }
+        FileSince::ReplayConflict => "replay conflict".to_owned(),
         FileSince::New { added, .. } => format!("new +{added}"),
         _ => return None,
     };

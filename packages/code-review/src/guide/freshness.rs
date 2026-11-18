@@ -368,6 +368,9 @@ fn changed_lines(
         DeltaKind::Changed => {}
         DeltaKind::NewToYou | DeltaKind::WithRebase | DeltaKind::Unavailable => return None,
     }
+    if delta.file(path) == FileSince::ReplayConflict {
+        return None;
+    }
     if delta.file(path) == FileSince::Unchanged {
         return Some(Vec::new());
     }

@@ -454,7 +454,7 @@ mod deltas {
     }
 
     #[test]
-    fn a_conflicting_replay_compares_with_the_rebase_and_missing_commits_are_unavailable() {
+    fn a_conflicting_path_has_no_since_counts_and_missing_commits_are_unavailable() {
         let repo = empty_repo();
         let at = PUSHES[0];
         repo.commit(at, "f.txt", "a\n");
@@ -487,8 +487,9 @@ mod deltas {
             ],
         )
         .expect("deltas");
-        assert_eq!(deltas[0].kind, DeltaKind::WithRebase);
-        assert_eq!(deltas[0].replay_oid.as_deref(), Some(l2_old.as_str()));
+        assert_eq!(deltas[0].kind, DeltaKind::Changed);
+        assert_eq!(deltas[0].file("f.txt"), FileSince::ReplayConflict);
+        assert_eq!(deltas[0].totals(), (0, 0));
         assert_eq!(deltas[0].files.len(), 1);
         assert_eq!(deltas[1].kind, DeltaKind::Unavailable);
     }

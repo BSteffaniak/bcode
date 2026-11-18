@@ -11,16 +11,23 @@ use crate::data::git;
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// For each `(old fork, new fork, old head)`: the tree of the old head's own change replayed on
-/// the new fork, or `None` when the replay conflicts. One `git merge-tree --stdin` for all.
+/// A tree and the paths for which Git could not replay the baseline unambiguously.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct Replay {
+    pub oid: String,
+    pub conflicts: std::collections::BTreeSet<String>,
+}
+
+/// For each `(old fork, new fork, old head)`, replay the old change onto the new fork.
+/// One `git merge-tree --stdin` for all.
 ///
 /// # Errors
 ///
 /// * [`DataError::InvalidRequest`] for a malformed commit id; [`DataError::Git`] when git fails.
-pub fn replay_trees(
+pub(super) fn replay_trees(
     root: &Path,
     replays: &[(String, String, String)],
-) -> Result<Vec<Option<String>>, DataError> {
+) -> Result<Vec<Option<Replay>>, DataError> {
     if replays.is_empty() {
         return Ok(Vec::new());
     }
@@ -38,28 +45,55 @@ pub fn replay_trees(
             "--stdin",
             "--write-tree",
             "--name-only",
-            "--no-messages",
+            "--messages",
         ],
         &input,
     )?;
-    // Per merge: its status (1 clean, 0 conflicted), its tree, any conflicted paths, then an
-    // empty field.
+    // Parse the two NUL-terminated lists for each merge. Include related paths from
+    // Git's structured conflict records (e.g. both sides of a rename), not just unmerged entries.
     let text = String::from_utf8_lossy(&output);
-    let mut fields = text.split('\0');
+    let mut fields = text.split_terminator('\0');
+    let invalid = || DataError::Git("invalid merge-tree batch output".to_owned());
     let mut trees = Vec::with_capacity(replays.len());
-    while trees.len() < replays.len() {
-        let Some(status) = fields.next() else {
-            break;
-        };
-        let tree = fields.next().unwrap_or_default();
-        for field in fields.by_ref() {
-            if field.is_empty() {
+    for _ in replays {
+        let status = fields.next().ok_or_else(invalid)?;
+        let oid = fields.next().ok_or_else(invalid)?;
+        git::validate_oid(oid)?;
+        let mut conflicts = std::collections::BTreeSet::new();
+        loop {
+            let path = fields.next().ok_or_else(invalid)?;
+            if path.is_empty() {
                 break;
             }
+            conflicts.insert(path.to_owned());
         }
-        trees.push((status == "1").then(|| tree.to_owned()));
+        loop {
+            let count = fields.next().ok_or_else(invalid)?;
+            if count.is_empty() {
+                break;
+            }
+            let count: usize = count.parse().map_err(|_| invalid())?;
+            let paths = fields.clone().take(count);
+            let kind = fields.nth(count).ok_or_else(invalid)?;
+            let _message = fields.next().ok_or_else(invalid)?;
+            if kind.starts_with("CONFLICT") {
+                conflicts.extend(paths.map(str::to_owned));
+            }
+        }
+        trees.push(match status {
+            "1" if conflicts.is_empty() => Some(Replay {
+                oid: oid.to_owned(),
+                conflicts,
+            }),
+            "0" if !conflicts.is_empty() => Some(Replay {
+                oid: oid.to_owned(),
+                conflicts,
+            }),
+            // Git couldn't identify affected paths: don't trust the partial tree.
+            "0" => None,
+            _ => return Err(invalid()),
+        });
     }
-    trees.resize(replays.len(), None);
     Ok(trees)
 }
 

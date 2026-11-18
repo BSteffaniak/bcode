@@ -118,7 +118,7 @@ Every result is content-addressed by commit and tree ids and cached.
 
 * **Replay.** For a layer from version A to version B, A's own change (`fork(A) → head(A)`) is
   replayed onto `fork(B)` with one `git merge-tree --write-tree --stdin` batch for every layer
-  being compared. A clean replay yields a tree; it is wrapped in a **deterministic** commit
+  being compared. The replay tree is wrapped in a **deterministic** commit
   (`commit-tree` with fixed author, committer, dates and a message naming its inputs, parent
   `fork(B)`), so the same inputs always produce the same commit id and every downstream cache key
   is stable. No ref is written; a lost replay commit is rebuilt from its inputs.
@@ -127,9 +127,10 @@ Every result is content-addressed by commit and tree ids and cached.
   * *rebased only* when the replay tree equals `head(B)`'s tree (no diff needed);
   * *changed*, with a per-file summary from one `git diff-tree -r --numstat -z replay head(B)`:
     each path's status, `+`/`−`, and whether the file was added to or dropped from the layer's
-    change relative to A;
+    change relative to A. Paths involved in a replay conflict show the full PR diff with a
+    conflict label instead of since-counts or line marks; other paths still use the replay;
   * *new to you* when there is no A: the whole change `fork(B) → head(B)`;
-  * *with the rebase* when either fork point is unknown or the replay conflicts: head against
+  * *with the rebase* when either fork point is unknown or no replay baseline can be determined: head against
     head, said so on the layer and its files;
   * *unavailable* when A's commits cannot be had (after one batched fetch by id).
 * **Line marks** for one file (`review.compare.marks`, a document need like whole-stack
@@ -458,7 +459,7 @@ the review.
 ## Caching and performance
 
 * **Cache kinds** (`cache.rs`, content-addressed, no invalidation): `Replay` keyed by
-  `(old fork, new fork, old head)` → replay commit or *conflicted*; `Delta` keyed by
+  `(old fork, new fork, old head)` → replay commit and unresolved paths; `Delta` keyed by
   `(replay, head)` → per-file summary; `Marks` keyed by `(fork, replay, head, path)` → line
   marks; `FileSteps` keyed by a layer's version heads → paths changed per step.
 * **Opening a changed stack:**

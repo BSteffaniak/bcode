@@ -524,6 +524,7 @@ fn file_delta(path: &str, since: FileSince) -> FileDelta {
         FileSince::Changed { added, removed } => ("changed", added, removed),
         FileSince::New { added, removed } => ("new", added, removed),
         FileSince::Dropped => ("dropped", 0, 0),
+        FileSince::ReplayConflict => ("replay_conflict", 0, 0),
         FileSince::Unknown => ("unknown", 0, 0),
     };
     FileDelta {
@@ -540,6 +541,7 @@ fn since_text(since: FileSince) -> String {
         FileSince::New { added, removed } => format!("new +{added} −{removed}"),
         FileSince::Unchanged => "unchanged".to_owned(),
         FileSince::Dropped => "dropped".to_owned(),
+        FileSince::ReplayConflict => "replay conflict (full PR diff)".to_owned(),
         FileSince::Unknown => "computing".to_owned(),
     }
 }

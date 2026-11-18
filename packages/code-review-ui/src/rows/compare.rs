@@ -661,6 +661,10 @@ pub fn since_badge(since: FileSince, baseline: Since, theme: &ReviewTheme) -> Op
             theme.badge_outdated,
         )),
         FileSince::Unknown => Some(Span::styled(theme.icons.ellipsis, theme.muted)),
+        FileSince::ReplayConflict => Some(Span::styled(
+            "replay conflict · showing full PR diff",
+            theme.since.badge,
+        )),
         FileSince::Dropped => None,
     }
 }

@@ -292,6 +292,75 @@ fn mark_viewed(doc: &mut ReviewDocument, workspace: &mut ReviewWorkspace, path: 
 }
 
 #[test]
+fn a_restack_conflict_does_not_hide_clean_file_interdiffs() {
+    let mut layer = layer();
+    let old_fork = layer.fork.clone();
+    layer.repo.git(&["checkout", "--detach", &old_fork]);
+    let inherited = numbered("base", 98);
+    layer.fork = layer.repo.commit(
+        &[("support.py", &inherited), ("a.txt", "new upstream\n")],
+        "new base",
+    );
+    layer.second = layer.repo.commit(
+        &[
+            ("support.py", &format!("{inherited}lobbying=None\n")),
+            ("a.txt", "resolved\n"),
+        ],
+        "resolved restack",
+    );
+    let service = ReviewData::default();
+    let delta = service
+        .compare_layers(&ReviewCompareLayersRequest {
+            repo_path: layer.repo.root.clone(),
+            pairs: vec![LayerPair {
+                number: 7,
+                from: Some(VersionPoint {
+                    head_oid: layer.first.clone(),
+                    fork_oid: Some(old_fork),
+                }),
+                to: VersionPoint {
+                    head_oid: layer.second.clone(),
+                    fork_oid: Some(layer.fork.clone()),
+                },
+            }],
+        })
+        .expect("compare")
+        .deltas
+        .remove(0);
+    assert_eq!(
+        delta.file("support.py"),
+        FileSince::New {
+            added: 1,
+            removed: 0
+        }
+    );
+    assert_eq!(delta.file("a.txt"), FileSince::ReplayConflict);
+    let mut doc = open(&service, &layer);
+    doc.set_comparison(
+        SOURCE,
+        Some(GroupComparison {
+            delta: Some(delta),
+            view: CompareView::Changes,
+            ..GroupComparison::default()
+        }),
+    );
+    serve(&service, &mut doc);
+    assert!(doc.file_shows_changes(&file("support.py")));
+    assert!(!doc.file_shows_changes(&file("a.txt")));
+    assert_eq!(old_only(&doc, "a.txt"), ["new upstream"]);
+    let additions: Vec<_> = items(&doc)
+        .into_iter()
+        .filter_map(|item| match item {
+            ReviewItem::Line(line) if line.file.path == "support.py" && line.old_line.is_none() => {
+                line.content.text().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(additions, ["lobbying=None"]);
+}
+
+#[test]
 fn the_full_view_marks_what_is_new_and_folds_what_was_viewed_and_is_unchanged() {
     let layer = layer();
     let service = ReviewData::default();
