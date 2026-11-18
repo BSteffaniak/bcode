@@ -606,6 +606,13 @@ impl ReviewSurface {
             }
             return None;
         }
+        if action == ThreadAction::ShowAll {
+            match self.thread_at_cursor() {
+                Some(thread_id) => self.toggle_thread_expanded(thread_id),
+                None => self.set_status("move to a thread first", StatusSeverity::Warning),
+            }
+            return None;
+        }
         if let Some(thread_id) = self.thread_at_cursor()
             && self.remote_thread_action(&thread_id, action, None)
         {
@@ -677,7 +684,7 @@ impl ReviewSurface {
                 self.set_status("this thread has no web page", StatusSeverity::Info);
                 return None;
             }
-            ThreadAction::Viewed => return None,
+            ThreadAction::Viewed | ThreadAction::ShowAll => return None,
         };
         match result {
             Ok(Some(message)) => self.set_status(message, StatusSeverity::Success),
@@ -686,6 +693,14 @@ impl ReviewSurface {
         }
         self.sync_notes();
         None
+    }
+
+    /// Show the long comments of thread `thread_id` in full, or cut them again.
+    fn toggle_thread_expanded(&mut self, thread_id: String) {
+        if !self.folds.expanded.remove(&thread_id) {
+            self.folds.expanded.insert(thread_id);
+        }
+        self.folds.revision = self.folds.revision.wrapping_add(1);
     }
 
     /// Resolve (or reopen) your own thread `thread_id`.

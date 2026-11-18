@@ -692,6 +692,8 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   (the default is configurable). **Ask Bcode** sends the whole thread with the question (see
   [AI cards](#ai-cards)), outdated ones included, and the review tools read the same threads
   (see [Review tools](#review-tools)).
+  A comment longer than 12 rows is cut with `…`; **Show all** on the thread (any thread, yours
+  too) shows its comments in full, and **Show less** cuts them again.
 * **The rail** marks each layer approved (✓) or changes requested (✕), with its open threads
   and a dot when something is new.
 * **The threads panel** lists pull request threads too, and filters them: *on the pull request*,

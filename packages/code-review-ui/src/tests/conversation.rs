@@ -785,3 +785,44 @@ fn a_review_going_away_stops_its_provider_watch_at_once() {
         "{calls:?}"
     );
 }
+
+#[test]
+fn a_long_comment_is_cut_with_show_all_and_shows_in_full_on_it() {
+    let fixture = fixture();
+    let provider = FakeProvider::new(fixture.root()).with_conversation(everything());
+    let mut long = activity();
+    let body: Vec<String> = (1..=16).map(|n| format!("* Point number {n}.")).collect();
+    long.threads[0].comments = vec![comment("c1", "raj", &body.join("\n"))];
+    provider.set_activity(long);
+    let backend = Arc::new(TestBackend::default().with_provider(provider));
+    let (mut scenario, _) = open_pull(&backend, &fixture);
+    // Fold the pull request's card so the thread comes up.
+    let screen = click(&mut scenario, "▾ ✓");
+    assert!(screen.contains("Point number 1."), "{}", screen.text());
+    assert!(!screen.contains("Point number 16."), "{}", screen.text());
+    assert!(!screen.contains("Show less"), "{}", screen.text());
+
+    let screen = click(&mut scenario, "Show all");
+    let last = screen.find("Point number 16.").map_or_else(
+        || panic!("the whole comment shows:\n{}", screen.text()),
+        |at| at.y,
+    );
+    let less = screen
+        .find("Show less")
+        .unwrap_or_else(|| panic!("Show less is offered:\n{}", screen.text()));
+    assert!(last < less.y, "{}", screen.text());
+
+    let screen = click(&mut scenario, "Show less");
+    assert!(!screen.contains("Point number 16."), "{}", screen.text());
+    assert!(screen.contains("Show all"), "{}", screen.text());
+}
+
+#[test]
+fn a_short_comment_offers_no_show_all() {
+    let fixture = fixture();
+    let backend = backend(&fixture, everything());
+    let (mut scenario, _) = open_pull(&backend, &fixture);
+    let screen = click(&mut scenario, "▾ ✓");
+    assert!(screen.contains("Why this constant?"), "{}", screen.text());
+    assert!(!screen.contains("Show all"), "{}", screen.text());
+}

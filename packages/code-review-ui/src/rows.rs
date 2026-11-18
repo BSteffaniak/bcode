@@ -217,6 +217,8 @@ pub enum ThreadAction {
     Open,
     /// Mark the thread viewed or unviewed.
     Viewed,
+    /// Show the thread's long comments in full, or cut them again.
+    ShowAll,
 }
 
 /// An action on an AI answer item.
@@ -275,6 +277,8 @@ pub struct Folds {
     /// Opened feed items of AI cards (reasoning text, all tool output), keyed by
     /// [`open_key`]; not saved with the workspace.
     pub feed_open: std::collections::BTreeSet<String>,
+    /// Threads whose long comments show in full; not saved with the workspace.
+    pub expanded: std::collections::BTreeSet<String>,
     /// Changes whenever the folds change.
     pub revision: u64,
 }
@@ -1980,10 +1984,16 @@ pub fn markdown_lines(text: &str, width: usize, max: usize, theme: &ReviewTheme)
 /// `text` rendered as markdown in `width` cells: its first `max` rows, with an ellipsis row
 /// after them when rows were elided.
 fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Line> {
+    markdown_cut(text, width, max, theme).0
+}
+
+/// [`markdown`], and whether rows were elided.
+fn markdown_cut(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> (Vec<Line>, bool) {
     let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
     let options = bcode_markdown_render::MarkdownRenderOptions::new(width);
     let mut lines = bcode_markdown_render::render_markdown(text, &options).lines;
-    if lines.len() > max {
+    let cut = lines.len() > max;
+    if cut {
         lines.truncate(max.saturating_sub(1));
         lines.push(Line::from_spans(vec![Span::styled(
             theme.icons.ellipsis,
@@ -1993,7 +2003,7 @@ fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Li
     if lines.is_empty() {
         lines.push(Line::default());
     }
-    lines
+    (lines, cut)
 }
 
 /// Rendered markdown kept for reuse, newest last.
@@ -2142,6 +2152,8 @@ fn thread_rows(
 /// What a thread card shows besides its comments: folded, viewed, new.
 struct Look {
     folded: bool,
+    /// Long comments show in full.
+    expanded: bool,
     viewed: bcode_code_review::threads::ThreadViewed,
     new: std::collections::BTreeSet<String>,
     checkbox: Span,
@@ -2161,9 +2173,37 @@ impl Look {
         };
         Self {
             folded: folds.collapsed.contains(key),
+            expanded: folds.expanded.contains(key),
             viewed,
             new: look.map(|look| look.new.clone()).unwrap_or_default(),
             checkbox,
+        }
+    }
+
+    /// Rows of one comment shown: all when expanded, else at most [`MAX_COMMENT_ROWS`].
+    const fn comment_rows(&self) -> usize {
+        if self.expanded {
+            usize::MAX
+        } else {
+            MAX_COMMENT_ROWS
+        }
+    }
+
+    /// The *Show all* or *Show less* button, first of `buttons`, when a comment was cut
+    /// (`cut`) or the card shows them in full.
+    fn show_all_button(&self, cut: bool, buttons: &mut Vec<(&str, ItemAction)>) {
+        if cut || self.expanded {
+            buttons.insert(
+                0,
+                (
+                    if self.expanded {
+                        "Show less"
+                    } else {
+                        "Show all"
+                    },
+                    ItemAction::Thread(ThreadAction::ShowAll),
+                ),
+            );
         }
     }
 
@@ -2221,7 +2261,8 @@ fn line_reference(
     })
 }
 
-/// A comment's byline (author, age, `• new`) and its markdown, at `inner` cells.
+/// A comment's byline (author, age, `• new`) and its markdown, at `inner` cells and at most
+/// `max` rows; and whether rows were cut.
 fn comment_section(
     author: &str,
     at: Option<u64>,
@@ -2229,7 +2270,8 @@ fn comment_section(
     body: &str,
     theme: &ReviewTheme,
     inner: usize,
-) -> thread_card::Section {
+    max: usize,
+) -> (thread_card::Section, bool) {
     let mut byline = vec![Span::styled(author.to_owned(), theme.title)];
     let age = crate::conversation::ago(at);
     if !age.is_empty() {
@@ -2246,11 +2288,15 @@ fn comment_section(
         ));
     }
     let mut lines = vec![Line::from_spans(byline).truncate(inner)];
-    lines.extend(markdown(body, inner, MAX_COMMENT_ROWS, theme));
-    thread_card::Section {
-        lines,
-        actions: Vec::new(),
-    }
+    let (body, cut) = markdown_cut(body, inner, max, theme);
+    lines.extend(body);
+    (
+        thread_card::Section {
+            lines,
+            actions: Vec::new(),
+        },
+        cut,
+    )
 }
 
 /// The header chips of your own thread: its comments, kind and severity, and state.
@@ -2320,17 +2366,21 @@ fn local_card<'a>(
 ) -> thread_card::Card<'a> {
     let comments = notes.thread(&thread.thread_id);
     let title = local_title(thread, notes, &comments, look, theme);
+    let mut cut = false;
     let mut sections: Vec<thread_card::Section> = comments
         .iter()
         .map(|comment| {
-            comment_section(
+            let (section, cut_here) = comment_section(
                 "you",
                 Some(comment.created_at_ms),
                 false,
                 &comment.body,
                 theme,
                 inner,
-            )
+                look.comment_rows(),
+            );
+            cut |= cut_here;
+            section
         })
         .collect();
     let (lines, actions) = suggestion_rows(
@@ -2351,7 +2401,7 @@ fn local_card<'a>(
     if !lines.is_empty() {
         sections.push(thread_card::Section { lines, actions });
     }
-    let buttons: Vec<(&str, ItemAction)> = if thread.resolved {
+    let mut buttons: Vec<(&str, ItemAction)> = if thread.resolved {
         vec![
             ("Reopen", ItemAction::Thread(ThreadAction::Resolve)),
             ("Reply", ItemAction::Thread(ThreadAction::Reply)),
@@ -2365,6 +2415,7 @@ fn local_card<'a>(
             ("Ask Bcode", ItemAction::Thread(ThreadAction::Ask)),
         ]
     };
+    look.show_all_button(cut, &mut buttons);
     thread_card::Card {
         title,
         viewed: Some(look.checkbox.clone()),
@@ -2509,26 +2560,32 @@ fn external_card<'a>(
             actions: Vec::new(),
         });
     }
+    let mut cut = false;
     for comment in &comments {
         let author = external
             .authors
             .get(&comment.comment_id)
             .map_or("unknown", String::as_str);
-        sections.push(comment_section(
+        let (section, cut_here) = comment_section(
             author,
             Some(comment.created_at_ms),
             look.new.contains(&comment.comment_id),
             &comment.body,
             theme,
             inner,
-        ));
+            look.comment_rows(),
+        );
+        cut |= cut_here;
+        sections.push(section);
     }
     let resolved = external.state == ExternalReviewThreadState::Resolved;
+    let mut buttons = Vec::new();
+    look.show_all_button(cut, &mut buttons);
     thread_card::Card {
         title,
         viewed: Some(look.checkbox.clone()),
         sections,
-        buttons: Vec::new(),
+        buttons,
         footer: line_reference(thread.lines, theme),
         border: look.border(resolved, false, theme),
         folded: look.folded,
@@ -2552,6 +2609,7 @@ fn remote_card<'a>(
         .filter(|comment| !comment.comment_id.starts_with(super::notes::REMOTE_PREFIX))
         .count();
     let title = remote_title(remote, &comments, held, look, theme);
+    let mut cut = false;
     let sections = comments
         .iter()
         .map(|comment| {
@@ -2559,14 +2617,17 @@ fn remote_card<'a>(
                 || ("you · held for your review".to_owned(), None),
                 |(author, at)| (author.clone(), *at),
             );
-            comment_section(
+            let (section, cut_here) = comment_section(
                 &author,
                 at,
                 look.new.contains(&comment.comment_id),
                 &comment.body,
                 theme,
                 inner,
-            )
+                look.comment_rows(),
+            );
+            cut |= cut_here;
+            section
         })
         .collect();
     let mut buttons: Vec<(&str, ItemAction)> = Vec::new();
@@ -2585,6 +2646,7 @@ fn remote_card<'a>(
     if !remote.resolved {
         buttons.push(("Ask Bcode", ItemAction::Thread(ThreadAction::Ask)));
     }
+    look.show_all_button(cut, &mut buttons);
     thread_card::Card {
         title,
         viewed: Some(look.checkbox.clone()),
