@@ -76,6 +76,7 @@ fn author_codec_opens_async_factory_without_caller_tokio_runtime() {
     let adapter = extension(
         async_registry,
         PluginCreateContext {
+            cli_command: None,
             runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
             instance: LoadedInstanceId::from_uuid(uuid::Uuid::new_v4()),
             role: crate::definition::ComponentRole::Frontend,
@@ -503,6 +504,7 @@ async fn dropped_author_task_is_not_joined_settlement() {
 async fn admitted_state_has_no_mutex_guard_and_nested_calls_fail_closed() {
     let author = AuthorFrontend {
         context: PluginCreateContext {
+            cli_command: None,
             runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
             instance: LoadedInstanceId::from_uuid(uuid::Uuid::new_v4()),
             role: crate::definition::ComponentRole::Frontend,
@@ -540,6 +542,7 @@ async fn author_updates_use_attached_bounded_stream_without_replaying_overflow()
     let adapter = extension(
         registry,
         PluginCreateContext {
+            cli_command: None,
             runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
             instance: LoadedInstanceId::from_uuid(uuid::Uuid::new_v4()),
             role: crate::definition::ComponentRole::Frontend,
@@ -618,6 +621,7 @@ async fn author_updates_use_attached_bounded_stream_without_replaying_overflow()
 
 async fn open_rich_scene_probe() -> (Arc<dyn ProductComponentExtension>, uuid::Uuid) {
     let context = PluginCreateContext {
+        cli_command: None,
         runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
         instance: LoadedInstanceId::from_uuid(uuid::Uuid::new_v4()),
         role: crate::definition::ComponentRole::Frontend,
@@ -768,6 +772,7 @@ async fn author_wire_factory_preserves_rich_scene_and_revision_fences() {
     let other = extension(
         registry,
         PluginCreateContext {
+            cli_command: None,
             runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
             instance: LoadedInstanceId::from_uuid(uuid::Uuid::new_v4()),
             role: crate::definition::ComponentRole::Frontend,

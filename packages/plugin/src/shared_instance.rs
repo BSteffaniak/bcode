@@ -128,6 +128,7 @@ impl SharedInstance {
         }
         let scope = InstanceScope::new(host.runtime);
         let context = PluginCreateContext {
+            cli_command: None,
             runtime_scope: host.runtime,
             instance: scope.id(),
             role,

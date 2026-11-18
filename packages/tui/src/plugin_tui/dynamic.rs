@@ -3155,6 +3155,7 @@ mod input_replay_tests {
                 author: bcode_plugin_sdk::tui::portable::extension(
                     registry,
                     PluginCreateContext {
+                        cli_command: None,
                         runtime_scope: bmux_plugin_sdk::definition::RuntimeScopeId::from_uuid(
                             uuid::Uuid::new_v4(),
                         ),
