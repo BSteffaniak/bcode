@@ -212,6 +212,7 @@ fn expand_is_granted_one_section_and_changes_only_its_subtree() {
         text,
         grant,
         context,
+        ..
     }) = requests.into_iter().next()
     else {
         panic!("expand asks the assistant");

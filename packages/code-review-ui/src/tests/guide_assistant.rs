@@ -787,10 +787,48 @@ fn expand_binds_the_conversation_to_the_section_for_that_message_only() {
         }
     );
 
-    // The next ordinary message binds it without one again.
+    // The expand turn runs; a follow-up sent meanwhile waits, so the running turn keeps the
+    // grant it was sent with.
+    let mut items = turn.items.clone();
+    items.push(user(&request.text));
+    let mut running = snapshot(items.clone());
+    running.runtime.active_turn_id = Some("turn-expand".to_owned());
+    setup.deliver(&session, running);
     setup.scenario.paste("Thanks.");
     setup.scenario.key("enter");
+    let screen = setup.settle();
+    assert_eq!(
+        setup.backend.host().turns().len(),
+        turns.len(),
+        "the follow-up is held: {}",
+        screen.text()
+    );
+    assert!(
+        screen.contains("sent once the running turn ends"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        setup
+            .binding(&session)
+            .and_then(|binding| binding.guide_grant)
+            .is_some_and(|grant| matches!(
+                grant.mode,
+                bcode_code_review_models::GrantMode::Expand { .. }
+            )),
+        "the running expand keeps its grant"
+    );
+
+    // Once the expand turn ends, the follow-up is sent bound without a grant again.
+    items.push(super::assistant::answer("Expanded."));
+    setup.deliver(&session, snapshot(items));
     setup.settle();
+    let sent = setup.backend.host().turns();
+    assert_eq!(sent.len(), turns.len() + 1, "{sent:?}");
+    assert_eq!(
+        sent.last().map(|(_, request)| request.text.as_str()),
+        Some("Thanks.")
+    );
     assert_eq!(
         setup
             .binding(&session)

@@ -76,8 +76,8 @@ pub struct Prepared {
 enum Synthesis {
     /// Not asked for: areas are still being written.
     Waiting,
-    /// Asked for; whether the conversation was seen working on it since.
-    Asked { seen_working: bool },
+    /// Asked for with the guide message of this ticket, whose turn has not ended.
+    Asked { ticket: u64 },
     /// Done.
     Done,
 }
@@ -147,6 +147,8 @@ pub(super) struct FanOutUi {
     reply: Option<oneshot::Sender<ClientToolReply>>,
     /// Children seen working, so an idle child counts as finished only after its turn ran.
     seen_working: BTreeSet<String>,
+    /// Tickets of guide messages whose turn ended, not looked at yet.
+    settled: BTreeSet<u64>,
     /// Changes whenever what the fan-out shows changes.
     pub(super) revision: u64,
 }
@@ -159,6 +161,18 @@ impl ReviewSurface {
             fan.assistant = session.map(str::to_owned);
         }
         fan.assistant_working = working;
+    }
+
+    /// Tell the screen the guide messages (by ticket) whose turn ended.
+    pub fn guide_messages_settled(&mut self, tickets: Vec<u64>) {
+        let fan = &mut self.guide.fan_out;
+        fan.settled.extend(tickets);
+        // Only the synthesis asked now is waited on.
+        let waited = match fan.run.as_ref().map(|run| &run.synthesis) {
+            Some(Synthesis::Asked { ticket }) => Some(*ticket),
+            _ => None,
+        };
+        fan.settled.retain(|ticket| Some(*ticket) == waited);
     }
 
     /// The children of the fan-out running (to follow like AI cards).
@@ -511,6 +525,7 @@ impl ReviewSurface {
                     text: fanout::refresh_prompt(&sections),
                     grant: Some(grant),
                     context: Vec::new(),
+                    ticket: None,
                 });
                 self.set_status(
                     format!(
@@ -611,13 +626,11 @@ impl ReviewSurface {
         }
         match run.synthesis {
             Synthesis::Waiting => self.ask_synthesis(&run, host),
-            Synthesis::Asked { seen_working } => {
-                let working = self.guide.fan_out.assistant_working;
-                if working && !seen_working {
-                    if let Some(run) = self.guide.fan_out.run.as_mut() {
-                        run.synthesis = Synthesis::Asked { seen_working: true };
-                    }
-                } else if (seen_working && !working) || run.status == GuideStatus::Complete {
+            Synthesis::Asked { ticket } => {
+                // Only the synthesis message's own turn ending counts: another turn of the
+                // conversation (the reviewer's) may end first.
+                if self.guide.fan_out.settled.remove(&ticket) || run.status == GuideStatus::Complete
+                {
                     self.synthesized(&run, host);
                 }
             }
@@ -774,10 +787,9 @@ impl ReviewSurface {
     /// Every area is done: link the layer guides (a stack guide), mark the version
     /// synthesizing, and ask the conversation to write the guide from the areas.
     fn ask_synthesis(&mut self, run: &FanOutRun, host: &UiContext) {
+        let ticket = crate::assistant::next_guide_ticket();
         if let Some(stored) = self.guide.fan_out.run.as_mut() {
-            stored.synthesis = Synthesis::Asked {
-                seen_working: false,
-            };
+            stored.synthesis = Synthesis::Asked { ticket };
         }
         let layers: Vec<GenerationArea> = if run.strategy == GuideStrategy::PerLayer {
             run.generation
@@ -809,6 +821,7 @@ impl ReviewSurface {
             ),
             grant: Some(grant),
             context: Vec::<ContextBlock>::new(),
+            ticket: Some(ticket),
         });
         self.set_status(
             "every area is written: asked the assistant to synthesize the guide",

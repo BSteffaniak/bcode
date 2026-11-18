@@ -553,7 +553,11 @@ is pinned to, since guides and their delta check); the review screen drives it
 * **Grants from the app.** The review records the grant it gives the assistant's session in
   that session's binding (`guide_grant`); a changed grant binds the session again before its
   next message. Asking for a new walkthrough drops the grant, so the session writes the
-  versions it starts. The grant also ends once the guide moves past it: when another version
+  versions it starts. Because the binding is the session's, a message that binds another
+  grant (a guide action's, or an ordinary message after one) waits while the conversation has a
+  turn running or a sent message whose turn has not ended, and is sent once they end, so a
+  running turn keeps the grant it was sent with. The fan-out's synthesis counts as done only
+  when its own message's turn ends. The grant also ends once the guide moves past it: when another version
   of the guide becomes current, or when no section a `Refresh` names is stale any more.
 * **Versions.** `V` (`Guide: versions…`) lists the guide's versions, newest first, with
   status, the version each was forked from, and when it last changed. Picking an older one

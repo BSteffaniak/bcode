@@ -183,6 +183,19 @@ fn run_turn(setup: &mut Setup, session: &str, text: &str) {
     setup.deliver(session, snapshot(vec![user(text), answer("Done.")]));
 }
 
+/// The synthesis message sent to the conversation `parent`.
+fn synthesis_text(setup: &Setup, parent: &str) -> String {
+    setup
+        .backend
+        .host()
+        .turns()
+        .into_iter()
+        .rev()
+        .find(|(session, request)| session == parent && request.text.contains("Synthesize"))
+        .map(|(_, request)| request.text)
+        .expect("synthesis was asked")
+}
+
 /// The running child writes its area (one cited step) and its turn ends.
 fn child_writes_its_area(setup: &mut Setup, guide_id: &str, child: &str, area_id: &str) {
     let (path, line) = cited_line(setup);
@@ -321,7 +334,8 @@ fn children_write_only_their_areas_one_at_a_time_and_the_conversation_synthesize
             {"op": "set_status", "status": "complete"}
         ]),
     ));
-    run_turn(&mut setup, &parent, "synthesize");
+    let synthesis = synthesis_text(&setup, &parent);
+    run_turn(&mut setup, &parent, &synthesis);
     settle_until(&mut setup, "the fan-out ends", |setup| {
         setup
             .app()
@@ -508,7 +522,8 @@ fn the_verifier_records_checks_that_render_beside_the_content_and_unsupported_on
             {"op": "set_status", "status": "complete"}
         ]),
     ));
-    run_turn(&mut setup, &parent, "synthesize");
+    let synthesis = synthesis_text(&setup, &parent);
+    run_turn(&mut setup, &parent, &synthesis);
     settle_until(&mut setup, "the verifier runs", |setup| {
         setup.backend.host().turns().iter().any(|(_, request)| {
             request.agent.as_deref() == Some(crate::assistant::profile::GUIDE_VERIFIER_PROFILE_ID)
@@ -806,4 +821,82 @@ fn setup_grant(
         .binding?
         .guide_grant
         .map(|grant| (grant.guide_id, grant.mode))
+}
+
+#[test]
+fn synthesis_waits_for_its_own_turn_while_the_reviewer_chats() {
+    let mut setup = setup_with(backend(serial()), 170, 50, true);
+    let parent = conversation(&mut setup);
+    fan_out(&mut setup);
+    settle_until(&mut setup, "the fan-out starts", |setup| {
+        progress(setup).is_some() && !setup.backend.host().child_sessions().is_empty()
+    });
+    let (guide_id, _, generation) = progress(&setup).expect("progress");
+    let areas: Vec<String> = generation
+        .areas
+        .iter()
+        .map(|area| area.area_id.clone())
+        .collect();
+    // The reviewer's own turn runs while the last area is written.
+    let chat = vec![user("Hello"), answer("Hi."), user("What is left?")];
+    for (index, area_id) in areas.iter().enumerate() {
+        settle_until(&mut setup, "the area's child runs", |setup| {
+            child_of(setup, area_id).is_some()
+        });
+        if index + 1 == areas.len() {
+            let mut running = snapshot(chat.clone());
+            running.runtime.active_turn_id = Some("turn-chat".to_owned());
+            setup.deliver(&parent, running);
+        }
+        let child = child_of(&setup, area_id).expect("child");
+        child_writes_its_area(&mut setup, &guide_id, &child, area_id);
+    }
+    let asked = |setup: &Setup| {
+        setup
+            .backend
+            .host()
+            .turns()
+            .iter()
+            .any(|(session, request)| *session == parent && request.text.contains("Synthesize"))
+    };
+    for _ in 0..4 {
+        setup.settle();
+    }
+    assert!(
+        !asked(&setup),
+        "the synthesis waits while the reviewer's turn runs"
+    );
+
+    // The reviewer's turn ends: the synthesis is sent, and the run waits for its turn.
+    let mut ended = chat.clone();
+    ended.push(answer("Two areas."));
+    setup.deliver(&parent, snapshot(ended.clone()));
+    settle_until(&mut setup, "synthesis is asked for", asked);
+    for _ in 0..4 {
+        setup.settle();
+    }
+    assert!(
+        setup
+            .app()
+            .review()
+            .is_some_and(crate::surface::ReviewSurface::fan_out_running),
+        "the reviewer's turn ending does not end the synthesis"
+    );
+    assert_eq!(stored(&setup, &guide_id).0, GuideStatus::Synthesizing);
+
+    // Its own turn ends: the version is complete.
+    let synthesis = synthesis_text(&setup, &parent);
+    ended.push(user(&synthesis));
+    let mut running = snapshot(ended.clone());
+    running.runtime.active_turn_id = Some("turn-synthesis".to_owned());
+    setup.deliver(&parent, running);
+    ended.push(answer("Synthesized."));
+    setup.deliver(&parent, snapshot(ended));
+    settle_until(&mut setup, "the fan-out ends", |setup| {
+        setup
+            .app()
+            .review()
+            .is_some_and(|review| !review.fan_out_running())
+    });
+    assert_eq!(stored(&setup, &guide_id).0, GuideStatus::Complete);
 }

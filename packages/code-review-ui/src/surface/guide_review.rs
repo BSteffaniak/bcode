@@ -521,6 +521,7 @@ impl ReviewSurface {
                 mode: GrantMode::Expand { section_id: id },
             }),
             context,
+            ticket: None,
         });
         self.set_status(
             format!("asked the assistant to expand §{number}"),
@@ -915,6 +916,7 @@ impl ReviewSurface {
                         ),
                         request_only: false,
                     }],
+                    ticket: None,
                 });
                 self.focus = Focus::Review;
             }

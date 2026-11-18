@@ -501,6 +501,7 @@ impl ReviewApp {
         }
         if let Route::Review(review) = &mut self.route {
             review.set_assistant(self.assistant.session(), self.assistant.working());
+            review.guide_messages_settled(self.assistant.take_settled());
         }
         for call in self.assistant.take_tool_calls() {
             self.answer_tool(call, host);
@@ -1673,12 +1674,13 @@ impl ReviewApp {
                     text,
                     grant,
                     context,
+                    ticket,
                 } => {
                     self.assistant.focus();
                     let place = self.place(true);
                     let outcome = self
                         .assistant
-                        .send_guide_message(&text, grant, context, &place, host);
+                        .send_guide_message(&text, grant, context, ticket, &place, host);
                     let result = self.assistant_outcome(outcome, host);
                     if result != Action::Redraw && result != Action::None {
                         action = result;

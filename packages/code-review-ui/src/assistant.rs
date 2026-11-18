@@ -103,10 +103,20 @@ pub enum LinkRequest {
         grant: Option<bcode_code_review_models::GuideGrant>,
         /// Context blocks (the section and its citations).
         context: Vec<crate::host::ContextBlock>,
+        /// Reported back to the screen once the message's turn ended (see
+        /// [`next_guide_ticket`]).
+        ticket: Option<u64>,
     },
     /// Open the guide: its panel where the screen has room for it, else the assistant's Guide
     /// tab.
     OpenGuide,
+}
+
+/// A new ticket for a [`LinkRequest::GuideMessage`], unique for the life of the app.
+#[must_use]
+pub fn next_guide_ticket() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl ScreenLink {

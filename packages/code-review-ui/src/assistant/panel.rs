@@ -391,6 +391,17 @@ pub struct Assistant {
     /// The guide grant the session is bound with: set for one message by a guide action
     /// (expand, restructure), and cleared by the next ordinary message.
     guide_grant: Option<bcode_code_review_models::GuideGrant>,
+    /// Messages of the active conversation sent (or waiting to be) whose turn has not ended,
+    /// oldest first.
+    unsettled: VecDeque<Unsettled>,
+    /// Sends (or session starts with a first message) the host has not answered yet.
+    in_flight: Cell<usize>,
+    /// Messages binding another guide grant, held until the conversation's turns end: the
+    /// binding is the session's, so swapping it while a turn runs would change what that turn
+    /// may write.
+    held: VecDeque<Held>,
+    /// Tickets of guide messages whose turn ended, not taken yet.
+    settled: Vec<u64>,
     input: RefCell<TextInputState>,
     policy: TextInputPolicy,
     /// Whether messages carry what is on screen.
@@ -482,6 +493,10 @@ impl Assistant {
             epoch: 0,
             attached: None,
             guide_grant: None,
+            unsettled: VecDeque::new(),
+            in_flight: Cell::new(0),
+            held: VecDeque::new(),
+            settled: Vec::new(),
             input: RefCell::new(empty_input()),
             policy,
             context: true,
@@ -1143,6 +1158,15 @@ impl Assistant {
         self.starting = false;
         self.attached = None;
         self.guide_grant = None;
+        // The earlier conversation's turns are no longer followed: their tickets end here, and
+        // held messages were meant for it.
+        self.settled.extend(
+            self.unsettled
+                .drain(..)
+                .filter_map(|message| message.ticket),
+        );
+        self.settled
+            .extend(self.held.drain(..).filter_map(|message| message.ticket));
         self.epoch = self.epoch.wrapping_add(1);
         self.scroll.set(0);
         self.mode = Mode::Chat;
@@ -1257,16 +1281,87 @@ impl Assistant {
 
     /// Send `text` for a guide action: the session is bound with `grant` for this message (an
     /// ordinary message afterwards binds it without one again), and `context` goes with it.
+    /// `ticket`, when given, is reported by [`Self::take_settled`] once the message's turn
+    /// ended.
     pub fn send_guide_message(
         &mut self,
         text: &str,
         grant: Option<bcode_code_review_models::GuideGrant>,
         context: Vec<ContextBlock>,
+        ticket: Option<u64>,
         place: &Place,
         ui: &UiContext,
     ) -> Outcome {
         self.show_chat_tab();
-        self.send_with(text, false, place, ui, (grant, context))
+        self.send_with(
+            text,
+            false,
+            place,
+            ui,
+            Guided {
+                grant,
+                context,
+                ticket,
+                releasing: false,
+            },
+        )
+    }
+
+    /// Tickets of guide messages whose turn ended since the last call (or that will not run:
+    /// their conversation was left).
+    pub fn take_settled(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.settled)
+    }
+
+    /// Whether the active conversation has a turn running, or a message sent whose turn has not
+    /// ended yet.
+    fn busy(&self) -> bool {
+        self.starting
+            || self.in_flight.get() > 0
+            || !self.unsettled.is_empty()
+            || self.queued.iter().any(|(epoch, _, _)| *epoch == self.epoch)
+            || self.working()
+    }
+
+    /// End the turns of sent messages the session's transcript shows answered: once no turn
+    /// runs and nothing is in flight, the newest message the transcript ends with and every
+    /// one before it. Then send the next held message.
+    fn settle(&mut self, ui: &UiContext) {
+        if !self.unsettled.is_empty()
+            && !self.starting
+            && self.in_flight.get() == 0
+            && !self.working()
+            && let Some(last) = self
+                .session
+                .as_deref()
+                .and_then(|session| self.agents.state(session))
+                .and_then(|state| state.feed.turns.last().map(|turn| turn.question.clone()))
+            && let Some(at) = self
+                .unsettled
+                .iter()
+                .rposition(|message| message.question == last)
+        {
+            for message in self.unsettled.drain(..=at) {
+                self.settled.extend(message.ticket);
+            }
+        }
+        if self.busy() {
+            return;
+        }
+        if let Some(held) = self.held.pop_front() {
+            let _ = self.send_with(
+                &held.text,
+                false,
+                &held.place,
+                ui,
+                Guided {
+                    grant: held.grant,
+                    context: held.context,
+                    ticket: held.ticket,
+                    releasing: true,
+                },
+            );
+        }
     }
 
     /// Put `text` in the message input for the user to finish and send, replacing what was
@@ -1280,7 +1375,7 @@ impl Assistant {
     }
 
     fn send_text(&mut self, text: &str, typed: bool, place: &Place, ui: &UiContext) -> Outcome {
-        self.send_with(text, typed, place, ui, (None, Vec::new()))
+        self.send_with(text, typed, place, ui, Guided::default())
     }
 
     fn send_with(
@@ -1289,10 +1384,12 @@ impl Assistant {
         typed: bool,
         place: &Place,
         ui: &UiContext,
-        (grant, extra): (
-            Option<bcode_code_review_models::GuideGrant>,
-            Vec<ContextBlock>,
-        ),
+        Guided {
+            grant,
+            context: extra,
+            ticket,
+            releasing,
+        }: Guided,
     ) -> Outcome {
         let text = text.trim_end().to_owned();
         if text.trim().is_empty() {
@@ -1311,10 +1408,33 @@ impl Assistant {
             ));
             return Outcome::Redraw;
         }
+        let regrant = self.guide_grant != grant;
+        if (!self.held.is_empty() && !releasing) || (regrant && self.busy()) {
+            // Sent once the running turns end, in order, bound with its own grant then.
+            if typed {
+                *self.input.borrow_mut() = empty_input();
+            }
+            self.held.push_back(Held {
+                text,
+                grant,
+                context: extra,
+                ticket,
+                place: place.clone(),
+            });
+            self.notice = Some((
+                "the message is sent once the running turn ends".to_owned(),
+                false,
+            ));
+            self.touch();
+            return Outcome::Redraw;
+        }
         let mut context = self.context_blocks(place);
         context.extend(extra);
-        let regrant = self.guide_grant != grant;
         self.guide_grant = grant;
+        self.unsettled.push_back(Unsettled {
+            question: crate::agent::feed::question_of(&text),
+            ticket,
+        });
         let request = TurnRequest {
             text,
             context,
@@ -1411,6 +1531,7 @@ impl Assistant {
         );
         let template = self.binding_for(place, "");
         self.attached = Some(place.key());
+        self.in_flight.set(self.in_flight.get() + 1);
         let services = self.services.clone();
         let repo = self.repo.clone();
         let inbox = Arc::clone(&self.inbox);
@@ -1486,6 +1607,7 @@ impl Assistant {
         let services = self.services.clone();
         let repo = self.repo.clone();
         let inbox = Arc::clone(&self.inbox);
+        self.in_flight.set(self.in_flight.get() + 1);
         ui.spawn(Box::pin(async move {
             let result = async {
                 if let Some(attachment) = attachment {
@@ -1608,6 +1730,9 @@ impl Assistant {
             .agents
             .ensure(ui, self.session.iter().map(String::as_str));
         changed |= self.agents.drain();
+        let held = self.held.len();
+        self.settle(ui);
+        changed |= self.held.len() != held;
         drop(self.agents.take_attention());
         self.collect_finished_tools();
         let before = self.agents.revision();
@@ -1627,6 +1752,21 @@ impl Assistant {
 
     fn finish(&mut self, done: Done, ui: &UiContext) {
         self.touch();
+        if matches!(done, Done::Sent { .. } | Done::Started { .. }) {
+            self.in_flight.set(self.in_flight.get().saturating_sub(1));
+        }
+        if matches!(
+            &done,
+            Done::Sent { result: Err(error), retried, .. }
+                if *retried || error.code != crate::host::REQUEST_ONLY_CONTEXT_UNAVAILABLE
+        ) {
+            // The message's turn will not run: its newest unsettled entry is dropped.
+            self.unsettled.pop_back();
+        }
+        if matches!(&done, Done::Started { epoch, result: Err(_) } if *epoch == self.epoch) {
+            // No session: none of the conversation's messages runs.
+            self.unsettled.clear();
+        }
         match done {
             Done::Created { epoch, session } => {
                 if epoch == self.epoch {
@@ -4509,4 +4649,33 @@ mod tests {
         assert!(title.chars().count() <= MAX_TITLE_CHARS, "{title}");
         assert!(title.ends_with('…'));
     }
+}
+
+/// A message sent whose turn has not ended yet.
+#[derive(Debug)]
+struct Unsettled {
+    /// The message as the session's transcript names its turn.
+    question: String,
+    /// The guide message's ticket, when it has one.
+    ticket: Option<u64>,
+}
+
+/// A message held until the conversation's turns end.
+#[derive(Debug)]
+struct Held {
+    text: String,
+    grant: Option<bcode_code_review_models::GuideGrant>,
+    context: Vec<ContextBlock>,
+    ticket: Option<u64>,
+    place: Place,
+}
+
+/// What a guide action sends with its message.
+#[derive(Debug, Default)]
+struct Guided {
+    grant: Option<bcode_code_review_models::GuideGrant>,
+    context: Vec<ContextBlock>,
+    ticket: Option<u64>,
+    /// The message is a held one being sent now.
+    releasing: bool,
 }
