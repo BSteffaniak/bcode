@@ -128,6 +128,7 @@ async fn route_inner(
     let choice = choices
         .iter()
         .find(|choice| selected_model.is_none_or(|model| choice.model_id == model))
+        .or_else(|| choices.first())
         .ok_or("model is unavailable for the selected account")?;
     let context = ProviderRequestContext {
         account_reference: Some(account.to_owned()),
@@ -135,14 +136,48 @@ async fn route_inner(
         settings: choice.settings.clone(),
         ..Default::default()
     };
-    // Membership and routing come from the provider's offline choices. The owning catalog
-    // enriches the bounded list; no ambient endpoint, model profile or credential is inherited.
+    // Routing comes from the provider's offline choices. Membership starts there and is
+    // supplemented by the provider's bounded live list when one is available without
+    // credentials: the request carries routing settings only, and the provider decides
+    // whether a credential-free listing is possible. No ambient endpoint, model profile or
+    // credential is inherited.
     let catalog_provider = choice
         .settings
         .get("catalog_provider_id")
         .cloned()
         .unwrap_or(resolved.provider_id);
-    let list = ModelList {
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state
+            .plugins
+            .invoke_service_json::<_, bcode_model::ModelList>(
+                provider,
+                bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+                bcode_model::OP_MODELS,
+                &bcode_model::ModelListRequest {
+                    provider_context: context.clone(),
+                    selected_model_id: selected_model.map(str::to_string),
+                },
+            ),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .filter(|list| !list.models.is_empty() && list.models.len() <= MAX_MODELS);
+    let list = live.unwrap_or_else(|| offline_choice_list(&choices, &catalog_provider));
+    let list = state
+        .model_catalog
+        .resolve_selection(list, selected_model, None)
+        .await;
+    Ok((context, list))
+}
+
+/// Minimal offline fallback when the provider's live list is unavailable.
+fn offline_choice_list(
+    choices: &[bcode_model::StartupRecommendation],
+    catalog_provider: &str,
+) -> ModelList {
+    ModelList {
         models: choices
             .iter()
             .map(|choice| bcode_model::ModelInfo {
@@ -164,18 +199,13 @@ async fn route_inner(
             .collect(),
         catalog: bcode_model::ModelCatalogHints {
             policy: bcode_model::ModelCatalogPolicy::EnrichOnly {
-                provider_id: catalog_provider,
+                provider_id: catalog_provider.to_owned(),
                 target: None,
                 authority: bcode_model::ModelListAuthority::Authoritative,
             },
             ..Default::default()
         },
-    };
-    let list = state
-        .model_catalog
-        .resolve_selection(list, selected_model, None)
-        .await;
-    Ok((context, list))
+    }
 }
 
 fn require_discovery_budget(

@@ -29,6 +29,7 @@ Then choose a model under the connected account in `/model`. The selection appli
 ## Routing and billing
 
 * Go uses Chat Completions at `https://opencode.ai/inference/go/openai/v1`; Go model discovery uses `https://opencode.ai/inference/go/v1/models`.
+* The Go model listing is public, and Bcode uses it as the authoritative source for which models are available: the model picker and `/model` account section show every non-promotional Go model, including models not yet in Bcode's bundled catalog. The listing also documents limits, pricing, and capabilities, which Bcode normalizes; Bcode's verified catalog overlays serving details (for example, Google models through Go must not use `strict` tool schemas). Promotional `-free` models are never advertised.
 * Bcode sends its own user-agent and a stable `x-opencode-session` derived from the Bcode session ID. You do not need to configure these headers.
 * Bcode does not automatically fall back from Go to pay-as-you-go service. However, **Extra Usage** in OpenCode Console can add charges beyond the Go allowance. Disable Extra Usage **in Console** if you do not want those charges; Bcode does not control that setting.
 

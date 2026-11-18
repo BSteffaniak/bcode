@@ -71,6 +71,45 @@ impl bcode_plugin_sdk::RustPlugin for Provider {
             )
             .unwrap();
         }
+        if context.request.operation == bcode_model::OP_MODELS {
+            // Account routing requests carry routing settings only; no credentials may be
+            // required to answer them.
+            let request: bcode_model::ModelListRequest = context.request.payload_json().unwrap();
+            assert!(request.provider_context.auth.is_none());
+            let catalog_provider = request
+                .provider_context
+                .settings
+                .get("catalog_provider_id")
+                .cloned()
+                .unwrap_or_default();
+            let ids = match catalog_provider.as_str() {
+                "opencode-go" => vec!["glm-5", "grok-4.7"],
+                _ => vec!["gpt-5"],
+            };
+            return bcode_plugin_sdk::ServiceResponse::json(&bcode_model::ModelList {
+                models: ids
+                    .into_iter()
+                    .map(|id| bcode_model::ModelInfo {
+                        model_id: id.into(),
+                        display_name: id.into(),
+                        is_default: false,
+                        context_window: None,
+                        max_output_tokens: None,
+                        max_image_input_base64_bytes: None,
+                        capabilities: BTreeSet::from([bcode_model::ModelCapability::ToolCalls]),
+                        feature_support: bcode_model::ModelFeatureSupport::default(),
+                        reasoning: None,
+                        cache: bcode_model::ModelCacheInfo::default(),
+                        metadata_source: None,
+                        pricing: None,
+                        api_surface: None,
+                        visibility: bcode_model::ModelVisibility::default(),
+                    })
+                    .collect(),
+                catalog: bcode_model::ModelCatalogHints::default(),
+            })
+            .unwrap();
+        }
         if context.request.operation == bcode_model::OP_START_TURN {
             let request: bcode_model::ModelTurnRequest = context.request.payload_json().unwrap();
             assert_eq!(
@@ -243,6 +282,32 @@ async fn independent_accounts_validate_materialize_and_resume_without_transient_
     drop(restored);
 }
 
+/// The account's live list supplements the offline choices: live-only models appear in the
+/// picker, and selecting one keeps the provider-owned routing settings.
+async fn assert_live_only_models_are_selectable(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    go: &(ProviderRequestContext, ModelList),
+) {
+    assert!(go.1.models.iter().any(|model| model.model_id == "grok-4.7"));
+    let live_only = route(state, config, PROVIDER, "go", Some("grok-4.7"))
+        .await
+        .unwrap();
+    assert_eq!(live_only.0.settings["base_url"], "https://go.invalid/v1");
+    assert!(
+        live_only
+            .1
+            .models
+            .iter()
+            .any(|model| model.model_id == "grok-4.7")
+    );
+    assert!(
+        materialize(state, config, PROVIDER, "grok-4.7", "go")
+            .await
+            .is_ok()
+    );
+}
+
 async fn assert_account_discovery_and_dispatch(
     state: &ServerState,
     config: &bcode_config::BcodeConfig,
@@ -260,6 +325,16 @@ async fn assert_account_discovery_and_dispatch(
             .any(|account| account.account_reference == "go"
                 && account.display_name.starts_with("OpenCode Go"))
     );
+    assert!(
+        discovered
+            .iter()
+            .find(|account| account.account_reference == "go")
+            .unwrap()
+            .models
+            .models
+            .iter()
+            .any(|model| model.model_id == "grok-4.7")
+    );
     let sol = route(state, config, PROVIDER, "sol", Some("gpt-5"))
         .await
         .unwrap();
@@ -268,6 +343,7 @@ async fn assert_account_discovery_and_dispatch(
         .unwrap();
     assert_ne!(sol.0.settings["base_url"], go.0.settings["base_url"]);
     assert_eq!(go.1.models[0].model_id, "glm-5");
+    assert_live_only_models_are_selectable(state, config, &go).await;
     assert!(go.0.auth.is_none());
     assert!(go.0.env.is_empty());
     set(

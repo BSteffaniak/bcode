@@ -7941,7 +7941,11 @@ impl OpenAiCompatibleProviderPlugin {
     ) -> Option<Vec<ModelInfo>> {
         let runtime = self.runtime.as_ref().ok()?;
         let settings = settings.clone();
-        let api_key = model_metadata_api_key(&settings, context)?;
+        // The provider-owned Go models listing is published without authentication, so live
+        // discovery can run even before a key resolves; the fetch simply omits the bearer
+        // header. Only the dedicated Go endpoint qualifies.
+        let api_key = model_metadata_api_key(&settings, context)
+            .or_else(|| opencode_go::permits_keyless_listing(&settings).then(String::new))?;
         let selected_model_id = selected_model_id.map(str::to_string);
         runtime
             .block_on(async move {
@@ -7995,7 +7999,11 @@ async fn resolve_model_candidates_with_catalog(
 ) -> Result<Vec<ModelInfo>, ProviderError> {
     let configured_model_ids = model_ids_with_selected(&settings.model_ids, selected_model_id);
     let baseline = discovery::offline_models_with_catalog(settings, selected_model_id, catalog);
-    if settings.model_ids_are_explicit || settings.live_discovery_disabled || api_key.is_empty() {
+    // The provider-owned Go listing answers without credentials; every other endpoint needs a
+    // resolved key before it can be queried.
+    let live_discovery_available = !settings.live_discovery_disabled
+        && (!api_key.is_empty() || opencode_go::permits_keyless_listing(settings));
+    if settings.model_ids_are_explicit || !live_discovery_available {
         return Ok(baseline);
     }
     // One bounded enrichment attempt; errors and empty lists retain the offline baseline.
@@ -8042,10 +8050,15 @@ async fn fetch_provider_model_items(
             )
         })?;
     let url = opencode_go::models_url(settings);
-    let response = client
+    let mut request = client
         .get(url)
-        .header("User-Agent", concat!("bcode/", env!("CARGO_PKG_VERSION")))
-        .bearer_auth(api_key)
+        .header("User-Agent", concat!("bcode/", env!("CARGO_PKG_VERSION")));
+    // A missing credential must not be sent as an invalid bearer token; the Go listing is
+    // public, and other endpoints fail closed earlier in resolution.
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| reqwest_provider_error("models_request_failed", &error))?;

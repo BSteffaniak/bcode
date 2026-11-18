@@ -8,7 +8,8 @@ use bcode_model_catalog_models::ModelSupportTarget;
 
 use super::{
     ModelResponseItem, Settings, catalog_provider_id, model_ids_with_selected,
-    model_infos_from_ids_without_catalog, model_infos_from_items_without_catalog, startup,
+    model_infos_from_ids_without_catalog, model_infos_from_items_without_catalog, opencode_go,
+    startup,
 };
 
 pub const LIVE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -119,16 +120,21 @@ pub fn merge_live(
     } else {
         items
     };
-    // An ID-only response cannot establish price, context, or tool support.
-    let mut live = model_infos_from_items_without_catalog(items, None);
-    for model in &mut live {
-        model.is_default = false;
-        model.capabilities.clear();
-        if provider_id == "opencode-go" {
-            model.cache = bcode_model::ModelCacheInfo::default();
+    // The Go listing documents limits, pricing, and capabilities per entry, so its live
+    // entries keep their declared facts and the catalog merge overlays verified serving
+    // quirks. Other providers return IDs only; an ID cannot establish price, context, or
+    // tool support, so those entries stay metadata-free.
+    let live = if provider_id == "opencode-go" {
+        opencode_go::model_infos_from_items(items)
+    } else {
+        let mut live = model_infos_from_items_without_catalog(items, None);
+        for model in &mut live {
+            model.is_default = false;
+            model.capabilities.clear();
+            model.metadata_source = Some(ModelMetadataSource::ProviderLive);
         }
-        model.metadata_source = Some(ModelMetadataSource::ProviderLive);
-    }
+        live
+    };
     let target = ModelSupportTarget::new(
         provider_id,
         "api_key",
@@ -153,6 +159,24 @@ pub fn merge_live(
             }
             if model.max_output_tokens.is_some() {
                 existing.max_output_tokens = model.max_output_tokens;
+            }
+            // Go listings also declare capabilities, cache behavior, and reasoning shape;
+            // merge those additively so catalog-verified quirks survive.
+            if provider_id == "opencode-go" {
+                existing
+                    .capabilities
+                    .extend(model.capabilities.iter().copied());
+                existing
+                    .cache
+                    .capabilities
+                    .extend(model.cache.capabilities.iter().copied());
+                existing
+                    .cache
+                    .ttl_seconds
+                    .extend(model.cache.ttl_seconds.iter().copied());
+                if model.reasoning.is_some() {
+                    existing.reasoning = model.reasoning;
+                }
             }
         } else {
             baseline.push(model);
