@@ -483,6 +483,51 @@ The review assistant writes a guide with one agent (see
   writer each attempt (a version another conversation resumed meanwhile is left to it), keeping
   what was written; the panel's banner says `stopped · N of M sections written`.
 
+### Lifecycle and comparisons
+
+`bcode_code_review::guide::lifecycle` holds the domain side (refresh forks, the heads a version
+is pinned to, since guides and their delta check); the review screen drives it
+(`surface/guide_lifecycle.rs`).
+
+* **Stale.** A current version with stale sections shows the banner `N sections stale since
+  #102 1a2b3c4 · r refresh · alt+r refresh stale · V versions` (the version's first pinned
+  head; the keys as bound), stale outline rows end in `⚠ stale`, and the guide card counts
+  them (`⚠ 2 stale`).
+* **Refresh.** In the guide panel, `r` refreshes the current section and `alt+r` every stale
+  one (`Guide: refresh stale sections` in the palette). When the version is pinned to other
+  heads than the review's now, the app forks the next version (`based_on` the shown one,
+  pinned to the heads now, complete): every section is copied, citations that are fresh or
+  moved are remapped to the current revision and lines, stale and gone ones are kept for the
+  rewrite, and sections that stayed fresh record `refreshed_from`. The fork becomes current
+  and the review assistant's session is granted `Refresh{ids}` on it; a later refresh while
+  that version is still pinned to the heads now edits it in place, adding to the granted
+  ids. The assistant is then asked to rewrite just those sections with `put_section`. A
+  version being written, or an older version, is not refreshed.
+* **Grants from the app.** The review records the grant it gives the assistant's session in
+  that session's binding (`guide_grant`); a changed grant binds the session again before its
+  next message. Asking for a new walkthrough drops the grant, so the session writes the
+  versions it starts.
+* **Versions.** `V` (`Guide: versions…`) lists the guide's versions, newest first, with
+  status, the version each was forked from, and when it last changed. Picking an older one
+  shows it read-only with the banner `v1 · pinned to #102 1a2b3c4 · read-only · current is v2
+  · V versions`; picking the current one (or a guide write landing) shows the current one
+  again. `guide_show` takes `version` and shows that version the same way.
+* **Cards.** Each turn's guide card names the version that turn wrote, read from the `version`
+  its guide writes answered with (else the version a write named). A turn of another version
+  than the one on screen shows a compact card for that version without sections.
+* **Since guides.** "Guide these changes" (the first row of the Compare menu while a pull
+  request is compared, `enter` on the empty guide panel then, or `Guide: walk me through what
+  changed since I last looked` in the palette) creates a guide of scope `Since` with the
+  comparison's baseline and its current (not historical) layer pairs, pinned to the heads now
+  and planning, grants the assistant's session `Generate` on its version 1, and asks it to
+  write it without starting another. A guide whose version is pinned to a head the baseline
+  compares from (bounded: 8 guides, 8 versions each) is named in the request, so the
+  walkthrough opens with what changed in its sections. Writes to a since guide refuse
+  (`outside_delta`, nothing written) citations that are not about what changed: new-side
+  lines that are not new since the baseline with the rebase taken out (the refusal names the
+  new lines of the file), sources not compared, unchanged or rebased-only layers, and,
+  where the new lines cannot be told, citations of unchanged code.
+
 ## Review actions
 
 Keys of the `code-review-guide` scope; an older version is read-only and says so.
@@ -608,14 +653,15 @@ path inside the repository, so write-path rules apply.
 | P3 | Read-only guide panel (markdown bodies, draggable outline split, header pill), diff markers, navigation | Yes |
 | P4 | Single-agent generation from the assistant, guide card, tab fallback, stop | Yes |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | Yes |
-| P6 | Freshness in the UI, refresh forks, versions picker, since guides | No |
+| P6 | Freshness in the UI, refresh forks, versions picker, since guides | Yes |
 | P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | No |
 | P8 | Templates and lint, export to file | No |
 
-The review actions set grants: expand (`Expand`) and restructure (`Restructure`) bind the
-assistant's conversation for one message, and ask sessions are bound with `Ask`. Other sessions
-have no grant and write the versions they started or resumed. Fan-out children (P7) will set
-`Area` grants. Guide freshness is told in
+The app sets grants: expand (`Expand`) and restructure (`Restructure`) bind the assistant's
+conversation for one message, ask sessions are bound with `Ask`, and refresh (`Refresh`) and
+since guides (`Generate`) are recorded on the review's binding until a new walkthrough. Other
+sessions have no grant and write the versions they started or resumed. Fan-out children (P7)
+will set `Area` grants. Guide freshness is told in
 the panel (badges, tint and moved lines follow the review's current sources, and the peek of a
-moved citation reads the current revision); stale banners, refresh forks and the versions picker
-come with P6.
+moved citation reads the current revision), and stale banners, refresh forks and the versions
+picker are described under [Lifecycle and comparisons](#lifecycle-and-comparisons).

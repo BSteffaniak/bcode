@@ -219,7 +219,35 @@ fn a_since_guide_cites_only_lines_new_since_the_baseline() {
         .outside(&data, &repo.root, &old_line, None)
         .expect("not new since the baseline");
     assert!(refused.contains("new lines there: 8"), "{refused}");
+    // A guide written for the code last looked at is the one a since guide links; a since
+    // guide is pinned to the code now.
+    let earlier = guide(
+        &trunk_of(&pair),
+        pair.from.as_ref().map_or("", |from| &from.head_oid),
+    );
+    assert!(written_for_baseline(&earlier, std::slice::from_ref(&pair)));
+    let (since_row, since_version) = since_guide(
+        "review",
+        GuideScope::Since {
+            baseline: bcode_code_review_models::ReviewCompareBaseline::LastLooked,
+            pairs: vec![pair.clone()],
+        },
+        "Changes since you last looked",
+        (&[source(&trunk_of(&pair), &pushed)], &BTreeMap::new()),
+        None,
+        5,
+    );
+    assert_eq!(since_row.guide_id, since_version.guide_id);
+    assert_eq!(since_version.status, GuideStatus::Planning);
+    assert!(!written_for_baseline(
+        &since_version,
+        std::slice::from_ref(&pair)
+    ));
     let mut elsewhere = new_line;
     elsewhere.source_id = Some("other".to_owned());
     assert!(since.outside(&data, &repo.root, &elsewhere, None).is_some());
+}
+
+fn trunk_of(pair: &LayerPair) -> String {
+    pair.to.fork_oid.clone().unwrap_or_default()
 }
