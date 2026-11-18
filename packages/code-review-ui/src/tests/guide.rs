@@ -624,7 +624,7 @@ fn the_line_under_the_cursor_shows_its_section() {
 }
 
 #[test]
-fn panel_keys_reserved_for_later_say_so_instead_of_acting_on_the_review() {
+fn panel_keys_act_on_the_guide_instead_of_the_review() {
     let (mut setup, _, _fixture) = guided(150, 40);
     setup.scenario.key("alt+g");
     stable(&mut setup.scenario);
@@ -639,7 +639,7 @@ fn panel_keys_reserved_for_later_say_so_instead_of_acting_on_the_review() {
         .unwrap();
     setup.scenario.key("r");
     let screen = stable(&mut setup.scenario);
-    assert!(screen.contains("not available yet"), "{}", screen.text());
+    assert!(!screen.contains("not available yet"), "{}", screen.text());
     let doc = setup.scenario.surface().document().unwrap();
     assert!(
         !doc.viewed_state(&first)

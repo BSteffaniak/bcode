@@ -26,9 +26,8 @@ use bcode_code_review::guide::config::Markers;
 use bcode_code_review_models::{
     CitationRelation, GetGuideVersionRequest, GetGuideVersionResponse, GuideScope,
     ListGuideSectionMarksRequest, ListGuideSectionMarksResponse, ListGuideThreadsRequest,
-    ListGuideVersionsRequest,
-    ListReviewGuidesRequest, ListReviewGuidesResponse, ResolvedSource, ReviewLineInterval,
-    ReviewLineSide, RevisionRef,
+    ListGuideVersionsRequest, ListReviewGuidesRequest, ListReviewGuidesResponse, ResolvedSource,
+    ReviewLineInterval, ReviewLineSide, RevisionRef,
 };
 use bmux_keyboard::KeyStroke;
 use bmux_tui::geometry::Rect;

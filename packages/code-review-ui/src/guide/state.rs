@@ -9,8 +9,9 @@ use bcode_code_review::document::ItemKey;
 use bcode_code_review::guide::freshness::GuideFreshness;
 use bcode_code_review_models::{
     Citation, CitationRelation, Freshness, GuideRecord, GuideSectionMark, GuideStatus, GuideThread,
-    GuideThreadStatus, GuideVersion, GuideVersionRecord, GuideVersionSummary, ReviewGuide, ReviewLineInterval,
-    ReviewLineSide, RevisionRef, Section, SectionKind, SectionState, Verification,
+    GuideThreadStatus, GuideVersion, GuideVersionRecord, GuideVersionSummary, ReviewGuide,
+    ReviewLineInterval, ReviewLineSide, RevisionRef, Section, SectionKind, SectionState,
+    Verification,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
