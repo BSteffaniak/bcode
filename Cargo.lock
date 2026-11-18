@@ -588,7 +588,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -599,7 +599,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4533,7 +4533,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -4543,7 +4543,7 @@ dependencies = [
 [[package]]
 name = "bmux_cell_geometry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -4551,7 +4551,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "lz4_flex 0.14.0",
  "serde",
@@ -4561,7 +4561,7 @@ dependencies = [
 [[package]]
 name = "bmux_color"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "serde",
 ]
@@ -4569,7 +4569,7 @@ dependencies = [
 [[package]]
 name = "bmux_config_composition"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "libc",
  "serde",
@@ -4579,7 +4579,7 @@ dependencies = [
 [[package]]
 name = "bmux_fonts"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -4588,7 +4588,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -4604,7 +4604,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -4619,7 +4619,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "serde",
 ]
@@ -4627,7 +4627,7 @@ dependencies = [
 [[package]]
 name = "bmux_markdown"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
@@ -4645,7 +4645,7 @@ dependencies = [
 [[package]]
 name = "bmux_mermaid_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_fonts",
  "cranelift-codegen",
@@ -4657,7 +4657,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "serde",
  "serde_json",
@@ -4666,7 +4666,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
@@ -4694,7 +4694,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "serde",
  "serde_json",
@@ -4707,7 +4707,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "serde",
  "sha2 0.11.1",
@@ -4718,7 +4718,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4738,7 +4738,7 @@ dependencies = [
 [[package]]
 name = "bmux_pty"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -4747,7 +4747,7 @@ dependencies = [
 [[package]]
 name = "bmux_syntax_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_tui",
  "syntect",
@@ -4757,7 +4757,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_keyboard",
  "futures-core",
@@ -4768,7 +4768,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_terminal_protocol",
@@ -4780,7 +4780,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "serde",
 ]
@@ -4788,7 +4788,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_keyboard",
@@ -4801,7 +4801,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
@@ -4822,7 +4822,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
@@ -4839,7 +4839,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_image",
  "bmux_keyboard",
@@ -4853,7 +4853,7 @@ dependencies = [
 [[package]]
 name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#109126f0963bbdab271916158f5f5809eb91c88f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b94403e7da4182015f32e1e561dfb0cda58c3831"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
@@ -5625,7 +5625,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6517,7 +6517,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6802,7 +6802,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10409,7 +10409,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11898,7 +11898,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12936,7 +12936,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12949,7 +12949,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13699,7 +13699,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13838,7 +13838,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15239,7 +15239,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -17048,7 +17048,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
