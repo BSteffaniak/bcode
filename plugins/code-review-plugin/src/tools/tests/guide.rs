@@ -1014,3 +1014,91 @@ fn a_citation_heavy_guide_reads_as_whole_json_within_the_output_bound() {
         );
     }
 }
+
+#[test]
+fn fan_out_children_write_only_their_area_and_synthesis_reuses_their_citation_ids() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let (guide, path, line) = started(&mut harness);
+    let quote = line_text(&harness, &path, line);
+    let store = harness.store();
+    let repo = harness.fixture.root().to_path_buf();
+    store
+        .update_guide_version(
+            &repo,
+            guide.clone(),
+            None,
+            None,
+            |version: &mut bcode_code_review_models::GuideVersion| -> Result<(), ()> {
+                version.generation = Some(bcode_code_review_models::GenerationState::default());
+                Ok(())
+            },
+        )
+        .expect("update")
+        .expect("updated");
+    let child = "33333333-3333-4333-8444-555555555555";
+    harness.bind(child);
+    grant(
+        &harness,
+        child,
+        Some(GuideGrant {
+            guide_id: guide.clone(),
+            version: Some(1),
+            mode: GrantMode::Area {
+                area_id: "crates/net".to_owned(),
+            },
+        }),
+    );
+    let section = harness.call(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "ops": [{"op": "put_section", "id": "s1", "body": "x"}]}),
+        child,
+    );
+    assert!(section.is_error, "an area child may not write the version");
+    let other_area = harness.call(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "ops": [{"op": "area_result", "area_id": "crates/db", "sections": []}]}),
+        child,
+    );
+    assert!(
+        other_area.is_error,
+        "an area child may not write another area"
+    );
+    let area = harness.json(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "ops": [{"op": "area_result", "area_id": "crates/net", "sections": [
+            {"id": "a1", "kind": "step", "title": "Net", "body": "Retries [[1]].",
+             "citations": [{"path": path, "start_line": line, "end_line": line, "quote": quote}]}
+        ]}]}),
+        child,
+    );
+    let id = area["citations"][0]["id"].as_str().expect("id").to_owned();
+    assert_eq!(id, "crates-net.c1", "{area}");
+
+    let synthesized = harness.json(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "ops": [
+            {"op": "put_section", "id": "s2", "body": "Covers the network [[crates-net.c1]].", "citations": [id]}
+        ]}),
+        SESSION,
+    );
+    assert_eq!(synthesized["written"], true, "{synthesized}");
+    let version = store
+        .guide_version(&GetGuideVersionRequest {
+            repo_path: repo,
+            guide_id: guide,
+            version: None,
+        })
+        .expect("read")
+        .version
+        .expect("version")
+        .version;
+    let reused = version.citations.get(&id).expect("the area's citation");
+    assert_eq!(reused.lines.start, line);
+    assert_eq!(
+        version
+            .section("s2")
+            .map(|section| section.citations.clone()),
+        Some(vec![id])
+    );
+}

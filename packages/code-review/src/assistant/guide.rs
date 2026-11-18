@@ -21,11 +21,12 @@ use crate::guide::plan::{GuidePlan, PlanFile, PlanInput, PlanLayer, plan};
 use crate::guide::template::{ResolvedTemplate, resolve_template};
 use crate::guide::write::{
     ApplyOutcome, AreaStatusInput, Doc, GuideOp, MAX_OPS, OUTSIDE_GRANT, OpError, OutlineInput,
-    SectionWrite, Writer, apply, apply_area_sections, batch_citations, inline_citations,
+    SectionWrite, Writer, apply, apply_area_sections, area_citation_prefix, batch_citations,
+    inline_citations, named_citation_ids,
 };
 use crate::store::StoreError;
 use bcode_code_review_models::{
-    CitationCheck, CitationCheckStatus, CitationRequest, CreateReviewGuideRequest,
+    Citation, CitationCheck, CitationCheckStatus, CitationRequest, CreateReviewGuideRequest,
     ForkGuideVersionRequest, GetGuideVersionRequest, GrantMode, GuideArea, GuideAreaStatus,
     GuideDepth, GuideGrant, GuideHead, GuideOrigin, GuideRecord, GuideScope, GuideStatus,
     GuideStrategy, GuideVersion, GuideVersionRecord, ListGuideAreasRequest,
@@ -114,6 +115,8 @@ pub struct GuideStart {
     pub directions: Option<String>,
     /// A planned outline.
     pub outline: Vec<OutlineInput>,
+    /// The stack guide a new layer guide belongs to.
+    pub parent_guide_id: Option<String>,
 }
 
 /// What `guide.write` did: written, or refused with nothing written.
@@ -748,7 +751,7 @@ impl ReviewTools<'_> {
                 guide_id,
                 review_key: String::new(),
                 scope,
-                parent_guide_id: None,
+                parent_guide_id: start.parent_guide_id.clone(),
                 title: crate::guide::config::cut(
                     &title,
                     bcode_code_review_models::MAX_GUIDE_TITLE_BYTES,
@@ -825,19 +828,10 @@ impl ReviewTools<'_> {
                 "citations": numbered_checks(&checks),
             })));
         }
-        if let GuideScope::Since { pairs, .. } = &guide.guide.scope
-            && !pairs.is_empty()
-        {
-            let errors = self.outside_delta(review, pairs, &ops, &checks)?;
-            if !errors.is_empty() {
-                return Ok(GuideWriteOutcome::Refused(json!({
-                    "written": false,
-                    "code": GUIDE_OUTSIDE_DELTA,
-                    "message": "this guide walks through what changed since the comparison baseline, so it cites only lines new since then; nothing was written. Cite the new lines named, or leave the point out, and write again",
-                    "errors": errors,
-                })));
-            }
+        if let Some(refused) = self.since_refusal(review, &guide, &ops, &checks)? {
+            return Ok(refused);
         }
+        let imports = self.area_citations(review, &current.version, &ops)?;
         let grant = review.guide_grant.clone();
         let caller = session.map(str::to_owned);
         let guide_row = guide.guide;
@@ -855,6 +849,12 @@ impl ReviewTools<'_> {
                     session_id: caller.as_deref(),
                     now_ms: now,
                 };
+                for (id, citation) in &imports {
+                    version
+                        .citations
+                        .entry(id.clone())
+                        .or_insert_with(|| citation.clone());
+                }
                 apply(version, &ops, &checks, &writer).map_err(Refusal::Ops)
             },
         );
@@ -888,6 +888,31 @@ impl ReviewTools<'_> {
             "citations": outcome.citations.iter().map(citation_view).collect::<Vec<_>>(),
             "lint": lint,
         })))
+    }
+
+    /// The refusal of a since guide's write citing lines not new since its baseline.
+    fn since_refusal(
+        &self,
+        review: &OpenReview,
+        guide: &GuideRecord,
+        ops: &[GuideOp],
+        checks: &[CitationCheck],
+    ) -> Result<Option<GuideWriteOutcome>, AssistantError> {
+        let GuideScope::Since { pairs, .. } = &guide.guide.scope else {
+            return Ok(None);
+        };
+        if pairs.is_empty() {
+            return Ok(None);
+        }
+        let errors = self.outside_delta(review, pairs, ops, checks)?;
+        Ok((!errors.is_empty()).then(|| {
+            GuideWriteOutcome::Refused(json!({
+                "written": false,
+                "code": GUIDE_OUTSIDE_DELTA,
+                "message": "this guide walks through what changed since the comparison baseline, so it cites only lines new since then; nothing was written. Cite the new lines named, or leave the point out, and write again",
+                "errors": errors,
+            }))
+        }))
     }
 
     /// The citations of `ops` (checked as `checks`, in batch order) that a since guide of
@@ -926,6 +951,40 @@ impl ReviewTools<'_> {
             at += count;
         }
         Ok(errors)
+    }
+
+    /// The citations of `version`'s fan-out areas that `ops` name by id and the version does
+    /// not have yet: synthesis reuses the areas' checked citations as they are.
+    fn area_citations(
+        &self,
+        review: &OpenReview,
+        version: &GuideVersion,
+        ops: &[GuideOp],
+    ) -> Result<BTreeMap<String, Citation>, AssistantError> {
+        let missing: Vec<String> = named_citation_ids(ops)
+            .into_iter()
+            .filter(|id| !version.citations.contains_key(id))
+            .collect();
+        if missing.is_empty() || version.generation.is_none() {
+            return Ok(BTreeMap::new());
+        }
+        let areas = self
+            .store
+            .list_guide_areas(&ListGuideAreasRequest {
+                repo_path: review.repo_root.clone(),
+                guide_id: version.guide_id.clone(),
+                version: version.version,
+            })?
+            .areas;
+        Ok(missing
+            .into_iter()
+            .filter_map(|id| {
+                areas
+                    .iter()
+                    .find_map(|record| record.area.citations.get(&id))
+                    .map(|citation| (id, citation.clone()))
+            })
+            .collect())
     }
 
     fn write_area(
@@ -972,6 +1031,7 @@ impl ReviewTools<'_> {
         let checks = self.check(review, Some(&version.heads), &requests);
         let now = now_ms();
         let (mut area, expected) = self.area(review, session, version, area_id, now)?;
+        let prefix = area_citation_prefix(area_id);
         let mut outcome = ApplyOutcome::default();
         let mut retired = Vec::new();
         let mut doc = Doc {
@@ -979,6 +1039,7 @@ impl ReviewTools<'_> {
             citations: &mut area.citations,
             retired: &mut retired,
             replace_citations: true,
+            id_prefix: &prefix,
         };
         if let Err((code, message)) = apply_area_sections(&mut doc, sections, &checks, &mut outcome)
         {
@@ -1315,6 +1376,23 @@ impl ReviewTools<'_> {
             "template": template,
             "context": context,
         }))
+    }
+
+    /// The plan of a guide of the review (as [`Self::guide_plan`] reports it), for an app
+    /// that runs the plan itself.
+    ///
+    /// # Errors
+    ///
+    /// * [`AssistantError::Data`] when the repository cannot be read.
+    pub fn guide_plan_of(
+        &self,
+        review: &OpenReview,
+        config: &GuideConfig,
+        strategy: Option<StrategyChoice>,
+        depth: Option<GuideDepth>,
+    ) -> Result<GuidePlan, AssistantError> {
+        let input = self.plan_input(review, 0)?;
+        Ok(plan(&input, config, strategy, depth))
     }
 
     fn plan_input(

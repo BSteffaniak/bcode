@@ -385,6 +385,85 @@ pub fn inline_citations(op: &GuideOp) -> Vec<&CitationRequest> {
     out
 }
 
+/// Citation ids `ops` name as existing citations (ids in citation lists and findings, and
+/// body tokens), in first-use order.
+#[must_use]
+pub fn named_citation_ids(ops: &[GuideOp]) -> Vec<String> {
+    fn of_section(
+        body: Option<&str>,
+        citations: Option<&[CiteInput]>,
+        findings: Option<&[FindingInput]>,
+        out: &mut Vec<String>,
+    ) {
+        let mut push = |id: &str| {
+            if !id.is_empty() && !out.iter().any(|known| known == id) {
+                out.push(id.to_owned());
+            }
+        };
+        for cite in citations.unwrap_or_default() {
+            if let CiteInput::Id(id) = cite {
+                push(id);
+            }
+        }
+        for finding in findings.unwrap_or_default() {
+            for cite in &finding.citations {
+                if let FindingCite::Id(id) = cite {
+                    push(id);
+                }
+            }
+        }
+        for token in body_tokens(body.unwrap_or_default()) {
+            if token.parse::<usize>().is_err() {
+                push(&token);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            GuideOp::PutSection(write) => of_section(
+                write.body.as_deref(),
+                write.citations.as_deref(),
+                write.findings.as_deref(),
+                &mut out,
+            ),
+            GuideOp::AddExpansion(write) => of_section(
+                Some(&write.body),
+                Some(&write.citations),
+                Some(&write.findings),
+                &mut out,
+            ),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The prefix of the citation ids an area's writer stores (`crates-net.c1`), so that the
+/// citations of every area of a version can be reused by id in the version itself.
+#[must_use]
+pub fn area_citation_prefix(area_id: &str) -> String {
+    const MAX_TAG_BYTES: usize = 32;
+    let mut tag: String = area_id
+        .trim()
+        .trim_matches('/')
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || "_-".contains(character) {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    tag.truncate(MAX_TAG_BYTES);
+    if tag.is_empty() {
+        tag.push_str("area");
+    }
+    tag.push('.');
+    tag
+}
+
 /// Every inline citation of `ops`, in order.
 #[must_use]
 pub fn batch_citations(ops: &[GuideOp]) -> Vec<CitationRequest> {
@@ -405,6 +484,9 @@ pub struct Doc<'a> {
     /// citation (writers of a whole version or area). A narrower writer leaves it as it is, for
     /// other sections cite it too, and stores a different one under a free id.
     pub replace_citations: bool,
+    /// Prefix of the citation ids stored (an area's, see [`area_citation_prefix`]; empty for
+    /// a version).
+    pub id_prefix: &'a str,
 }
 
 /// Apply `ops` to `version` as `writer`; `checks` are the results of checking
@@ -609,6 +691,7 @@ fn apply_one(
         citations: &mut version.citations,
         retired: &mut version.retired_sections,
         replace_citations: matches!(writer.mode, GrantMode::Generate | GrantMode::Restructure),
+        id_prefix: "",
     };
     match op {
         GuideOp::SetOutline { sections } => set_outline(&mut doc, sections, restructure)?,
@@ -1000,7 +1083,14 @@ fn store_citation(
     outcome: &mut ApplyOutcome,
 ) -> Result<String, (&'static str, String)> {
     let mut citation = check.citation.clone();
-    let wanted = match wanted.map(str::trim).filter(|id| !id.is_empty()) {
+    let prefixed = wanted.map(str::trim).filter(|id| !id.is_empty()).map(|id| {
+        if id.starts_with(doc.id_prefix) {
+            id.to_owned()
+        } else {
+            format!("{}{id}", doc.id_prefix)
+        }
+    });
+    let wanted = match prefixed.as_deref() {
         Some(id) => {
             check_id(id, "citation")?;
             match doc.citations.get(id) {
@@ -1028,7 +1118,7 @@ fn store_citation(
     } else {
         let mut next = doc.citations.len() + 1;
         loop {
-            let candidate = format!("c{next}");
+            let candidate = format!("{}c{next}", doc.id_prefix);
             if !doc.citations.contains_key(&candidate) {
                 break candidate;
             }
@@ -1057,6 +1147,13 @@ fn resolve_cites<'c>(
     for cite in cites {
         let id = match cite {
             CiteInput::Id(id) => {
+                let qualified = format!("{}{id}", doc.id_prefix);
+                let id =
+                    if !doc.citations.contains_key(id) && doc.citations.contains_key(&qualified) {
+                        &qualified
+                    } else {
+                        id
+                    };
                 if !doc.citations.contains_key(id) {
                     return Err(invalid(format!(
                         "no citation {id}; cite with an inline citation object or an existing id"

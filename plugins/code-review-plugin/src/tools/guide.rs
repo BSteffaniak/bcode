@@ -535,6 +535,7 @@ fn start_of(arguments: GuideArguments) -> Result<GuideStart, AssistantError> {
         template: arguments.template,
         directions: arguments.directions,
         outline: arguments.outline,
+        parent_guide_id: None,
     })
 }
 

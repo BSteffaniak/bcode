@@ -371,6 +371,55 @@ pub struct GenerationState {
     /// The soft token budget, when one applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u64>,
+    /// Children running at once at most; every area at once when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<usize>,
+    /// The verifier child checking the version's claims, once one runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_session: Option<String>,
+    /// Whether the version's claims are checked by a verifier child after synthesis.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
+    /// Why writing ended early, such as the token budget running out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl GenerationState {
+    /// Areas done (complete, failed, or cancelled).
+    #[must_use]
+    pub fn terminal(&self) -> usize {
+        self.areas
+            .iter()
+            .filter(|area| area.status.is_terminal())
+            .count()
+    }
+
+    /// Areas written.
+    #[must_use]
+    pub fn complete(&self) -> usize {
+        self.areas
+            .iter()
+            .filter(|area| area.status == GuideAreaStatus::Complete)
+            .count()
+    }
+
+    /// Whether every area is done.
+    #[must_use]
+    pub fn all_terminal(&self) -> bool {
+        self.areas.iter().all(|area| area.status.is_terminal())
+    }
+
+    /// The area `area_id`.
+    #[must_use]
+    pub fn area(&self, area_id: &str) -> Option<&GenerationArea> {
+        self.areas.iter().find(|area| area.area_id == area_id)
+    }
+
+    /// The area `area_id`, to change.
+    pub fn area_mut(&mut self, area_id: &str) -> Option<&mut GenerationArea> {
+        self.areas.iter_mut().find(|area| area.area_id == area_id)
+    }
 }
 
 /// One planned area of a fan-out.
@@ -385,6 +434,26 @@ pub struct GenerationArea {
     pub session_id: Option<String>,
     /// Where it stands.
     pub status: GuideAreaStatus,
+    /// Repository-relative paths the area covers (an area of a fan-out by area).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// The stack layer's source id (a layer of a fan-out by layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// The layer's own guide, which the child writes (a fan-out by layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_id: Option<String>,
+    /// Tokens the child used, as last observed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tokens: u64,
+    /// Why the area failed or was stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Where one fan-out area stands.
