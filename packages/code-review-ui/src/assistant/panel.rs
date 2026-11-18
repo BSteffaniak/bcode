@@ -1183,7 +1183,10 @@ impl Assistant {
         let mut binding = *review.binding.clone()?;
         session.clone_into(&mut binding.session_id);
         binding.detached_at_ms = None;
-        binding.guide_grant.clone_from(&self.guide_grant);
+        // A guide action's grant for this message; otherwise the grant the review records.
+        if self.guide_grant.is_some() {
+            binding.guide_grant.clone_from(&self.guide_grant);
+        }
         // Where it started, for a session the store has not seen yet.
         binding.started = Some(match &self.tag {
             Some(Tag::Review {
