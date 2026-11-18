@@ -199,7 +199,7 @@ fn a_since_guide_cites_only_lines_new_since_the_baseline() {
     let pair = LayerPair {
         number: 7,
         from: Some(VersionPoint {
-            head_oid: looked.clone(),
+            head_oid: looked,
             fork_oid: Some(trunk.clone()),
         }),
         to: VersionPoint {
@@ -219,7 +219,7 @@ fn a_since_guide_cites_only_lines_new_since_the_baseline() {
         .outside(&data, &repo.root, &old_line, None)
         .expect("not new since the baseline");
     assert!(refused.contains("new lines there: 8"), "{refused}");
-    let mut elsewhere = new_line.clone();
+    let mut elsewhere = new_line;
     elsewhere.source_id = Some("other".to_owned());
     assert!(since.outside(&data, &repo.root, &elsewhere, None).is_some());
 }

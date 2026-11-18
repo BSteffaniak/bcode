@@ -62,6 +62,8 @@ pub enum Message {
     /// A guide review action (reviewed, comment, expand, ask, promote, discard,
     /// restructure) finished.
     GuideReview(Box<super::surface::GuideReviewDone>),
+    /// Guide refresh or since-guide work finished.
+    GuideLifecycle(Box<super::surface::LifecycleDone>),
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

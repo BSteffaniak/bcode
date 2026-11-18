@@ -207,7 +207,7 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
             "Show the review's guide (written with code_review.guide.start and code_review.guide.write) and move the user through it exactly as the guide keys do: open the guide panel (or the assistant's Guide tab when the screen has no room for it), select a section, show one of its citations in the diff, or step to the next, previous or next unreviewed section. Without arguments it opens the guide where the user left it. Returns what is on screen now, with the guide's current section.",
             &json!({
                 "guide_id": {"type": "string", "description": "The guide to show (default: the one on screen, else the review's newest)."},
-                "version": {"type": "integer", "minimum": 1, "description": "Must be the version on screen (the guide's current one)."},
+                "version": {"type": "integer", "minimum": 1, "description": "The version to show (v1 is the first; the version on screen when omitted). An older version shows read-only, pinned to the code it was written for."},
                 "section": {"type": "string", "description": "Section id (s3, s3.1) or outline number (3.1) to show, with its first citation."},
                 "citation": {"type": "string", "description": "Citation id (c7) to show in the diff, in the section citing it."},
                 "step": {"type": "string", "enum": ["next", "previous", "next_unreviewed"], "description": "Step from the current place, as alt+down, alt+up and alt+u do."},
@@ -223,7 +223,7 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
 pub struct GuideShowArguments {
     /// The guide to show.
     pub guide_id: Option<String>,
-    /// The version, which must be the one on screen.
+    /// The version to show; the one on screen when absent.
     pub version: Option<u32>,
     /// Section id or outline number.
     pub section: Option<String>,

@@ -61,6 +61,8 @@ pub enum MenuChoice {
     Seen(SeenHunks),
     /// Mark option: code removed since the baseline shows inline.
     RemovedInline,
+    /// Ask the review assistant for a guide of the changes since the baseline in effect.
+    Guide,
 }
 
 const fn mark_style_id(style: MarkStyle) -> &'static str {
@@ -96,6 +98,7 @@ impl MenuChoice {
             Self::Words => "words".to_owned(),
             Self::Seen(seen) => seen_id(seen).to_owned(),
             Self::RemovedInline => "removed_inline".to_owned(),
+            Self::Guide => "guide".to_owned(),
         }
     }
 
@@ -111,6 +114,7 @@ impl MenuChoice {
             "view" => Self::View,
             "words" => Self::Words,
             "removed_inline" => Self::RemovedInline,
+            "guide" => Self::Guide,
             other => {
                 if let Some(style) = MarkStyle::ALL
                     .into_iter()
@@ -141,6 +145,12 @@ impl MenuChoice {
                 | Self::Seen(_)
                 | Self::RemovedInline
         )
+    }
+
+    /// Whether the row is an action that closes the menu rather than a choice.
+    #[must_use]
+    pub const fn is_action(self) -> bool {
+        matches!(self, Self::Guide)
     }
 
     /// Whether picking the row opens another picker (the push timeline or the version picker)
@@ -211,6 +221,8 @@ pub struct MenuState {
     pub marks: MarkOptions,
     /// What each tab badge glyph means.
     pub legend: String,
+    /// Some pull request is compared: the menu offers a guide of the changes.
+    pub guide: bool,
 }
 
 /// What the menu can offer to pick from.
@@ -317,7 +329,8 @@ impl CompareMenu {
                 Line::from_spans(vec![Span::styled(label.to_owned(), theme.title)]),
             )
         };
-        let mut items = vec![
+        let mut items: Vec<PickerItem> = Self::guide_item(state, theme).into_iter().collect();
+        items.extend([
             section("s.since", "Show changes since"),
             target(
                 MenuChoice::LastLooked,
@@ -325,7 +338,7 @@ impl CompareMenu {
                 state.last_looked.as_deref(),
                 "each pull request as you last saw it",
             ),
-        ];
+        ]);
         if state.offers.pushes {
             items.push(target(
                 MenuChoice::PreviousPush,
@@ -384,6 +397,24 @@ impl CompareMenu {
             Line::from_spans(vec![Span::styled(state.legend.clone(), theme.muted)]),
         ));
         items
+    }
+
+    /// The row asking for a guide of the changes, while some pull request is compared.
+    fn guide_item(state: &MenuState, theme: &ReviewTheme) -> Option<PickerItem> {
+        state.guide.then(|| {
+            PickerItem::new(
+                MenuChoice::Guide.id(),
+                Line::from_spans(vec![
+                    Span::styled(theme.icons.guide_marker, theme.accent),
+                    Span::raw(" "),
+                    Span::styled("Guide these changes", theme.text),
+                    Span::styled(
+                        "  the review assistant walks you through what changed",
+                        theme.muted,
+                    ),
+                ]),
+            )
+        })
     }
 
     /// The rows choosing how what is new since the baseline is marked: radio buttons for the
@@ -497,7 +528,7 @@ impl CompareMenu {
                 return self
                     .focused()
                     .map_or(CompareMenuOutcome::Ignored, |choice| {
-                        if choice.opens_picker() {
+                        if choice.opens_picker() || choice.is_action() {
                             CompareMenuOutcome::ApplyAndClose(choice)
                         } else {
                             CompareMenuOutcome::Apply(choice)
@@ -538,7 +569,9 @@ impl CompareMenu {
         match self.picker.mouse(event, theme) {
             PickerOutcome::Cancel => CompareMenuOutcome::Cancel,
             PickerOutcome::Picked(id) => match MenuChoice::from_id(&id) {
-                Some(choice) if choice.opens_picker() => CompareMenuOutcome::ApplyAndClose(choice),
+                Some(choice) if choice.opens_picker() || choice.is_action() => {
+                    CompareMenuOutcome::ApplyAndClose(choice)
+                }
                 Some(choice) => CompareMenuOutcome::Apply(choice),
                 None => CompareMenuOutcome::Ignored,
             },
@@ -904,6 +937,7 @@ mod tests {
             stack_at: None,
             marks: MarkOptions::default(),
             legend: crate::history::badge_legend(&crate::theme::Icons::UNICODE),
+            guide: false,
         }
     }
 
@@ -1063,6 +1097,31 @@ mod tests {
             CompareMenuOutcome::ApplyAndClose(MenuChoice::Version)
         );
         assert_eq!(menu.key(key(KeyCode::Escape)), CompareMenuOutcome::Cancel);
+    }
+
+    #[test]
+    fn a_comparison_offers_a_guide_of_its_changes_that_closes_the_menu() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let plain = CompareMenu::new(&menu_state(), &theme).rows();
+        assert!(!plain.iter().any(|row| row.contains("Guide these changes")));
+        let mut state = menu_state();
+        state.guide = true;
+        let mut menu = CompareMenu::new(&state, &theme);
+        assert!(
+            menu.rows()[0].contains("Guide these changes"),
+            "{:?}",
+            menu.rows()
+        );
+        menu.key(key(KeyCode::Home));
+        assert_eq!(menu.focused(), Some(MenuChoice::Guide));
+        assert_eq!(
+            menu.key(key(KeyCode::Space)),
+            CompareMenuOutcome::ApplyAndClose(MenuChoice::Guide)
+        );
+        assert_eq!(
+            menu.key(key(KeyCode::Enter)),
+            CompareMenuOutcome::ApplyAndClose(MenuChoice::Guide)
+        );
     }
 
     #[test]

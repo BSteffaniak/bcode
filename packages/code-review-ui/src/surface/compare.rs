@@ -164,6 +164,17 @@ impl Comparing {
         !self.pairs.is_empty()
     }
 
+    /// The pairs compared now, by source id (historical views, which show older code, are
+    /// left out).
+    #[must_use]
+    pub fn current_pairs(&self) -> Vec<(String, LayerPair)> {
+        self.pairs
+            .iter()
+            .filter(|(_, compared)| !compared.historical)
+            .map(|(source, compared)| (source.clone(), compared.pair.clone()))
+            .collect()
+    }
+
     /// What layers are compared with.
     #[must_use]
     pub const fn baseline(&self) -> Baseline {

@@ -163,6 +163,7 @@ mod flows;
 mod guide;
 mod guide_assist;
 mod guide_review;
+mod guide_lifecycle;
 mod history;
 mod pointer;
 mod reconcile;
@@ -183,6 +184,7 @@ pub use flows::Modal;
 pub use guide::{GUIDE_PANE_ID, GUIDE_SCOPE, PEEK_ID};
 pub use guide_assist::{GUIDE_TAB_VIEW_ID, GuideShowOutcome, WALKTHROUGH, WALKTHROUGH_DIRECTIONS};
 pub use guide_review::GuideReviewDone;
+pub use guide_lifecycle::LifecycleDone;
 pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
 
 pub use find::{SearchState, ThreadsFilter};
@@ -2148,6 +2150,7 @@ impl ReviewSurface {
             Message::Peek { citation, result } => self.apply_peek(&citation, result),
             Message::GuideStopped(result) => self.guide_stop_written(result),
             Message::GuideReview(done) => self.guide_review_done(*done),
+            Message::GuideLifecycle(done) => self.apply_guide_lifecycle(*done),
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -4097,6 +4100,7 @@ impl ReviewSurface {
             Some(Modal::History(panel)) => panel.paint(&theme, area, cx),
             Some(Modal::Compare(menu)) => menu.paint(&theme, area, cx),
             Some(Modal::Versions(picker)) => picker.paint(&theme, area, cx),
+            Some(Modal::GuideVersions(picker)) => picker.paint(&theme, area, cx),
             None => {}
         }
         if self.publish.open

@@ -114,7 +114,8 @@ impl ReviewSurface {
             title: self.title.clone(),
             layer: self.current_layer_number(),
             chip: self.assistant_place(),
-            generation: self.generation,
+            // A changed guide grant binds the session again, as a reopened review does.
+            generation: self.generation ^ self.guide.grant_epoch.rotate_left(32),
             binding: binding.then(|| Box::new(self.assistant_binding(String::new()))),
         }
     }
@@ -150,7 +151,7 @@ impl ReviewSurface {
             updated_at_ms: 0,
             started: None,
             detached_at_ms: None,
-            guide_grant: None,
+            guide_grant: self.guide.grant.clone(),
         }
     }
 

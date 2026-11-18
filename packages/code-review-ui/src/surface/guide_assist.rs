@@ -73,6 +73,8 @@ impl ReviewSurface {
         } else {
             WALKTHROUGH_DIRECTIONS
         };
+        // A new walkthrough writes the versions it starts, not what an earlier request granted.
+        self.set_guide_grant(None);
         self.link.requests.push(LinkRequest::Message {
             text: text.to_owned(),
             send,
@@ -113,6 +115,8 @@ impl ReviewSurface {
         if !wrote {
             return false;
         }
+        // What is being written shows: the current version, not an older one being read.
+        self.guide.view = None;
         self.reload_guide();
         if started {
             self.guide.state.engaged = true;
@@ -223,6 +227,14 @@ impl ReviewSurface {
             self.wait_for_guide_show(arguments);
             return Ok(GuideShowOutcome::Waiting);
         }
+        if let (Some(version), Some(active)) = (arguments.version, self.guide.state.active.as_ref())
+            && version != active.version.version
+        {
+            let guide_id = active.guide.guide_id.clone();
+            self.want_guide_version(&guide_id, version);
+            self.wait_for_guide_show(arguments);
+            return Ok(GuideShowOutcome::Waiting);
+        }
         if shown.is_none() {
             return match &self.guide.state.load {
                 GuideLoad::Ready => Err("this review has no guide yet; write one with \
@@ -300,8 +312,8 @@ impl ReviewSurface {
             && version != active.version.version
         {
             return Err(format!(
-                "only v{} of this guide (the version on screen) can be shown",
-                active.version.version
+                "this guide has no version {version} (its current version is v{})",
+                active.guide.current_version
             ));
         }
         let target = if let Some(section) = arguments.section.as_deref() {

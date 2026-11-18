@@ -9,7 +9,7 @@ use bcode_code_review::document::ItemKey;
 use bcode_code_review::guide::freshness::GuideFreshness;
 use bcode_code_review_models::{
     Citation, CitationRelation, Freshness, GuideRecord, GuideSectionMark, GuideStatus, GuideThread,
-    GuideThreadStatus, GuideVersion, GuideVersionRecord, ReviewGuide, ReviewLineInterval,
+    GuideThreadStatus, GuideVersion, GuideVersionRecord, GuideVersionSummary, ReviewGuide, ReviewLineInterval,
     ReviewLineSide, RevisionRef, Section, SectionKind, SectionState, Verification,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +44,19 @@ pub struct GuideLoaded {
     pub freshness: Option<GuideFreshness>,
     /// The ask threads about the version shown, oldest first.
     pub threads: Vec<GuideThread>,
+    /// The versions of the guide shown, oldest first.
+    pub versions: Vec<GuideVersionSummary>,
+}
+
+/// Keys the guide's banners name (empty when unbound).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuideKeys {
+    /// Refresh the current section.
+    pub refresh: String,
+    /// Refresh every stale section.
+    pub refresh_stale: String,
+    /// The versions picker.
+    pub versions: String,
 }
 
 /// One section of the version shown, in reading order.
@@ -158,6 +171,8 @@ pub struct ActiveGuide {
     pub threads: Vec<GuideThread>,
     /// In-diff files the guide cites that the review shows viewed (source id, path).
     pub viewed: BTreeSet<(String, String)>,
+    /// Keys the banners name.
+    pub keys: GuideKeys,
 }
 
 impl ActiveGuide {
@@ -203,6 +218,7 @@ impl ActiveGuide {
             cite: None,
             threads: Vec::new(),
             viewed: BTreeSet::new(),
+            keys: GuideKeys::default(),
         }
     }
 
@@ -409,19 +425,59 @@ impl ActiveGuide {
         if status.is_some() {
             return status;
         }
+        let hint = |key: &str, what: &str| {
+            if key.is_empty() {
+                String::new()
+            } else {
+                format!(" · {key} {what}")
+            }
+        };
         if self.is_old_version() {
             return Some(Banner::note(format!(
-                "v{} · pinned to the code it was written for · current is v{}",
-                self.version.version, self.guide.current_version
+                "v{} · pinned to {} · read-only · current is v{}{}",
+                self.version.version,
+                self.pinned_label(),
+                self.guide.current_version,
+                hint(&self.keys.versions, "versions"),
             )));
         }
         (!self.stale.is_empty()).then(|| {
             let count = self.stale.len();
             Banner::problem(format!(
-                "{count} section{} changed since written",
-                if count == 1 { "" } else { "s" }
+                "{count} section{} stale since {}{}{}{}",
+                if count == 1 { "" } else { "s" },
+                self.pinned_label(),
+                hint(&self.keys.refresh, "refresh"),
+                hint(&self.keys.refresh_stale, "refresh stale"),
+                hint(&self.keys.versions, "versions"),
             ))
         })
+    }
+
+    /// The code the version is pinned to, briefly: its first source's label and head
+    /// (`#102 1a2b3c4`).
+    #[must_use]
+    pub fn pinned_label(&self) -> String {
+        self.version.heads.values().next().map_or_else(
+            || format!("v{}", self.version.version),
+            |head| {
+                let revision = bcode_code_review::guide::lifecycle::short_revision(&head.head);
+                if head.label.is_empty() {
+                    revision
+                } else {
+                    format!("{} {revision}", head.label)
+                }
+            },
+        )
+    }
+
+    /// The stale sections in reading order.
+    #[must_use]
+    pub fn stale_in_order(&self) -> Vec<&SectionEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| self.stale.contains(&entry.id))
+            .collect()
     }
 
     /// Whether a citation is verified, unverified, or has a problem (or went stale).
@@ -523,6 +579,10 @@ pub struct GuideState {
     pub guides: Vec<GuideRecord>,
     /// The guide shown.
     pub active: Option<ActiveGuide>,
+    /// The versions of the guide shown, oldest first.
+    pub versions: Vec<GuideVersionSummary>,
+    /// Keys the banners name.
+    pub keys: GuideKeys,
     /// Changes whenever anything shown changes.
     pub revision: u64,
     /// Whether the reviewer is using the guide (the panel was opened or a guide key used): only
@@ -544,6 +604,8 @@ impl GuideState {
             .as_ref()
             .and_then(|active| active.current().map(|entry| entry.id.clone()));
         self.guides = loaded.guides;
+        self.versions = loaded.versions;
+        let keys = self.keys.clone();
         self.active = loaded.active.map(|(guide, version)| {
             let viewed = self
                 .active
@@ -554,6 +616,7 @@ impl GuideState {
                 ActiveGuide::new(guide.guide, version.version, loaded.marks, loaded.freshness);
             active.threads = loaded.threads;
             active.viewed = viewed;
+            active.keys = keys;
             if let Some(index) =
                 keep.and_then(|id| active.entries.iter().position(|entry| entry.id == id))
             {
@@ -730,7 +793,23 @@ mod tests {
         assert!(banner.text.contains("provider down"), "{banner:?}");
         guide.version.status = GuideStatus::Complete;
         guide.stale.insert("s1".to_owned());
-        assert!(guide.banner().unwrap().text.contains("1 section changed"));
+        assert!(
+            guide
+                .banner()
+                .unwrap()
+                .text
+                .contains("1 section stale since v1")
+        );
+        guide.keys = GuideKeys {
+            refresh: "r".to_owned(),
+            refresh_stale: "alt+r".to_owned(),
+            versions: "V".to_owned(),
+        };
+        let banner = guide.banner().unwrap().text;
+        assert!(
+            banner.contains("r refresh · alt+r refresh stale · V versions"),
+            "{banner}"
+        );
     }
 
     #[test]

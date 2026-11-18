@@ -12,9 +12,9 @@
 use super::freshness::{GuideFreshness, new_lines};
 use crate::data::{DataError, ReviewData};
 use bcode_code_review_models::{
-    Citation, CitationRelation, DeltaKind, Freshness, GuideHead, GuideStatus, GuideVersion,
-    LayerDelta, LayerPair, LineSpan, ResolvedSource, ReviewCompareLayersRequest, ReviewLineSide,
-    RevisionRef, Section,
+    Citation, CitationRelation, DeltaKind, Freshness, GuideHead, GuideOrigin, GuideScope,
+    GuideStatus, GuideVersion, LayerDelta, LayerPair, LineSpan, REVIEW_GUIDE_SCHEMA_VERSION,
+    ResolvedSource, ReviewCompareLayersRequest, ReviewGuide, ReviewLineSide, RevisionRef, Section,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -122,6 +122,93 @@ pub fn refresh_fork(
     (version, stale)
 }
 
+/// A new since guide's row and first version.
+///
+/// The guide of `scope` is titled `title` for the review keyed by `workspace_id`; its version is
+/// pinned to `current` (labelled from `labels`), planning with no sections yet, with
+/// `directions` recorded.
+#[must_use]
+pub fn since_guide(
+    workspace_id: &str,
+    scope: GuideScope,
+    title: &str,
+    (current, labels): (&[ResolvedSource], &BTreeMap<String, String>),
+    directions: Option<String>,
+    now_ms: u64,
+) -> (ReviewGuide, GuideVersion) {
+    let guide_id = new_guide_id(workspace_id, now_ms);
+    let guide = ReviewGuide {
+        guide_id: guide_id.clone(),
+        review_key: String::new(),
+        scope,
+        parent_guide_id: None,
+        title: title.to_owned(),
+        current_version: 1,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        archived_at_ms: None,
+    };
+    let version = GuideVersion {
+        guide_id,
+        version: 1,
+        schema_version: REVIEW_GUIDE_SCHEMA_VERSION,
+        heads: heads_of(current, labels),
+        based_on: None,
+        origin: GuideOrigin {
+            directions,
+            ..GuideOrigin::default()
+        },
+        status: GuideStatus::Planning,
+        generation: None,
+        outline: Vec::new(),
+        citations: BTreeMap::new(),
+        retired_sections: Vec::new(),
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+    (guide, version)
+}
+
+/// A fresh guide id (`g` and 16 hex digits) for the review keyed by `workspace_id`.
+#[must_use]
+pub fn new_guide_id(workspace_id: &str, now_ms: u64) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_id.as_bytes());
+    hasher.update(now_ms.to_le_bytes());
+    hasher.update(
+        COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    hasher.update(std::process::id().to_le_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .fold(String::from("g"), |mut id, byte| {
+            let _ = write!(id, "{byte:02x}");
+            id
+        })
+}
+
+/// Whether `version` was written for code `pair` compares from: some source of it pinned to
+/// the pair's baseline head.
+#[must_use]
+pub fn written_for_baseline(version: &GuideVersion, pairs: &[LayerPair]) -> bool {
+    pairs
+        .iter()
+        .filter_map(|pair| pair.from.as_ref())
+        .any(|from| {
+            version
+                .heads
+                .values()
+                .any(|head| head.head.commit_oid() == Some(from.head_oid.as_str()))
+        })
+}
+
 fn mark_refreshed(sections: &mut [Section], stale: &[String], from: u32) {
     for section in sections {
         if !stale.contains(&section.id) {
@@ -139,11 +226,14 @@ struct SourceDelta {
     head: String,
 }
 
+/// Lines new since the baseline, by source id and path (`None`: not known).
+type NewLines = BTreeMap<(String, String), Option<Vec<LineSpan>>>;
+
 /// What is new since a comparison baseline, by source, for checking a since guide's citations.
 #[derive(Debug)]
 pub struct SinceDelta {
     by_source: BTreeMap<String, SourceDelta>,
-    lines: RefCell<BTreeMap<(String, String), Option<Vec<LineSpan>>>>,
+    lines: RefCell<NewLines>,
 }
 
 impl SinceDelta {

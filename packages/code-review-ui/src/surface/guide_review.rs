@@ -241,22 +241,6 @@ impl ReviewSurface {
         self.set_status(format!("§{number} reviewed"), StatusSeverity::Success);
     }
 
-    /// The review's sources, distinct, in document order.
-    fn guide_sources(&self) -> Vec<ResolvedSource> {
-        let mut sources: Vec<ResolvedSource> = Vec::new();
-        if let Some(review) = self.review.as_ref() {
-            for group in review.doc.groups() {
-                if !sources
-                    .iter()
-                    .any(|source| source.source_id == group.source.source_id)
-                {
-                    sources.push(group.source.clone());
-                }
-            }
-        }
-        sources
-    }
-
     /// Mark `files` viewed (or unviewed) through the review's viewed path.
     fn set_files_viewed(&mut self, files: &BTreeSet<ReviewFile>, viewed: bool) {
         let Some(review) = self.review.as_ref() else {

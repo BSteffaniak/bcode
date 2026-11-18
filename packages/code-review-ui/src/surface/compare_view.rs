@@ -405,6 +405,7 @@ impl ReviewSurface {
                 .map(|at| super::super::history::ago(at, super::super::history::now_ms())),
             marks: self.mark_options(),
             legend: crate::history::badge_legend(&self.theme.icons),
+            guide: self.comparing.active(),
         }
     }
 
@@ -480,6 +481,10 @@ impl ReviewSurface {
                 }
                 self.sync_compare_menu();
                 Action::Redraw
+            }
+            CompareMenuOutcome::ApplyAndClose(MenuChoice::Guide) => {
+                self.close_compare_menu();
+                self.guide_since(host)
             }
             CompareMenuOutcome::ApplyAndClose(choice) if choice.opens_picker() => {
                 // What the menu previewed stays pending until that picker compares (kept) or
@@ -559,6 +564,8 @@ impl ReviewSurface {
             MenuChoice::RemovedInline => {
                 self.change_marks(|marks| marks.removed_inline = !marks.removed_inline);
             }
+            // An action the menu's outcome runs, never a choice applied here.
+            MenuChoice::Guide => {}
         }
     }
 

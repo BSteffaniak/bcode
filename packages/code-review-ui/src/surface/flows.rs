@@ -36,6 +36,8 @@ pub enum Modal {
     Compare(crate::compare_menu::CompareMenu),
     /// Choosing two versions of one pull request.
     Versions(crate::compare_menu::VersionPicker),
+    /// Choosing a version of the guide to read.
+    GuideVersions(crate::picker::Picker),
 }
 
 impl ReviewSurface {
@@ -577,6 +579,7 @@ impl ReviewSurface {
                 let outcome = picker.key(stroke, &theme);
                 self.version_outcome(outcome, number, host)
             }
+            Some(Modal::GuideVersions(_)) => self.guide_versions_key(stroke),
             None => Action::None,
         }
     }
@@ -592,7 +595,13 @@ impl ReviewSurface {
                 let outcome = flow.paste(text);
                 self.import_outcome(outcome, host)
             }
-            Some(Modal::History(_) | Modal::Compare(_) | Modal::Versions(_)) | None => Action::None,
+            Some(
+                Modal::History(_)
+                | Modal::Compare(_)
+                | Modal::Versions(_)
+                | Modal::GuideVersions(_),
+            )
+            | None => Action::None,
         }
     }
 
@@ -617,6 +626,7 @@ impl ReviewSurface {
                 let outcome = picker.mouse(event, &theme);
                 self.version_outcome(outcome, number, host)
             }
+            Some(Modal::GuideVersions(_)) => self.guide_versions_mouse(event),
             Some(Modal::History(_)) | None => Action::None,
         }
     }

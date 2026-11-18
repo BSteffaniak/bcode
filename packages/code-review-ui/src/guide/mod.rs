@@ -20,4 +20,6 @@ pub mod state;
 pub use card::{CardSection, CardSectionState, CardStatus, GuideCard};
 pub use marks::{BadgeGlyph, GuideMarks, MarkBadge, RowMarks};
 pub use panel::{GuidePanelView, PanelClick, PanelModel, Peek, PeekView, Placement};
-pub use state::{ActiveGuide, CiteTarget, GuideLoad, GuideLoaded, GuideState, SectionEntry};
+pub use state::{
+    ActiveGuide, CiteTarget, GuideKeys, GuideLoad, GuideLoaded, GuideState, SectionEntry,
+};

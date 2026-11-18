@@ -262,6 +262,8 @@ store_operations! {
         "guide.version.get", |store, request| store.guide_version(&request);
     models::SaveGuideVersionRequest => models::SaveGuideVersionResponse,
         "guide.version.save", |store, request| store.save_guide_version(request);
+    models::ForkGuideVersionRequest => models::ForkGuideVersionResponse,
+        "guide.version.fork", |store, request| store.fork_guide_version(request);
     models::ListGuideSectionMarksRequest => models::ListGuideSectionMarksResponse,
         "guide.marks.list", |store, request| store.list_guide_section_marks(&request);
     models::SetGuideSectionMarkRequest => models::SetGuideSectionMarkResponse,
@@ -272,8 +274,6 @@ store_operations! {
         "guide.threads.list", |store, request| store.list_guide_threads(&request);
     models::SaveGuideThreadRequest => models::SaveGuideThreadResponse,
         "guide.threads.save", |store, request| store.save_guide_thread(request);
-    models::ForkGuideVersionRequest => models::ForkGuideVersionResponse,
-        "guide.version.fork", |store, request| store.fork_guide_version(request);
     PreviewBundle => models::PublishReviewPreviewResponse,
         models::OP_REVIEW_PUBLISH_BUNDLE_PREVIEW,
         |_store, request| bcode_code_review::store::preview_bundle(&request.0);

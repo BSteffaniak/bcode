@@ -26,6 +26,7 @@ use bcode_code_review::guide::config::Markers;
 use bcode_code_review_models::{
     CitationRelation, GetGuideVersionRequest, GetGuideVersionResponse, GuideScope,
     ListGuideSectionMarksRequest, ListGuideSectionMarksResponse, ListGuideThreadsRequest,
+    ListGuideVersionsRequest,
     ListReviewGuidesRequest, ListReviewGuidesResponse, ResolvedSource, ReviewLineInterval,
     ReviewLineSide, RevisionRef,
 };
@@ -69,7 +70,7 @@ pub(super) struct GuideUi {
     marks_stamp: Option<(u64, bool, Markers)>,
     /// What the panel says.
     pub(super) model: PanelModel,
-    model_stamp: Option<(u64, Placement, u64)>,
+    model_stamp: Option<(u64, Placement, u64, bool)>,
     /// What the panel says without a guide.
     pub(super) empty: Vec<Line>,
     /// Folded sections, by id.
@@ -106,6 +107,12 @@ pub(super) struct GuideUi {
     pub(super) tab_area: Cell<Option<Rect>>,
     /// The review actions' state.
     pub(super) review: super::guide_review::GuideReviewState,
+    /// An older version picked to read (guide id and version); the current one when absent.
+    pub(super) view: Option<(String, u32)>,
+    /// What the review assistant's session may change in a guide, as this review grants it.
+    pub(super) grant: Option<bcode_code_review_models::GuideGrant>,
+    /// Changes whenever [`Self::grant`] changes, so the session is bound again.
+    pub(super) grant_epoch: u64,
 }
 
 /// Which guide the next load shows.
@@ -143,19 +150,22 @@ impl GuideUi {
             card: RefCell::new(None),
             tab_area: Cell::new(None),
             review: super::guide_review::GuideReviewState::default(),
+            view: None,
+            grant: None,
+            grant_epoch: 0,
         }
     }
 }
 
 /// Read the review's guide: its guides, the one shown (`preferred` when it still exists, else
 /// the most recently changed guide when `newest`, else the newest whole-review guide, else the
-/// newest), that guide's current version and reviewed sections, and its citations' freshness
-/// against `sources`.
+/// newest), that guide's current version (or the version `view` names for it) and reviewed
+/// sections, its versions, and its citations' freshness against `sources`.
 async fn read_guide(
     services: ReviewServices,
     scope: NoteScope,
     sources: Vec<ResolvedSource>,
-    (preferred, newest): (Option<String>, bool),
+    (preferred, newest, view): (Option<String>, bool, Option<(String, u32)>),
 ) -> Result<Box<GuideLoaded>, String> {
     let listed: ListReviewGuidesResponse = services
         .call(ListReviewGuidesRequest {
@@ -184,17 +194,40 @@ async fn read_guide(
             marks: Vec::new(),
             freshness: None,
             threads: Vec::new(),
+            versions: Vec::new(),
         }));
     };
     let guide_id = chosen.guide.guide_id.clone();
-    let version: GetGuideVersionResponse = services
+    let wanted = view
+        .filter(|(id, number)| *id == guide_id && *number != chosen.guide.current_version)
+        .map(|(_, number)| number);
+    let mut version: GetGuideVersionResponse = services
         .call(GetGuideVersionRequest {
             repo_path: scope.repo_path.clone(),
             guide_id: guide_id.clone(),
-            version: None,
+            version: wanted,
         })
         .await
         .map_err(|error| error.message)?;
+    if version.version.is_none() && wanted.is_some() {
+        // A version the guide does not have: its current one shows.
+        version = services
+            .call(GetGuideVersionRequest {
+                repo_path: scope.repo_path.clone(),
+                guide_id: guide_id.clone(),
+                version: None,
+            })
+            .await
+            .map_err(|error| error.message)?;
+    }
+    let versions = services
+        .call(ListGuideVersionsRequest {
+            repo_path: scope.repo_path.clone(),
+            guide_id: guide_id.clone(),
+        })
+        .await
+        .map_err(|error| error.message)?
+        .versions;
     let Some(version) = version.version else {
         return Ok(Box::new(GuideLoaded {
             guides,
@@ -202,6 +235,7 @@ async fn read_guide(
             marks: Vec::new(),
             freshness: None,
             threads: Vec::new(),
+            versions,
         }));
     };
     let marks: ListGuideSectionMarksResponse = services
@@ -240,6 +274,7 @@ async fn read_guide(
         marks: marks.marks,
         freshness,
         threads,
+        versions,
     }))
 }
 
@@ -305,14 +340,16 @@ impl ReviewSurface {
                 .map(|active| active.guide.guide_id.clone()),
         };
         let scope = self.note_scope();
+        self.guide.state.keys = self.guide_keys();
         self.guide.state.loading = true;
         self.guide.state.load = GuideLoad::Loading;
         self.guide.generation = self.guide.generation.wrapping_add(1);
         let generation = self.guide.generation;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
+        let view = self.guide.view.clone();
         host.spawn(Box::pin(async move {
-            let result = read_guide(services, scope, sources, (preferred, newest)).await;
+            let result = read_guide(services, scope, sources, (preferred, newest, view)).await;
             inbox.push(Message::Guide { generation, result });
         }));
     }
@@ -441,6 +478,7 @@ impl ReviewSurface {
             self.guide.state.revision,
             placement,
             self.paint_revision ^ self.guide_threads_revision(),
+            self.comparing.active(),
         );
         if self.guide.model_stamp == Some(stamp) {
             return;
@@ -473,24 +511,41 @@ impl ReviewSurface {
             .get("assistant_toggle")
             .cloned()
             .unwrap_or_else(|| "the Ask AI button".to_owned());
-        self.guide.empty = match &self.guide.state.load {
-            GuideLoad::Failed(error) => vec![Line::from_spans(vec![Span::styled(
-                format!("The guide could not be read: {error}"),
-                theme.error,
-            )])],
-            GuideLoad::Idle | GuideLoad::Loading => vec![Line::from_spans(vec![Span::styled(
-                "Reading the guide…",
-                theme.muted,
-            )])],
-            GuideLoad::Ready => {
-                let directions = self
-                    .action_keys
-                    .get("guide_walkthrough_directions")
-                    .cloned()
-                    .filter(|key| !key.is_empty());
-                let mut lines = vec![
+        self.guide.empty =
+            match &self.guide.state.load {
+                GuideLoad::Failed(error) => vec![Line::from_spans(vec![Span::styled(
+                    format!("The guide could not be read: {error}"),
+                    theme.error,
+                )])],
+                GuideLoad::Idle | GuideLoad::Loading => vec![Line::from_spans(vec![Span::styled(
+                    "Reading the guide…",
+                    theme.muted,
+                )])],
+                GuideLoad::Ready => {
+                    let directions = self
+                        .action_keys
+                        .get("guide_walkthrough_directions")
+                        .cloned()
+                        .filter(|key| !key.is_empty());
+                    let mut lines = Vec::new();
+                    if self.comparing.active() {
+                        lines.push(Line::from_spans(vec![
+                            Span::styled("enter", theme.accent),
+                            Span::styled(
+                                format!(
+                                    " guides these changes (since {})",
+                                    self.baseline_labels()[1]
+                                ),
+                                theme.muted,
+                            ),
+                        ]));
+                    }
+                    lines.extend([
                     Line::from_spans(vec![
-                        Span::styled("enter", theme.accent),
+                        Span::styled(
+                            if self.comparing.active() { "palette" } else { "enter" },
+                            theme.accent,
+                        ),
                         Span::styled(
                             format!(
                                 " asks the review assistant ({assistant}) to walk you through it"
@@ -509,16 +564,16 @@ impl ReviewSurface {
                         ),
                         theme.muted,
                     )]),
-                ];
-                if self.is_transient() {
-                    lines.push(Line::from_spans(vec![Span::styled(
-                        "Save the review to keep its guide.",
-                        theme.notice,
-                    )]));
+                ]);
+                    if self.is_transient() {
+                        lines.push(Line::from_spans(vec![Span::styled(
+                            "Save the review to keep its guide.",
+                            theme.notice,
+                        )]));
+                    }
+                    lines
                 }
-                lines
-            }
-        };
+            };
     }
 
     /// The guide panel's title and status.
@@ -955,6 +1010,9 @@ impl ReviewSurface {
                 self.walk_me_through(false);
                 Action::Redraw
             }
+            "guide_refresh_all" => self.guide_refresh(true, host),
+            "guide_since" => self.guide_since(host),
+            "guide_versions_list" => self.open_guide_versions(),
             _ => return None,
         })
     }
@@ -996,18 +1054,13 @@ impl ReviewSurface {
             self.focus = Focus::Review;
             return Some(Action::Redraw);
         }
-        let unavailable = match action {
-            "guide_refresh" => Some("refreshing sections"),
-            "guide_versions" => Some("guide versions"),
-            _ => None,
-        };
-        if let Some(what) = unavailable {
-            self.set_status(format!("{what} is not available yet"), StatusSeverity::Info);
-            return Some(Action::Redraw);
-        }
         if self.guide.state.active.is_none() {
             if action == "guide_open" && self.guide.state.load == GuideLoad::Ready {
-                self.walk_me_through(true);
+                if self.comparing.active() {
+                    self.guide_since(host);
+                } else {
+                    self.walk_me_through(true);
+                }
             } else {
                 self.no_guide();
             }
@@ -1032,6 +1085,9 @@ impl ReviewSurface {
                 self.guide_cite(action == "guide_cite_next", host);
             }
             "guide_copy" => self.guide_copy(),
+            "guide_refresh" => return Some(self.guide_refresh(false, host)),
+            "guide_refresh_stale" => return Some(self.guide_refresh(true, host)),
+            "guide_versions" => return Some(self.open_guide_versions()),
             _ => return Some(Action::None),
         }
         Some(Action::Redraw)

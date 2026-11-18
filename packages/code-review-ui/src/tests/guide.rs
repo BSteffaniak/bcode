@@ -265,7 +265,10 @@ pub(super) fn setup_configured(
 }
 
 /// A review at `width` x `height` with the seeded guide read.
-fn guided(width: u16, height: u16) -> (Setup, Cited, crate::testing::fixture::GitFixture) {
+pub(super) fn guided(
+    width: u16,
+    height: u16,
+) -> (Setup, Cited, crate::testing::fixture::GitFixture) {
     guided_with(width, height, Markers::Current)
 }
 
@@ -783,7 +786,11 @@ fn reviewed_verified_and_approved_glyphs_stay_distinct() {
 
 /// Give citation `id` of the shown guide the text at its lines in `fixture`'s checkout, so its
 /// freshness can be told after the file changes.
-fn quote_citation(setup: &mut Setup, fixture: &crate::testing::fixture::GitFixture, id: &str) {
+pub(super) fn quote_citation(
+    setup: &mut Setup,
+    fixture: &crate::testing::fixture::GitFixture,
+    id: &str,
+) {
     let repo_path = setup.workspace.repo_root.clone();
     let record = setup
         .backend

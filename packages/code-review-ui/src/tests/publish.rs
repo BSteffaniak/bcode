@@ -98,7 +98,11 @@ fn cursor(scenario: &Scenario<ReviewApp>) -> Option<ItemKey> {
 fn publish_step(scenario: &Scenario<ReviewApp>) -> Option<Step> {
     match scenario.surface().review()?.modal()? {
         Modal::Publish(flow) => Some(flow.step().clone()),
-        Modal::Import(_) | Modal::History(_) | Modal::Compare(_) | Modal::Versions(_) => None,
+        Modal::Import(_)
+        | Modal::History(_)
+        | Modal::Compare(_)
+        | Modal::Versions(_)
+        | Modal::GuideVersions(_) => None,
     }
 }
 
