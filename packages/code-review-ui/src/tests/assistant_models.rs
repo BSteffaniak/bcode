@@ -96,7 +96,8 @@ fn last_turn_line(setup: &Setup, session: &str) -> String {
 
 #[test]
 fn the_model_picker_lists_bcodes_models_and_the_next_turn_runs_with_the_choice() {
-    let mut setup = setup(140, 40, true);
+    // Wide enough for every chip at its full label.
+    let mut setup = setup(160, 40, true);
     let session = conversation(&mut setup);
     assert!(
         setup.settle().contains("Bcode's model (Fake echo)"),

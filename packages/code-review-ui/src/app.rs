@@ -1629,6 +1629,21 @@ impl ReviewApp {
                         self.assistant.prefill(&text);
                     }
                 }
+                crate::assistant::LinkRequest::GuideMessage {
+                    text,
+                    grant,
+                    context,
+                } => {
+                    self.assistant.focus();
+                    let place = self.place(true);
+                    let outcome = self
+                        .assistant
+                        .send_guide_message(&text, grant, context, &place, host);
+                    let result = self.assistant_outcome(outcome, host);
+                    if result != Action::Redraw && result != Action::None {
+                        action = result;
+                    }
+                }
             }
         }
         Some(action)

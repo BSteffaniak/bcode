@@ -94,6 +94,16 @@ pub enum LinkRequest {
         /// Whether it is sent at once.
         send: bool,
     },
+    /// Send `text` at once for a guide action, with the session bound with `grant` for it and
+    /// `context` carried with it.
+    GuideMessage {
+        /// The message.
+        text: String,
+        /// What the session may change in the guide for this message.
+        grant: Option<bcode_code_review_models::GuideGrant>,
+        /// Context blocks (the section and its citations).
+        context: Vec<crate::host::ContextBlock>,
+    },
 }
 
 impl ScreenLink {

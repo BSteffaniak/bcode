@@ -388,6 +388,9 @@ pub struct Assistant {
     epoch: u64,
     /// The place the session was last attached for.
     attached: Option<PlaceKey>,
+    /// The guide grant the session is bound with: set for one message by a guide action
+    /// (expand, restructure), and cleared by the next ordinary message.
+    guide_grant: Option<bcode_code_review_models::GuideGrant>,
     input: RefCell<TextInputState>,
     policy: TextInputPolicy,
     /// Whether messages carry what is on screen.
@@ -478,6 +481,7 @@ impl Assistant {
             start_place: None,
             epoch: 0,
             attached: None,
+            guide_grant: None,
             input: RefCell::new(empty_input()),
             policy,
             context: true,
@@ -1129,6 +1133,7 @@ impl Assistant {
         self.tag = None;
         self.starting = false;
         self.attached = None;
+        self.guide_grant = None;
         self.epoch = self.epoch.wrapping_add(1);
         self.scroll.set(0);
         self.mode = Mode::Chat;
@@ -1178,6 +1183,7 @@ impl Assistant {
         let mut binding = *review.binding.clone()?;
         session.clone_into(&mut binding.session_id);
         binding.detached_at_ms = None;
+        binding.guide_grant.clone_from(&self.guide_grant);
         // Where it started, for a session the store has not seen yet.
         binding.started = Some(match &self.tag {
             Some(Tag::Review {
@@ -1237,6 +1243,20 @@ impl Assistant {
         self.send_text(text, false, place, ui)
     }
 
+    /// Send `text` for a guide action: the session is bound with `grant` for this message (an
+    /// ordinary message afterwards binds it without one again), and `context` goes with it.
+    pub fn send_guide_message(
+        &mut self,
+        text: &str,
+        grant: Option<bcode_code_review_models::GuideGrant>,
+        context: Vec<ContextBlock>,
+        place: &Place,
+        ui: &UiContext,
+    ) -> Outcome {
+        self.show_chat_tab();
+        self.send_with(text, false, place, ui, (grant, context))
+    }
+
     /// Put `text` in the message input for the user to finish and send, replacing what was
     /// typed there.
     pub fn prefill(&mut self, text: &str) {
@@ -1248,6 +1268,20 @@ impl Assistant {
     }
 
     fn send_text(&mut self, text: &str, typed: bool, place: &Place, ui: &UiContext) -> Outcome {
+        self.send_with(text, typed, place, ui, (None, Vec::new()))
+    }
+
+    fn send_with(
+        &mut self,
+        text: &str,
+        typed: bool,
+        place: &Place,
+        ui: &UiContext,
+        (grant, extra): (
+            Option<bcode_code_review_models::GuideGrant>,
+            Vec<ContextBlock>,
+        ),
+    ) -> Outcome {
         let text = text.trim_end().to_owned();
         if text.trim().is_empty() {
             return Outcome::Ignored;
@@ -1265,9 +1299,13 @@ impl Assistant {
             ));
             return Outcome::Redraw;
         }
+        let mut context = self.context_blocks(place);
+        context.extend(extra);
+        let regrant = self.guide_grant != grant;
+        self.guide_grant = grant;
         let request = TurnRequest {
             text,
-            context: self.context_blocks(place),
+            context,
             agent: Some(super::profile::PROFILE_ID.to_owned()),
             tool_allowlist: self.tool_allowlist(),
         };
@@ -1280,8 +1318,9 @@ impl Assistant {
         self.touch();
         let attachment = match self.session.clone() {
             // Rebinding first keeps the session's default review the one on screen.
-            Some(session) if !self.starting => (self.attached.as_ref() != Some(&place.key()))
-                .then(|| Attachment::of(self.binding_for(place, &session))),
+            Some(session) if !self.starting => (regrant
+                || self.attached.as_ref() != Some(&place.key()))
+            .then(|| Attachment::of(self.binding_for(place, &session))),
             _ => None,
         };
         if self.session.is_some() && !self.starting {
@@ -4012,11 +4051,11 @@ impl Assistant {
 /// The categories the chips row and the permissions overlay switch (reads have no chip).
 pub const CHIP_CATEGORIES: [Category; 6] = [
     Category::ReviewWrites,
-    Category::Guides,
     Category::FileWrites,
     Category::Shell,
     Category::Publish,
     Category::Navigation,
+    Category::Guides,
 ];
 
 /// A category's glyph on its chip.
@@ -4024,7 +4063,7 @@ pub const CHIP_CATEGORIES: [Category; 6] = [
 pub const fn category_glyph(category: Category) -> &'static str {
     match category {
         Category::ReviewWrites => "✎",
-        Category::Guides => "◆",
+        Category::Guides => "§",
         Category::FileWrites => "▤",
         Category::Shell => "$",
         Category::Publish => "⇪",
