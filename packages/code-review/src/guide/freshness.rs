@@ -363,6 +363,25 @@ fn changed_lines(
     source: &ResolvedSource,
     path: &str,
 ) -> Option<Vec<LineSpan>> {
+    new_lines(
+        data,
+        repo_path,
+        delta,
+        (source.base.commit_oid()?, source.head.commit_oid()?),
+        path,
+    )
+}
+
+/// Lines of `path` at `head` (its change starting at `fork`) new since the baseline `delta`
+/// compares with, with the rebase taken out; `None` when the delta could not take the rebase
+/// out or the file is too large to mark.
+pub(crate) fn new_lines(
+    data: &ReviewData,
+    repo_path: &Path,
+    delta: &LayerDelta,
+    (fork, head): (&str, &str),
+    path: &str,
+) -> Option<Vec<LineSpan>> {
     match delta.kind {
         DeltaKind::Unchanged | DeltaKind::RebasedOnly => return Some(Vec::new()),
         DeltaKind::Changed => {}
@@ -377,9 +396,9 @@ fn changed_lines(
     let marks = data
         .compare_marks(&ReviewCompareMarksRequest {
             repo_path: repo_path.to_path_buf(),
-            fork_oid: source.base.commit_oid()?.to_owned(),
+            fork_oid: fork.to_owned(),
             replay_oid: delta.replay_oid.clone()?,
-            head_oid: source.head.commit_oid()?.to_owned(),
+            head_oid: head.to_owned(),
             path: path.to_owned(),
             old_path: None,
         })

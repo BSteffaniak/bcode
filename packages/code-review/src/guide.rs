@@ -23,6 +23,7 @@ pub mod coverage;
 pub mod document;
 pub mod export;
 pub mod freshness;
+pub mod lifecycle;
 pub mod lint;
 pub mod plan;
 pub mod template;
