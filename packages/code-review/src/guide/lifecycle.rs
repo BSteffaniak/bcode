@@ -194,6 +194,39 @@ pub fn new_guide_id(workspace_id: &str, now_ms: u64) -> String {
         })
 }
 
+/// A since guide's `pairs` compared up to the heads a version of it is pinned to: a refreshed
+/// version is pinned to newer heads than the guide was started at, and its citations' lines are
+/// at those heads. Each pair whose layer (by `numbers`, source id to pull request number) the
+/// version pins to another commit compares to that commit, from the same baseline, with the
+/// pinned base as where the layer's own change starts.
+#[must_use]
+pub fn pairs_at(
+    pairs: &[LayerPair],
+    heads: &BTreeMap<String, GuideHead>,
+    numbers: &BTreeMap<String, u64>,
+) -> Vec<LayerPair> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let mut pair = pair.clone();
+            let pinned = numbers
+                .iter()
+                .filter(|(_, number)| **number == pair.number)
+                .find_map(|(source_id, _)| heads.get(source_id));
+            if let Some(head) = pinned
+                && let Some(oid) = head.head.commit_oid()
+                && oid != pair.to.head_oid
+            {
+                oid.clone_into(&mut pair.to.head_oid);
+                if let Some(fork) = head.base.commit_oid() {
+                    pair.to.fork_oid = Some(fork.to_owned());
+                }
+            }
+            pair
+        })
+        .collect()
+}
+
 /// Whether `version` was written for code `pair` compares from: some source of it pinned to
 /// the pair's baseline head.
 #[must_use]

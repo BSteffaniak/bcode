@@ -581,7 +581,9 @@ is pinned to, since guides and their delta check); the review screen drives it
   (`outside_delta`, nothing written) citations that are not about what changed: new-side
   lines that are not new since the baseline with the rebase taken out (the refusal names the
   new lines of the file), sources not compared, unchanged or rebased-only layers, and,
-  where the new lines cannot be told, citations of unchanged code.
+  where the new lines cannot be told, citations of unchanged code. The check compares from the
+  baseline to the heads the written version is pinned to, so a since guide refreshed after
+  another push is checked at its new heads.
 
 ## Review actions
 

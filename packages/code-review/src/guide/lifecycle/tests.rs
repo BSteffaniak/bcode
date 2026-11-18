@@ -248,6 +248,69 @@ fn a_since_guide_cites_only_lines_new_since_the_baseline() {
     assert!(since.outside(&data, &repo.root, &elsewhere, None).is_some());
 }
 
+#[test]
+fn a_refreshed_since_guide_is_checked_at_the_heads_it_is_pinned_to() {
+    let repo = Repo::new();
+    let trunk = repo.commit("a.txt", "a\n");
+    repo.git(&["checkout", "-q", "-b", "layer"]);
+    let looked = repo.commit("b.txt", TEN);
+    let pushed_text = TEN.replace("eight", "EIGHT");
+    let pushed = repo.commit("b.txt", &pushed_text);
+    let pair = LayerPair {
+        number: 7,
+        from: Some(VersionPoint {
+            head_oid: looked,
+            fork_oid: Some(trunk.clone()),
+        }),
+        to: VersionPoint {
+            head_oid: pushed,
+            fork_oid: Some(trunk.clone()),
+        },
+    };
+    // Another push inserts lines above the new line: it is line 10 now, not 8.
+    let again_text = format!("zero\nhalf\n{pushed_text}");
+    let again = repo.commit("b.txt", &again_text);
+    let numbers = BTreeMap::from([("layer".to_owned(), 7)]);
+    let heads = BTreeMap::from([(
+        "layer".to_owned(),
+        GuideHead {
+            base: RevisionRef::commit(trunk),
+            head: RevisionRef::commit(again.clone()),
+            label: "#7".to_owned(),
+        },
+    )]);
+    let data = ReviewData::default();
+    let content = file(&again_text);
+    let moved = citation("c1", &content, 10, 10, &again);
+    let unchanged = citation("c2", &content, 7, 7, &again);
+
+    // Checked against the delta the guide was started with, the lines are wrong.
+    let started = SinceDelta::compute(&data, &repo.root, std::slice::from_ref(&pair), &numbers)
+        .expect("delta");
+    assert!(started.outside(&data, &repo.root, &moved, None).is_some());
+
+    // At the refreshed version's heads, the new line is accepted where it is now, the line
+    // that was there before the push is not, and the lines inserted since count as new.
+    let pairs = pairs_at(std::slice::from_ref(&pair), &heads, &numbers);
+    assert_eq!(pairs[0].to.head_oid, again);
+    assert_eq!(pairs[0].from, pair.from, "the baseline stays");
+    let refreshed = SinceDelta::compute(&data, &repo.root, &pairs, &numbers).expect("delta");
+    assert_eq!(refreshed.outside(&data, &repo.root, &moved, None), None);
+    assert!(
+        refreshed
+            .outside(&data, &repo.root, &unchanged, None)
+            .is_some()
+    );
+    let inserted = citation("c3", &content, 1, 2, &again);
+    assert_eq!(refreshed.outside(&data, &repo.root, &inserted, None), None);
+
+    // A pair whose layer the version does not pin stays as it was.
+    assert_eq!(
+        pairs_at(std::slice::from_ref(&pair), &BTreeMap::new(), &numbers)[0],
+        pair
+    );
+}
+
 fn trunk_of(pair: &LayerPair) -> String {
     pair.to.fork_oid.clone().unwrap_or_default()
 }

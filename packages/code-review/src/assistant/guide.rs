@@ -828,7 +828,9 @@ impl ReviewTools<'_> {
                 "citations": numbered_checks(&checks),
             })));
         }
-        if let Some(refused) = self.since_refusal(review, &guide, &ops, &checks)? {
+        if let Some(refused) =
+            self.since_refusal(review, &guide, &current.version.heads, &ops, &checks)?
+        {
             return Ok(refused);
         }
         let imports = self.area_citations(review, &current.version, &ops)?;
@@ -890,11 +892,13 @@ impl ReviewTools<'_> {
         })))
     }
 
-    /// The refusal of a since guide's write citing lines not new since its baseline.
+    /// The refusal of a since guide's write citing lines not new since its baseline, checked
+    /// at the heads the written version is pinned to (`heads`).
     fn since_refusal(
         &self,
         review: &OpenReview,
         guide: &GuideRecord,
+        heads: &BTreeMap<String, GuideHead>,
         ops: &[GuideOp],
         checks: &[CitationCheck],
     ) -> Result<Option<GuideWriteOutcome>, AssistantError> {
@@ -904,7 +908,7 @@ impl ReviewTools<'_> {
         if pairs.is_empty() {
             return Ok(None);
         }
-        let errors = self.outside_delta(review, pairs, ops, checks)?;
+        let errors = self.outside_delta(review, pairs, heads, ops, checks)?;
         Ok((!errors.is_empty()).then(|| {
             GuideWriteOutcome::Refused(json!({
                 "written": false,
@@ -916,11 +920,12 @@ impl ReviewTools<'_> {
     }
 
     /// The citations of `ops` (checked as `checks`, in batch order) that a since guide of
-    /// `pairs` may not cite: lines not new since the baseline.
+    /// `pairs` may not cite: lines not new since the baseline, up to `heads`.
     fn outside_delta(
         &self,
         review: &OpenReview,
         pairs: &[bcode_code_review_models::LayerPair],
+        heads: &BTreeMap<String, GuideHead>,
         ops: &[GuideOp],
         checks: &[CitationCheck],
     ) -> Result<Vec<OpError>, AssistantError> {
@@ -928,7 +933,8 @@ impl ReviewTools<'_> {
             return Ok(Vec::new());
         }
         let numbers = Self::pinned(review, None).numbers;
-        let since = SinceDelta::compute(self.data, &review.repo_root, pairs, &numbers)?;
+        let pairs = crate::guide::lifecycle::pairs_at(pairs, heads, &numbers);
+        let since = SinceDelta::compute(self.data, &review.repo_root, &pairs, &numbers)?;
         let primary = review
             .resolved
             .first()
