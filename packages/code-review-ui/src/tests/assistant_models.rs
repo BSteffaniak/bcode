@@ -663,7 +663,7 @@ fn open_in_bcode_shows_only_with_a_conversation_and_the_title_row_closes_and_zoo
     assert!(!setup.app().assistant().zoomed());
     let screen = setup.settle();
     let close = screen
-        .find("✕ ")
+        .find("× ")
         .filter(|at| at.y == 0)
         .expect("the title row's ✕");
     setup.scenario.click(close.x, close.y);

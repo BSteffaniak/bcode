@@ -448,6 +448,8 @@ pub struct Assistant {
     chip_plan: RefCell<ChipPlan>,
     /// The history row under the pointer.
     hover: Option<usize>,
+    /// Where the pointer is over the panel (its window controls show), if it is.
+    pointer: Option<PointerOver>,
     /// The `✕` painted on a history row: its row, column and session.
     history_delete: Cell<Option<(usize, u16)>>,
     /// Double clicks on the title row (they toggle maximize).
@@ -531,6 +533,7 @@ impl Assistant {
             failure: None,
             chip_plan: RefCell::default(),
             hover: None,
+            pointer: None,
             history_delete: Cell::new(None),
             title_clicks: crate::panel_controls::TitleClicks::default(),
             zoom: Zoom::Docked,
@@ -2438,10 +2441,25 @@ impl Assistant {
         {
             ui.request_redraw();
         }
+        // The window controls show while the pointer is over the panel, the one under it
+        // hovered, as hit tested on the painted title row.
+        let pointer = panel.contains(mouse.position).then(|| PointerOver {
+            control: painted
+                .actions
+                .iter()
+                .find(|(_, area)| area.contains(mouse.position))
+                .and_then(|(id, _)| crate::panel_controls::Control::from_id(id)),
+        });
+        let pointer_moved = pointer != self.pointer;
+        if pointer_moved {
+            self.pointer = pointer;
+            self.touch();
+        }
         if !panel.contains(mouse.position) {
             // The pointer left: the history row's `✕` goes back to the selected row. The move
             // stays the review's, so the panel asks for its own redraw.
-            if mouse.kind == MouseEventKind::Move && self.hover.take().is_some() {
+            if (mouse.kind == MouseEventKind::Move && self.hover.take().is_some()) || pointer_moved
+            {
                 self.touch();
                 ui.request_redraw();
             }
@@ -2477,7 +2495,11 @@ impl Assistant {
                         (index < picker.matching().len()).then_some(index)
                     });
                 if hover == self.hover {
-                    return Some(Outcome::Ignored);
+                    return Some(if pointer_moved {
+                        Outcome::Redraw
+                    } else {
+                        Outcome::Ignored
+                    });
                 }
                 self.hover = hover;
                 self.touch();
@@ -3860,7 +3882,8 @@ impl Assistant {
             crate::panel_controls::PanelKind::Assistant,
             shape,
             theme,
-        );
+        )
+        .hovered(self.pointer.and_then(|pointer| pointer.control));
         let chrome = controls.apply(
             Pane::new()
                 .title(theme.pane_title(title, focused))
@@ -3873,7 +3896,7 @@ impl Assistant {
         );
         let pane_rect = Rect::new(0, 0, rect.width, rect.height);
         painted.title = Some(Rect::new(rect.x, rect.y, rect.width, 1));
-        let ids = controls.list();
+        let ids = controls.painted();
         for (index, action_area) in chrome.title_layout(pane_rect).actions {
             if let Some(control) = ids.get(index) {
                 painted.actions.push((
@@ -3912,14 +3935,15 @@ impl Assistant {
         };
         ids.extend(
             self.controls(dock, &self.theme.get())
-                .list()
+                .painted()
                 .into_iter()
                 .map(crate::panel_controls::Control::id),
         );
         ids
     }
 
-    /// The panel controls docked as `dock`.
+    /// The panel controls docked as `dock`: shown while the panel is focused or under the
+    /// pointer, the control under the pointer hovered.
     const fn controls(
         &self,
         dock: Dock,
@@ -3930,6 +3954,11 @@ impl Assistant {
             self.shape_in(dock),
             theme,
         )
+        .shown(self.is_focused() || self.pointer.is_some())
+        .hovered(match self.pointer {
+            Some(pointer) => pointer.control,
+            None => None,
+        })
     }
 
     /// Paint the dock group over the screen and the painted panel: it highlights the divider
@@ -4917,4 +4946,11 @@ struct Guided {
     ticket: Option<u64>,
     /// The message is a held one being sent now.
     releasing: bool,
+}
+
+/// The pointer over the assistant panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointerOver {
+    /// The window control under it, as last painted.
+    control: Option<crate::panel_controls::Control>,
 }

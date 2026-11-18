@@ -589,8 +589,15 @@ fn hit_regions_agree_with_painting_after_resize() {
             "{width}x{height}"
         );
     }
-    // The close control really hides the panel.
+    // The close control really hides the panel. Its controls show with the pointer over it.
     scenario.resize(160, 40);
+    stable(&mut scenario);
+    let files = area_of(&scenario, FILES_PANE_ID).expect("file panel");
+    scenario.mouse(
+        bmux_tui::event::MouseEventKind::Move,
+        files.x + 2,
+        files.y + 2,
+    );
     let screen = stable(&mut scenario);
     let close = format!("{FILES_PANE_ID}.action.close");
     let action = screen

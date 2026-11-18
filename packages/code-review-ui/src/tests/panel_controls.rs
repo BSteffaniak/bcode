@@ -8,6 +8,7 @@ use crate::assistant::panel::PANEL_ID;
 use crate::panel_controls::{Control, DOUBLE_CLICK, PanelKind, Shape};
 use crate::surface::{FILES_PANE_ID, GUIDE_PANE_ID, REVIEW_PANE_ID, THREADS_PANE_ID};
 use crate::testing::harness::Screen;
+use bmux_tui::event::MouseEventKind;
 use bmux_tui::geometry::Rect;
 
 const WIDTH: u16 = 200;
@@ -96,15 +97,28 @@ fn control(screen: &Screen, kind: PanelKind, control: Control) -> Option<Rect> {
         .map(|hit| hit.area)
 }
 
+/// Click `kind`'s `which` control as a pointer does: over the panel (which shows its controls),
+/// onto the control, then a press.
 fn click_control(setup: &mut Setup, kind: PanelKind, which: Control) -> Screen {
+    hover(setup, kind);
     let screen = setup.settle();
     let at = control(&screen, kind, which)
         .unwrap_or_else(|| panic!("{kind:?} {which:?}\n{}", screen.text()));
+    setup
+        .scenario
+        .mouse(MouseEventKind::Move, at.x + at.width / 2, at.y);
+    setup.settle();
     setup.scenario.click(at.x + at.width / 2, at.y);
     // The very next frame already shows the new state on its controls.
     let first = setup.scenario.frame();
     assert_controls_agree(&first, setup, &format!("{kind:?} {which:?}: first frame"));
     setup.settle()
+}
+
+/// Move the pointer over `kind`'s title row, off its controls.
+fn hover(setup: &mut Setup, kind: PanelKind) {
+    let (x, y) = title_cell(setup, kind);
+    setup.scenario.mouse(MouseEventKind::Move, x, y);
 }
 
 /// A cell of `kind`'s title row inside its corners, off its controls.
@@ -149,7 +163,7 @@ fn assert_controls_agree(screen: &Screen, setup: &Setup, context: &str) {
                 "{context}: a region of a hidden {kind:?}: {hit:?}"
             );
             let glyph = match (which, state) {
-                (Control::Minimize, Some(shape)) if shape.minimized() => icons.panel_restore,
+                (Control::Minimize, Some(shape)) if shape.minimized() => icons.panel_unminimize,
                 (Control::Minimize, _) => icons.panel_minimize,
                 (Control::Maximize, Some(Shape::Maximized)) => icons.panel_restore,
                 (Control::Maximize, _) => icons.panel_maximize,
@@ -449,4 +463,148 @@ fn control_regions_agree_with_painting_at_tiny_and_resized_sizes() {
             assert_controls_agree(&screen, &setup, &format!("{name} at {width}x{height}"));
         }
     }
+}
+
+/// The window controls of `kind` painted on `screen`.
+fn painted(screen: &Screen, kind: PanelKind) -> Vec<Control> {
+    let prefix = format!("{}.action.", pane_id(kind));
+    screen
+        .hits()
+        .iter()
+        .filter_map(|hit| {
+            hit.id
+                .as_str()
+                .strip_prefix(&prefix)
+                .and_then(Control::from_id)
+        })
+        .collect()
+}
+
+/// The title row of `kind` on `screen`.
+fn title_row(setup: &Setup, screen: &Screen, kind: PanelKind) -> String {
+    let area = area(setup, kind).unwrap_or_else(|| panic!("{kind:?} shown"));
+    screen.text_in(Rect::new(area.x, area.y, area.width, 1), area.y)
+}
+
+#[test]
+fn controls_show_on_the_focused_and_hovered_panels_and_follow_the_pointer() {
+    let mut setup = all_open(WIDTH, HEIGHT);
+    let theme = crate::theme::ReviewTheme::derive(None, crate::theme::IconStyle::default());
+    let icons = theme.icons;
+    // Off the panels, only the focused document shows its controls (it does not close).
+    focus(&mut setup, PanelKind::Review);
+    setup.scenario.mouse(MouseEventKind::Move, 0, 0);
+    let screen = setup.settle();
+    assert_eq!(
+        painted(&screen, PanelKind::Review),
+        [Control::Minimize, Control::Maximize],
+        "{}",
+        screen.text()
+    );
+    let cluster = format!(
+        "{} {} {} {}",
+        icons.panel_cap_start, icons.panel_minimize, icons.panel_maximize, icons.panel_cap_end
+    );
+    assert!(
+        title_row(&setup, &screen, PanelKind::Review).contains(&cluster),
+        "{}",
+        title_row(&setup, &screen, PanelKind::Review)
+    );
+    for kind in [
+        PanelKind::Files,
+        PanelKind::Threads,
+        PanelKind::Guide,
+        PanelKind::Assistant,
+    ] {
+        assert_eq!(painted(&screen, kind), [], "{kind:?}");
+        let row = title_row(&setup, &screen, kind);
+        assert!(!row.contains(icons.panel_cap_start), "{kind:?}: {row}");
+    }
+    for kind in [
+        PanelKind::Files,
+        PanelKind::Threads,
+        PanelKind::Guide,
+        PanelKind::Assistant,
+    ] {
+        // The pointer over a panel shows its controls on the very next frame.
+        hover(&mut setup, kind);
+        let first = setup.scenario.frame();
+        assert_eq!(
+            painted(&first, kind),
+            [Control::Minimize, Control::Maximize, Control::Close],
+            "{kind:?}\n{}",
+            first.text()
+        );
+        assert_controls_agree(&first, &setup, &format!("{kind:?} hovered"));
+        let row = title_row(&setup, &first, kind);
+        let cluster = format!(
+            "{} {} {} {} {}",
+            icons.panel_cap_start,
+            icons.panel_minimize,
+            icons.panel_maximize,
+            icons.panel_close,
+            icons.panel_cap_end
+        );
+        assert!(row.contains(&cluster), "{kind:?}: {row}");
+        // Over a control, it takes the hover colour: the accent, close the error colour.
+        for (which, style) in [
+            (Control::Maximize, theme.accent),
+            (Control::Close, theme.error),
+        ] {
+            let at = control(&first, kind, which).expect("painted");
+            setup.scenario.mouse(MouseEventKind::Move, at.x, at.y);
+            let screen = setup.scenario.frame();
+            assert_eq!(
+                screen.style_at(at.x, at.y).fg,
+                style.fg,
+                "{kind:?} {which:?}"
+            );
+            let other = control(&screen, kind, Control::Minimize).expect("painted");
+            assert_eq!(
+                screen.style_at(other.x, other.y).fg,
+                theme.muted.fg,
+                "{kind:?}"
+            );
+        }
+    }
+    // Leaving a panel hides its controls with their regions; the document keeps its own.
+    hover(&mut setup, PanelKind::Files);
+    let shown = setup.settle();
+    let close = control(&shown, PanelKind::Files, Control::Close).expect("painted");
+    setup.scenario.mouse(MouseEventKind::Move, 0, 0);
+    let screen = setup.scenario.frame();
+    assert_eq!(painted(&screen, PanelKind::Files), []);
+    assert_eq!(painted(&screen, PanelKind::Review).len(), 2);
+    // A press where the hidden close control was focuses the panel and closes nothing.
+    setup.scenario.click(close.x, close.y);
+    setup.settle();
+    assert_eq!(shape(&setup, PanelKind::Files), Some(Shape::Normal));
+}
+
+#[test]
+fn minimized_panels_always_show_their_restore_control() {
+    let mut setup = all_open(WIDTH, HEIGHT);
+    for kind in [PanelKind::Files, PanelKind::Threads, PanelKind::Guide] {
+        click_control(&mut setup, kind, Control::Minimize);
+    }
+    focus(&mut setup, PanelKind::Review);
+    setup.scenario.mouse(MouseEventKind::Move, 0, 0);
+    let screen = setup.settle();
+    let icons = crate::theme::ReviewTheme::derive(None, crate::theme::IconStyle::default()).icons;
+    for kind in [PanelKind::Files, PanelKind::Threads, PanelKind::Guide] {
+        assert_eq!(painted(&screen, kind), [Control::Minimize], "{kind:?}");
+        let at = control(&screen, kind, Control::Minimize).expect("painted");
+        assert_eq!(
+            screen.text_in(at, at.y).trim(),
+            icons.panel_unminimize,
+            "{kind:?}"
+        );
+    }
+    // A minimized row shows only its restore control between the caps.
+    let row = title_row(&setup, &screen, PanelKind::Threads);
+    let restore = format!(
+        "{} {} {}",
+        icons.panel_cap_start, icons.panel_unminimize, icons.panel_cap_end
+    );
+    assert!(row.contains(&restore), "{row}");
 }

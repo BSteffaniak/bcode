@@ -717,6 +717,8 @@ pub struct ReviewSurface {
     panels: Panels,
     /// Double clicks on panel title rows.
     title_clicks: crate::panel_controls::TitleClicks<PanelId>,
+    /// Where the pointer last was: the body panel under it shows its window controls.
+    pointer: Option<bmux_tui::geometry::Point>,
     files_pane: Cell<PaneState>,
     review_pane: Cell<PaneState>,
     threads_pane: Cell<PaneState>,
@@ -889,6 +891,7 @@ impl ReviewSurface {
             link: crate::assistant::ScreenLink::default(),
             panels: Panels::default(),
             title_clicks: crate::panel_controls::TitleClicks::default(),
+            pointer: None,
             files_pane: Cell::new(PaneState::new(Rect::default())),
             review_pane: Cell::new(PaneState::new(Rect::default())),
             threads_pane: Cell::new(PaneState::new(Rect::default())),
@@ -3756,10 +3759,32 @@ impl ReviewSurface {
             .then_some(Action::Redraw)
     }
 
+    /// A pointer event: the hovered panel's window controls follow the pointer (a change
+    /// redraws), and the event goes to what it is over.
     fn handle_mouse(&mut self, event: &Event, host: &UiContext) -> Action {
         let Event::Mouse(mouse) = event else {
             return Action::None;
         };
+        // A press runs on the title rows as painted, before the pointer moves the hover.
+        let title = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            .then(|| self.panel_title_target(mouse.position))
+            .flatten();
+        let hover = self.title_hover();
+        self.pointer = Some(mouse.position);
+        let action = self.route_mouse(event, *mouse, title, host);
+        if action == Action::None && self.title_hover() != hover {
+            return Action::Redraw;
+        }
+        action
+    }
+
+    fn route_mouse(
+        &mut self,
+        event: &Event,
+        mouse: bmux_tui::event::MouseEvent,
+        title: Option<(PanelId, TitleTarget)>,
+        host: &UiContext,
+    ) -> Action {
         if self.modal.is_some() {
             return self.modal_mouse(event, host);
         }
@@ -3769,7 +3794,7 @@ impl ReviewSurface {
         }
         if let Some(action) = self
             .compare_mouse(event, host)
-            .or_else(|| self.side_mouse(event, *mouse))
+            .or_else(|| self.side_mouse(event, mouse))
             .or_else(|| self.bar_mouse(event, host))
         {
             return action;
@@ -3802,7 +3827,8 @@ impl ReviewSurface {
             .is_some_and(|area| area.contains(mouse.position));
         if pressed {
             self.focus_at(mouse.position);
-            if self.panel_title_press(mouse.position) {
+            if let Some((id, hit)) = title {
+                self.panel_title_press(id, hit);
                 return Action::Redraw;
             }
             if in_files && self.legend_click(mouse.position) {
@@ -3831,7 +3857,7 @@ impl ReviewSurface {
         {
             redraw |= self.scroll_tree(rows, viewport.height);
         }
-        let (clicked, host_action) = self.after_list_event(*mouse, in_list);
+        let (clicked, host_action) = self.after_list_event(mouse, in_list);
         self.run_queued_clicks(host);
         redraw |= clicked;
         if let Some(action) = host_action {
@@ -4000,33 +4026,47 @@ impl ReviewSurface {
         true
     }
 
-    /// Run a press on a panel's title row at `position`: a control runs on its panel, and a
-    /// press elsewhere on the row focuses the panel (a second press soon after toggles
-    /// maximize). Hit tests the same chrome the frame painted, at the pane's laid-out area.
-    /// Returns whether the press was on a title row.
-    fn panel_title_press(&mut self, position: bmux_tui::geometry::Point) -> bool {
-        let Some(review) = self.review.as_ref() else {
-            return false;
+    /// What `position` is on in a body panel's title row, hit tested on the chrome as it is
+    /// painted, at the pane's laid-out area.
+    fn panel_title_target(
+        &self,
+        position: bmux_tui::geometry::Point,
+    ) -> Option<(PanelId, TitleTarget)> {
+        let review = self.review.as_ref()?;
+        BODY_PANELS.into_iter().find_map(|id| {
+            let area = self.body_area(pane_id(id))?;
+            let (chrome, controls) = self.pane_chrome(id, review);
+            controls
+                .target(&chrome, area, position)
+                .map(|hit| (id, hit))
+        })
+    }
+
+    /// The body panel under the pointer and the window control under it, if any.
+    fn title_hover(&self) -> Option<(PanelId, Option<crate::panel_controls::Control>)> {
+        let id = self.hovered_panel()?;
+        let review = self.review.as_ref()?;
+        let area = self.body_area(pane_id(id))?;
+        let (chrome, controls) = self.pane_chrome(id, review);
+        let control = match controls.target(&chrome, area, self.pointer?) {
+            Some(TitleTarget::Control(control)) => Some(control),
+            _ => None,
         };
-        let mut found = None;
-        for id in [
-            PanelId::Files,
-            PanelId::Review,
-            PanelId::Threads,
-            PanelId::Guide,
-        ] {
-            let Some(area) = self.body_area(pane_id(id)) else {
-                continue;
-            };
-            let chrome = self.pane_chrome(id, review);
-            if let Some(hit) = self.controls(id).target(&chrome, area, position) {
-                found = Some((id, hit));
-                break;
-            }
-        }
-        let Some((id, hit)) = found else {
-            return false;
-        };
+        Some((id, control))
+    }
+
+    /// The body panel under the pointer.
+    fn hovered_panel(&self) -> Option<PanelId> {
+        let pointer = self.pointer?;
+        BODY_PANELS.into_iter().find(|id| {
+            self.body_area(pane_id(*id))
+                .is_some_and(|area| area.contains(pointer))
+        })
+    }
+
+    /// Run a press on panel `id`'s title row: a control runs on its panel, and a press
+    /// elsewhere on the row focuses the panel (a second press soon after toggles maximize).
+    fn panel_title_press(&mut self, id: PanelId, hit: TitleTarget) {
         self.focus_panel(id);
         match hit {
             TitleTarget::Control(control) => {
@@ -4039,7 +4079,6 @@ impl ReviewSurface {
                 }
             }
         }
-        true
     }
 
     /// Give keyboard focus to panel `id` (a focus inside it, such as the file filter, stays).
@@ -4112,13 +4151,22 @@ impl ReviewSurface {
         Action::Redraw
     }
 
-    /// The controls of panel `id` as it is shown.
+    /// The controls of panel `id` as it is shown: on the focused panel and the panel under
+    /// the pointer.
     fn controls(&self, id: PanelId) -> bmux_tui_components::panel_window::WindowControls {
         crate::panel_controls::controls(panel_kind(id), self.panels.shape(id), &self.theme)
+            .shown(self.focused_panel() == id || self.hovered_panel() == Some(id))
     }
 
-    /// The chrome of panel `id`, as painted.
-    fn pane_chrome(&self, id: PanelId, review: &Review) -> Pane<'static> {
+    /// The chrome of panel `id` as painted, with its controls.
+    fn pane_chrome(
+        &self,
+        id: PanelId,
+        review: &Review,
+    ) -> (
+        Pane<'static>,
+        bmux_tui_components::panel_window::WindowControls,
+    ) {
         match id {
             PanelId::Files => self.files_pane_chrome(review),
             PanelId::Threads => self.threads_pane_chrome(review),
@@ -4937,7 +4985,13 @@ impl ReviewSurface {
         }
     }
 
-    fn files_pane_chrome(&self, review: &Review) -> Pane<'static> {
+    fn files_pane_chrome(
+        &self,
+        review: &Review,
+    ) -> (
+        Pane<'static>,
+        bmux_tui_components::panel_window::WindowControls,
+    ) {
         let files = &review.files;
         let count = if files.filter().is_empty() {
             files.file_count().to_string()
@@ -4948,7 +5002,13 @@ impl ReviewSurface {
         self.chrome(PanelId::Files, "Files", &count, focused)
     }
 
-    fn review_pane_chrome(&self, review: &Review) -> Pane<'static> {
+    fn review_pane_chrome(
+        &self,
+        review: &Review,
+    ) -> (
+        Pane<'static>,
+        bmux_tui_components::panel_window::WindowControls,
+    ) {
         let files = review.files.file_count();
         let status = format!("{files} file{}", if files == 1 { "" } else { "s" });
         self.chrome(
@@ -4959,7 +5019,13 @@ impl ReviewSurface {
         )
     }
 
-    fn threads_pane_chrome(&self, review: &Review) -> Pane<'static> {
+    fn threads_pane_chrome(
+        &self,
+        review: &Review,
+    ) -> (
+        Pane<'static>,
+        bmux_tui_components::panel_window::WindowControls,
+    ) {
         let count = review.threads.borrow().keys.len();
         self.chrome(
             PanelId::Threads,
@@ -4969,20 +5035,47 @@ impl ReviewSurface {
         )
     }
 
-    fn guide_pane_chrome(&self) -> Pane<'static> {
+    fn guide_pane_chrome(
+        &self,
+    ) -> (
+        Pane<'static>,
+        bmux_tui_components::panel_window::WindowControls,
+    ) {
         let (title, status) = self.guide_titles();
         self.chrome(PanelId::Guide, &title, &status, self.focus == Focus::Guide)
     }
 
-    /// A panel's chrome: its title, its status on the right, and the panel controls.
-    fn chrome(&self, id: PanelId, title: &str, status: &str, focused: bool) -> Pane<'static> {
+    /// A panel's chrome: its title, its status on the right, and the panel controls (with the
+    /// control under the pointer hovered), with those controls.
+    fn chrome(
+        &self,
+        id: PanelId,
+        title: &str,
+        status: &str,
+        focused: bool,
+    ) -> (
+        Pane<'static>,
+        bmux_tui_components::panel_window::WindowControls,
+    ) {
         let theme = &self.theme;
         let pane = Pane::new()
             .title(theme.pane_title(title, focused))
             .right_title(theme.pane_status(status))
             .styles(self.pane_styles())
             .chrome(theme.component.chrome);
-        self.controls(id).apply(pane)
+        let controls = self.controls(id);
+        let hovered = self
+            .pointer
+            .filter(|_| self.hovered_panel() == Some(id))
+            .zip(self.body_area(pane_id(id)))
+            .and_then(|(pointer, area)| {
+                match controls.target(&controls.apply(pane.clone()), area, pointer)? {
+                    TitleTarget::Control(control) => Some(control),
+                    TitleTarget::Action(_) | TitleTarget::Title => None,
+                }
+            });
+        let controls = controls.hovered(hovered);
+        (controls.apply(pane), controls)
     }
 
     /// A panel's pane: `content`, or while the panel is minimized, its strip (side by side)
@@ -5030,7 +5123,7 @@ impl ReviewSurface {
         }
         let review_pane = self.panel_pane(
             PanelId::Review,
-            self.review_pane_chrome(review),
+            self.review_pane_chrome(review).0,
             &self.review_pane,
             list,
         );
@@ -5087,7 +5180,7 @@ impl ReviewSurface {
 
     fn guide_pane(&self, placement: super::panels::SidePlacement) -> PaneComponent<'_, '_> {
         let theme = &self.theme;
-        let chrome = self.guide_pane_chrome();
+        let chrome = self.guide_pane_chrome().0;
         if self.guide.state.active.is_none() {
             let empty = EmptyStateComponent::new("review.guide.empty", "No guide for this review")
                 .icon(theme.icons.guide_marker)
@@ -5167,7 +5260,7 @@ impl ReviewSurface {
         let content = content.flex(Flex::new(1, viewport));
         self.panel_pane(
             PanelId::Files,
-            self.files_pane_chrome(review),
+            self.files_pane_chrome(review).0,
             &self.files_pane,
             content,
         )
@@ -5177,7 +5270,7 @@ impl ReviewSurface {
     fn threads_pane<'a>(&'a self, review: &'a Review) -> PaneComponent<'a, 'a> {
         let theme = &self.theme;
         let count = review.threads.borrow().keys.len();
-        let chrome = self.threads_pane_chrome(review);
+        let chrome = self.threads_pane_chrome(review).0;
         let focused = self.focus == Focus::Threads;
         if count == 0 {
             let empty = EmptyStateComponent::new("review.threads.empty", "No threads yet")
@@ -5199,6 +5292,14 @@ impl ReviewSurface {
         self.panel_pane(PanelId::Threads, chrome, &self.threads_pane, list)
     }
 }
+
+/// The body panels with window controls on their title rows.
+const BODY_PANELS: [PanelId; 4] = [
+    PanelId::Files,
+    PanelId::Review,
+    PanelId::Threads,
+    PanelId::Guide,
+];
 
 /// Layout id of panel `id`'s pane.
 const fn pane_id(id: PanelId) -> &'static str {
