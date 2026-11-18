@@ -58,6 +58,8 @@ struct Turn {
     session: String,
     items: Vec<bcode_session_view_models::TranscriptViewItem>,
     guide_id: Option<String>,
+    /// Which turn of the conversation it is: tool call ids are unique within a session.
+    round: usize,
 }
 
 impl Turn {
@@ -66,6 +68,7 @@ impl Turn {
             session: session.to_owned(),
             items: vec![user(question)],
             guide_id: None,
+            round: 1,
         }
     }
 
@@ -104,12 +107,12 @@ impl Turn {
             .expect("started");
         self.guide_id = started["guide_id"].as_str().map(str::to_owned);
         self.items.push(tool(
-            "plan-1",
+            &format!("plan-{}", self.round),
             "code_review.guide.plan",
             r#"{"strategy":"auto"}"#,
         ));
         self.items.push(tool(
-            "start-1",
+            &format!("start-{}", self.round),
             "code_review.guide.start",
             &serde_json::json!({"title": "Retry walkthrough", "outline": outline()}).to_string(),
         ));
@@ -658,4 +661,61 @@ fn guide_show_answers_once_the_guide_it_names_is_read_or_known_missing() {
             .as_deref(),
         Some("second")
     );
+}
+
+#[test]
+fn a_second_walkthrough_in_the_same_conversation_is_sent_and_starts_a_new_version() {
+    let mut setup = setup(170, 50, true);
+    setup.scenario.key("alt+g");
+    setup.settle();
+    setup.scenario.key("enter");
+    setup.settle();
+    let (session, _) = setup
+        .backend
+        .host()
+        .turns()
+        .last()
+        .cloned()
+        .expect("the walkthrough was sent");
+    let mut turn = Turn::new(&session, crate::surface::WALKTHROUGH);
+    turn.plan_and_start(&mut setup);
+    turn.items
+        .push(super::assistant::answer("The guide is written."));
+    let finished = snapshot(turn.items.clone());
+    setup.deliver(&session, finished);
+    let first = turn.guide_id.clone().expect("guide");
+    settle_until(&mut setup, "the guide is shown", |setup| {
+        setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .is_some_and(|active| active.guide.guide_id == first)
+    });
+
+    // Asked again from the palette, in the same conversation.
+    setup.scenario.key("esc");
+    setup.settle();
+    setup.scenario.key(":");
+    setup.scenario.paste("walk me through this review");
+    setup.scenario.key("enter");
+    setup.settle();
+    let turns = setup.backend.host().turns();
+    assert_eq!(turns.len(), 2, "the second walkthrough is sent: {turns:?}");
+    assert_eq!(turns[1].0, session, "to the same conversation");
+    assert_eq!(turns[1].1.text, crate::surface::WALKTHROUGH);
+
+    // The assistant may start again: the review's guide gets a new version.
+    let mut again = Turn::new(&session, crate::surface::WALKTHROUGH);
+    again.round = 2;
+    again.items = turn.items.clone();
+    again.items.push(user(crate::surface::WALKTHROUGH));
+    again.plan_and_start(&mut setup);
+    assert_eq!(again.guide_id.as_deref(), Some(first.as_str()));
+    settle_until(&mut setup, "the new version is shown", |setup| {
+        setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .is_some_and(|active| active.version.version == 2)
+    });
 }

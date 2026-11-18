@@ -5,8 +5,8 @@
 //!   selection is the union of the enabled [`Category`] tool lists plus `extra`, intersected by
 //!   Bcode with what `build` exposes; every call is still decided by `build`'s permission rules.
 //! * **Categories.** Configured under `[plugins.config."bcode.code_review".assistant.tools]`,
-//!   every one on by default: review reads, review writes, publish, navigation, file reads, file
-//!   writes, shell. A category set to `false` removes its tools; an unknown key or a non-boolean
+//!   every one on by default: review reads, review writes, guides, publish, navigation, file
+//!   reads, file writes, shell. A category set to `false` removes its tools; an unknown key or a non-boolean
 //!   value is reported and the default is used.
 //! * **Client tools.** The tools the app itself answers, under its provider id, with their policy
 //!   class fixed at registration.
@@ -30,8 +30,11 @@ const TOOL_DEADLINE_MS: u32 = 30_000;
 pub enum Category {
     /// Reading reviews: plugin read tools and the app's view of the screen.
     ReviewReads,
-    /// Changing reviews: comments, replies, resolution, viewed marks, suggestions, guides.
+    /// Changing reviews: comments, replies, resolution, viewed marks, suggestions.
     ReviewWrites,
+    /// Writing guided reviews (a versioned, derived artifact; never the review's comments or
+    /// viewed state).
+    Guides,
     /// Publishing review comments.
     Publish,
     /// Moving the user within the app.
@@ -46,9 +49,10 @@ pub enum Category {
 
 impl Category {
     /// Every category, in configuration order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ReviewReads,
         Self::ReviewWrites,
+        Self::Guides,
         Self::Publish,
         Self::Navigation,
         Self::FileReads,
@@ -62,6 +66,7 @@ impl Category {
         match self {
             Self::ReviewReads => "review_reads",
             Self::ReviewWrites => "review_writes",
+            Self::Guides => "guides",
             Self::Publish => "publish",
             Self::Navigation => "navigation",
             Self::FileReads => "file_reads",
@@ -105,10 +110,9 @@ impl Category {
                 "code_review.create_review",
                 "code_review.update_review",
                 "code_review.delete_review",
-                "code_review.guide.start",
-                "code_review.guide.write",
                 actions::COMPLETE_PASS,
             ],
+            Self::Guides => &["code_review.guide.start", "code_review.guide.write"],
             Self::Publish => &[
                 "code_review.publish",
                 actions::PUBLISH,
@@ -500,6 +504,22 @@ mod tests {
         assert_eq!(profile.id, PROFILE_ID);
         assert_eq!(profile.base_agent, BASE_AGENT);
         assert_eq!(profile.tools, tools);
+    }
+
+    #[test]
+    fn guide_writes_have_their_own_category_that_review_writes_do_not_turn_off() {
+        let (config, problems) = parse("[assistant.tools]\nreview_writes = false\n");
+        assert_eq!(problems, Vec::<String>::new());
+        let tools = config.tools();
+        assert!(!tools.iter().any(|tool| tool == "code_review.add_comment"));
+        for tool in ["code_review.guide.start", "code_review.guide.write"] {
+            assert!(tools.iter().any(|name| name == tool), "{tool}");
+        }
+        let (config, _) = parse("[assistant.tools]\nguides = false\n");
+        let tools = config.tools();
+        assert!(!tools.iter().any(|tool| tool == "code_review.guide.write"));
+        assert!(tools.iter().any(|tool| tool == "code_review.add_comment"));
+        assert!(tools.iter().any(|tool| tool == "code_review.guide.get"));
     }
 
     #[test]

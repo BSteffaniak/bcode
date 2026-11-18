@@ -3054,7 +3054,12 @@ impl Assistant {
                 ),
                 keys: String::new(),
             });
-            let reads = matches!(category, Category::ReviewReads | Category::FileReads);
+            // Guide writes are allowed by default like reads: they change only a derived,
+            // versioned artifact.
+            let reads = matches!(
+                category,
+                Category::ReviewReads | Category::FileReads | Category::Guides
+            );
             for tool in category.tools() {
                 entries.push(OverlayEntry {
                     action: Some(format!("tool:{tool}")),
@@ -4005,8 +4010,9 @@ impl Assistant {
 }
 
 /// The categories the chips row and the permissions overlay switch (reads have no chip).
-pub const CHIP_CATEGORIES: [Category; 5] = [
+pub const CHIP_CATEGORIES: [Category; 6] = [
     Category::ReviewWrites,
+    Category::Guides,
     Category::FileWrites,
     Category::Shell,
     Category::Publish,
@@ -4018,6 +4024,7 @@ pub const CHIP_CATEGORIES: [Category; 5] = [
 pub const fn category_glyph(category: Category) -> &'static str {
     match category {
         Category::ReviewWrites => "✎",
+        Category::Guides => "◆",
         Category::FileWrites => "▤",
         Category::Shell => "$",
         Category::Publish => "⇪",
@@ -4031,6 +4038,7 @@ pub const fn category_glyph(category: Category) -> &'static str {
 pub const fn category_name(category: Category) -> &'static str {
     match category {
         Category::ReviewWrites => "review",
+        Category::Guides => "guides",
         Category::FileWrites => "files",
         Category::Shell => "shell",
         Category::Publish => "publish",
