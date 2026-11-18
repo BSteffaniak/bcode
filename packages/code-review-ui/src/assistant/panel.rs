@@ -622,6 +622,15 @@ impl Assistant {
         self.session.as_deref()
     }
 
+    /// Whether the active conversation's turn is running.
+    #[must_use]
+    pub fn working(&self) -> bool {
+        self.session
+            .as_deref()
+            .and_then(|session| self.agents.state(session))
+            .is_some_and(|state| state.working)
+    }
+
     /// The active conversation's title, once known.
     #[must_use]
     pub fn title(&self) -> Option<&str> {
@@ -1545,7 +1554,12 @@ impl Assistant {
             self.tools = self
                 .services
                 .host()
-                .serve_client_tools(super::profile::client_tools(), vec![config.profile()])
+                .serve_client_tools(
+                    super::profile::client_tools(),
+                    std::iter::once(config.profile())
+                        .chain(super::profile::guide_profiles())
+                        .collect(),
+                )
                 .ok();
         }
     }

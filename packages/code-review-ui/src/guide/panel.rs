@@ -160,6 +160,9 @@ pub struct SectionHeader {
 pub struct PanelModel {
     /// A line saying where the guide stands, when it is not simply complete.
     pub banner: Option<Line>,
+    /// Fan-out progress under the banner, each row's text and right-aligned trailing text
+    /// (bounded; display only).
+    pub progress: Vec<(Line, Line)>,
     /// Outline rows shown (folded sections' children are left out).
     pub outline: Vec<OutlineRow>,
     /// The current section's header.
@@ -183,6 +186,8 @@ impl PanelModel {
 struct Geometry {
     /// The banner's row.
     banner: Option<u16>,
+    /// First row and count of the fan-out progress rows shown.
+    progress: Option<(u16, u16)>,
     /// First row and height of the outline, and its first outline row shown.
     outline: Option<(u16, u16, usize)>,
     /// Whether the outline shows its trailing marks.
@@ -279,8 +284,20 @@ impl<'a> GuidePanelView<'a> {
 
     /// The rows below the banner the outline and the current section share, when both show,
     /// with the split's limits set for this outline.
+    /// Rows of the banner and of the fan-out progress shown in `height` rows: progress rows
+    /// only while [`MIN_SECTION_ROWS`] rows stay for the rest, dropped from the bottom first.
+    fn top_rows(&self, height: u16) -> (u16, u16) {
+        let banner = u16::from(self.model.banner.is_some() && height > 1);
+        let room = height.saturating_sub(banner + MIN_SECTION_ROWS);
+        let progress = u16::try_from(self.model.progress.len())
+            .unwrap_or(u16::MAX)
+            .min(room);
+        (banner, progress)
+    }
+
     fn split_area(&self, width: u16, height: u16) -> Option<Rect> {
-        let top = u16::from(self.model.banner.is_some() && height > 1);
+        let (banner, progress) = self.top_rows(height);
+        let top = banner + progress;
         let rows = height.saturating_sub(top);
         let outline_rows = u16::try_from(self.model.outline.len()).unwrap_or(u16::MAX);
         let combined = width >= OUTLINE_ONLY_WIDTH
@@ -298,8 +315,10 @@ impl<'a> GuidePanelView<'a> {
     }
 
     fn geometry(&self, width: u16, height: u16) -> Geometry {
-        let top = u16::from(self.model.banner.is_some() && height > 1);
-        let banner = (top == 1).then_some(0);
+        let (banner_rows, progress_rows) = self.top_rows(height);
+        let top = banner_rows + progress_rows;
+        let banner = (banner_rows == 1).then_some(0);
+        let progress = (progress_rows > 0).then_some((banner_rows, progress_rows));
         let rows = height.saturating_sub(top);
         let outline_only = width < OUTLINE_ONLY_WIDTH;
         let window = |outline_height: u16| {
@@ -326,6 +345,7 @@ impl<'a> GuidePanelView<'a> {
         };
         Geometry {
             banner,
+            progress,
             outline,
             trailing: !outline_only,
             rule,
@@ -539,6 +559,18 @@ impl Component for GuidePanelView<'_> {
         let geometry = self.geometry(width, height);
         if let (Some(y), Some(banner)) = (geometry.banner, &self.model.banner) {
             cx.write_line(row_rect(y), &fit(banner, &Line::default(), cells));
+        }
+        if let Some((top, rows)) = geometry.progress {
+            for (offset, (line, trailing)) in self
+                .model
+                .progress
+                .iter()
+                .take(usize::from(rows))
+                .enumerate()
+            {
+                let y = top + u16::try_from(offset).unwrap_or(u16::MAX);
+                cx.write_line(row_rect(y), &fit(line, trailing, cells));
+            }
         }
         if let Some((top, rows, first)) = geometry.outline {
             for (offset, row) in self
@@ -881,6 +913,7 @@ pub fn build_model(
         });
     PanelModel {
         banner,
+        progress: Vec::new(),
         outline,
         header,
         detail: detail_lines(active, theme),
@@ -1022,7 +1055,43 @@ fn detail_lines(active: &super::state::ActiveGuide, theme: &ReviewTheme) -> Vec<
     for finding in &section.findings {
         lines.push(prose(finding_line(active, finding, theme)));
     }
+    if !section.checks.is_empty() {
+        lines.push(prose(Line::default()));
+        lines.push(prose(Line::from_spans(vec![Span::styled(
+            "Checked claims",
+            theme.muted,
+        )])));
+    }
+    for check in &section.checks {
+        lines.push(prose(check_line(check, theme)));
+    }
     lines
+}
+
+/// One claim check a verifier recorded: supported (the verified glyph), unsupported (the
+/// problem glyph) or unclear (the dimmed unverified glyph), the claim, and the note. Checks
+/// never stand in for the section's content.
+fn check_line(check: &bcode_code_review_models::ClaimCheck, theme: &ReviewTheme) -> Line {
+    use bcode_code_review_models::ClaimStatus;
+    let (glyph, style, word) = match check.status {
+        ClaimStatus::Supported => (theme.icons.guide_verified, theme.guide.badge, "supported"),
+        ClaimStatus::Unsupported => (theme.icons.alert, theme.guide.problem, "unsupported"),
+        ClaimStatus::Unclear => (theme.icons.guide_unverified, theme.tiers.dim, "unclear"),
+    };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(glyph, style),
+        Span::raw(" "),
+        Span::styled(check.claim.clone(), theme.text),
+        Span::styled(format!(" · {word}"), style),
+    ];
+    if !check.note.trim().is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}", check.note.trim()),
+            theme.muted,
+        ));
+    }
+    Line::from_spans(spans)
 }
 
 /// One row of the current section's citations: its badge, where it is, and how it relates to

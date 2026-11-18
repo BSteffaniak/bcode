@@ -6,6 +6,8 @@
 //!   badges and the current section's tint without scanning the guide.
 //! * [`card`]: the guide as the assistant's conversation shows it, a live card in place of a
 //!   turn's guide tool lines.
+//! * [`fanout`]: a guide written by child agents: queueing, budget, resume, and the progress
+//!   the panel and the card show.
 //! * [`panel`]: the read-only guide panel (outline and current section) and the context peek of
 //!   cited code outside the review.
 //!
@@ -13,6 +15,7 @@
 //! `code_review.guide.*` tools.
 
 pub mod card;
+pub mod fanout;
 pub mod marks;
 pub mod panel;
 pub mod state;

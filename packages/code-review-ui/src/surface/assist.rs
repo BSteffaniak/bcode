@@ -853,6 +853,7 @@ impl ReviewSurface {
             "guide_walkthrough",
             "guide_walkthrough_directions",
             "guide_walkthrough_template",
+            "guide_fan_out_start",
         ]);
         let entries = Self::menu_entries(&actions, host);
         self.overlay = Some(Overlay::new(OverlayKind::Menu, entries, &self.theme));

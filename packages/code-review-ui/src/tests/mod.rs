@@ -17,6 +17,7 @@ mod feed;
 mod files;
 mod guide;
 mod guide_assistant;
+mod guide_fanout;
 mod guide_lifecycle;
 mod guide_review;
 mod guide_share;

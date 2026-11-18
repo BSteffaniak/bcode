@@ -499,6 +499,9 @@ impl ReviewApp {
             self.assistant.resend(&place, host);
             changed = true;
         }
+        if let Route::Review(review) = &mut self.route {
+            review.set_assistant(self.assistant.session(), self.assistant.working());
+        }
         for call in self.assistant.take_tool_calls() {
             self.answer_tool(call, host);
             changed = true;
@@ -1061,6 +1064,22 @@ impl ReviewApp {
             }
             actions::GUIDE_SHOW => {
                 self.guide_show_for_tool(&arguments, reply, host);
+                return;
+            }
+            actions::GUIDE_FAN_OUT => {
+                let Route::Review(review) = &mut self.route else {
+                    let _ = reply.send(Self::refused(
+                        "no_review",
+                        "no review is on screen; open one with bcode.code-review.open_review",
+                    ));
+                    return;
+                };
+                match parse::<actions::GuideFanOutArguments>(&arguments) {
+                    Ok(fan_out) => review.assistant_guide_fan_out(&fan_out, reply, host),
+                    Err(message) => {
+                        let _ = reply.send(Self::refused("invalid_arguments", message));
+                    }
+                }
                 return;
             }
             actions::REFRESH => match &mut self.route {

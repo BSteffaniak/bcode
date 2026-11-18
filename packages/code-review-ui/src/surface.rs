@@ -162,6 +162,7 @@ mod find;
 mod flows;
 mod guide;
 mod guide_assist;
+mod guide_fanout;
 mod guide_lifecycle;
 mod guide_review;
 mod guide_share;
@@ -184,6 +185,7 @@ pub use feed::FEED_SCOPE;
 pub use flows::Modal;
 pub use guide::{GUIDE_PANE_ID, GUIDE_SCOPE, PEEK_ID};
 pub use guide_assist::{GUIDE_TAB_VIEW_ID, GuideShowOutcome, WALKTHROUGH, WALKTHROUGH_DIRECTIONS};
+pub use guide_fanout::{FanOutDone, FanOutRequest, FanOutRun, Prepared};
 pub use guide_lifecycle::LifecycleDone;
 pub use guide_review::GuideReviewDone;
 pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
@@ -2159,6 +2161,7 @@ impl ReviewSurface {
             Message::GuideReview(done) => self.guide_review_done(*done),
             Message::GuideLifecycle(done) => self.apply_guide_lifecycle(*done),
             Message::GuideExported(result) => self.guide_exported(result),
+            Message::GuideFanOut(done) => self.fan_out_done(*done, host),
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -5762,6 +5765,8 @@ impl View for ReviewSurface {
         self.pump_feed(host);
         changed |= self.agents.drain();
         self.reflect_review_tools(host);
+        self.follow_layer_guide();
+        self.pump_fan_out(host);
         changed |= self.tick_feed(host);
         self.feed_attention();
         if changed {

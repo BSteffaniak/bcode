@@ -395,6 +395,10 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.guide_export", scope = "code-review", description = "Guide: Export to file", defaults = [
     ] },
+    { id = "bcode.code_review.guide_fan_out_start", scope = "code-review", description = "Guide: walk me through this review with child agents (or resume their fan-out)", defaults = [
+    ] },
+    { id = "bcode.code_review.guide_fan_out_stop", scope = "code-review", description = "Guide: stop the child agents writing the guide", defaults = [
+    ] },
     { id = "bcode.code_review.guide_down", scope = "code-review-guide", description = "Next section", defaults = [
         "j",
         "down",
@@ -450,6 +454,12 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.guide_unreviewed", scope = "code-review-guide", description = "Next section not reviewed", defaults = [
         "n",
+    ] },
+    { id = "bcode.code_review.guide_fan_out", scope = "code-review-guide", description = "Write the guide with child agents, confirm their fan-out, or resume it", defaults = [
+        "f",
+    ] },
+    { id = "bcode.code_review.guide_fan_out_cancel", scope = "code-review-guide", description = "Stop the child agents writing the guide", defaults = [
+        "shift+x",
     ] },
     { id = "bcode.code_review.guide_leave", scope = "code-review-guide", description = "Back to the review", defaults = [
         "esc",

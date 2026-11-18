@@ -49,8 +49,13 @@ const GUIDE_CARD_INDENT: usize = 2;
 const GUIDE_CARD_MAX_DEPTH: u16 = 3;
 /// Tools whose lines a guide card replaces (the guide tools).
 const GUIDE_TOOL_PREFIX: &str = "code_review.guide.";
-/// Guide tools that write; a turn calling one of them shows a guide card.
-const GUIDE_WRITE_TOOLS: [&str; 2] = ["code_review.guide.start", "code_review.guide.write"];
+/// Guide tools that write (and the app's fan-out); a turn calling one of them shows a guide
+/// card.
+const GUIDE_WRITE_TOOLS: [&str; 3] = [
+    "code_review.guide.start",
+    "code_review.guide.write",
+    crate::assistant::actions::GUIDE_FAN_OUT,
+];
 
 /// Separator between a feed item's key and the exchange it belongs to, in [`Folds::feed_open`].
 const OPEN_SEPARATOR: char = '\u{1f}';
@@ -603,10 +608,27 @@ impl Card<'_> {
                 theme.tiers.dim,
             )]);
         }
+        if let Some(fan_out) = &card.fan_out {
+            self.guide_fan_out(fan_out);
+        }
         self.buttons(&[(
             format!("Open guide {}", icons.external),
             ItemAction::Agent(AgentAction::GuideOpen),
         )]);
+    }
+
+    /// A guide card's fan-out rows: what the panel shows under its banner.
+    fn guide_fan_out(&mut self, fan_out: &crate::guide::fanout::FanOutView) {
+        let theme = self.theme;
+        for (line, trailing) in crate::guide::fanout::progress_rows(fan_out, theme, "") {
+            let mut spans = vec![Span::raw(" ".repeat(GUIDE_CARD_INDENT))];
+            spans.extend(line.spans);
+            if !trailing.spans.is_empty() {
+                spans.push(Span::styled(theme.icons.separator, theme.tiers.dim));
+                spans.extend(trailing.spans);
+            }
+            self.push(spans);
+        }
     }
 
     fn tool(&mut self, tool: &ToolLine, open: bool, toggle: ItemAction) {
@@ -1116,6 +1138,7 @@ mod tests {
             sections: Vec::new(),
             more: 0,
             stale: 1,
+            fan_out: None,
             revision: 0,
         }
     }

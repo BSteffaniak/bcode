@@ -66,6 +66,8 @@ pub enum Message {
     GuideLifecycle(Box<super::surface::LifecycleDone>),
     /// Where a guide export was written, or why not.
     GuideExported(Result<String, String>),
+    /// Fan-out work finished.
+    GuideFanOut(Box<super::surface::FanOutDone>),
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

@@ -136,14 +136,35 @@ impl ReviewSurface {
     #[must_use]
     pub fn guide_card(&self) -> Option<Arc<GuideCard>> {
         let active = self.guide.state.active.as_ref()?;
-        let revision = self.guide.state.revision;
+        let fan_out = if self.fan_out_running() {
+            self.agents.revision().rotate_left(29) ^ self.guide.fan_out.revision
+        } else {
+            self.guide.fan_out.revision
+        };
+        let revision = self.guide.state.revision ^ fan_out.rotate_left(11);
         let mut cached = self.guide.card.borrow_mut();
         if let Some((at, card)) = cached.as_ref()
             && *at == revision
         {
             return Some(Arc::clone(card));
         }
-        let card = Arc::new(GuideCard::of(active, revision));
+        let mut card = GuideCard::of(active, revision);
+        card.fan_out = self.fan_out_view().map(|mut view| {
+            // The card names the keys of a child's permission request beside it.
+            if let Some(permission) = view.permission.as_mut() {
+                let keys = self.agents.keys();
+                let feed: Vec<&str> = [&keys.allow, &keys.always, &keys.decline, &keys.never]
+                    .into_iter()
+                    .map(String::as_str)
+                    .filter(|key| !key.is_empty())
+                    .collect();
+                if !feed.is_empty() {
+                    *permission = format!("{}  {permission}", feed.join("/"));
+                }
+            }
+            view
+        });
+        let card = Arc::new(card);
         *cached = Some((revision, Arc::clone(&card)));
         Some(card)
     }
@@ -450,6 +471,7 @@ impl ReviewSurface {
     /// The assistant's turn in `session` was stopped: mark every version of the review's guides
     /// that session is writing stopped (whether or not it is on screen). Written sections stay.
     pub fn guide_turn_stopped(&mut self, session: &str, host: &UiContext) {
+        self.fan_out_turn_stopped(session, host);
         let scope = self.note_scope();
         let services = self.services.clone();
         let inbox = self.inbox.clone();

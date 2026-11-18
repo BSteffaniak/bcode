@@ -82,6 +82,8 @@ pub struct GuideCard {
     pub more: usize,
     /// Sections whose code changed since they were written.
     pub stale: usize,
+    /// Fan-out progress, when child agents write the guide.
+    pub fan_out: Option<super::fanout::FanOutView>,
     /// Changes whenever anything the card shows changes.
     pub revision: u64,
 }
@@ -147,6 +149,7 @@ impl GuideCard {
             sections,
             more,
             stale: active.stale.len(),
+            fan_out: None,
             revision,
         }
     }
@@ -168,6 +171,7 @@ impl GuideCard {
             sections: Vec::new(),
             more: 0,
             stale: 0,
+            fan_out: None,
             ..self.clone()
         })
     }

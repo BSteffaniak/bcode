@@ -112,7 +112,11 @@ impl Category {
                 "code_review.delete_review",
                 actions::COMPLETE_PASS,
             ],
-            Self::Guides => &["code_review.guide.start", "code_review.guide.write"],
+            Self::Guides => &[
+                "code_review.guide.start",
+                "code_review.guide.write",
+                actions::GUIDE_FAN_OUT,
+            ],
             Self::Publish => &[
                 "code_review.publish",
                 actions::PUBLISH,
@@ -362,6 +366,92 @@ impl AssistantConfig {
     }
 }
 
+/// Id of the profile a fan-out child writes its area or layer guide with.
+pub const GUIDE_WRITER_PROFILE_ID: &str = "bcode.code-review.guide-writer";
+/// Id of the profile a verifier child checks a guide's claims with.
+pub const GUIDE_VERIFIER_PROFILE_ID: &str = "bcode.code-review.guide-verifier";
+
+/// Plugin tools a guide child reads the review with.
+const GUIDE_READS: [&str; 13] = [
+    "code_review.summary",
+    "code_review.list_files",
+    "code_review.file_diff",
+    "code_review.file_content",
+    "code_review.list_threads",
+    "code_review.get_thread",
+    "code_review.pull_request",
+    "code_review.search_code",
+    "code_review.diff_hunks",
+    "code_review.related_files",
+    "code_review.guide.get",
+    "code_review.guide.check",
+    "code_review.guide.plan",
+];
+
+/// The profiles of fan-out children.
+///
+/// The guide writer has review and file reads and the guide tools; the guide verifier has the
+/// same reads and `code_review.guide.write`, which its grant limits to recording claim checks.
+/// Both narrow `build` and never include the app's own tools.
+#[must_use]
+pub fn guide_profiles() -> Vec<ClientAgentProfile> {
+    let reads = GUIDE_READS
+        .iter()
+        .chain(Category::FileReads.tools())
+        .map(|tool| (*tool).to_owned());
+    let mut writer: Vec<String> = reads
+        .clone()
+        .chain(["code_review.guide.start", "code_review.guide.write"].map(str::to_owned))
+        .collect();
+    writer.sort();
+    let mut verifier: Vec<String> = reads
+        .chain(std::iter::once("code_review.guide.write".to_owned()))
+        .collect();
+    verifier.sort();
+    vec![
+        ClientAgentProfile {
+            id: GUIDE_WRITER_PROFILE_ID.to_owned(),
+            name: "Guide writer".to_owned(),
+            description: "Writes one area or stack layer of a guided review for the code review \
+                          app, under the build agent's permission rules."
+                .to_owned(),
+            base_agent: BASE_AGENT.to_owned(),
+            instructions: WRITER_INSTRUCTIONS.to_owned(),
+            tools: writer,
+        },
+        ClientAgentProfile {
+            id: GUIDE_VERIFIER_PROFILE_ID.to_owned(),
+            name: "Guide verifier".to_owned(),
+            description: "Checks a guided review's claims against their citations for the \
+                          code review app, recording what it finds without changing content."
+                .to_owned(),
+            base_agent: BASE_AGENT.to_owned(),
+            instructions: VERIFIER_INSTRUCTIONS.to_owned(),
+            tools: verifier,
+        },
+    ]
+}
+
+/// The guide writer's instructions.
+const WRITER_INSTRUCTIONS: &str = "You write one part of a guided review for the Bcode code \
+review app: a cited walkthrough the reviewer steps through beside the diff. The message names \
+the guide, the version and your part: an area of the change (its paths) or one stack layer. \
+Read only what your part needs with the code_review read tools. For an area, send exactly one \
+code_review.guide.write with a single area_result operation (area_id as given) holding your \
+sections: a short purpose of the area and one step per stop in the diff, each body citing exact \
+lines with a short `quote` copied from them; it may be sent again to correct it. For a layer, \
+write that layer's own guide as the message says (put_section per section, then set_status \
+complete). When a write reports citation problems, fix the citation with the suggestion given \
+instead of dropping it. You cannot change anything else in the guide.";
+
+/// The guide verifier's instructions.
+const VERIFIER_INSTRUCTIONS: &str = "You check a guided review for the Bcode code review app. \
+Read the guide with code_review.guide.get (bodies and citations) and, for every written section, \
+check each claim of its body and findings against the cited lines (read them with the code_review \
+read tools). Record what you find with code_review.guide.write record_checks per section: one \
+check per claim with status supported, unsupported or unclear and a short note. Never rewrite, \
+remove or reorder content: checks are the only thing you may write.";
+
 /// The profile's instructions.
 const INSTRUCTIONS: &str = "You are the review assistant of the Bcode code review app. \
 Each user message comes with a `review app view` block describing the screen the user is on \
@@ -417,7 +507,9 @@ code_review.guide.write per section (put_section with its body and citations), s
 sees sections fill in; finally set_status complete. Cite every claim with exact lines and a \
 short `quote` copied from them; when a write reports citation problems, fix the citation with \
 the suggestion given instead of dropping it. Keep sections short. Never restructure a written \
-guide (move or remove written sections) unless the user asks for a restructure. Use \
+guide (move or remove written sections) unless the user asks for a restructure. When the plan's strategy is \
+per_layer or areas, call bcode.code-review.guide_fan_out instead of writing it alone: the app \
+runs child agents and later asks you to synthesize their results. Use \
 bcode.code-review.guide_show to show a section or citation, or to step through the guide, when \
 the user asks to be taken somewhere in it.
 
@@ -579,11 +671,10 @@ mod tests {
     fn the_profile_is_a_valid_contribution_and_its_tools_are_ones_build_exposes() {
         let config = AssistantConfig::default();
         let profile = config.profile();
+        let all: Vec<ClientAgentProfile> =
+            std::iter::once(profile).chain(guide_profiles()).collect();
         assert_eq!(
-            bcode_agent_profile::client_profile::validate_client_agent_profiles(
-                PROVIDER_ID,
-                std::slice::from_ref(&profile),
-            ),
+            bcode_agent_profile::client_profile::validate_client_agent_profiles(PROVIDER_ID, &all),
             Ok(())
         );
         // Every plugin tool the categories name is a tool Bcode's build agent is offered, so a
@@ -593,7 +684,7 @@ mod tests {
             &defaults, BASE_AGENT,
         ));
         let client: Vec<String> = client_tools().into_iter().map(|tool| tool.name).collect();
-        for tool in profile.tools {
+        for tool in all.into_iter().flat_map(|profile| profile.tools) {
             if tool.starts_with(&format!("{PROVIDER_ID}.")) {
                 assert!(client.contains(&tool), "{tool} is a client tool of the app");
             } else {

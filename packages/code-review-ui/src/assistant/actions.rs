@@ -33,6 +33,8 @@ pub const PULL_REQUEST_REVIEW: &str = "bcode.code-review.pull_request_review";
 pub const PUBLISH: &str = "bcode.code-review.publish";
 /// Shows the review's guide and steps through it.
 pub const GUIDE_SHOW: &str = "bcode.code-review.guide_show";
+/// Writes the review's guide with child agents, one per area or stack layer.
+pub const GUIDE_FAN_OUT: &str = "bcode.code-review.guide_fan_out";
 
 /// Pull requests and stacks listed at most.
 pub const MAX_FOUND: usize = 50;
@@ -214,7 +216,32 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
                 "focus": {"type": "boolean", "description": "Give the guide panel the keyboard (default false)."}
             }),
         ),
+        descriptor(
+            GUIDE_FAN_OUT,
+            ClientToolPolicy::Mutating,
+            "Write the review's guide with child agents when code_review.guide.plan says one writer is not enough (strategy per_layer or areas): the app creates one child session of this conversation per stack layer or area (with this conversation's model and effort), runs at most max_parallel at once, shows their progress in the guide, and when every child is done sends this conversation a message to synthesize the guide from their results (reusing their citation ids). Above the configured token estimate the user confirms first. Do not call code_review.guide.start yourself for a fan-out; the app starts the version. Returns what was started, or that the user is asked to confirm.",
+            &json!({
+                "strategy": {"type": "string", "enum": ["auto", "per_layer", "areas"], "description": "auto (default) follows the plan; per_layer and areas force that split."},
+                "depth": {"type": "string", "enum": ["brief", "standard", "deep"], "description": "How deep (the configured depth by default); deep adds a verifier pass."},
+                "directions": {"type": "string", "description": "The user's directions, given to every child."},
+                "title": {"type": "string", "description": "The guide's title."}
+            }),
+        ),
     ]
+}
+
+/// What `guide_fan_out` takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuideFanOutArguments {
+    /// `auto`, `per_layer` or `areas`.
+    pub strategy: Option<String>,
+    /// How deep.
+    pub depth: Option<bcode_code_review_models::GuideDepth>,
+    /// The user's directions.
+    pub directions: Option<String>,
+    /// The guide's title.
+    pub title: Option<String>,
 }
 
 /// What `guide_show` takes.

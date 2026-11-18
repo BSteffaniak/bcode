@@ -167,6 +167,21 @@ impl Setup {
         self.scenario.surface()
     }
 
+    /// Close the app and open it again on the review, over the same state and host.
+    pub(super) fn reopen(&mut self, width: u16, height: u16) {
+        let app = ReviewApp::new(
+            self.backend.services(),
+            self.review.repo_root.clone(),
+            ReviewViewConfig::default(),
+            Entry::Workspace {
+                workspace: Box::new(self.review.clone()),
+            },
+        )
+        .with_scroll_motion(Duration::ZERO);
+        self.scenario = Scenario::with_shared_host(app, self.backend.host(), width, height);
+        settled(&mut self.scenario);
+    }
+
     pub(super) fn session(&self) -> Option<String> {
         self.app().assistant().session().map(str::to_owned)
     }

@@ -359,7 +359,27 @@ fn the_profile_follows_the_tool_categories_and_every_turn_names_it() {
             .collect::<Vec<_>>()
     );
     let profiles = host.agent_profiles();
-    assert_eq!(profiles.len(), 1);
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            crate::assistant::profile::PROFILE_ID,
+            crate::assistant::profile::GUIDE_WRITER_PROFILE_ID,
+            crate::assistant::profile::GUIDE_VERIFIER_PROFILE_ID,
+        ]
+    );
+    for guide in &profiles[1..] {
+        assert_eq!(guide.base_agent, "build");
+        assert!(
+            !guide
+                .tools
+                .iter()
+                .any(|tool| tool.starts_with("bcode.code-review.")),
+            "guide children get no app tools"
+        );
+    }
     let profile = &profiles[0];
     assert_eq!(profile.id, crate::assistant::profile::PROFILE_ID);
     assert_eq!(profile.base_agent, "build");

@@ -115,6 +115,10 @@ pub(super) struct GuideUi {
     pub(super) grant: Option<bcode_code_review_models::GuideGrant>,
     /// Changes whenever [`Self::grant`] changes, so the session is bound again.
     pub(super) grant_epoch: u64,
+    /// A guide written by child agents.
+    pub(super) fan_out: super::guide_fanout::FanOutUi,
+    /// The layer whose guide the panel last followed (`guide.follow_layer`).
+    pub(super) followed_layer: Option<String>,
 }
 
 /// Which guide the next load shows.
@@ -145,6 +149,8 @@ impl GuideUi {
             generation: 0,
             prefer: None,
             reload_wanted: false,
+            fan_out: super::guide_fanout::FanOutUi::default(),
+            followed_layer: None,
             assessed: Vec::new(),
             pending_show: None,
             show_answer: None,
@@ -481,10 +487,15 @@ impl ReviewSurface {
         } else {
             Placement::Beside
         };
+        let fan_out = if self.fan_out_running() {
+            self.agents.revision().rotate_left(29) ^ self.guide.fan_out.revision
+        } else {
+            self.guide.fan_out.revision
+        };
         let stamp = (
             self.guide.state.revision,
             placement,
-            self.paint_revision ^ self.guide_threads_revision(),
+            self.paint_revision ^ self.guide_threads_revision() ^ fan_out.rotate_left(7),
             self.comparing.active(),
         );
         if self.guide.model_stamp == Some(stamp) {
@@ -508,6 +519,7 @@ impl ReviewSurface {
                 });
         let extra = self.guide_review_lines();
         self.guide.model.detail.extend(extra);
+        self.guide.model.progress = self.fan_out_rows();
         self.guide.model.revision = self
             .guide
             .model
@@ -539,7 +551,11 @@ impl ReviewSurface {
                     .get("guide_walkthrough_directions")
                     .cloned()
                     .filter(|key| !key.is_empty());
-                let mut lines = Vec::new();
+                let mut lines: Vec<Line> = self
+                    .fan_out_rows()
+                    .into_iter()
+                    .map(|(line, _)| line)
+                    .collect();
                 if self.comparing.active() {
                     lines.push(Line::from_spans(vec![
                         Span::styled("enter", theme.accent),
@@ -581,6 +597,20 @@ impl ReviewSurface {
                         theme.muted,
                     )]),
                 ]);
+                if let Some(key) = self
+                    .action_keys
+                    .get("guide_fan_out")
+                    .cloned()
+                    .filter(|key| !key.is_empty() && !self.guide.fan_out_confirming())
+                {
+                    lines.push(Line::from_spans(vec![
+                        Span::styled(key, theme.accent),
+                        Span::styled(
+                            " has child agents write it, one per area or stack layer",
+                            theme.muted,
+                        ),
+                    ]));
+                }
                 if self.is_transient() {
                     lines.push(Line::from_spans(vec![Span::styled(
                         "Save the review to keep its guide.",
@@ -1031,6 +1061,8 @@ impl ReviewSurface {
             }
             "guide_refresh_all" => self.guide_refresh(true, host),
             "guide_since" => self.guide_since(host),
+            "guide_fan_out_start" => self.guide_fan_out_key(host),
+            "guide_fan_out_stop" => self.stop_fan_out(host),
             "guide_versions_list" => self.open_guide_versions(),
             _ => return None,
         })
@@ -1067,11 +1099,25 @@ impl ReviewSurface {
 
     /// Keys of the guide panel. `None` for keys the panel does not use.
     pub(super) fn guide_key(&mut self, stroke: KeyStroke, host: &UiContext) -> Option<Action> {
+        if let Some(answered) = self.fan_out_permission_key(stroke, host) {
+            return Some(answered);
+        }
         let action = host.keymap_action(GUIDE_SCOPE, stroke)?;
         let action = action.strip_prefix("bcode.code_review.").unwrap_or(&action);
         if action == "guide_leave" {
-            self.focus = Focus::Review;
+            if !self.decline_fan_out() {
+                self.focus = Focus::Review;
+            }
             return Some(Action::Redraw);
+        }
+        match action {
+            "guide_fan_out" => return Some(self.guide_fan_out_key(host)),
+            "guide_open" if self.guide.fan_out_confirming() => {
+                return Some(self.guide_fan_out_key(host));
+            }
+            "guide_fan_out_cancel" => return Some(self.stop_fan_out(host)),
+            "guide_open" if self.open_layer_link() => return Some(Action::Redraw),
+            _ => {}
         }
         if self.guide.state.active.is_none() {
             if action == "guide_open" && self.guide.state.load == GuideLoad::Ready {

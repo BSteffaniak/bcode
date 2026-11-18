@@ -270,6 +270,8 @@ store_operations! {
         "guide.marks.set", |store, request| store.set_guide_section_mark(request);
     models::ClearGuideSectionMarkRequest => models::ClearGuideSectionMarkResponse,
         "guide.marks.clear", |store, request| store.clear_guide_section_mark(&request);
+    models::ListGuideAreasRequest => models::ListGuideAreasResponse,
+        "guide.areas.list", |store, request| store.list_guide_areas(&request);
     models::ListGuideThreadsRequest => models::ListGuideThreadsResponse,
         "guide.threads.list", |store, request| store.list_guide_threads(&request);
     models::SaveGuideThreadRequest => models::SaveGuideThreadResponse,

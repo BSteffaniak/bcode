@@ -117,6 +117,7 @@ impl ReviewSurface {
             .filter_map(|exchange| exchange.session_id.clone())
             .collect();
         sessions.extend(self.guide_thread_sessions());
+        sessions.extend(self.fan_out_sessions());
         if self
             .agents
             .ensure(host, sessions.iter().map(String::as_str))
