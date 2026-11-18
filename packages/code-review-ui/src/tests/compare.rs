@@ -2052,3 +2052,66 @@ fn a_version_picked_while_a_baseline_is_in_effect_is_not_named_for_every_row() {
     assert!(!screen.contains("new since v"), "{}", screen.text());
     assert!(screen.contains("new since then"), "{}", screen.text());
 }
+
+#[test]
+fn guiding_the_changes_starts_a_since_guide_and_asks_the_assistant_to_write_it() {
+    let fixture = fixture();
+    let backend = Arc::new(TestBackend::default().with_provider(FakeProvider::new(fixture.root())));
+    let pull = bcode_code_review_models::ReviewSourceKind::PullRequest {
+        provider: FAKE_PROVIDER.to_owned(),
+        repository: FAKE_REPOSITORY.to_owned(),
+        number: 101,
+    };
+    let workspace = create(&backend, &fixture, "One pull request", vec![pull]);
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+    scenario.key("n");
+    scenario.key("v");
+    scenario.key("q");
+    settled(&mut scenario);
+    push_to(&fixture, STACK_BRANCHES[0], "pushed-later.txt");
+    let mut scenario = resume(&fixture, &backend, &workspace.id);
+    settled(&mut scenario);
+
+    let screen = run(
+        &mut scenario,
+        "walk me through what changed since I last looked",
+    );
+    let screen = (0..4).fold(screen, |_, _| settled(&mut scenario));
+    let review = scenario.surface().review().expect("review");
+    let guide = review
+        .guide()
+        .unwrap_or_else(|| panic!("the since guide shows: {}", screen.text()));
+    let bcode_code_review_models::GuideScope::Since { pairs, .. } = &guide.guide.scope else {
+        panic!("a since guide: {:?}", guide.guide.scope);
+    };
+    assert_eq!(pairs.len(), 1, "the compared pull request: {pairs:?}");
+    assert_eq!(guide.version.version, 1);
+    assert_eq!(
+        review.guide_grant(),
+        Some(&bcode_code_review_models::GuideGrant {
+            guide_id: guide.guide.guide_id.clone(),
+            version: Some(1),
+            mode: bcode_code_review_models::GrantMode::Generate,
+        }),
+        "the assistant may write its version 1"
+    );
+    assert!(
+        screen.contains("Changes since") || screen.contains("walk you through the changes"),
+        "{}",
+        screen.text()
+    );
+    let host = backend.host();
+    let asked: Vec<String> = host
+        .turns()
+        .into_iter()
+        .map(|(_, request)| request.text)
+        .chain(host.messages().into_iter().map(|(_, text)| text))
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .any(|text| text.starts_with("Walk me through what changed since I last looked")),
+        "the assistant is asked: {asked:?}"
+    );
+}
