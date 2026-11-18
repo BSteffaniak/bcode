@@ -17,6 +17,7 @@ use bcode_code_review_models::{
     Section, SectionKind, SectionState, all_sections, find_section,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Operations one write takes at most.
@@ -439,13 +440,17 @@ pub fn named_citation_ids(ops: &[GuideOp]) -> Vec<String> {
     out
 }
 
-/// The prefix of the citation ids an area's writer stores (`crates-net.c1`), so that the
-/// citations of every area of a version can be reused by id in the version itself.
+/// The prefix of the citation ids an area's writer stores (`crates-net-1f0c4a2e.c1`), so that
+/// the citations of every area of a version can be reused by id in the version itself.
+///
+/// The readable part keeps the area id's letters, digits, `_` and `-` (others become `-`), cut
+/// to a bounded length; a hash of the whole id follows, so areas whose readable parts agree
+/// (`a/b` and `a.b`, or long paths sharing their start) never share a prefix.
 #[must_use]
 pub fn area_citation_prefix(area_id: &str) -> String {
-    const MAX_TAG_BYTES: usize = 32;
-    let mut tag: String = area_id
-        .trim()
+    const MAX_TAG_BYTES: usize = 24;
+    let id = area_id.trim();
+    let mut tag: String = id
         .trim_matches('/')
         .chars()
         .map(|character| {
@@ -460,8 +465,13 @@ pub fn area_citation_prefix(area_id: &str) -> String {
     if tag.is_empty() {
         tag.push_str("area");
     }
-    tag.push('.');
-    tag
+    let digest = Sha256::digest(id.as_bytes());
+    let hash: String = digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{tag}-{hash}.")
 }
 
 /// Every inline citation of `ops`, in order.

@@ -1073,12 +1073,15 @@ fn fan_out_children_write_only_their_area_and_synthesis_reuses_their_citation_id
         child,
     );
     let id = area["citations"][0]["id"].as_str().expect("id").to_owned();
-    assert_eq!(id, "crates-net.c1", "{area}");
+    assert!(
+        id.starts_with("crates-net-") && id.ends_with(".c1"),
+        "{area}"
+    );
 
     let synthesized = harness.json(
         "code_review.guide.write",
         &json!({"guide_id": guide, "ops": [
-            {"op": "put_section", "id": "s2", "body": "Covers the network [[crates-net.c1]].", "citations": [id]}
+            {"op": "put_section", "id": "s2", "body": format!("Covers the network [[{id}]]."), "citations": [id]}
         ]}),
         SESSION,
     );

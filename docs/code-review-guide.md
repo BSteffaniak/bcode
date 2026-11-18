@@ -417,8 +417,9 @@ whose estimate passes `confirm_above_tokens` needs confirmation.
   show per area, and a child's permission request shows in the panel and the guide card with the
   feed keys (`y`/`a`/`n`/`d`), which answer it from the guide panel. When a child's turn ends, its
   area is ready when its area row (by layer, its layer guide) is written, else failed.
-* **Citations.** An area writer's citation ids carry the area's prefix (`crates-net.c1`), so the
-  ids of every area are distinct; a version write naming an area citation by id (in a citation
+* **Citations.** An area writer's citation ids carry the area's prefix (`crates-net-1f0c4a2e.c1`:
+  the area id's readable part, bounded, then a hash of the whole id), so the ids of every area
+  are distinct even for areas whose ids read alike; a version write naming an area citation by id (in a citation
   list, a finding, or a body token) copies it into the version as it was checked.
 * **Synthesis.** When every area is done the version is marked synthesizing and the conversation
   is asked, with a `Generate` grant for that message, to write purpose, scope and one reading

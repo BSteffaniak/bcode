@@ -437,3 +437,34 @@ fn a_narrow_writer_never_replaces_a_citation_other_sections_use() {
         "the version's writer replaces it"
     );
 }
+
+#[test]
+fn area_citation_prefixes_stay_distinct_for_areas_that_read_alike() {
+    let ids = [
+        "plugins/github-review-publisher-plugin/src",
+        "plugins/github-review-publisher-plugin/tests",
+        "a/b",
+        "a.b",
+        "a-b",
+        "",
+        "/",
+    ];
+    let prefixes: BTreeSet<String> = ids.iter().map(|id| area_citation_prefix(id)).collect();
+    assert_eq!(prefixes.len(), ids.len(), "{prefixes:?}");
+    for prefix in &prefixes {
+        assert!(prefix.ends_with('.'), "{prefix}");
+        assert!(
+            prefix
+                .trim_end_matches('.')
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character)),
+            "{prefix}"
+        );
+    }
+    assert!(area_citation_prefix("crates/net").starts_with("crates-net-"));
+    assert_eq!(
+        area_citation_prefix("crates/net"),
+        area_citation_prefix(" crates/net "),
+        "the same area keeps its prefix"
+    );
+}
