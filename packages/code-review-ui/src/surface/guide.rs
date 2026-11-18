@@ -410,7 +410,10 @@ impl ReviewSurface {
             .as_ref()
             .and_then(|active| active.current().map(|entry| entry.id.clone()));
         match result {
-            Ok(loaded) => self.guide.state.apply(*loaded),
+            Ok(loaded) => {
+                self.guide.state.apply(*loaded);
+                self.expire_guide_grant();
+            }
             Err(error) => self.guide.state.fail(error),
         }
         if std::mem::take(&mut self.guide.reload_wanted) {

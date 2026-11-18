@@ -81,6 +81,30 @@ impl ReviewSurface {
         }
     }
 
+    /// Drop the review's grant once the guide it names has moved past it: another version of
+    /// the guide became current, or a `Refresh` has no granted section stale any more. A later
+    /// ordinary message then binds the session without it, so it neither writes an older version
+    /// nor keeps a narrow grant that refuses starting a guide.
+    pub(super) fn expire_guide_grant(&mut self) {
+        let (Some(grant), Some(active)) = (&self.guide.grant, self.guide.state.active.as_ref())
+        else {
+            return;
+        };
+        if grant.guide_id != active.guide.guide_id {
+            return;
+        }
+        let Some(version) = grant.version else {
+            return;
+        };
+        let superseded = active.guide.current_version != version;
+        let refreshed = active.version.version == version
+            && matches!(&grant.mode, GrantMode::Refresh { section_ids }
+                if !section_ids.iter().any(|id| active.stale.contains(id)));
+        if superseded || refreshed {
+            self.set_guide_grant(None);
+        }
+    }
+
     /// The grant the review gives the assistant's session.
     #[must_use]
     pub const fn guide_grant(&self) -> Option<&GuideGrant> {

@@ -131,3 +131,40 @@ fn refreshing_a_stale_section_forks_the_next_version_and_keeps_the_old_one_reada
         "an older version is never refreshed"
     );
 }
+
+#[test]
+fn a_refresh_grant_ends_once_another_version_becomes_current() {
+    let (mut setup, cited, fixture) = guided(160, 40);
+    for id in ["c1", "c2", "c3"] {
+        quote_citation(&mut setup, &fixture, id);
+    }
+    push_edit_of_cited_line(&mut setup, &cited, &fixture);
+    setup.scenario.key("alt+g");
+    stable(&mut setup.scenario);
+    setup.scenario.key("alt+r");
+    stable(&mut setup.scenario);
+    assert!(
+        matches!(
+            setup.scenario.surface().guide_grant(),
+            Some(GuideGrant {
+                version: Some(2),
+                mode: GrantMode::Refresh { .. },
+                ..
+            })
+        ),
+        "{:?}",
+        setup.scenario.surface().guide_grant()
+    );
+
+    // Restructuring forks v3: the refresh of v2 no longer applies to ordinary messages.
+    setup.scenario.key("shift+r");
+    stable(&mut setup.scenario);
+    setup.scenario.paste("group by layer");
+    setup.scenario.key("ctrl+s");
+    stable(&mut setup.scenario);
+    stable(&mut setup.scenario);
+    stable(&mut setup.scenario);
+    let guide = setup.scenario.surface().guide().expect("guide");
+    assert_eq!(guide.guide.current_version, 3);
+    assert_eq!(setup.scenario.surface().guide_grant(), None);
+}

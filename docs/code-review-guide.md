@@ -553,7 +553,8 @@ is pinned to, since guides and their delta check); the review screen drives it
 * **Grants from the app.** The review records the grant it gives the assistant's session in
   that session's binding (`guide_grant`); a changed grant binds the session again before its
   next message. Asking for a new walkthrough drops the grant, so the session writes the
-  versions it starts.
+  versions it starts. The grant also ends once the guide moves past it: when another version
+  of the guide becomes current, or when no section a `Refresh` names is stale any more.
 * **Versions.** `V` (`Guide: versions…`) lists the guide's versions, newest first, with
   status, the version each was forked from, and when it last changed. Picking an older one
   shows it read-only with the banner `v1 · pinned to #102 1a2b3c4 · read-only · current is v2
