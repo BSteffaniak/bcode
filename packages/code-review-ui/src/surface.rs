@@ -32,7 +32,7 @@ use super::files::{FilePanelView, FileTree};
 use super::loader::{self, Inbox, Message, NeedResult, Opened};
 use super::notes::ReviewNotes;
 use super::palette::Overlay;
-use super::panel_controls::{Command, Controls, PanelKind, TitleHit};
+use super::panel_controls::{Command, PanelKind, TitleTarget};
 use super::panels::{PanelId, Panels};
 use super::rows::{
     Folds, GapAction, Interaction, RowCache, RowContext, RowKey, SearchHighlights, ViewParams,
@@ -716,7 +716,7 @@ pub struct ReviewSurface {
     focus: Focus,
     panels: Panels,
     /// Double clicks on panel title rows.
-    title_clicks: crate::panel_controls::TitleClicks,
+    title_clicks: crate::panel_controls::TitleClicks<PanelId>,
     files_pane: Cell<PaneState>,
     review_pane: Cell<PaneState>,
     threads_pane: Cell<PaneState>,
@@ -2660,8 +2660,9 @@ impl ReviewSurface {
         // composer, search), which otherwise take every key.
         if matches!(self.focus, Focus::Composer | Focus::Search | Focus::Filter)
             && let Some(action) = host.keymap_action(SCOPE, stroke)
-            && let Some(command) =
-                Command::from_action(action.strip_prefix("bcode.code_review.").unwrap_or(&action))
+            && let Some(command) = crate::panel_controls::command(
+                action.strip_prefix("bcode.code_review.").unwrap_or(&action),
+            )
         {
             return self.panel_command(self.focused_panel(), command, None);
         }
@@ -2822,7 +2823,7 @@ impl ReviewSurface {
             "files_grow" => self.panel_command(PanelId::Files, Command::Grow, count),
             "files_shrink" => self.panel_command(PanelId::Files, Command::Shrink, count),
             _ => {
-                let command = Command::from_action(action)?;
+                let command = crate::panel_controls::command(action)?;
                 self.panel_command(self.focused_panel(), command, count)
             }
         })
@@ -4018,9 +4019,7 @@ impl ReviewSurface {
                 continue;
             };
             let chrome = self.pane_chrome(id, review);
-            if let Some(hit) =
-                crate::panel_controls::hit(&chrome, 0, self.controls(id), area, position)
-            {
+            if let Some(hit) = self.controls(id).target(&chrome, area, position) {
                 found = Some((id, hit));
                 break;
             }
@@ -4030,12 +4029,12 @@ impl ReviewSurface {
         };
         self.focus_panel(id);
         match hit {
-            TitleHit::Control(control) => {
+            TitleTarget::Control(control) => {
                 self.title_clicks.reset();
                 self.panel_command(id, control.command(), None);
             }
-            TitleHit::Title | TitleHit::Action(_) => {
-                if self.title_clicks.press(panel_kind(id)) {
+            TitleTarget::Title | TitleTarget::Action(_) => {
+                if self.title_clicks.press(id) {
                     self.panel_command(id, Command::Maximize, None);
                 }
             }
@@ -4088,50 +4087,34 @@ impl ReviewSurface {
         command: Command,
         count: Option<u32>,
     ) -> Action {
-        match command {
-            Command::Maximize => {
-                if self.panels.toggle_maximize(id).is_none() {
-                    self.set_status("the panel is not shown", StatusSeverity::Info);
-                }
+        use bmux_tui_components::panel_window::{WindowCommandOutcome, WindowRefusal};
+        let (outcome, persist) = self.panels.command(id, command, count);
+        match outcome {
+            WindowCommandOutcome::CloseRequested if self.focused_panel() == id => {
+                self.focus = Focus::Review;
             }
-            Command::Minimize => match self.panels.toggle_minimize(id) {
-                Some(_) => self.persist_panels(),
-                None if id == PanelId::Review => self.set_status(
-                    crate::panel_controls::REVIEW_MINIMIZE_REFUSED,
-                    StatusSeverity::Info,
-                ),
-                None => self.set_status("the panel is not shown", StatusSeverity::Info),
-            },
-            Command::Close => {
-                if self.panels.close(id) {
-                    if self.focused_panel() == id {
-                        self.focus = Focus::Review;
-                    }
-                    self.persist_panels();
-                } else {
-                    self.set_status(
-                        crate::panel_controls::REVIEW_CLOSE_REFUSED,
-                        StatusSeverity::Info,
-                    );
-                }
+            WindowCommandOutcome::Refused(WindowRefusal::NotShown) => {
+                self.set_status("the panel is not shown", StatusSeverity::Info);
             }
-            Command::Grow | Command::Shrink => {
-                if self.panels.resize(id, command.delta(count)) {
-                    self.persist_panels();
-                }
-            }
-            Command::ResetSize => {
-                if self.panels.reset_size(id) {
-                    self.persist_panels();
-                }
-            }
+            WindowCommandOutcome::Refused(WindowRefusal::KeepExpanded) => self.set_status(
+                crate::panel_controls::REVIEW_MINIMIZE_REFUSED,
+                StatusSeverity::Info,
+            ),
+            WindowCommandOutcome::Refused(WindowRefusal::NotClosable) => self.set_status(
+                crate::panel_controls::REVIEW_CLOSE_REFUSED,
+                StatusSeverity::Info,
+            ),
+            _ => {}
+        }
+        if persist {
+            self.persist_panels();
         }
         Action::Redraw
     }
 
     /// The controls of panel `id` as it is shown.
-    fn controls(&self, id: PanelId) -> Controls {
-        Controls::new(panel_kind(id), self.panels.shape(id))
+    fn controls(&self, id: PanelId) -> bmux_tui_components::panel_window::WindowControls {
+        crate::panel_controls::controls(panel_kind(id), self.panels.shape(id), &self.theme)
     }
 
     /// The chrome of panel `id`, as painted.
@@ -4999,7 +4982,7 @@ impl ReviewSurface {
             .right_title(theme.pane_status(status))
             .styles(self.pane_styles())
             .chrome(theme.component.chrome);
-        self.controls(id).apply(pane, theme)
+        self.controls(id).apply(pane)
     }
 
     /// A panel's pane: `content`, or while the panel is minimized, its strip (side by side)
@@ -5012,20 +4995,9 @@ impl ReviewSurface {
         content: impl Component + 'a,
     ) -> PaneComponent<'a, 'a> {
         let focused = self.focused_panel() == id;
-        match self.panels.shape(id) {
-            crate::panel_controls::Shape::Strip => Self::pane(
-                pane_id(id),
-                chrome,
-                focused,
-                state,
-                crate::panel_controls::strip_content(panel_kind(id), &self.theme),
-            ),
-            crate::panel_controls::Shape::Row => {
-                Self::pane(pane_id(id), chrome, focused, state, Column::new())
-            }
-            crate::panel_controls::Shape::Normal | crate::panel_controls::Shape::Maximized => {
-                Self::pane(pane_id(id), chrome, focused, state, content)
-            }
+        match crate::panel_controls::minimized(panel_kind(id), self.panels.shape(id), &self.theme) {
+            Some(minimized) => Self::pane(pane_id(id), chrome, focused, state, minimized),
+            None => Self::pane(pane_id(id), chrome, focused, state, content),
         }
     }
 
@@ -5062,14 +5034,8 @@ impl ReviewSurface {
             &self.review_pane,
             list,
         );
-        // A maximized panel is the only one laid out.
-        match self.panels.maximized() {
-            Some(PanelId::Review) => return Element::new(review_pane),
-            Some(PanelId::Files) => return Element::new(self.files_pane(review)),
-            Some(PanelId::Threads) => return Element::new(self.threads_pane(review)),
-            Some(PanelId::Guide) => return Element::new(self.guide_pane(plan.guide)),
-            Some(PanelId::Side) | None => {}
-        }
+        // A maximized panel is the only one laid out: each group along its way lays out only
+        // its branch.
         let mut review_pane = Some(review_pane);
         let mut root = PanelGroupComponent::new(
             ROOT_ID,

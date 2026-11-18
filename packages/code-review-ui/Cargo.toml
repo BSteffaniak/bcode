@@ -43,6 +43,7 @@ bmux_tui_components = { workspace = true, features = [
     "menu",
     "pane",
     "panel-group",
+    "panel-window",
     "picker-frame",
     "progress-bar",
     "scroll-view",

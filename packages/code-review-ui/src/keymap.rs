@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn panel_keys_are_the_same_everywhere_and_conflict_with_nothing() {
         let registry = registry(BTreeMap::new()).unwrap();
-        for (name, _) in crate::panel_controls::Command::ACTIONS {
+        for (name, _) in crate::panel_controls::ACTIONS {
             let id = format!("bcode.code_review.{name}");
             let keys = registry.keys_for_action(REVIEW_SCOPE, &id);
             assert!(!keys.is_empty(), "{name} has a default key");

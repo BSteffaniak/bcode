@@ -451,7 +451,7 @@ pub struct Assistant {
     /// The `✕` painted on a history row: its row, column and session.
     history_delete: Cell<Option<(usize, u16)>>,
     /// Double clicks on the title row (they toggle maximize).
-    title_clicks: crate::panel_controls::TitleClicks,
+    title_clicks: crate::panel_controls::TitleClicks<()>,
     /// Whether the panel is maximized or minimized.
     zoom: Zoom,
     /// The theme of the last frame (overlays are built with it).
@@ -2656,9 +2656,7 @@ impl Assistant {
         if !painted.title.is_some_and(|title| title.contains(position)) {
             return false;
         }
-        let double = self
-            .title_clicks
-            .press(crate::panel_controls::PanelKind::Assistant);
+        let double = self.title_clicks.press(());
         if double {
             self.panel_command(crate::panel_controls::Command::Maximize, None);
         }
@@ -2737,7 +2735,9 @@ impl Assistant {
                 self.zoom = Zoom::Docked;
                 self.dock_key.set(None);
             }
-            Command::Grow | Command::Shrink => self.resize_by(command.delta(count)),
+            Command::Grow | Command::Shrink => {
+                self.resize_by(command.delta(count, crate::panel_controls::RESIZE_STEP));
+            }
             Command::ResetSize => self.reset_size(),
         }
         Outcome::Redraw
@@ -3532,7 +3532,7 @@ impl Assistant {
                 });
             }
             _ => {
-                let Some(command) = crate::panel_controls::Command::from_action(action) else {
+                let Some(command) = crate::panel_controls::command(action) else {
                     return Outcome::Ignored;
                 };
                 return self.panel_command(command, None);
@@ -3856,9 +3856,10 @@ impl Assistant {
         painted: &mut Painted,
         cx: &mut PaintCx<'_, '_>,
     ) {
-        let controls = crate::panel_controls::Controls::new(
+        let controls = crate::panel_controls::controls(
             crate::panel_controls::PanelKind::Assistant,
             shape,
+            theme,
         );
         let chrome = controls.apply(
             Pane::new()
@@ -3869,7 +3870,6 @@ impl Assistant {
                     focused_border: theme.border_focused,
                 })
                 .chrome(theme.component.chrome),
-            theme,
         );
         let pane_rect = Rect::new(0, 0, rect.width, rect.height);
         painted.title = Some(Rect::new(rect.x, rect.y, rect.width, 1));
@@ -3890,11 +3890,12 @@ impl Assistant {
         let mut state = self.pane.get();
         state.interaction.focused = focused;
         self.pane.set(state);
-        let content = if shape == crate::panel_controls::Shape::Strip {
-            crate::panel_controls::strip_content(crate::panel_controls::PanelKind::Assistant, theme)
-        } else {
-            Column::new()
-        };
+        let content = crate::panel_controls::minimized(
+            crate::panel_controls::PanelKind::Assistant,
+            shape,
+            theme,
+        )
+        .unwrap_or_default();
         cx.paint_component(
             &PaneComponent::new(PANEL_ID, chrome, &self.pane, content),
             rect,
@@ -3910,7 +3911,7 @@ impl Assistant {
             self.title_actions()
         };
         ids.extend(
-            self.controls(dock)
+            self.controls(dock, &self.theme.get())
                 .list()
                 .into_iter()
                 .map(crate::panel_controls::Control::id),
@@ -3919,10 +3920,15 @@ impl Assistant {
     }
 
     /// The panel controls docked as `dock`.
-    const fn controls(&self, dock: Dock) -> crate::panel_controls::Controls {
-        crate::panel_controls::Controls::new(
+    const fn controls(
+        &self,
+        dock: Dock,
+        theme: &ReviewTheme,
+    ) -> bmux_tui_components::panel_window::WindowControls {
+        crate::panel_controls::controls(
             crate::panel_controls::PanelKind::Assistant,
             self.shape_in(dock),
+            theme,
         )
     }
 
@@ -4074,8 +4080,8 @@ impl Assistant {
         }
         // The conversation's title keeps more room than other panels' titles: its own buttons
         // drop first.
-        self.controls(dock)
-            .apply(chrome, theme)
+        self.controls(dock, theme)
+            .apply(chrome)
             .min_title_width(ASSISTANT_TITLE_CELLS)
     }
 
