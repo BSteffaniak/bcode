@@ -106,6 +106,8 @@ pub struct ScriptedHost {
     session_model_failure: Mutex<Option<String>>,
     /// Session model reads, per session.
     session_model_reads: Mutex<BTreeMap<String, usize>>,
+    /// Child sessions created: `(parent, child)`, oldest first.
+    children: Mutex<Vec<(String, String)>>,
 }
 
 /// A session's model choice in the fake daemon.
@@ -197,6 +199,7 @@ impl ScriptedHost {
             model_aliases: Mutex::default(),
             session_model_failure: Mutex::default(),
             session_model_reads: Mutex::default(),
+            children: Mutex::default(),
         }
     }
 
@@ -619,6 +622,16 @@ impl ScriptedHost {
         self.clipboard.lock().expect("clipboard lock").clone()
     }
 
+    /// Child sessions created so far: `(parent id, child id)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    #[must_use]
+    pub fn child_sessions(&self) -> Vec<(String, String)> {
+        self.children.lock().expect("children lock").clone()
+    }
+
     /// Sessions created so far: `(id, title)`.
     ///
     /// # Panics
@@ -801,6 +814,31 @@ impl ReviewHost for ScriptedHost {
         origin: bcode_session_models::SessionOrigin,
     ) -> HostFuture<String> {
         let created = self.create_now(title, origin);
+        Box::pin(async move { created })
+    }
+
+    fn create_child_session(
+        &self,
+        parent: String,
+        title: String,
+        _working_directory: PathBuf,
+    ) -> HostFuture<String> {
+        let failure = self.session_failure.lock().expect("failure lock").clone();
+        let created = failure.map_or_else(
+            || {
+                let id = SessionId::new().to_string();
+                self.sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .push((id.clone(), title));
+                self.children
+                    .lock()
+                    .expect("children lock")
+                    .push((parent, id.clone()));
+                Ok(id)
+            },
+            |message| Err(HostError::failed(message)),
+        );
         Box::pin(async move { created })
     }
 

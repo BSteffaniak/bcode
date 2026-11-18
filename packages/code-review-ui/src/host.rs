@@ -425,6 +425,19 @@ pub trait ReviewHost: Send + Sync {
         origin: bcode_session_models::SessionOrigin,
     ) -> HostFuture<String>;
 
+    /// Create a Bcode session named `title` working in `working_directory` as a child of
+    /// `parent` (it shows in Bcode's child monitor and opens like any session); returns its id.
+    /// A child starts with fresh context: nothing of the parent's conversation is copied.
+    fn create_child_session(
+        &self,
+        parent: String,
+        title: String,
+        working_directory: PathBuf,
+    ) -> HostFuture<String> {
+        let _ = (parent, title, working_directory);
+        Box::pin(async { Err(HostError::failed("this host cannot create child sessions")) })
+    }
+
     /// Send `text` to `session_id` as a user message.
     fn send_message(&self, session_id: String, text: String) -> HostFuture<()>;
 
@@ -916,6 +929,31 @@ impl ReviewHost for StandaloneHost {
                 .client()
                 .await?
                 .create_session_with_origin(Some(title), working_directory, Some(origin))
+                .await
+                .map(|session| session.id.to_string())
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn create_child_session(
+        &self,
+        parent: String,
+        title: String,
+        working_directory: PathBuf,
+    ) -> HostFuture<String> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let parent_id = parse_session(&parent)?;
+            let request = bcode_session_models::SessionChildCreateRequest {
+                child_id: SessionId::new(),
+                parent_id,
+                name: Some(title),
+                working_directory,
+            };
+            bcode
+                .client()
+                .await?
+                .create_child_session(request)
                 .await
                 .map(|session| session.id.to_string())
                 .map_err(|error| bcode.failure(&error))
