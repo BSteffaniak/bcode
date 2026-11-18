@@ -230,9 +230,10 @@ pub fn layer_prompt(
 ) -> String {
     let mut prompt = format!(
         "Write the guide of the stack layer {title} (source {source}): guide {layer_guide}, \
-         version 1, at {depth} depth. It covers only this layer's own changes.\n\nRead the \
-         layer's changes (code_review.list_files and code_review.file_diff with source \
-         {source}), then write the guide with code_review.guide.write (guide_id {layer_guide}): \
+         its current version, at {depth} depth. It covers only this layer's own changes.\n\n\
+         Read the layer's changes (code_review.list_files and code_review.file_diff with source \
+         {source}), then write the guide with code_review.guide.write (guide_id {layer_guide}, \
+         without `version`: this conversation writes the guide's current version): \
          set_outline with purpose, scope and reading_order (one step per stop in the diff), \
          put_section per section citing exact lines with quotes, and set_status complete.",
         title = area.title,
@@ -545,6 +546,16 @@ pub fn progress_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layer_child_is_asked_for_the_current_version_of_its_guide() {
+        let mut layer = area("layer-2", GuideAreaStatus::Queued);
+        layer.layer = Some("layer-2".to_owned());
+        let prompt = layer_prompt("guide-9", &layer, None, "standard");
+        assert!(prompt.contains("guide-9, its current version"), "{prompt}");
+        assert!(prompt.contains("without `version`"), "{prompt}");
+        assert!(!prompt.contains("version 1"), "{prompt}");
+    }
 
     fn area(id: &str, status: GuideAreaStatus) -> GenerationArea {
         GenerationArea {

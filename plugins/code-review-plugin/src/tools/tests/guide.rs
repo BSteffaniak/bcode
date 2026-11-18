@@ -1105,3 +1105,43 @@ fn fan_out_children_write_only_their_area_and_synthesis_reuses_their_citation_id
         Some(vec![id])
     );
 }
+
+#[test]
+fn a_layer_child_of_a_second_fan_out_writes_the_current_version_it_is_granted() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let (guide, _, _) = started(&mut harness);
+    let second = harness.json(
+        "code_review.guide.start",
+        &json!({"guide_id": guide, "mode": "new_version"}),
+        SESSION,
+    );
+    assert_eq!(second["version"], 2);
+
+    // The layer's child follows the guide's current version, as a fan-out by layer grants it.
+    let child = "33333333-3333-4333-8444-555555555555";
+    harness.bind(child);
+    grant(
+        &harness,
+        child,
+        Some(GuideGrant {
+            guide_id: guide.clone(),
+            version: None,
+            mode: GrantMode::Generate,
+        }),
+    );
+    let written = harness.json(
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "ops": [{"op": "set_status", "status": "complete"}]}),
+        child,
+    );
+    assert_eq!(written["written"], true, "{written}");
+    assert_eq!(written["version"], 2, "{written}");
+    let output = refusal(
+        &mut harness,
+        "code_review.guide.write",
+        &json!({"guide_id": guide, "version": 1, "ops": [{"op": "set_status", "status": "complete"}]}),
+        child,
+    );
+    assert!(output.contains("version 2"), "{output}");
+}
