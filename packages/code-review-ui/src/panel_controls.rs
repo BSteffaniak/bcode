@@ -9,7 +9,12 @@
 //! * **Panels.** [`PanelKind`] names the panels and says which close: every panel but the
 //!   review document, which is what the review is (its close key is refused, and it minimizes
 //!   only while another panel in its group stays expanded to take its room).
-//! * **Glyphs.** The theme's icons, with their ASCII fallbacks ([`controls`]).
+//! * **Glyphs.** The theme's icons, with their ASCII fallbacks, in one muted cluster joined
+//!   to the border: `┤ ▾ ⤢ × ├` ([`controls`]). A hovered control takes the accent colour,
+//!   close the error colour.
+//! * **Visibility.** The controls show on the focused panel and the panel under the pointer;
+//!   a minimized panel always shows its restore control. Keys and double clicks on a title
+//!   row work on every panel.
 //! * **Keys.** [`ACTIONS`] names the keymap actions that run a [`Command`] on the focused
 //!   panel, with the same keys in every panel's scope; grow and shrink move an edge
 //!   [`RESIZE_STEP`] cells.
@@ -74,15 +79,25 @@ impl PanelKind {
     }
 }
 
-/// The window-control glyphs of `theme`.
+/// The window-control glyphs of `theme`: its icons, with caps that join its panels' border
+/// line (a double or thick border takes matching tees).
 #[must_use]
 pub const fn glyphs(theme: &ReviewTheme) -> WindowGlyphs {
     let icons = &theme.icons;
+    let (cap_start, cap_end) = match theme.component.chrome.border_set {
+        Some(set) if set.horizontal == '═' => ("╡", "╞"),
+        Some(set) if set.horizontal == '━' => ("┥", "┝"),
+        Some(set) if set.horizontal == '-' => ("|", "|"),
+        _ => (icons.panel_cap_start, icons.panel_cap_end),
+    };
     WindowGlyphs {
         minimize: icons.panel_minimize,
+        restore_minimized: icons.panel_unminimize,
         maximize: icons.panel_maximize,
-        restore: icons.panel_restore,
+        restore_maximized: icons.panel_restore,
         close: icons.panel_close,
+        cap_start,
+        cap_end,
     }
 }
 
@@ -93,6 +108,7 @@ pub const fn controls(kind: PanelKind, shape: Shape, theme: &ReviewTheme) -> Win
         .closable(kind.closable())
         .glyphs(glyphs(theme))
         .style(theme.muted)
+        .hover_styles(theme.accent, theme.error)
         .min_title_width(MIN_TITLE_CELLS)
 }
 

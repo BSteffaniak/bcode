@@ -110,12 +110,18 @@ pub struct Icons {
     pub filter: &'static str,
     /// A panel's minimize control.
     pub panel_minimize: &'static str,
+    /// A minimized panel's restore control.
+    pub panel_unminimize: &'static str,
     /// A panel's maximize control.
     pub panel_maximize: &'static str,
-    /// A minimized or maximized panel's restore control.
+    /// A maximized panel's restore control.
     pub panel_restore: &'static str,
     /// A panel's close control.
     pub panel_close: &'static str,
+    /// The cap before a panel's window controls, joining its border.
+    pub panel_cap_start: &'static str,
+    /// The cap after a panel's window controls, joining its border.
+    pub panel_cap_end: &'static str,
     /// A collapsed group (the menu toggle marks an expanded one).
     pub collapsed: &'static str,
     /// A running tool call.
@@ -205,10 +211,13 @@ impl Icons {
         menu: "▾",
         selection_bar: "▌",
         filter: "⌕",
-        panel_minimize: "▁",
-        panel_maximize: "□",
-        panel_restore: "❐",
-        panel_close: "✕",
+        panel_minimize: "▾",
+        panel_unminimize: "▸",
+        panel_maximize: "⤢",
+        panel_restore: "⤡",
+        panel_close: "×",
+        panel_cap_start: "┤",
+        panel_cap_end: "├",
         collapsed: "▸",
         running: "◌",
         failed: "✗",
@@ -266,10 +275,13 @@ impl Icons {
         menu: "v",
         selection_bar: ">",
         filter: "/",
-        panel_minimize: "_",
+        panel_minimize: "v",
+        panel_unminimize: ">",
         panel_maximize: "+",
         panel_restore: "=",
         panel_close: "x",
+        panel_cap_start: "|",
+        panel_cap_end: "|",
         collapsed: ">",
         running: "*",
         failed: "x",
@@ -1444,9 +1456,12 @@ mod tests {
             icons.menu,
             icons.filter,
             icons.panel_minimize,
+            icons.panel_unminimize,
             icons.panel_maximize,
             icons.panel_restore,
             icons.panel_close,
+            icons.panel_cap_start,
+            icons.panel_cap_end,
             icons.running,
             icons.failed,
             icons.output,
