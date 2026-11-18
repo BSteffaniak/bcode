@@ -770,8 +770,10 @@ columns by earlier versions are converted the first time the review shows them.
 ### Panel controls
 
 Every panel of the app (the file panel, the review document, the threads panel, the guide panel
-and the review assistant) has the same window controls, defined once in
-`packages/code-review-ui/src/panel_controls.rs`:
+and the review assistant) has the same window controls. Their mechanics are BMUX
+`tui-components`' `panel_window` (title-row controls, minimized rows and strips, nested
+maximize, double clicks, window commands); the app's policy (which panels close, glyphs, keys,
+what is saved) is `packages/code-review-ui/src/panel_controls.rs`:
 
 | Control | Glyph (ASCII) | Click | Key (focused panel) |
 |---|---|---|---|
