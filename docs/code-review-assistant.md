@@ -91,7 +91,7 @@ The decision is made per frame from the app's area, in this order:
 2. **Bottom dock.** Fewer columns and at least 16 rows: the panel takes the bottom rows across
    the whole width. Its height is the dragged share of the area's height, else
    `assistant.height` (default 40%), at least 8 rows and at most what leaves the route 8 rows.
-   The divider on its top edge (the title row, where a double press still zooms) drags.
+   The divider on its top edge (the title row, where a double press still maximizes) drags.
 3. **Zoomed.** Smaller than both: the focused panel takes the whole area; an unfocused open
    panel is hidden (it stays open, and the Ask AI button shows that it is). `esc` returns to the
    route.
@@ -133,6 +133,25 @@ drag, so the cells it covered take pointer input for the route again.
 * **Reset.** The palette entry "Assistant: Reset the panel size to the configured default"
   (`assistant_reset_size`, unbound by default) forgets both shares, saves the cleared record
   and lays the panel out at the configured size again.
+
+#### Panel controls
+
+The panel has the window controls every review app panel shares (see "Panel controls" in
+[code-review-app.md](code-review-app.md#panel-controls)), after its own `+ new`, `⟲` and `↗`:
+
+* **Minimize** (`▁`, `alt+c`) collapses the docked panel in the dock group (BMUX
+  `PanelGroupState::collapse`): to its title row at the bottom, to a strip on the right holding
+  its restore control (`❐`) and its name. The route takes the rest, and the divider does not
+  drag meanwhile. Without room to dock, a minimized panel is hidden and the route keeps the
+  keyboard. Opening or focusing the panel (`ctrl+k`, Ask AI) and closing it restore it, so the
+  state lasts for the run and is not saved with the size.
+* **Maximize** (`□`, `alt+z`, or a double click on the title row) zooms the focused panel over
+  the whole area; `❐`, the same key, another double click or `esc` restores it, keeping the
+  focus in the panel.
+* **Close** (`✕`, `alt+w`, or `ctrl+k` while focused) closes it.
+* **Grow and shrink** (`alt+=`, `alt+-`) move the docked panel's inner edge by four cells within
+  the dock limits, and **reset** (`alt+0`, or the palette's reset entry) forgets the dragged
+  shares; both are saved like a drag.
 
 The review body loses its own assistant pane: `panels.rs` keeps the file and threads panels
 only.
@@ -844,7 +863,7 @@ applying SQL) have review analogs or are marked not applicable.
 | Delete every conversation | Palette entry "Delete every conversation bdata started", asks first | Missing | Palette entry "Delete every conversation the review app started": a confirmation with the count (the app's sessions in this repository, as the history lists them, legacy bindings included); running turns are stopped, each session is deleted and unbound; sessions Bcode refuses (open in another client) are counted in the result notice and kept. |
 | History rows | `alt+d` or the row's `✕` marks, a second press deletes; the footer says which row is armed | Partial: `alt+d` twice; no `✕` | `✕` at the right of the hovered (else selected) visible row, painted and registered only there; the armed row's `✕` turns to the danger style and the footer names it. |
 | History features | Open, delete | Present and beyond: search, rename, tags, turns, needs-you, open in Bcode | Kept. |
-| Title-row controls | `✕` closes, `»` collapses to a rail, `⤡` restores a zoomed panel, double-click on the title zooms | `+ new`, `⟲`, `↗` only; zoom only below the dock thresholds | `✕` closes the panel; double-click on the title row zooms the panel over the whole area and again restores it. No rail: the Ask AI button with its badges is the closed panel's indicator. |
+| Title-row controls | `✕` closes, `»` collapses to a rail, `⤡` restores a zoomed panel, double-click on the title zooms | `+ new`, `⟲`, `↗` only; zoom only below the dock thresholds | The shared panel controls: `▁` minimizes to the title row or a strip, `□` maximizes over the whole area (as does a double click on the title row) and `❐` restores, `✕` closes. No rail: the minimized strip and the Ask AI button with its badges are the indicators. |
 | Empty state | What it can do, four example requests, and what the chips control | One generic paragraph, the same on every screen | Per screen (home, wizard, review) a line of what it can do, three example requests, and one line on the chips; while models fail to load, the reason. |
 | Edit cards | Proposed SQL as diff cards: Apply (`alt+a`), Apply & run (`alt+g`), Copy, dismiss | Not applicable as such: the review app has no editor, and file edits are Bcode tool calls behind its permission prompt; panel answers have no actions | Answers in the panel get Copy and, when the conversation is attached to a review with a cursor line, Draft comment (a draft thread at that line, as an Ask AI card's Draft does). File edits keep Bcode's permission prompt. |
 | Reasoning and tool output | Reasoning folds; a tool's full output opens | Present: reasoning and tool output fold | Kept. |

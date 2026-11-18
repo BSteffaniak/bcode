@@ -241,8 +241,12 @@ from it, is in [code review assistant](code-review-assistant.md).
   conversation the review app started" asks with the count, stops running turns, deletes and
   unbinds each session, and reports the ones Bcode kept.
 * **Title row.** `↗` (and `ctrl+o`) opens the conversation in `bcode tui` once it has a session
-  (before that, `ctrl+o` says to start or open one); `✕` closes the panel; a double click on the
-  title zooms the focused panel over the whole screen, and another restores it. The screens'
+  (before that, `ctrl+o` says to start or open one). The panel controls follow, as on every
+  panel ([Panel controls](#panel-controls)): `▁` minimizes it to its title row (bottom dock) or a
+  strip (right dock), `□` maximizes it over the whole screen (as does a double click on the
+  title), `✕` closes it, and `alt+c`, `alt+z`, `alt+w`, `alt+=`, `alt+-` and `alt+0` do the same
+  from the keyboard. Without room to dock, a minimized panel is hidden and the screen keeps the
+  keyboard; `ctrl+k` restores it. The screens'
   palettes list the assistant's actions ("Assistant: …").
 * **Turns** show like an AI card: `▍you` and the message in full, reasoning, tool lines with their output
   and the answers in full (as on an AI card), with a spinner while the session works; the title row shows `needs you`,
@@ -755,11 +759,52 @@ few roles still get every tier (tinted surfaces on an RGB canvas, no fills with 
 colors). Warning color only marks what needs the reviewer, such as the drafts of an unsaved
 review; a modified file takes the accent and a renamed one the second accent.
 
-Panel dividers drag (as do `>` and `<` for the file panel), and a panel keeps the share of the
-screen it was given: resizing the terminal scales the file and threads panels and the assistant
+Panel dividers drag (as do the focused panel's grow and shrink keys, and `>` and `<` for the
+file panel), and a panel keeps the share of the screen it was given: resizing the terminal scales the file and threads panels and the assistant
 with it, as BMUX panes do, while the document keeps at least 40 columns and each panel its
 minimum. File and threads panel sizes are saved with the review as shares; sizes saved in
 columns by earlier versions are converted the first time the review shows them.
+
+### Panel controls
+
+Every panel of the app (the file panel, the review document, the threads panel, the guide panel
+and the review assistant) has the same window controls, defined once in
+`packages/code-review-ui/src/panel_controls.rs`:
+
+| Control | Glyph (ASCII) | Click | Key (focused panel) |
+|---|---|---|---|
+| Minimize / restore | `▁` / `❐` (`_` / `=`) | the title row's control | `alt+c` |
+| Maximize / restore | `□` / `❐` (`+` / `=`) | the title row's control, or a double click on the title | `alt+z`; `esc` also restores |
+| Close | `✕` (`x`) | the title row's control | `alt+w` |
+| Grow / shrink | | drag the panel's edge | `alt+=` / `alt+-` (a count repeats) |
+| Reset size | | | `alt+0` |
+
+* **Title row.** The controls are the last actions of the title row, in the order above. When
+  the row is too narrow the leftmost actions drop first (the assistant's own `+ new`, `⟲`, `↗`
+  and tabs, then minimize, then maximize; close goes last), and the title is clipped to the room
+  left, never overlapped. Their click targets are the cells they are painted on.
+* **Minimize** collapses a panel along its group: to its title row when stacked (the threads or
+  guide panel under the document, the guide over the threads, the assistant docked at the
+  bottom), to a strip with its restore control and its name down the strip when side by side
+  (the file panel, a panel on the right, the assistant docked on the right). The document takes
+  the room it frees. The document itself minimizes only while an expanded panel shares its group
+  (under it, else beside it); otherwise the key says there is nothing to take its room. `tab`
+  skips minimized panels; a click on a minimized title row focuses it; a key that opens or
+  focuses a panel (`alt+g`, `f`, `ctrl+k`) restores it.
+* **Maximize** gives the panel the whole review body (the assistant: the whole app) and lays out
+  no other panel until it is restored. The same control or key restores it, as does the focused
+  panel's back key (`esc`; in the document `esc` first clears a selection or search) and moving
+  the keyboard focus to another panel.
+* **Close** hides the panel (the file panel's `t`, the threads panel's `shift+t`, `alt+g` and
+  `ctrl+k` open them again). The review document has no close control and its close key is
+  refused. Closing or opening a panel restores it to its size.
+* **Saved.** Sizes, open panels and minimized panels are saved with the review (sizes as shares,
+  so they scale with the terminal). A maximized panel is not saved: a review reopens with every
+  panel at its size. The assistant's size is saved app-wide; it always opens focused, which
+  restores it, so its minimized state lasts for the run.
+* The old keys still work: `t`, `shift+t`, `alt+g` and `ctrl+k` open and close their panels, `>`
+  and `<` resize the file panel from anywhere, and the assistant's reset entry resets its size.
+  Every panel action is in the palette (`Panel: …`).
 
 Panels are rounded unless the theme chooses its own glyphs, and the focused panel's border and
 title take the accent, with counts at the right of each title row. The selected row of the file
@@ -853,6 +898,12 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `>` | Widen file panel |
 | `<` | Narrow file panel |
 | `shift+t` | Show / hide threads panel |
+| `alt+z` | Panel: maximize the focused panel, or restore it |
+| `alt+c` | Panel: minimize the focused panel to its title row, or restore it |
+| `alt+w` | Panel: close the focused panel |
+| `alt+=` | Panel: grow the focused panel |
+| `alt+-` | Panel: shrink the focused panel |
+| `alt+0` | Panel: reset the focused panel's size |
 | `alt+g` | Guide: open, focus, or close the guide panel |
 | `alt+down` | Guide: next citation, then the next section |
 | `alt+up` | Guide: previous citation, then the previous section |
@@ -1044,6 +1095,7 @@ markers.
 | `alt+p` | Turn the assistant's permission categories on or off for this conversation |
 | `alt+t` | List the assistant's tools and how Bcode decides them |
 | `alt+g` | Switch between the conversation and the guide (when the screen has no room for the guide panel) |
+| `alt+z`, `alt+c`, `alt+w`, `alt+=`, `alt+-`, `alt+0` | Panel: maximize, minimize, close, grow, shrink, reset size (see Panel controls) |
 | (palette) | Delete every conversation the review app started (asks first) |
 
 ### Conversation history (`code-review-assistant-history`)
