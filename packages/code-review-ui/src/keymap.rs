@@ -217,6 +217,48 @@ mod tests {
         );
     }
 
+    /// The panel actions have the same keys in the review scope (which the file, threads and
+    /// guide panels fall back to) and in the assistant's, and no scope a panel key passes
+    /// through first binds those keys to anything else.
+    #[test]
+    fn panel_keys_are_the_same_everywhere_and_conflict_with_nothing() {
+        let registry = registry(BTreeMap::new()).unwrap();
+        for (name, _) in crate::panel_controls::Command::ACTIONS {
+            let id = format!("bcode.code_review.{name}");
+            let keys = registry.keys_for_action(REVIEW_SCOPE, &id);
+            assert!(!keys.is_empty(), "{name} has a default key");
+            assert_eq!(
+                keys,
+                registry.keys_for_action(ASSISTANT_SCOPE, &id),
+                "{name}: the assistant uses the same keys"
+            );
+            for key in keys {
+                let stroke = parse_key_stroke(key).unwrap();
+                for scope in [REVIEW_SCOPE, ASSISTANT_SCOPE] {
+                    assert_eq!(
+                        registry.action_for_key(scope, stroke),
+                        Some(id.as_str()),
+                        "{scope} {key}"
+                    );
+                }
+                for scope in [
+                    FILES_SCOPE,
+                    THREADS_SCOPE,
+                    GUIDE_SCOPE,
+                    FEED_SCOPE,
+                    COMPOSER_SCOPE,
+                    ASSISTANT_HISTORY_SCOPE,
+                ] {
+                    assert_eq!(
+                        registry.action_for_key(scope, stroke),
+                        None,
+                        "{scope} binds {key}, which {name} uses"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_declared_scope_is_read_by_a_review_route() {
         let routes = [

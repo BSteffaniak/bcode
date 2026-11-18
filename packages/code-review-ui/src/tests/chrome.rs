@@ -568,9 +568,9 @@ fn hit_regions_agree_with_painting_after_resize() {
                     .clone();
                 assert_eq!(symbol, "│", "{width}x{height} {hit:?}");
             }
-            if id.ends_with(".action.collapse") {
+            if id.ends_with(".action.close") {
                 assert!(
-                    screen.text_in(hit.area, hit.area.y).contains('«'),
+                    screen.text_in(hit.area, hit.area.y).contains('✕'),
                     "{hit:?}"
                 );
             }
@@ -589,13 +589,14 @@ fn hit_regions_agree_with_painting_after_resize() {
             "{width}x{height}"
         );
     }
-    // The hide action really hides the panel.
+    // The close control really hides the panel.
     scenario.resize(160, 40);
     let screen = stable(&mut scenario);
+    let close = format!("{FILES_PANE_ID}.action.close");
     let action = screen
         .hits()
         .iter()
-        .find(|hit| hit.id.as_str().ends_with(".action.collapse"))
+        .find(|hit| hit.id.as_str() == close)
         .unwrap()
         .area;
     scenario.click(action.x, action.y);
@@ -778,7 +779,9 @@ fn ascii_icons_replace_unicode_glyphs() {
         screen.row_text(0)
     );
     let text = screen.text();
-    for glyph in ["✓", "○", "−", "■", "▱", "▍", "┄", "↓", "⌕", "«", "·"] {
+    for glyph in [
+        "✓", "○", "−", "■", "▱", "▍", "┄", "↓", "⌕", "✕", "□", "▁", "·",
+    ] {
         assert!(!text.contains(glyph), "{glyph}\n{text}");
     }
 }

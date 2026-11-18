@@ -22,6 +22,7 @@ mod guide_lifecycle;
 mod guide_review;
 mod guide_share;
 mod interaction;
+mod panel_controls;
 mod parity;
 mod publish;
 mod screen;

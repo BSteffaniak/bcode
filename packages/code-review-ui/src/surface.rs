@@ -32,6 +32,7 @@ use super::files::{FilePanelView, FileTree};
 use super::loader::{self, Inbox, Message, NeedResult, Opened};
 use super::notes::ReviewNotes;
 use super::palette::Overlay;
+use super::panel_controls::{Command, Controls, PanelKind, TitleHit};
 use super::panels::{PanelId, Panels};
 use super::rows::{
     Folds, GapAction, Interaction, RowCache, RowContext, RowKey, SearchHighlights, ViewParams,
@@ -68,7 +69,7 @@ use bmux_tui::style::Style;
 use bmux_tui::text::{Line, Span, Text};
 use bmux_tui_components::diff_viewer::{DiffGutterShape, DiffRowGutter, DiffRowOverflow};
 use bmux_tui_components::empty_state::{EmptyStateComponent, EmptyStatePolicy};
-use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles, PaneTitleAction};
+use bmux_tui_components::pane::{Pane, PaneComponent, PaneState, PaneStyles};
 use bmux_tui_components::panel_group::{PanelGroupAxis, PanelGroupComponent};
 use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::spinner::Spinner;
@@ -130,8 +131,6 @@ pub const FILTER_ID: &str = "review.files.filter";
 const THREADS_TREE_ID: &str = "review.threads.list";
 /// Rows the tree scrolls per wheel step.
 const TREE_WHEEL_ROWS: i64 = 3;
-/// Columns a keyboard resize moves the file panel divider.
-const RESIZE_STEP: i32 = 4;
 /// Longest wait for running saves and annotation calls when exiting.
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Id of a transient (unsaved) workspace.
@@ -716,6 +715,8 @@ pub struct ReviewSurface {
     generation: u64,
     focus: Focus,
     panels: Panels,
+    /// Double clicks on panel title rows.
+    title_clicks: crate::panel_controls::TitleClicks,
     files_pane: Cell<PaneState>,
     review_pane: Cell<PaneState>,
     threads_pane: Cell<PaneState>,
@@ -887,6 +888,7 @@ impl ReviewSurface {
             reflection: review_tools::Reflection::default(),
             link: crate::assistant::ScreenLink::default(),
             panels: Panels::default(),
+            title_clicks: crate::panel_controls::TitleClicks::default(),
             files_pane: Cell::new(PaneState::new(Rect::default())),
             review_pane: Cell::new(PaneState::new(Rect::default())),
             threads_pane: Cell::new(PaneState::new(Rect::default())),
@@ -2654,6 +2656,15 @@ impl ReviewSurface {
         if let Some(action) = self.timeline_key(stroke, host) {
             return action;
         }
+        // Panel keys work from the text inputs inside panels too (the file filter, the
+        // composer, search), which otherwise take every key.
+        if matches!(self.focus, Focus::Composer | Focus::Search | Focus::Filter)
+            && let Some(action) = host.keymap_action(SCOPE, stroke)
+            && let Some(command) =
+                Command::from_action(action.strip_prefix("bcode.code_review.").unwrap_or(&action))
+        {
+            return self.panel_command(self.focused_panel(), command, None);
+        }
         match self.focus {
             Focus::Composer => return self.composer_key(stroke, host),
             Focus::Search => return self.search_key(stroke),
@@ -2730,6 +2741,10 @@ impl ReviewSurface {
                     self.clear_search();
                     return Some(Action::Redraw);
                 }
+                // Then it restores a maximized panel.
+                if self.panels.restore_maximized() {
+                    return Some(Action::Redraw);
+                }
                 // An unsaved review with annotations offers saving once before leaving.
                 if !std::mem::take(&mut self.exit_armed) && self.offers_save() {
                     self.exit_armed = true;
@@ -2789,7 +2804,8 @@ impl ReviewSurface {
                 Action::Redraw
             }
             "files_filter" => {
-                if !self.files_shown() {
+                // A hidden or minimized file panel opens at its size.
+                if !self.files_shown() || self.panels.shape(PanelId::Files).minimized() {
                     self.panels.show_files();
                     self.persist_panels();
                 }
@@ -2803,15 +2819,12 @@ impl ReviewSurface {
                 self.persist_panels();
                 Action::Redraw
             }
-            "files_grow" | "files_shrink" => {
-                let step = RESIZE_STEP * i32::try_from(count.unwrap_or(1)).unwrap_or(1);
-                let delta = if action == "files_grow" { step } else { -step };
-                if self.panels.resize_files(delta) {
-                    self.persist_panels();
-                }
-                Action::Redraw
+            "files_grow" => self.panel_command(PanelId::Files, Command::Grow, count),
+            "files_shrink" => self.panel_command(PanelId::Files, Command::Shrink, count),
+            _ => {
+                let command = Command::from_action(action)?;
+                self.panel_command(self.focused_panel(), command, count)
             }
-            _ => return None,
         })
     }
 
@@ -3136,10 +3149,11 @@ impl ReviewSurface {
 
     /// Move focus to the next shown pane.
     fn focus_next(&mut self) {
-        let plan = self.panels.current();
-        let files = plan.is_some_and(|plan| plan.files);
-        let threads = plan.is_some_and(|plan| plan.threads != super::panels::SidePlacement::Hidden);
-        let guide = plan.is_some_and(|plan| plan.guide != super::panels::SidePlacement::Hidden);
+        // Minimized panels are skipped.
+        let open = |id: PanelId| self.panels.shown(id) && !self.panels.shape(id).minimized();
+        let files = open(PanelId::Files);
+        let threads = open(PanelId::Threads);
+        let guide = open(PanelId::Guide);
         self.focus = match self.focus {
             Focus::Review if files => Focus::Files,
             Focus::Review | Focus::Files | Focus::Filter if guide => Focus::Guide,
@@ -3254,7 +3268,10 @@ impl ReviewSurface {
             return Some(Action::Redraw);
         }
         if panel.as_deref() == Some("files_back") {
-            self.focus = Focus::Review;
+            // Back out of a maximized panel first.
+            if !self.panels.restore_maximized() {
+                self.focus = Focus::Review;
+            }
             return Some(Action::Redraw);
         }
         let selected = selected?;
@@ -3510,6 +3527,9 @@ impl ReviewSurface {
                     self.threads_filter.previous()
                 };
                 review.threads_state.borrow_mut().set_selected_visible(None);
+                return Some(Action::Redraw);
+            }
+            (Some("threads_back"), _) if self.panels.restore_maximized() => {
                 return Some(Action::Redraw);
             }
             (Some("threads_open" | "threads_back"), _) => {
@@ -3781,7 +3801,10 @@ impl ReviewSurface {
             .is_some_and(|area| area.contains(mouse.position));
         if pressed {
             self.focus_at(mouse.position);
-            if in_files && self.files_chrome_click(mouse.position) {
+            if self.panel_title_press(mouse.position) {
+                return Action::Redraw;
+            }
+            if in_files && self.legend_click(mouse.position) {
                 return Action::Redraw;
             }
         }
@@ -3976,32 +3999,149 @@ impl ReviewSurface {
         true
     }
 
-    /// Run a press on the file panel's chrome at `position`: its hide action, or a row of the
-    /// comparison legend. Returns whether it was one.
-    fn files_chrome_click(&mut self, position: bmux_tui::geometry::Point) -> bool {
-        if self.files_action_at(position) {
-            self.panels.toggle_files();
-            self.focus = Focus::Review;
-            self.persist_panels();
-            return true;
-        }
-        self.legend_click(position)
-    }
-
-    /// Whether `position` is on the file panel's hide action, from the pane's own title layout.
-    fn files_action_at(&self, position: bmux_tui::geometry::Point) -> bool {
-        let (Some(review), Some(area)) = (self.review.as_ref(), self.body_area(FILES_PANE_ID))
-        else {
+    /// Run a press on a panel's title row at `position`: a control runs on its panel, and a
+    /// press elsewhere on the row focuses the panel (a second press soon after toggles
+    /// maximize). Hit tests the same chrome the frame painted, at the pane's laid-out area.
+    /// Returns whether the press was on a title row.
+    fn panel_title_press(&mut self, position: bmux_tui::geometry::Point) -> bool {
+        let Some(review) = self.review.as_ref() else {
             return false;
         };
-        let pane = self.files_pane_chrome(review);
-        pane.title_layout(Rect::new(0, 0, area.width, area.height))
-            .actions
-            .iter()
-            .any(|(_, rect)| {
-                Rect::new(area.x + rect.x, area.y + rect.y, rect.width, rect.height)
-                    .contains(position)
-            })
+        let mut found = None;
+        for id in [
+            PanelId::Files,
+            PanelId::Review,
+            PanelId::Threads,
+            PanelId::Guide,
+        ] {
+            let Some(area) = self.body_area(pane_id(id)) else {
+                continue;
+            };
+            let chrome = self.pane_chrome(id, review);
+            if let Some(hit) =
+                crate::panel_controls::hit(&chrome, 0, self.controls(id), area, position)
+            {
+                found = Some((id, hit));
+                break;
+            }
+        }
+        let Some((id, hit)) = found else {
+            return false;
+        };
+        self.focus_panel(id);
+        match hit {
+            TitleHit::Control(control) => {
+                self.title_clicks.reset();
+                self.panel_command(id, control.command(), None);
+            }
+            TitleHit::Title | TitleHit::Action(_) => {
+                if self.title_clicks.press(panel_kind(id)) {
+                    self.panel_command(id, Command::Maximize, None);
+                }
+            }
+        }
+        true
+    }
+
+    /// Give keyboard focus to panel `id` (a focus inside it, such as the file filter, stays).
+    fn focus_panel(&mut self, id: PanelId) {
+        if self.focused_panel() == id {
+            return;
+        }
+        self.focus = match id {
+            PanelId::Files => Focus::Files,
+            PanelId::Threads => Focus::Threads,
+            PanelId::Guide => Focus::Guide,
+            PanelId::Review | PanelId::Side => Focus::Review,
+        };
+    }
+
+    /// How body panel `kind` is shown, or `None` while it is not (or `kind` is not a body
+    /// panel).
+    #[must_use]
+    pub fn panel_shape(&self, kind: PanelKind) -> Option<crate::panel_controls::Shape> {
+        let id = match kind {
+            PanelKind::Files => PanelId::Files,
+            PanelKind::Review => PanelId::Review,
+            PanelKind::Threads => PanelId::Threads,
+            PanelKind::Guide => PanelId::Guide,
+            PanelKind::Assistant => return None,
+        };
+        let shown = self.body_area(pane_id(id)).is_some();
+        shown.then(|| self.panels.shape(id))
+    }
+
+    /// The panel that has keyboard focus.
+    pub(super) const fn focused_panel(&self) -> PanelId {
+        match self.focus {
+            Focus::Files | Focus::Filter => PanelId::Files,
+            Focus::Threads => PanelId::Threads,
+            Focus::Guide => PanelId::Guide,
+            Focus::Review | Focus::Composer | Focus::Search => PanelId::Review,
+        }
+    }
+
+    /// Run a panel command on panel `id` (a control, a key or the palette).
+    pub(super) fn panel_command(
+        &mut self,
+        id: PanelId,
+        command: Command,
+        count: Option<u32>,
+    ) -> Action {
+        match command {
+            Command::Maximize => {
+                if self.panels.toggle_maximize(id).is_none() {
+                    self.set_status("the panel is not shown", StatusSeverity::Info);
+                }
+            }
+            Command::Minimize => match self.panels.toggle_minimize(id) {
+                Some(_) => self.persist_panels(),
+                None if id == PanelId::Review => self.set_status(
+                    crate::panel_controls::REVIEW_MINIMIZE_REFUSED,
+                    StatusSeverity::Info,
+                ),
+                None => self.set_status("the panel is not shown", StatusSeverity::Info),
+            },
+            Command::Close => {
+                if self.panels.close(id) {
+                    if self.focused_panel() == id {
+                        self.focus = Focus::Review;
+                    }
+                    self.persist_panels();
+                } else {
+                    self.set_status(
+                        crate::panel_controls::REVIEW_CLOSE_REFUSED,
+                        StatusSeverity::Info,
+                    );
+                }
+            }
+            Command::Grow | Command::Shrink => {
+                if self.panels.resize(id, command.delta(count)) {
+                    self.persist_panels();
+                }
+            }
+            Command::ResetSize => {
+                if self.panels.reset_size(id) {
+                    self.persist_panels();
+                }
+            }
+        }
+        Action::Redraw
+    }
+
+    /// The controls of panel `id` as it is shown.
+    fn controls(&self, id: PanelId) -> Controls {
+        Controls::new(panel_kind(id), self.panels.shape(id))
+    }
+
+    /// The chrome of panel `id`, as painted.
+    fn pane_chrome(&self, id: PanelId, review: &Review) -> Pane<'static> {
+        match id {
+            PanelId::Files => self.files_pane_chrome(review),
+            PanelId::Threads => self.threads_pane_chrome(review),
+            PanelId::Guide => self.guide_pane_chrome(),
+            PanelId::Review | PanelId::Side => self.review_pane_chrome(review),
+        }
     }
 
     // ----------------------------------------------------------------------------------------
@@ -4540,20 +4680,13 @@ impl ReviewSurface {
 
     /// Lay out, prepare, and paint the body: panels, the file tree, and the document list.
     fn render_body(&mut self, body: Rect, cx: &mut PaintCx<'_, '_>) {
+        self.panels
+            .set_strip_width(crate::panel_controls::strip_width(&self.theme));
         let plan = self.panels.sync(body.width, body.height);
         if self.panels.take_converted() {
             self.persist_panels();
         }
-        // Focus never stays on a pane that is not shown.
-        let shown = match self.focus {
-            Focus::Files | Focus::Filter => plan.files,
-            Focus::Threads => plan.threads != super::panels::SidePlacement::Hidden,
-            Focus::Guide => plan.guide != super::panels::SidePlacement::Hidden,
-            Focus::Review | Focus::Composer | Focus::Search => true,
-        };
-        if !shown {
-            self.focus = Focus::Review;
-        }
+        self.keep_focus_shown(plan);
         // Apply rebuilt file headers to the tree.
         if let Some(review) = &mut self.review {
             for file in std::mem::take(&mut review.dirty_files) {
@@ -4584,9 +4717,12 @@ impl ReviewSurface {
             let tree_rows = layout
                 .find(&LayoutId::new(TREE_VIEWPORT_ID))
                 .map(|node| node.size.height);
-            (probe.get().unwrap_or(Size::new(0, 0)), tree_rows)
+            (probe.get(), tree_rows)
         };
-        let prepared = self.prepare_list(list_size);
+        // The document is prepared only when the body lays it out (not while another panel is
+        // maximized or the document is minimized).
+        let prepared = list_size.and_then(|size| self.prepare_list(size));
+        let list_size = list_size.unwrap_or(Size::new(0, 0));
         self.sync_tree_to_cursor();
         if let Some(rows) = tree_rows {
             self.reveal_tree_selection(rows);
@@ -4639,6 +4775,30 @@ impl ReviewSurface {
                 layout,
                 list_area,
             });
+        }
+    }
+
+    /// Keep the focus on a shown panel, and a maximized panel maximized only while it has the
+    /// focus.
+    fn keep_focus_shown(&mut self, plan: super::panels::PanelPlan) {
+        // Focus never stays on a pane that is not shown.
+        let shown = match self.focus {
+            Focus::Files | Focus::Filter => plan.files,
+            Focus::Threads => plan.threads != super::panels::SidePlacement::Hidden,
+            Focus::Guide => plan.guide != super::panels::SidePlacement::Hidden,
+            Focus::Review | Focus::Composer | Focus::Search => true,
+        };
+        if !shown {
+            self.focus = Focus::Review;
+        }
+        // A maximized panel stays maximized while it has the focus.
+        if self
+            .panels
+            .maximized()
+            .is_some_and(|maximized| maximized != self.focused_panel())
+        {
+            self.panels.restore_maximized();
+            self.title_clicks.reset();
         }
     }
 
@@ -4795,7 +4955,6 @@ impl ReviewSurface {
     }
 
     fn files_pane_chrome(&self, review: &Review) -> Pane<'static> {
-        let theme = &self.theme;
         let files = &review.files;
         let count = if files.filter().is_empty() {
             files.file_count().to_string()
@@ -4803,18 +4962,71 @@ impl ReviewSurface {
             format!("{}/{}", files.matches(), files.file_count())
         };
         let focused = matches!(self.focus, Focus::Files | Focus::Filter);
-        Pane::new()
-            .title(theme.pane_title("Files", focused))
-            .right_title(theme.pane_status(&count))
-            .action(PaneTitleAction::new(
-                "collapse",
-                Line::from_spans(vec![Span::styled(
-                    format!(" {} ", theme.icons.collapse),
-                    theme.muted,
-                )]),
-            ))
+        self.chrome(PanelId::Files, "Files", &count, focused)
+    }
+
+    fn review_pane_chrome(&self, review: &Review) -> Pane<'static> {
+        let files = review.files.file_count();
+        let status = format!("{files} file{}", if files == 1 { "" } else { "s" });
+        self.chrome(
+            PanelId::Review,
+            "Review",
+            &status,
+            matches!(self.focus, Focus::Review | Focus::Composer | Focus::Search),
+        )
+    }
+
+    fn threads_pane_chrome(&self, review: &Review) -> Pane<'static> {
+        let count = review.threads.borrow().keys.len();
+        self.chrome(
+            PanelId::Threads,
+            "Threads",
+            &count.to_string(),
+            self.focus == Focus::Threads,
+        )
+    }
+
+    fn guide_pane_chrome(&self) -> Pane<'static> {
+        let (title, status) = self.guide_titles();
+        self.chrome(PanelId::Guide, &title, &status, self.focus == Focus::Guide)
+    }
+
+    /// A panel's chrome: its title, its status on the right, and the panel controls.
+    fn chrome(&self, id: PanelId, title: &str, status: &str, focused: bool) -> Pane<'static> {
+        let theme = &self.theme;
+        let pane = Pane::new()
+            .title(theme.pane_title(title, focused))
+            .right_title(theme.pane_status(status))
             .styles(self.pane_styles())
-            .chrome(theme.component.chrome)
+            .chrome(theme.component.chrome);
+        self.controls(id).apply(pane, theme)
+    }
+
+    /// A panel's pane: `content`, or while the panel is minimized, its strip (side by side)
+    /// or nothing (its title row only).
+    fn panel_pane<'a>(
+        &'a self,
+        id: PanelId,
+        chrome: Pane<'a>,
+        state: &'a Cell<PaneState>,
+        content: impl Component + 'a,
+    ) -> PaneComponent<'a, 'a> {
+        let focused = self.focused_panel() == id;
+        match self.panels.shape(id) {
+            crate::panel_controls::Shape::Strip => Self::pane(
+                pane_id(id),
+                chrome,
+                focused,
+                state,
+                crate::panel_controls::strip_content(panel_kind(id), &self.theme),
+            ),
+            crate::panel_controls::Shape::Row => {
+                Self::pane(pane_id(id), chrome, focused, state, Column::new())
+            }
+            crate::panel_controls::Shape::Normal | crate::panel_controls::Shape::Maximized => {
+                Self::pane(pane_id(id), chrome, focused, state, content)
+            }
+        }
     }
 
     fn pane<'a>(
@@ -4844,20 +5056,20 @@ impl ReviewSurface {
         if !plan.bordered {
             return list;
         }
-        let review_pane = Self::pane(
-            REVIEW_PANE_ID,
-            Pane::new()
-                .title(theme.pane_title("Review", self.focus == Focus::Review))
-                .right_title(theme.pane_status(&{
-                    let files = review.files.file_count();
-                    format!("{files} file{}", if files == 1 { "" } else { "s" })
-                }))
-                .styles(self.pane_styles())
-                .chrome(theme.component.chrome),
-            self.focus == Focus::Review,
+        let review_pane = self.panel_pane(
+            PanelId::Review,
+            self.review_pane_chrome(review),
             &self.review_pane,
             list,
         );
+        // A maximized panel is the only one laid out.
+        match self.panels.maximized() {
+            Some(PanelId::Review) => return Element::new(review_pane),
+            Some(PanelId::Files) => return Element::new(self.files_pane(review)),
+            Some(PanelId::Threads) => return Element::new(self.threads_pane(review)),
+            Some(PanelId::Guide) => return Element::new(self.guide_pane(plan.guide)),
+            Some(PanelId::Side) | None => {}
+        }
         let mut review_pane = Some(review_pane);
         let mut root = PanelGroupComponent::new(
             ROOT_ID,
@@ -4909,36 +5121,30 @@ impl ReviewSurface {
 
     fn guide_pane(&self, placement: super::panels::SidePlacement) -> PaneComponent<'_, '_> {
         let theme = &self.theme;
-        let focused = self.focus == Focus::Guide;
-        let (title, status) = self.guide_titles();
-        let chrome = Pane::new()
-            .title(theme.pane_title(&title, focused))
-            .right_title(theme.pane_status(&status))
-            .styles(self.pane_styles())
-            .chrome(theme.component.chrome);
+        let chrome = self.guide_pane_chrome();
         if self.guide.state.active.is_none() {
             let empty = EmptyStateComponent::new("review.guide.empty", "No guide for this review")
                 .icon(theme.icons.guide_marker)
                 .body(&self.guide.empty)
                 .policy(EmptyStatePolicy::centered())
                 .styles(theme.component.empty_state_styles());
-            return Self::pane(GUIDE_PANE_ID, chrome, focused, &self.guide.pane, empty);
+            return self.panel_pane(PanelId::Guide, chrome, &self.guide.pane, empty);
         }
         let view = crate::guide::GuidePanelView::new(
             guide::GUIDE_VIEW_ID,
             &self.guide.model,
             theme,
-            placement != super::panels::SidePlacement::Bottom,
+            placement != super::panels::SidePlacement::Bottom
+                || self.panels.maximized() == Some(PanelId::Guide),
             &self.guide.scroll,
             &self.guide.clicks,
             &self.guide.split,
         );
-        Self::pane(GUIDE_PANE_ID, chrome, focused, &self.guide.pane, view)
+        self.panel_pane(PanelId::Guide, chrome, &self.guide.pane, view)
     }
 
     fn files_pane<'a>(&'a self, review: &'a Review) -> PaneComponent<'a, 'a> {
         let theme = &self.theme;
-        let focused = matches!(self.focus, Focus::Files | Focus::Filter);
         let tree = review
             .tree_component()
             .styles(if self.focus == Focus::Files {
@@ -4993,10 +5199,9 @@ impl ReviewSurface {
             );
         }
         let content = content.flex(Flex::new(1, viewport));
-        Self::pane(
-            FILES_PANE_ID,
+        self.panel_pane(
+            PanelId::Files,
             self.files_pane_chrome(review),
-            focused,
             &self.files_pane,
             content,
         )
@@ -5005,14 +5210,8 @@ impl ReviewSurface {
 
     fn threads_pane<'a>(&'a self, review: &'a Review) -> PaneComponent<'a, 'a> {
         let theme = &self.theme;
-        let threads = review.threads.borrow();
-        let count = threads.keys.len();
-        drop(threads);
-        let chrome = Pane::new()
-            .title(theme.pane_title("Threads", self.focus == Focus::Threads))
-            .right_title(theme.pane_status(&count.to_string()))
-            .styles(self.pane_styles())
-            .chrome(theme.component.chrome);
+        let count = review.threads.borrow().keys.len();
+        let chrome = self.threads_pane_chrome(review);
         let focused = self.focus == Focus::Threads;
         if count == 0 {
             let empty = EmptyStateComponent::new("review.threads.empty", "No threads yet")
@@ -5020,7 +5219,7 @@ impl ReviewSurface {
                 .body(&self.threads_empty)
                 .policy(EmptyStatePolicy::centered())
                 .styles(theme.component.empty_state_styles());
-            return Self::pane(THREADS_PANE_ID, chrome, focused, &self.threads_pane, empty);
+            return self.panel_pane(PanelId::Threads, chrome, &self.threads_pane, empty);
         }
         let list = ThreadsList(
             review,
@@ -5031,7 +5230,27 @@ impl ReviewSurface {
             },
             theme.tree_selection_bar(),
         );
-        Self::pane(THREADS_PANE_ID, chrome, focused, &self.threads_pane, list)
+        self.panel_pane(PanelId::Threads, chrome, &self.threads_pane, list)
+    }
+}
+
+/// Layout id of panel `id`'s pane.
+const fn pane_id(id: PanelId) -> &'static str {
+    match id {
+        PanelId::Files => FILES_PANE_ID,
+        PanelId::Threads => THREADS_PANE_ID,
+        PanelId::Guide => GUIDE_PANE_ID,
+        PanelId::Review | PanelId::Side => REVIEW_PANE_ID,
+    }
+}
+
+/// The window-controls panel kind of body panel `id`.
+const fn panel_kind(id: PanelId) -> PanelKind {
+    match id {
+        PanelId::Files => PanelKind::Files,
+        PanelId::Threads => PanelKind::Threads,
+        PanelId::Guide => PanelKind::Guide,
+        PanelId::Review | PanelId::Side => PanelKind::Review,
     }
 }
 

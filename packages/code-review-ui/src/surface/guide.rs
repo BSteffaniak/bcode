@@ -1034,6 +1034,8 @@ impl ReviewSurface {
             self.guide.state.bump();
         } else if self.focus != Focus::Guide {
             self.focus = Focus::Guide;
+            // Focused from the keyboard, a minimized panel is restored.
+            self.panels.show_guide();
         } else {
             self.panels.toggle_guide();
             self.focus = Focus::Review;
@@ -1108,7 +1110,7 @@ impl ReviewSurface {
         let action = host.keymap_action(GUIDE_SCOPE, stroke)?;
         let action = action.strip_prefix("bcode.code_review.").unwrap_or(&action);
         if action == "guide_leave" {
-            if !self.decline_fan_out() {
+            if !self.decline_fan_out() && !self.panels.restore_maximized() {
                 self.focus = Focus::Review;
             }
             return Some(Action::Redraw);

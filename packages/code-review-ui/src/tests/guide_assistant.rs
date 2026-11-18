@@ -239,7 +239,7 @@ fn walking_through_a_review_fills_the_guide_live_and_its_card_drives_the_diff() 
     });
     let screen = setup.settle();
     assert!(
-        screen.contains("Guide · v1 · Retry walkthrough"),
+        screen.contains("Guide · v1 · Retry walk"),
         "{}",
         screen.text()
     );

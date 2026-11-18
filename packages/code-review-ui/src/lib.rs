@@ -62,6 +62,7 @@ pub mod modal;
 pub mod notes;
 pub mod options_form;
 pub mod palette;
+pub mod panel_controls;
 pub mod panels;
 pub mod path_completion;
 pub mod path_picker;

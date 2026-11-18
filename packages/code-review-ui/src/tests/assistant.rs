@@ -302,11 +302,7 @@ fn the_panel_opens_on_home_and_keeps_its_conversation_into_a_review_and_back() {
     assert!(setup.app().assistant().is_open());
     assert_eq!(setup.session().as_deref(), Some(session.as_str()));
     let screen = setup.settle();
-    assert!(
-        screen.contains("Create a review for my"),
-        "{}",
-        screen.text()
-    );
+    assert!(screen.contains("Create a review for"), "{}", screen.text());
     let binding = setup
         .binding(&session)
         .expect("attached to the review on screen");
@@ -752,10 +748,7 @@ fn the_history_lists_every_conversation_and_switches_to_the_one_searched() {
     setup.scenario.key("enter");
     let screen = setup.settle();
     assert_eq!(setup.session().as_deref(), Some(first.as_str()));
-    assert!(
-        screen.contains("Why did the cap move?"),
-        "the header names it"
-    );
+    assert!(screen.contains("Why did the cap"), "the header names it");
 }
 
 /// Two conversations started in the review; the second is active.

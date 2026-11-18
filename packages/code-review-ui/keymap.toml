@@ -95,6 +95,24 @@ keymap_actions = [
     { id = "bcode.code_review.threads_toggle", scope = "code-review", description = "Show / hide threads panel", defaults = [
         "shift+t",
     ] },
+    { id = "bcode.code_review.panel_maximize", scope = "code-review", description = "Panel: maximize the focused panel, or restore it", defaults = [
+        "alt+z",
+    ] },
+    { id = "bcode.code_review.panel_minimize", scope = "code-review", description = "Panel: minimize the focused panel to its title row, or restore it", defaults = [
+        "alt+c",
+    ] },
+    { id = "bcode.code_review.panel_close", scope = "code-review", description = "Panel: close the focused panel", defaults = [
+        "alt+w",
+    ] },
+    { id = "bcode.code_review.panel_grow", scope = "code-review", description = "Panel: grow the focused panel", defaults = [
+        "alt+=",
+    ] },
+    { id = "bcode.code_review.panel_shrink", scope = "code-review", description = "Panel: shrink the focused panel", defaults = [
+        "alt+-",
+    ] },
+    { id = "bcode.code_review.panel_reset_size", scope = "code-review", description = "Panel: reset the focused panel's size", defaults = [
+        "alt+0",
+    ] },
     { id = "bcode.code_review.assistant_toggle", scope = "code-review", description = "Ask AI: open, focus, or close the review assistant", defaults = [
         "ctrl+k",
     ] },
@@ -612,6 +630,24 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.assistant_guide_tab", scope = "code-review-assistant", description = "Switch between the conversation and the guide (when the screen has no room for the guide panel)", defaults = [
         "alt+g",
+    ] },
+    { id = "bcode.code_review.panel_maximize", scope = "code-review-assistant", description = "Panel: maximize the focused panel, or restore it", defaults = [
+        "alt+z",
+    ] },
+    { id = "bcode.code_review.panel_minimize", scope = "code-review-assistant", description = "Panel: minimize the focused panel to its title row, or restore it", defaults = [
+        "alt+c",
+    ] },
+    { id = "bcode.code_review.panel_close", scope = "code-review-assistant", description = "Panel: close the focused panel", defaults = [
+        "alt+w",
+    ] },
+    { id = "bcode.code_review.panel_grow", scope = "code-review-assistant", description = "Panel: grow the focused panel", defaults = [
+        "alt+=",
+    ] },
+    { id = "bcode.code_review.panel_shrink", scope = "code-review-assistant", description = "Panel: shrink the focused panel", defaults = [
+        "alt+-",
+    ] },
+    { id = "bcode.code_review.panel_reset_size", scope = "code-review-assistant", description = "Panel: reset the focused panel's size", defaults = [
+        "alt+0",
     ] },
     { id = "bcode.code_review.assistant_reset_size", scope = "code-review-assistant", description = "Reset the panel size to the configured default", defaults = [
     ] },

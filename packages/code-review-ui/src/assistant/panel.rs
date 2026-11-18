@@ -124,10 +124,10 @@ const WHEEL_ROWS: usize = 3;
 const MODEL_LABEL_CELLS: usize = 24;
 /// Cells the title keeps when it is cut to leave room for the usage.
 const MIN_TITLE_CELLS: u16 = 12;
+/// Cells of the title row's title the buttons leave it at least.
+const ASSISTANT_TITLE_CELLS: u16 = 28;
 /// Cells of a history row's `✕` (a space and the glyph).
 const DELETE_CELLS: usize = 2;
-/// Two presses on the title row within this time zoom the panel.
-const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 /// Bytes of a message the panel sends at most.
 const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 /// Characters of a new conversation's title.
@@ -148,13 +148,17 @@ enum Shown {
     Focused,
 }
 
-/// Whether the focused panel was zoomed over the whole area by hand.
+/// Whether the panel was maximized (zoomed over the whole area while focused) or minimized
+/// by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Zoom {
     /// Placed by the area's size.
     Docked,
     /// Over the whole area.
     Zoomed,
+    /// Collapsed to its title row (bottom dock) or a strip (right dock); hidden without room
+    /// to dock.
+    Minimized,
 }
 
 /// Where the panel is.
@@ -372,7 +376,8 @@ pub struct Assistant {
     /// The screen and the docked panel as a panel group, and the area and dock it was built
     /// for.
     dock: RefCell<PanelGroupState>,
-    dock_key: Cell<Option<(Rect, Dock)>>,
+    /// The area, dock and minimized state the dock group was built for.
+    dock_key: Cell<Option<(Rect, Dock, bool)>>,
     session: Option<String>,
     /// Title of the active conversation, once known.
     title: Option<String>,
@@ -445,9 +450,9 @@ pub struct Assistant {
     hover: Option<usize>,
     /// The `✕` painted on a history row: its row, column and session.
     history_delete: Cell<Option<(usize, u16)>>,
-    /// The last press on the title row (for double-click zoom).
-    title_press: Option<Instant>,
-    /// Whether the focused panel covers the whole area.
+    /// Double clicks on the title row (they toggle maximize).
+    title_clicks: crate::panel_controls::TitleClicks,
+    /// Whether the panel is maximized or minimized.
     zoom: Zoom,
     /// The theme of the last frame (overlays are built with it).
     theme: Cell<ReviewTheme>,
@@ -527,7 +532,7 @@ impl Assistant {
             chip_plan: RefCell::default(),
             hover: None,
             history_delete: Cell::new(None),
-            title_press: None,
+            title_clicks: crate::panel_controls::TitleClicks::default(),
             zoom: Zoom::Docked,
             theme: Cell::new(ReviewTheme::derive(
                 None,
@@ -714,6 +719,13 @@ impl Assistant {
         matches!(self.zoom, Zoom::Zoomed)
     }
 
+    /// Whether the panel is minimized (shown as its title row, or a strip on the right, while
+    /// docked; hidden while the screen has no room to dock it).
+    #[must_use]
+    pub const fn minimized(&self) -> bool {
+        matches!(self.zoom, Zoom::Minimized)
+    }
+
     /// The model and effort label a question or card shows: `model · effort`, for `session`
     /// (the app default without one).
     #[must_use]
@@ -794,7 +806,7 @@ impl Assistant {
         *self.painted.borrow_mut() = Painted::default();
         self.hover = None;
         self.history_delete.set(None);
-        self.title_press = None;
+        self.title_clicks.reset();
         self.dock_key.set(None);
         *self.dock.borrow_mut() = PanelGroupState::new(Vec::new());
         // A drag cut short keeps the size it reached.
@@ -863,7 +875,7 @@ impl Assistant {
                 panel: Some((panel, dock)),
             };
         }
-        if self.is_focused() {
+        if self.is_focused() && !self.minimized() {
             Split {
                 screen: None,
                 panel: Some((area, Dock::Zoomed)),
@@ -899,7 +911,8 @@ impl Assistant {
     /// The dock thresholds leave room for both minimums; should an area not, the panel's
     /// minimum wins over the screen's, and neither exceeds the area.
     fn sync_dock(&self, area: Rect, dock: Dock) {
-        if self.dock_key.get() == Some((area, dock)) {
+        let key = (area, dock, self.minimized());
+        if self.dock_key.get() == Some(key) {
             return;
         }
         let config = self.services.assistant_config();
@@ -927,7 +940,13 @@ impl Assistant {
             )
             .clamp(min.min(max), max)
             .min(length);
-        let screen = length - panel;
+        // Minimized, the panel collapses to its title row (bottom) or a strip (right), and the
+        // screen takes the rest.
+        let collapsed = self.minimized().then(|| match dock {
+            Dock::Right => crate::panel_controls::strip_width(&self.theme.get()).min(length),
+            Dock::Bottom | Dock::Zoomed => 1.min(length),
+        });
+        let screen = length - collapsed.unwrap_or(panel);
         let mut state = PanelGroupState::new([
             PanelSize::flex(screen.max(1)),
             PanelSize::flex(panel.max(1)),
@@ -936,8 +955,11 @@ impl Assistant {
             PanelGroupConstraints::new(screen_min.min(length), None),
             PanelGroupConstraints::new(min.min(length), Some(max)),
         ]);
+        if let Some(cells) = collapsed {
+            state.collapse(1, cells);
+        }
         *self.dock.borrow_mut() = state;
-        self.dock_key.set(Some((area, dock)));
+        self.dock_key.set(Some(key));
     }
 
     /// Hand a pointer event to the dock group (a divider press, drag or hover), keeping a
@@ -1050,19 +1072,22 @@ impl Assistant {
 
     /// `ctrl+k`, the Ask AI button and the palette entry: open and focus the panel, focus it
     /// when it is open, and close it when it is focused.
-    pub const fn toggle(&mut self) {
+    pub fn toggle(&mut self) {
         self.visibility = match self.visibility {
             Shown::Closed | Shown::Open => Shown::Focused,
             Shown::Focused => Shown::Closed,
         };
+        // Opened or focused this way, a minimized panel is restored.
+        self.set_minimized(false);
         // A listing that failed (Bcode starting, a provider signed out) is tried again.
         self.models.relist = true;
         self.touch();
     }
 
     /// Open the panel and give it keyboard focus.
-    pub const fn focus(&mut self) {
+    pub fn focus(&mut self) {
         self.visibility = Shown::Focused;
+        self.set_minimized(false);
         self.models.relist = true;
         self.touch();
     }
@@ -2593,12 +2618,11 @@ impl Assistant {
             .iter()
             .find(|(_, area)| area.contains(position))
         {
+            if let Some(control) = crate::panel_controls::Control::from_id(id) {
+                self.title_clicks.reset();
+                return Some(self.panel_command(control.command(), None));
+            }
             return Some(match id.as_str() {
-                "close" => {
-                    self.visibility = Shown::Closed;
-                    self.zoom = Zoom::Docked;
-                    Outcome::Redraw
-                }
                 "new" => {
                     self.new_conversation();
                     Outcome::Redraw
@@ -2632,18 +2656,119 @@ impl Assistant {
         if !painted.title.is_some_and(|title| title.contains(position)) {
             return false;
         }
-        let now = Instant::now();
         let double = self
-            .title_press
-            .is_some_and(|last| now.duration_since(last) <= DOUBLE_CLICK);
-        self.title_press = (!double).then_some(now);
+            .title_clicks
+            .press(crate::panel_controls::PanelKind::Assistant);
         if double {
-            self.zoom = match self.zoom {
-                Zoom::Docked => Zoom::Zoomed,
-                Zoom::Zoomed => Zoom::Docked,
-            };
+            self.panel_command(crate::panel_controls::Command::Maximize, None);
         }
         double
+    }
+
+    /// Minimize or restore the panel. The state lasts for the run: the panel always opens
+    /// focused, and focusing it from the keyboard restores it.
+    fn set_minimized(&mut self, minimized: bool) {
+        if self.minimized() != minimized {
+            self.zoom = if minimized {
+                Zoom::Minimized
+            } else {
+                Zoom::Docked
+            };
+            self.dock_key.set(None);
+            self.touch();
+        }
+    }
+
+    /// How the panel is shown, for its controls.
+    #[must_use]
+    pub fn shape(&self) -> crate::panel_controls::Shape {
+        self.on_screen().map_or_else(
+            || {
+                if self.zoomed() {
+                    crate::panel_controls::Shape::Maximized
+                } else {
+                    crate::panel_controls::Shape::Normal
+                }
+            },
+            |(_, dock)| self.shape_in(dock),
+        )
+    }
+
+    /// How the panel is shown docked as `dock`.
+    const fn shape_in(&self, dock: Dock) -> crate::panel_controls::Shape {
+        use crate::panel_controls::Shape;
+        match dock {
+            Dock::Zoomed => Shape::Maximized,
+            Dock::Right if self.minimized() => Shape::Strip,
+            Dock::Bottom if self.minimized() => Shape::Row,
+            Dock::Right | Dock::Bottom => Shape::Normal,
+        }
+    }
+
+    /// Run a panel command on the panel (a control, a key or a screen's palette).
+    pub fn panel_command(
+        &mut self,
+        command: crate::panel_controls::Command,
+        count: Option<u32>,
+    ) -> Outcome {
+        use crate::panel_controls::Command;
+        self.touch();
+        match command {
+            Command::Maximize => {
+                self.zoom = match self.zoom {
+                    Zoom::Docked | Zoom::Minimized => Zoom::Zoomed,
+                    Zoom::Zoomed => Zoom::Docked,
+                };
+                if self.zoomed() {
+                    self.visibility = Shown::Focused;
+                }
+                self.dock_key.set(None);
+            }
+            Command::Minimize => {
+                let minimize = !self.minimized();
+                self.set_minimized(minimize);
+                // Without room to dock, a minimized panel is hidden: the screen has the keys.
+                if minimize && self.split(self.painted.borrow().area).panel.is_none() {
+                    self.unfocus();
+                }
+            }
+            Command::Close => {
+                self.visibility = Shown::Closed;
+                self.zoom = Zoom::Docked;
+                self.dock_key.set(None);
+            }
+            Command::Grow | Command::Shrink => self.resize_by(command.delta(count)),
+            Command::ResetSize => self.reset_size(),
+        }
+        Outcome::Redraw
+    }
+
+    /// Grow (positive) or shrink the docked panel by `delta` cells, within the limits of
+    /// dragging its edge. Minimized and maximized, it keeps its size.
+    fn resize_by(&mut self, delta: i32) {
+        let Some((_, dock)) = self.on_screen() else {
+            return;
+        };
+        if dock == Dock::Zoomed || self.minimized() {
+            return;
+        }
+        let area = self.painted.borrow().area;
+        self.sync_dock(area, dock);
+        let group = dock_group(dock_axis(dock), PanelGroupStyles::default());
+        // The panel is after the screen: it grows as the divider moves toward the screen.
+        let outcome = group.resize_divider(area, &mut self.dock.borrow_mut(), 0, -delta);
+        if matches!(outcome, PanelGroupOutcome::Resized { .. }) {
+            let layout = group.layout(area, &self.dock.borrow());
+            if let Some(panel) = layout.panels.get(1) {
+                match dock {
+                    Dock::Right => self.right_share = Some(share_of(panel.width, area.width)),
+                    Dock::Bottom => self.bottom_share = Some(share_of(panel.height, area.height)),
+                    Dock::Zoomed => {}
+                }
+                self.size.chosen = true;
+                self.size.pending = SizeSave::Due;
+            }
+        }
     }
 
     fn feed_action(&mut self, action: AgentAction, ui: &UiContext) -> Outcome {
@@ -3359,6 +3484,11 @@ impl Assistant {
         self.touch();
         match action {
             "assistant_close" => self.visibility = Shown::Closed,
+            // Back out of a maximized panel first.
+            "assistant_back" if self.zoomed() => {
+                self.zoom = Zoom::Docked;
+                self.dock_key.set(None);
+            }
             "assistant_back" => self.visibility = Shown::Open,
             "assistant_stop" => self.stop(ui),
             "assistant_context" => self.context = !self.context,
@@ -3401,7 +3531,12 @@ impl Assistant {
                     -rows
                 });
             }
-            _ => return Outcome::Ignored,
+            _ => {
+                let Some(command) = crate::panel_controls::Command::from_action(action) else {
+                    return Outcome::Ignored;
+                };
+                return self.panel_command(command, None);
+            }
         }
         let _ = place;
         Outcome::Redraw
@@ -3631,6 +3766,13 @@ impl Assistant {
         }
         let focused = self.is_focused();
         let title = self.title_text(theme);
+        let shape = self.shape_in(dock);
+        if shape.minimized() {
+            self.paint_minimized(rect, shape, &title, focused, theme, &mut painted, cx);
+            *self.painted.borrow_mut() = painted;
+            self.paint_divider(area, dock, theme, cx);
+            return;
+        }
         if rect.width < TITLE_ONLY_WIDTH || rect.height < 3 {
             let style = if focused {
                 theme.pane_title_focused
@@ -3648,9 +3790,9 @@ impl Assistant {
         }
         let compact = rect.width < COMPACT_WIDTH || rect.height < COMPACT_HEIGHT;
         let pane_rect = Rect::new(0, 0, rect.width, rect.height);
-        let chrome = self.chrome_with_usage(theme, &title, focused, compact, pane_rect);
+        let chrome = self.chrome_with_usage(theme, &title, (focused, compact), pane_rect, dock);
         painted.title = Some(Rect::new(rect.x, rect.y, rect.width, 1));
-        let ids = self.title_actions();
+        let ids = self.action_ids(compact, dock);
         for (index, action_area) in chrome.title_layout(pane_rect).actions {
             let id = ids.get(index).copied().unwrap_or("");
             painted.actions.push((
@@ -3701,10 +3843,93 @@ impl Assistant {
         self.paint_divider(area, dock, theme, cx);
     }
 
+    /// Paint the minimized panel into `rect`: its title row with the panel controls, or a strip
+    /// with its restore control and its name down the strip.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_minimized(
+        &self,
+        rect: Rect,
+        shape: crate::panel_controls::Shape,
+        title: &str,
+        focused: bool,
+        theme: &ReviewTheme,
+        painted: &mut Painted,
+        cx: &mut PaintCx<'_, '_>,
+    ) {
+        let controls = crate::panel_controls::Controls::new(
+            crate::panel_controls::PanelKind::Assistant,
+            shape,
+        );
+        let chrome = controls.apply(
+            Pane::new()
+                .title(theme.pane_title(title, focused))
+                .styles(PaneStyles {
+                    background: None,
+                    border: theme.border,
+                    focused_border: theme.border_focused,
+                })
+                .chrome(theme.component.chrome),
+            theme,
+        );
+        let pane_rect = Rect::new(0, 0, rect.width, rect.height);
+        painted.title = Some(Rect::new(rect.x, rect.y, rect.width, 1));
+        let ids = controls.list();
+        for (index, action_area) in chrome.title_layout(pane_rect).actions {
+            if let Some(control) = ids.get(index) {
+                painted.actions.push((
+                    control.id().to_owned(),
+                    Rect::new(
+                        rect.x + action_area.x,
+                        rect.y + action_area.y,
+                        action_area.width,
+                        action_area.height,
+                    ),
+                ));
+            }
+        }
+        let mut state = self.pane.get();
+        state.interaction.focused = focused;
+        self.pane.set(state);
+        let content = if shape == crate::panel_controls::Shape::Strip {
+            crate::panel_controls::strip_content(crate::panel_controls::PanelKind::Assistant, theme)
+        } else {
+            Column::new()
+        };
+        cx.paint_component(
+            &PaneComponent::new(PANEL_ID, chrome, &self.pane, content),
+            rect,
+        );
+    }
+
+    /// The ids of the title row's actions, in order: its own (none while compact), then the
+    /// panel controls.
+    fn action_ids(&self, compact: bool, dock: Dock) -> Vec<&'static str> {
+        let mut ids = if compact {
+            Vec::new()
+        } else {
+            self.title_actions()
+        };
+        ids.extend(
+            self.controls(dock)
+                .list()
+                .into_iter()
+                .map(crate::panel_controls::Control::id),
+        );
+        ids
+    }
+
+    /// The panel controls docked as `dock`.
+    const fn controls(&self, dock: Dock) -> crate::panel_controls::Controls {
+        crate::panel_controls::Controls::new(
+            crate::panel_controls::PanelKind::Assistant,
+            self.shape_in(dock),
+        )
+    }
+
     /// Paint the dock group over the screen and the painted panel: it highlights the divider
     /// while hovered or dragged and registers its handle, at the cells the split laid out.
     fn paint_divider(&self, area: Rect, dock: Dock, theme: &ReviewTheme, cx: &mut PaintCx<'_, '_>) {
-        if dock == Dock::Zoomed || self.dock_key.get() != Some((area, dock)) {
+        if dock == Dock::Zoomed || self.dock_key.get() != Some((area, dock, self.minimized())) {
             return;
         }
         let group = PanelGroupComponent::new(
@@ -3752,11 +3977,11 @@ impl Assistant {
         &self,
         theme: &ReviewTheme,
         title: &str,
-        focused: bool,
-        compact: bool,
+        (focused, compact): (bool, bool),
         pane_rect: Rect,
+        dock: Dock,
     ) -> Pane<'static> {
-        let chrome = self.chrome(theme, title, focused, compact);
+        let chrome = self.chrome(theme, title, (focused, compact), dock);
         let status = self.status_text();
         let layout = chrome.title_layout(pane_rect);
         if compact || status.is_empty() || layout.right_title.is_some() {
@@ -3774,10 +3999,11 @@ impl Assistant {
         }
         let cut = Line::from_spans(vec![Span::raw(title.to_owned())]).truncate(usize::from(room));
         let cut: String = cut.spans.iter().map(|span| span.content.as_str()).collect();
-        self.chrome(theme, &cut, focused, compact)
+        self.chrome(theme, &cut, (focused, compact), dock)
     }
 
-    /// The title row's buttons, in order: `+ new`, `⟲`, `↗` (only with a session) and `✕`.
+    /// The title row's own buttons, in order: the `Chat` and `Guide` tabs (with a guide),
+    /// `+ new`, `⟲` and `↗` (only with a session). The panel controls follow them.
     fn title_actions(&self) -> Vec<&'static str> {
         let mut ids = if self.guide.available {
             vec!["chat", "guide"]
@@ -3788,7 +4014,6 @@ impl Assistant {
         if self.session.is_some() {
             ids.push("open");
         }
-        ids.push("close");
         ids
     }
 
@@ -3796,8 +4021,8 @@ impl Assistant {
         &self,
         theme: &ReviewTheme,
         title: &str,
-        focused: bool,
-        compact: bool,
+        (focused, compact): (bool, bool),
+        dock: Dock,
     ) -> Pane<'static> {
         let mut chrome = Pane::new()
             .title(theme.pane_title(title, focused))
@@ -3839,8 +4064,7 @@ impl Assistant {
                     }
                     "new" => ("+ new".to_owned(), theme.accent),
                     "history" => ("⟲".to_owned(), theme.accent),
-                    "open" => (theme.icons.external.to_owned(), theme.accent),
-                    _ => ("✕".to_owned(), theme.accent),
+                    _ => (theme.icons.external.to_owned(), theme.accent),
                 };
                 chrome = chrome.action(PaneTitleAction::new(
                     id,
@@ -3848,7 +4072,11 @@ impl Assistant {
                 ));
             }
         }
-        chrome
+        // The conversation's title keeps more room than other panels' titles: its own buttons
+        // drop first.
+        self.controls(dock)
+            .apply(chrome, theme)
+            .min_title_width(ASSISTANT_TITLE_CELLS)
     }
 
     fn content<'a>(

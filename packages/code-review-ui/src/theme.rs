@@ -108,8 +108,14 @@ pub struct Icons {
     pub selection_bar: &'static str,
     /// Prompt of the file filter.
     pub filter: &'static str,
-    /// Hide-the-panel action of the file panel.
-    pub collapse: &'static str,
+    /// A panel's minimize control.
+    pub panel_minimize: &'static str,
+    /// A panel's maximize control.
+    pub panel_maximize: &'static str,
+    /// A minimized or maximized panel's restore control.
+    pub panel_restore: &'static str,
+    /// A panel's close control.
+    pub panel_close: &'static str,
     /// A collapsed group (the menu toggle marks an expanded one).
     pub collapsed: &'static str,
     /// A running tool call.
@@ -199,7 +205,10 @@ impl Icons {
         menu: "▾",
         selection_bar: "▌",
         filter: "⌕",
-        collapse: "«",
+        panel_minimize: "▁",
+        panel_maximize: "□",
+        panel_restore: "❐",
+        panel_close: "✕",
         collapsed: "▸",
         running: "◌",
         failed: "✗",
@@ -257,7 +266,10 @@ impl Icons {
         menu: "v",
         selection_bar: ">",
         filter: "/",
-        collapse: "<<",
+        panel_minimize: "_",
+        panel_maximize: "+",
+        panel_restore: "=",
+        panel_close: "x",
         collapsed: ">",
         running: "*",
         failed: "x",
@@ -1431,7 +1443,10 @@ mod tests {
             icons.progress_empty,
             icons.menu,
             icons.filter,
-            icons.collapse,
+            icons.panel_minimize,
+            icons.panel_maximize,
+            icons.panel_restore,
+            icons.panel_close,
             icons.running,
             icons.failed,
             icons.output,

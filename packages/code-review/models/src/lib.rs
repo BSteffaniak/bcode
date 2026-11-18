@@ -445,6 +445,18 @@ pub struct ReviewPanelState {
     /// outline and the current section share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide_outline_share: Option<u16>,
+    /// Whether the file panel is minimized to its title row (or a strip, side by side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_panel_minimized: Option<bool>,
+    /// Whether the review document is minimized to its title row (or a strip, side by side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_panel_minimized: Option<bool>,
+    /// Whether the threads panel is minimized to its title row (or a strip, side by side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads_panel_minimized: Option<bool>,
+    /// Whether the guide panel is minimized to its title row (or a strip, side by side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_panel_minimized: Option<bool>,
 }
 
 /// Revealed context of one file.

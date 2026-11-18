@@ -23,9 +23,22 @@
 //!    [`GUIDE_MIN_HEIGHT`] tall), otherwise not at all. When the threads panel is to the right
 //!    too, the two share the right column, the guide on top.
 //!
+//! **Window controls.** Every panel has the controls of [`crate::panel_controls`]. A minimized
+//! panel collapses along its group's axis (BMUX [`PanelGroupState::collapse`]): to its title
+//! row when stacked, to a strip when side by side; the review document takes the cells it
+//! frees (or, when the document itself is minimized, the expanded panels share them). The
+//! document minimizes only while an expanded panel shares its group: under it when panels sit
+//! under it, else beside it. When the guide and the threads share the right column and both are
+//! minimized, the column becomes a strip holding both. Dividers next to a minimized panel do not
+//! resize. A maximized panel is the only one the body lays out ([`Panels::maximized`]); the
+//! group states stay as they were, so restoring brings back the same sizes. Minimized panels
+//! are kept with the presentation state; the maximized panel is not (a review reopens with
+//! every panel at its size).
+//!
 //! The review assistant is not a review panel: the app docks it beside or under the whole
-//! screen ([`crate::assistant::panel`]).
+//! screen ([`crate::assistant::panel`]), with the same controls.
 
+use crate::panel_controls::Shape;
 use bcode_code_review_models::{PANEL_SHARE_SCALE, ReviewPanelState};
 use bmux_tui::geometry::Rect;
 use bmux_tui_components::panel_group::{
@@ -33,6 +46,7 @@ use bmux_tui_components::panel_group::{
     PanelGroupPolicy, PanelGroupResizePolicy, PanelGroupState, PanelGroupStyles, PanelSize,
 };
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Narrowest body that gets pane chrome and side panels.
 pub const MIN_BORDERED_WIDTH: u16 = 24;
@@ -74,7 +88,7 @@ const GUIDE_DEFAULT_HEIGHT: u16 = 10;
 const GUIDE_SIDE_PERCENT: u16 = 60;
 
 /// A panel of the body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PanelId {
     /// File tree.
     Files,
@@ -139,7 +153,47 @@ pub struct Panels {
     converted: bool,
     plan: Option<PanelPlan>,
     body: (u16, u16),
+    /// Panels the user minimized.
+    minimized: Minimized,
+    /// The panel the user maximized, while it is.
+    maximized: Option<PanelId>,
+    /// Width of a minimized strip ([`crate::panel_controls::strip_width`]).
+    strip: u16,
+    /// How each minimized panel is shown in the last [`Self::sync`].
+    shapes: BTreeMap<PanelId, Shape>,
 }
+
+/// Panels the user minimized.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Minimized(BTreeSet<PanelId>);
+
+impl Minimized {
+    fn get(&self, id: PanelId) -> bool {
+        self.0.contains(&id)
+    }
+
+    fn set(&mut self, id: PanelId, minimized: bool) {
+        if id == PanelId::Side {
+            return;
+        }
+        if minimized {
+            self.0.insert(id);
+        } else {
+            self.0.remove(&id);
+        }
+    }
+}
+
+/// Panels a sync collapses, as `(index, cells)` in each group.
+#[derive(Debug, Default)]
+struct Collapses {
+    root: Vec<(usize, u16)>,
+    column: Vec<(usize, u16)>,
+    side: Vec<(usize, u16)>,
+}
+
+/// Default strip width before the surface sets one from its theme.
+const DEFAULT_STRIP: u16 = 5;
 
 /// Sizes chosen by resizing, in parts of [`PANEL_SHARE_SCALE`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -181,6 +235,10 @@ impl Default for Panels {
             converted: false,
             plan: None,
             body: (0, 0),
+            minimized: Minimized::default(),
+            maximized: None,
+            strip: DEFAULT_STRIP,
+            shapes: BTreeMap::new(),
         }
     }
 }
@@ -204,6 +262,11 @@ pub fn cells_of(share: u16, total: u16) -> u16 {
     let scale = u32::from(PANEL_SHARE_SCALE);
     let cells = (share * u32::from(total) + scale / 2) / scale;
     u16::try_from(cells).unwrap_or(total)
+}
+
+/// `Some(true)` for a set flag, else `None` (left out of the saved state).
+const fn flag(set: bool) -> Option<bool> {
+    if set { Some(true) } else { None }
 }
 
 /// Requested sizes for panels that fill `total` cells exactly: each panel's flex weight is its
@@ -239,13 +302,24 @@ impl Panels {
                     .filter(|_| shares.threads_right.is_none() && shares.threads_bottom.is_none()),
             },
             shares,
+            minimized: Minimized(
+                [
+                    (PanelId::Files, state.file_panel_minimized),
+                    (PanelId::Review, state.review_panel_minimized),
+                    (PanelId::Threads, state.threads_panel_minimized),
+                    (PanelId::Guide, state.guide_panel_minimized),
+                ]
+                .into_iter()
+                .filter_map(|(id, minimized)| minimized.unwrap_or(false).then_some(id))
+                .collect(),
+            ),
             ..Self::default()
         }
     }
 
     /// Presentation state of the panels.
     #[must_use]
-    pub const fn state(&self) -> ReviewPanelState {
+    pub fn state(&self) -> ReviewPanelState {
         ReviewPanelState {
             file_panel_visible: self.files_choice,
             file_panel_width: self.legacy.files,
@@ -258,6 +332,10 @@ impl Panels {
             guide_right_share: self.shares.guide_right,
             guide_bottom_share: self.shares.guide_bottom,
             guide_outline_share: self.shares.guide_outline,
+            file_panel_minimized: flag(self.minimized.get(PanelId::Files)),
+            review_panel_minimized: flag(self.minimized.get(PanelId::Review)),
+            threads_panel_minimized: flag(self.minimized.get(PanelId::Threads)),
+            guide_panel_minimized: flag(self.minimized.get(PanelId::Guide)),
         }
     }
 
@@ -470,33 +548,34 @@ impl Panels {
             lengths.push(cells);
             constraints.push(PanelGroupConstraints::new(right_min, Some(right_max)));
         }
-        let mut root = PanelGroupState::new(flex_sizes(&lengths));
-        root.set_constraints(constraints);
-        *self.root.borrow_mut() = root;
         self.root_members = members;
-        self.sync_side(height);
-        self.sync_column(plan, height);
+        let (column_lengths, column_constraints) = self.column_layout(plan, height);
+        let collapses = self.collapses();
+        let review = self
+            .root_members
+            .iter()
+            .position(|member| *member == PanelId::Review);
+        *self.root.borrow_mut() = build_group(lengths, constraints, &collapses.root, review);
+        *self.column.borrow_mut() = build_group(
+            column_lengths,
+            column_constraints,
+            &collapses.column,
+            Some(0),
+        );
+        let (side_lengths, side_constraints) = side_layout(height);
+        let side_absorb = collapses.side.first().map(|(index, _)| 1 - index.min(&1));
+        *self.side.borrow_mut() =
+            build_group(side_lengths, side_constraints, &collapses.side, side_absorb);
         plan
     }
 
-    /// The right column shared by the guide (on top) and the threads, at `height` rows.
-    fn sync_side(&self, height: u16) {
-        let guide = u16::try_from(u32::from(height) * u32::from(GUIDE_SIDE_PERCENT) / 100)
-            .unwrap_or(height);
-        let guide = guide
-            .max(GUIDE_MIN_HEIGHT)
-            .min(height.saturating_sub(THREADS_MIN_HEIGHT))
-            .max(MIN_PANE_ROWS.min(height));
-        let mut side = PanelGroupState::new(flex_sizes(&[guide, height.saturating_sub(guide)]));
-        side.set_constraints(vec![
-            PanelGroupConstraints::new(MIN_PANE_ROWS.min(height), None),
-            PanelGroupConstraints::new(MIN_PANE_ROWS.min(height), None),
-        ]);
-        *self.side.borrow_mut() = side;
-    }
-
-    /// The review column: the document, then the guide and threads panels under it.
-    fn sync_column(&mut self, plan: PanelPlan, height: u16) {
+    /// The review column: the document, then the guide and threads panels under it. Sets its
+    /// members and returns their lengths and constraints.
+    fn column_layout(
+        &mut self,
+        plan: PanelPlan,
+        height: u16,
+    ) -> (Vec<u16>, Vec<PanelGroupConstraints>) {
         let mut members = vec![PanelId::Review];
         let mut lengths = Vec::new();
         let mut constraints = Vec::new();
@@ -557,44 +636,128 @@ impl Panels {
                 Some(room.max(THREADS_MIN_HEIGHT)),
             ));
         }
-        let mut column = PanelGroupState::new(flex_sizes(&lengths));
-        column.set_constraints(constraints);
-        *self.column.borrow_mut() = column;
         self.column_members = members;
+        (lengths, constraints)
+    }
+
+    /// Decide which shown panels collapse, and how each is shown (see the module docs).
+    fn collapses(&mut self) -> Collapses {
+        let strip = self.strip.max(1);
+        let minimized = self.minimized.clone();
+        let mut collapses = Collapses::default();
+        let mut shapes = BTreeMap::new();
+        let mut side_strip = false;
+        if self.root_members.contains(&PanelId::Side) {
+            match (
+                minimized.get(PanelId::Guide),
+                minimized.get(PanelId::Threads),
+            ) {
+                (true, true) => {
+                    side_strip = true;
+                    shapes.insert(PanelId::Guide, Shape::Strip);
+                    shapes.insert(PanelId::Threads, Shape::Strip);
+                }
+                (true, false) => {
+                    collapses.side.push((0, 1));
+                    shapes.insert(PanelId::Guide, Shape::Row);
+                }
+                (false, true) => {
+                    collapses.side.push((1, 1));
+                    shapes.insert(PanelId::Threads, Shape::Row);
+                }
+                (false, false) => {}
+            }
+        }
+        for (index, member) in self.column_members.iter().enumerate().skip(1) {
+            if minimized.get(*member) {
+                collapses.column.push((index, 1));
+                shapes.insert(*member, Shape::Row);
+            }
+        }
+        for (index, member) in self.root_members.iter().enumerate() {
+            let collapse = match member {
+                PanelId::Files | PanelId::Guide | PanelId::Threads => minimized.get(*member),
+                PanelId::Side => side_strip,
+                PanelId::Review => false,
+            };
+            if collapse {
+                collapses.root.push((index, strip));
+                if *member != PanelId::Side {
+                    shapes.insert(*member, Shape::Strip);
+                }
+            }
+        }
+        if minimized.get(PanelId::Review) {
+            let expanded = |members: &[PanelId], collapsed: &[(usize, u16)]| {
+                (0..members.len()).any(|index| {
+                    members[index] != PanelId::Review
+                        && !collapsed.iter().any(|(at, _)| *at == index)
+                })
+            };
+            if self.column_members.len() > 1 {
+                if expanded(&self.column_members, &collapses.column) {
+                    collapses.column.push((0, 1));
+                    shapes.insert(PanelId::Review, Shape::Row);
+                }
+            } else if expanded(&self.root_members, &collapses.root)
+                && let Some(index) = self
+                    .root_members
+                    .iter()
+                    .position(|member| *member == PanelId::Review)
+            {
+                collapses.root.push((index, strip));
+                shapes.insert(PanelId::Review, Shape::Strip);
+            }
+        }
+        self.shapes = shapes;
+        collapses
     }
 
     /// Record the sizes a divider drag left, as shares of the body. Returns whether a
-    /// persisted size changed.
+    /// persisted size changed. Minimized panels keep their sizes, and a group whose document
+    /// is minimized records nothing (its panels hold the document's cells meanwhile).
     pub fn note_resize(&mut self) -> bool {
         let before = self.shares;
         let (width, height) = self.body;
-        let root = Self::lengths(
-            PanelGroupAxis::Horizontal,
-            &self.root.borrow(),
-            width,
-            height,
-        );
-        for (member, cells) in self.root_members.iter().zip(root) {
-            match member {
-                PanelId::Files => self.shares.files = Some(share_of(cells, width)),
-                PanelId::Threads => self.shares.threads_right = Some(share_of(cells, width)),
-                PanelId::Guide | PanelId::Side => {
-                    self.shares.guide_right = Some(share_of(cells, width));
+        let review_collapsed = |members: &[PanelId], state: &PanelGroupState| {
+            members
+                .iter()
+                .position(|member| *member == PanelId::Review)
+                .is_some_and(|index| state.is_collapsed(index))
+        };
+        let root_state = self.root.borrow().clone();
+        if !review_collapsed(&self.root_members, &root_state) {
+            let root = Self::lengths(PanelGroupAxis::Horizontal, &root_state, width, height);
+            for (index, (member, cells)) in self.root_members.iter().zip(root).enumerate() {
+                if root_state.is_collapsed(index) {
+                    continue;
                 }
-                PanelId::Review => {}
+                match member {
+                    PanelId::Files => self.shares.files = Some(share_of(cells, width)),
+                    PanelId::Threads => self.shares.threads_right = Some(share_of(cells, width)),
+                    PanelId::Guide | PanelId::Side => {
+                        self.shares.guide_right = Some(share_of(cells, width));
+                    }
+                    PanelId::Review => {}
+                }
             }
         }
-        let column = Self::lengths(
-            PanelGroupAxis::Vertical,
-            &self.column.borrow(),
-            width,
-            height,
-        );
-        for (member, cells) in self.column_members.iter().zip(column).skip(1) {
-            match member {
-                PanelId::Threads => self.shares.threads_bottom = Some(share_of(cells, height)),
-                PanelId::Guide => self.shares.guide_bottom = Some(share_of(cells, height)),
-                PanelId::Files | PanelId::Review | PanelId::Side => {}
+        let column_state = self.column.borrow().clone();
+        if !review_collapsed(&self.column_members, &column_state) {
+            let column = Self::lengths(PanelGroupAxis::Vertical, &column_state, width, height);
+            for (index, (member, cells)) in
+                self.column_members.iter().zip(column).enumerate().skip(1)
+            {
+                if column_state.is_collapsed(index) {
+                    continue;
+                }
+                match member {
+                    PanelId::Threads => {
+                        self.shares.threads_bottom = Some(share_of(cells, height));
+                    }
+                    PanelId::Guide => self.shares.guide_bottom = Some(share_of(cells, height)),
+                    PanelId::Files | PanelId::Review | PanelId::Side => {}
+                }
             }
         }
         before != self.shares
@@ -614,31 +777,31 @@ impl Panels {
     }
 
     /// Toggle the file panel at the current body width; returns whether it is now shown.
-    pub const fn toggle_files(&mut self) -> bool {
+    pub fn toggle_files(&mut self) -> bool {
         let (width, height) = self.body;
         let shown = self.plan(width, height).files;
         self.files_choice = Some(!shown);
-        self.plan = None;
+        self.opened_or_closed(PanelId::Files);
         self.plan(width, height).files
     }
 
     /// Show the file panel (when the body is wide enough for it at all).
-    pub const fn show_files(&mut self) {
+    pub fn show_files(&mut self) {
         self.files_choice = Some(true);
-        self.plan = None;
+        self.opened_or_closed(PanelId::Files);
     }
 
     /// Toggle the threads panel; returns whether the user wants it open.
-    pub const fn toggle_threads(&mut self) -> bool {
+    pub fn toggle_threads(&mut self) -> bool {
         self.threads_open = !self.threads_open;
-        self.plan = None;
+        self.opened_or_closed(PanelId::Threads);
         self.threads_open
     }
 
     /// Toggle the guide panel; returns whether the user wants it open.
-    pub const fn toggle_guide(&mut self) -> bool {
+    pub fn toggle_guide(&mut self) -> bool {
         self.guide_open = !self.guide_open;
-        self.plan = None;
+        self.opened_or_closed(PanelId::Guide);
         self.guide_open
     }
 
@@ -652,30 +815,268 @@ impl Panels {
             && (width >= GUIDE_RIGHT_BODY || height >= GUIDE_BOTTOM_BODY_HEIGHT)
     }
 
-    /// Open the guide panel.
-    pub const fn show_guide(&mut self) {
-        if !self.guide_open {
-            self.guide_open = true;
+    /// Open the guide panel (restored, when it was minimized).
+    pub fn show_guide(&mut self) {
+        self.guide_open = true;
+        self.opened_or_closed(PanelId::Guide);
+    }
+
+    /// A panel was opened (it shows at its size, not minimized) or closed (it is no longer
+    /// maximized, and opens at its size next time).
+    fn opened_or_closed(&mut self, id: PanelId) {
+        self.minimized.set(id, false);
+        if self.maximized == Some(id) {
+            self.maximized = None;
+        }
+        self.plan = None;
+    }
+
+    /// Close panel `id`; returns whether it closed. The review document never closes.
+    pub fn close(&mut self, id: PanelId) -> bool {
+        match id {
+            PanelId::Files => self.files_choice = Some(false),
+            PanelId::Threads => self.threads_open = false,
+            PanelId::Guide => self.guide_open = false,
+            PanelId::Review | PanelId::Side => return false,
+        }
+        self.opened_or_closed(id);
+        true
+    }
+
+    /// Set the width of a minimized strip.
+    pub const fn set_strip_width(&mut self, cells: u16) {
+        if self.strip != cells {
+            self.strip = cells;
             self.plan = None;
         }
+    }
+
+    /// Whether panel `id` shows in the body as last laid out.
+    #[must_use]
+    pub fn shown(&self, id: PanelId) -> bool {
+        self.plan.is_some_and(|plan| plan.bordered)
+            && (self.root_members.contains(&id)
+                || self.column_members.contains(&id)
+                || (matches!(id, PanelId::Guide | PanelId::Threads)
+                    && self.root_members.contains(&PanelId::Side)))
+    }
+
+    /// The maximized panel, while it shows: the only panel the body lays out.
+    #[must_use]
+    pub fn maximized(&self) -> Option<PanelId> {
+        self.maximized.filter(|id| self.shown(*id))
+    }
+
+    /// How panel `id` is shown in the body as last laid out.
+    #[must_use]
+    pub fn shape(&self, id: PanelId) -> Shape {
+        if self.maximized() == Some(id) {
+            return Shape::Maximized;
+        }
+        self.shapes.get(&id).copied().unwrap_or_default()
+    }
+
+    /// Restore a maximized panel; returns whether one was.
+    pub const fn restore_maximized(&mut self) -> bool {
+        self.maximized.take().is_some()
+    }
+
+    /// Maximize panel `id`, or restore it when it is maximized. Returns whether it is now
+    /// maximized; `None` when it does not show.
+    pub fn toggle_maximize(&mut self, id: PanelId) -> Option<bool> {
+        if self.maximized() == Some(id) {
+            self.maximized = None;
+            return Some(false);
+        }
+        if !self.shown(id) {
+            return None;
+        }
+        if self.minimized.get(id) {
+            self.minimized.set(id, false);
+            self.plan = None;
+        }
+        self.maximized = Some(id);
+        Some(true)
+    }
+
+    /// Minimize panel `id`, or restore it when it is minimized. Returns whether it is now
+    /// minimized; `None` when it cannot minimize here (it does not show, or it is the
+    /// document and no expanded panel shares its group).
+    pub fn toggle_minimize(&mut self, id: PanelId) -> Option<bool> {
+        if !self.shown(id) {
+            return None;
+        }
+        if self.maximized == Some(id) {
+            self.maximized = None;
+        }
+        let (width, height) = self.body;
+        if self.shape(id).minimized() {
+            self.minimized.set(id, false);
+            self.plan = None;
+            self.sync(width, height);
+            return Some(false);
+        }
+        self.minimized.set(id, true);
+        self.plan = None;
+        self.sync(width, height);
+        if self.shape(id).minimized() {
+            return Some(true);
+        }
+        self.minimized.set(id, false);
+        self.plan = None;
+        self.sync(width, height);
+        None
+    }
+
+    /// Grow (positive) or shrink panel `id` by `delta` cells, moving its edge toward the
+    /// document (the document's own edge toward a panel beside or under it), within the same
+    /// limits as dragging it. Returns whether a size changed. Minimized and maximized panels
+    /// keep their size.
+    pub fn resize(&mut self, id: PanelId, delta: i32) -> bool {
+        if self.maximized().is_some() || !self.shown(id) || self.shape(id).minimized() {
+            return false;
+        }
+        let in_side = matches!(id, PanelId::Guide | PanelId::Threads)
+            && self.root_members.contains(&PanelId::Side);
+        let member = if in_side { PanelId::Side } else { id };
+        // The document grows against panels under it when there are any, else beside it.
+        let column = self.column_members.len() > 1
+            && (member == PanelId::Review || self.column_members[1..].contains(&member));
+        let (axis, state, members) = if column {
+            (
+                PanelGroupAxis::Vertical,
+                &self.column,
+                self.column_members.clone(),
+            )
+        } else {
+            (
+                PanelGroupAxis::Horizontal,
+                &self.root,
+                self.root_members.clone(),
+            )
+        };
+        let Some(index) = members.iter().position(|at| *at == member) else {
+            return false;
+        };
+        let review = members
+            .iter()
+            .position(|at| *at == PanelId::Review)
+            .unwrap_or(0);
+        // A panel after the document moves the divider before it; one before the document (and
+        // the document itself, toward a panel after it) the divider after it.
+        let (divider, sign) = match index.cmp(&review) {
+            std::cmp::Ordering::Equal if index + 1 < members.len() => (index, 1),
+            std::cmp::Ordering::Equal if index > 0 => (index - 1, -1),
+            std::cmp::Ordering::Equal => return false,
+            std::cmp::Ordering::Greater => (index - 1, -1),
+            std::cmp::Ordering::Less => (index, 1),
+        };
+        let (width, height) = self.body;
+        let outcome = group(axis, PanelGroupStyles::default()).resize_divider(
+            Rect::new(0, 0, width, height),
+            &mut state.borrow_mut(),
+            divider,
+            delta.saturating_mul(sign),
+        );
+        matches!(outcome, PanelGroupOutcome::Resized { .. }) && self.note_resize()
     }
 
     /// Grow (positive) or shrink the file panel by `delta` columns, within the same limits as
     /// dragging its divider. Returns whether its size changed.
     pub fn resize_files(&mut self, delta: i32) -> bool {
-        if self.root_members.first() != Some(&PanelId::Files) {
-            return false;
-        }
-        let (width, height) = self.body;
-        let outcome = group(PanelGroupAxis::Horizontal, PanelGroupStyles::default())
-            .resize_divider(
-                Rect::new(0, 0, width, height),
-                &mut self.root.borrow_mut(),
-                0,
-                delta,
-            );
-        matches!(outcome, PanelGroupOutcome::Resized { .. }) && self.note_resize()
+        self.resize(PanelId::Files, delta)
     }
+
+    /// Forget the sizes chosen for panel `id` by resizing (for the document, every panel's),
+    /// so it takes its default size again. Returns whether a saved size changed.
+    pub fn reset_size(&mut self, id: PanelId) -> bool {
+        let before = (self.shares, self.legacy);
+        let files = |panels: &mut Self| {
+            panels.shares.files = None;
+            panels.legacy.files = None;
+        };
+        let threads = |panels: &mut Self| {
+            panels.shares.threads_right = None;
+            panels.shares.threads_bottom = None;
+            panels.legacy.threads = None;
+        };
+        let guide = |panels: &mut Self| {
+            panels.shares.guide_right = None;
+            panels.shares.guide_bottom = None;
+        };
+        match id {
+            PanelId::Files => files(self),
+            PanelId::Threads => threads(self),
+            PanelId::Guide => guide(self),
+            PanelId::Side => {
+                threads(self);
+                guide(self);
+            }
+            PanelId::Review => {
+                files(self);
+                threads(self);
+                guide(self);
+            }
+        }
+        self.plan = None;
+        before != (self.shares, self.legacy)
+    }
+}
+
+/// The right column shared by the guide (on top) and the threads, at `height` rows: lengths
+/// and constraints.
+fn side_layout(height: u16) -> (Vec<u16>, Vec<PanelGroupConstraints>) {
+    let guide =
+        u16::try_from(u32::from(height) * u32::from(GUIDE_SIDE_PERCENT) / 100).unwrap_or(height);
+    let guide = guide
+        .max(GUIDE_MIN_HEIGHT)
+        .min(height.saturating_sub(THREADS_MIN_HEIGHT))
+        .max(MIN_PANE_ROWS.min(height));
+    (
+        vec![guide, height.saturating_sub(guide)],
+        vec![
+            PanelGroupConstraints::new(MIN_PANE_ROWS.min(height), None),
+            PanelGroupConstraints::new(MIN_PANE_ROWS.min(height), None),
+        ],
+    )
+}
+
+/// A group's state: panels at `lengths` within `constraints`, with each of `collapsed` at its
+/// collapsed cells. The cells a collapse frees go to `absorb` (unless it is collapsed too),
+/// else the expanded panels share them; either way the expanded panels lose their upper
+/// limits, so they fill the group.
+fn build_group(
+    mut lengths: Vec<u16>,
+    mut constraints: Vec<PanelGroupConstraints>,
+    collapsed: &[(usize, u16)],
+    absorb: Option<usize>,
+) -> PanelGroupState {
+    let is_collapsed = |index: usize| collapsed.iter().any(|(at, _)| *at == index);
+    if !collapsed.is_empty() {
+        let mut freed: u16 = 0;
+        for (index, cells) in collapsed {
+            if let Some(length) = lengths.get(*index) {
+                freed = freed.saturating_add(length.saturating_sub(*cells));
+            }
+        }
+        for (index, constraint) in constraints.iter_mut().enumerate() {
+            if !is_collapsed(index) {
+                constraint.max = None;
+            }
+        }
+        if let Some(length) = absorb
+            .filter(|index| !is_collapsed(*index))
+            .and_then(|index| lengths.get_mut(index))
+        {
+            *length = length.saturating_add(freed);
+        }
+    }
+    let mut state = PanelGroupState::new(flex_sizes(&lengths));
+    state.set_constraints(constraints);
+    for (index, cells) in collapsed {
+        state.collapse(*index, *cells);
+    }
+    state
 }
 
 /// The policy of every resizable group: live resizing that keeps panels flexible, so dragged
