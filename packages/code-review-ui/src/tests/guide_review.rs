@@ -151,6 +151,51 @@ fn reviewing_a_section_views_its_files_and_unviewing_one_unreviews_it() {
 }
 
 #[test]
+fn under_never_the_guide_leaves_files_the_reviewer_viewed_alone() {
+    let fixture = fixture();
+    let mut setup = setup_configured(
+        &fixture,
+        150,
+        40,
+        GuideConfig {
+            mark_files_viewed: MarkFilesViewed::Never,
+            ..GuideConfig::default()
+        },
+    );
+    let cited = cited(&setup.scenario);
+    seed(&mut setup, &cited);
+    // The reviewer views the cited file: the section counts as reviewed through it.
+    let header = setup
+        .scenario
+        .surface()
+        .document()
+        .and_then(|doc| {
+            doc.index_of(&bcode_code_review::document::ItemKey::FileHeader(
+                cited.changed.0.clone(),
+            ))
+        })
+        .expect("the file's header");
+    super::interaction::move_to(&mut setup.scenario, header);
+    setup.scenario.key("v");
+    stable(&mut setup.scenario);
+    stable(&mut setup.scenario);
+    assert!(viewed(&setup, &cited));
+    select(&mut setup, "s2.1");
+    assert!(reviewed(&setup, "s2.1"));
+
+    // Un-reviewing it does not un-view the reviewer's file, and says why it stays reviewed.
+    setup.scenario.key("v");
+    let screen = stable(&mut setup.scenario);
+    assert!(viewed(&setup, &cited), "{}", screen.text());
+    assert!(reviewed(&setup, "s2.1"));
+    assert!(
+        screen.contains("counts as reviewed while its files are viewed"),
+        "{}",
+        screen.text()
+    );
+}
+
+#[test]
 fn n_steps_to_the_next_unreviewed_section() {
     let (mut setup, _, _fixture) = guided(150, 40);
     select(&mut setup, "s2.1");

@@ -179,7 +179,19 @@ impl ReviewSurface {
                 }));
             }
             if still {
-                // Reviewed because its files are viewed: un-viewing them un-reviews it.
+                // Reviewed because its files are viewed. The guide changes viewed files only
+                // when it may mark them (`mark_files_viewed` other than `never`); then
+                // un-viewing them un-reviews it.
+                if self.services.guide_config().mark_files_viewed == MarkFilesViewed::Never {
+                    self.set_status(
+                        format!(
+                            "§{number} counts as reviewed while its files are viewed; un-view \
+                             them to un-review it"
+                        ),
+                        StatusSeverity::Info,
+                    );
+                    return;
+                }
                 self.set_files_viewed(&files, false);
             }
             self.set_status(format!("§{number} not reviewed"), StatusSeverity::Info);

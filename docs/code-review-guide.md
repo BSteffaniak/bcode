@@ -596,9 +596,11 @@ Keys of the `code-review-guide` scope; an older version is read-only and says so
   them (`guide::coverage`): `covered` (default) marks a cited in-diff file once every added and
   removed line of its diff falls in ranges the reviewed sections cite on that side, `cited`
   marks every in-diff file a reviewed section cites, `never` none. A section also counts as
-  reviewed when every in-diff file it cites is viewed. Un-viewing a file (from anywhere)
-  clears the marks of the sections citing it, and un-reviewing a section reviewed only through
-  its viewed files un-views them. A mark whose fingerprint no longer matches (the cited code
+  reviewed when every in-diff file it cites is viewed. Unless `mark_files_viewed` is `never`,
+  un-viewing a file (from anywhere) clears the marks of the sections citing it, and
+  un-reviewing a section reviewed only through its viewed files un-views them. Under `never`
+  the guide leaves viewed files alone both ways: un-viewing keeps the sections' marks, and a
+  section reviewed only through its viewed files stays reviewed until they are un-viewed. A mark whose fingerprint no longer matches (the cited code
   changed) does not count.
 * **Next unreviewed** (`n` in the panel, `alt+u` anywhere) steps to the next written section
   not reviewed and shows its first citation.

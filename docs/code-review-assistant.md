@@ -588,7 +588,7 @@ Bcode's `build` policy decides every exposed call, and a category can only remov
 | --- | --- | --- | --- |
 | `review_reads` | read plugin tools (`find_paths`, the code reads and the guide reads among them), `current_view`, `find_pull_requests` | on | allowed (read-only); `code_review.pull_request` declares the repository's web address, so it asks unless a web rule allows it |
 | `review_writes` | write plugin tools and `complete_pass` | on | asks (mutating) |
-| `guides` | the guide writes (`guide.start`, `guide.write`) and `guide_fan_out` | on | allowed unless a `code_review.guide` rule says otherwise; turning `review_writes` off leaves them |
+| `guides` | the guide writes (`guide.start`, `guide.write`) and `guide_fan_out` | on | guide writes allowed unless a `code_review.guide` rule says otherwise; `guide_fan_out` asks (mutating) unless a rule allows it or the reviewer started the fan-out; turning `review_writes` off leaves them |
 | `publish` | `code_review.publish`, `bcode.code-review.publish`, `pull_request_review` | on | asks every time in the panel (Always is not offered) |
 | `navigation` | `go_to`, `set_comparison`, `set_view`, `refresh`, `open_review`, `guide_show` | on | allowed; `open_review` asks (it changes the screen) |
 | `file_reads` | `filesystem.read`, `list`, `find`, `grep`, `stat`, `exists` | on | Bcode `read` rules (allowed) |
