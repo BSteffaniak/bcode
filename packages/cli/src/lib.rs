@@ -22368,6 +22368,9 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
             format!("live context occupancy: {occupancy:?}")
         }
+        SessionLiveEventKind::PermissionModeChanged { mode } => {
+            format!("live permission mode: {mode:?}")
+        }
     }
 }
 

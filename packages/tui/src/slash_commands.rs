@@ -43,6 +43,8 @@ pub enum SlashCommandOutcome {
     Exit,
     /// Refresh pending permissions and open the existing review dialog.
     ReviewPermissions,
+    /// Step the attached session into or out of permission bypass.
+    PermissionBypass(super::permission_bypass::BypassRequest),
     /// Switch to a new unpersisted draft session.
     NewDraftSession,
     /// Set the draft session agent locally.
@@ -924,6 +926,13 @@ async fn execute_builtin(
         BuiltinCommandId::Monitor => Ok(SlashCommandOutcome::OpenChildMonitor),
         BuiltinCommandId::Search => Ok(SlashCommandOutcome::SearchSessions),
         BuiltinCommandId::Permissions => Ok(SlashCommandOutcome::ReviewPermissions),
+        BuiltinCommandId::Yolo => Ok(super::permission_bypass::BypassRequest::parse(
+            parts.get(1..).unwrap_or_default(),
+        )
+        .map_or_else(
+            || SlashCommandOutcome::Handled(super::permission_bypass::USAGE.to_owned()),
+            SlashCommandOutcome::PermissionBypass,
+        )),
         BuiltinCommandId::Resync => resync_command(client, parts).await,
         BuiltinCommandId::RescanImports => client.refresh_session_catalog(None).await.map(|list| {
             SlashCommandOutcome::Handled(format!(

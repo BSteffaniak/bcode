@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 pub const PROVIDER_ID: &str = crate::host::REVIEW_SESSION_APP_ID;
 /// Id of the assistant's agent profile.
 pub const PROFILE_ID: &str = "bcode.code-review.assistant";
-/// Agent the profile narrows.
+/// Agent the profiles narrow unless configured otherwise (`assistant.base_agent`,
+/// `guide.base_agent`).
 pub const BASE_AGENT: &str = "build";
 /// How long a client tool call may run, in milliseconds.
 const TOOL_DEADLINE_MS: u32 = 30_000;
@@ -167,6 +168,8 @@ pub struct AssistantConfig {
     pub width: DockLength,
     /// The bottom dock's height until one is dragged.
     pub height: DockLength,
+    /// Agent whose tools and permission rules the assistant narrows.
+    pub base_agent: String,
 }
 
 /// A docked panel's default size along its axis (`assistant.width` or `assistant.height`).
@@ -237,6 +240,7 @@ impl Default for AssistantConfig {
             effort: None,
             width: DockLength::default(),
             height: DockLength::default(),
+            base_agent: BASE_AGENT.to_owned(),
         }
     }
 }
@@ -263,6 +267,19 @@ impl AssistantConfig {
                 }
                 Some(_) => problems.push(format!("{prefix}.{key} must be a non-empty string")),
             }
+        }
+        match assistant.get("base_agent") {
+            None => {}
+            Some(toml::Value::String(agent)) if base_agent_problem(agent.trim()).is_none() => {
+                agent.trim().clone_into(&mut config.base_agent);
+            }
+            Some(toml::Value::String(agent)) => problems.push(format!(
+                "{prefix}.base_agent {}; using {BASE_AGENT}",
+                base_agent_problem(agent.trim()).unwrap_or_default()
+            )),
+            Some(_) => problems.push(format!(
+                "{prefix}.base_agent must name an agent; using {BASE_AGENT}"
+            )),
         }
         for (key, slot, unit) in [
             ("width", &mut config.width, "columns"),
@@ -355,11 +372,12 @@ impl AssistantConfig {
         ClientAgentProfile {
             id: PROFILE_ID.to_owned(),
             name: "Review assistant".to_owned(),
-            description: "Reviews code in the code review app: sees the screen, reads and \
-                          changes reviews, and moves the user, under the build agent's \
-                          permission rules."
-                .to_owned(),
-            base_agent: BASE_AGENT.to_owned(),
+            description: format!(
+                "Reviews code in the code review app: sees the screen, reads and changes \
+                 reviews, and moves the user, under the {} agent's permission rules.",
+                self.base_agent
+            ),
+            base_agent: self.base_agent.clone(),
             instructions: INSTRUCTIONS.to_owned(),
             tools: self.tools(),
         }
@@ -388,13 +406,47 @@ const GUIDE_READS: [&str; 13] = [
     "code_review.guide.plan",
 ];
 
-/// The profiles of fan-out children.
+/// Why `agent` cannot be a profile's base agent, when it cannot: empty, or one of the app's
+/// own profiles (a profile narrows a Bcode agent, never another contributed profile).
+fn base_agent_problem(agent: &str) -> Option<&'static str> {
+    if agent.is_empty() {
+        Some("must name an agent")
+    } else if agent.starts_with(&format!("{PROVIDER_ID}.")) {
+        Some("must be a Bcode agent, not one of the review app's own profiles")
+    } else {
+        None
+    }
+}
+
+/// The base agent of the guide agents: `guide.base_agent`, else the assistant's; and the
+/// problem with a configured one that cannot be used (the assistant's is used instead).
+#[must_use]
+pub fn guide_base_agent<'a>(
+    guide: &'a bcode_code_review::guide::config::GuideConfig,
+    assistant: &'a AssistantConfig,
+) -> (&'a str, Option<String>) {
+    let fallback = assistant.base_agent.as_str();
+    let Some(agent) = guide.base_agent.as_deref() else {
+        return (fallback, None);
+    };
+    base_agent_problem(agent).map_or((agent, None), |problem| {
+        (
+            fallback,
+            Some(format!(
+                "plugins.config.\"{}\".guide.base_agent {problem}; using {fallback}",
+                crate::config::PLUGIN_ID,
+            )),
+        )
+    })
+}
+
+/// The profiles of fan-out children, narrowing `base_agent`.
 ///
 /// The guide writer has review and file reads and the guide tools; the guide verifier has the
 /// same reads and `code_review.guide.write`, which its grant limits to recording claim checks.
-/// Both narrow `build` and never include the app's own tools.
+/// Neither includes the app's own tools.
 #[must_use]
-pub fn guide_profiles() -> Vec<ClientAgentProfile> {
+pub fn guide_profiles(base_agent: &str) -> Vec<ClientAgentProfile> {
     let reads = GUIDE_READS
         .iter()
         .chain(Category::FileReads.tools())
@@ -412,10 +464,11 @@ pub fn guide_profiles() -> Vec<ClientAgentProfile> {
         ClientAgentProfile {
             id: GUIDE_WRITER_PROFILE_ID.to_owned(),
             name: "Guide writer".to_owned(),
-            description: "Writes one area or stack layer of a guided review for the code review \
-                          app, under the build agent's permission rules."
-                .to_owned(),
-            base_agent: BASE_AGENT.to_owned(),
+            description: format!(
+                "Writes one area or stack layer of a guided review for the code review app, \
+                 under the {base_agent} agent's permission rules."
+            ),
+            base_agent: base_agent.to_owned(),
             instructions: WRITER_INSTRUCTIONS.to_owned(),
             tools: writer,
         },
@@ -425,7 +478,7 @@ pub fn guide_profiles() -> Vec<ClientAgentProfile> {
             description: "Checks a guided review's claims against their citations for the \
                           code review app, recording what it finds without changing content."
                 .to_owned(),
-            base_agent: BASE_AGENT.to_owned(),
+            base_agent: base_agent.to_owned(),
             instructions: VERIFIER_INSTRUCTIONS.to_owned(),
             tools: verifier,
         },
@@ -671,8 +724,9 @@ mod tests {
     fn the_profile_is_a_valid_contribution_and_its_tools_are_ones_build_exposes() {
         let config = AssistantConfig::default();
         let profile = config.profile();
-        let all: Vec<ClientAgentProfile> =
-            std::iter::once(profile).chain(guide_profiles()).collect();
+        let all: Vec<ClientAgentProfile> = std::iter::once(profile)
+            .chain(guide_profiles(BASE_AGENT))
+            .collect();
         assert_eq!(
             bcode_agent_profile::client_profile::validate_client_agent_profiles(PROVIDER_ID, &all),
             Ok(())
@@ -694,5 +748,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_assistant_and_guide_agents_narrow_the_configured_agents() {
+        let (config, problems) = parse("[assistant]\nbase_agent = \"yolo\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.profile().base_agent, "yolo");
+        assert!(config.profile().description.contains("the yolo agent's"));
+
+        // The guide agents follow the assistant unless they name their own.
+        let guide = bcode_code_review::guide::config::GuideConfig::default();
+        assert_eq!(guide_base_agent(&guide, &config), ("yolo", None));
+        let guide = bcode_code_review::guide::config::GuideConfig {
+            base_agent: Some("plan".to_owned()),
+            ..guide
+        };
+        assert_eq!(guide_base_agent(&guide, &config), ("plan", None));
+        for profile in guide_profiles("plan") {
+            assert_eq!(profile.base_agent, "plan");
+        }
+    }
+
+    #[test]
+    fn a_base_agent_that_cannot_be_used_is_reported_and_build_kept() {
+        for text in [
+            "[assistant]\nbase_agent = \"  \"\n",
+            "[assistant]\nbase_agent = 3\n",
+            "[assistant]\nbase_agent = \"bcode.code-review.guide-writer\"\n",
+        ] {
+            let (config, problems) = parse(text);
+            assert_eq!(config.base_agent, BASE_AGENT, "{text}");
+            assert_eq!(problems.len(), 1, "{text}: {problems:?}");
+            assert!(problems[0].contains("base_agent"), "{problems:?}");
+        }
+        let guide = bcode_code_review::guide::config::GuideConfig {
+            base_agent: Some(format!("{PROVIDER_ID}.assistant")),
+            ..bcode_code_review::guide::config::GuideConfig::default()
+        };
+        let assistant = AssistantConfig::default();
+        let (agent, problem) = guide_base_agent(&guide, &assistant);
+        assert_eq!(agent, BASE_AGENT);
+        assert!(problem.is_some_and(|problem| problem.contains("guide.base_agent")));
     }
 }

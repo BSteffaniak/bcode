@@ -418,6 +418,12 @@ Launch-selected permission and tool modes are therefore ephemeral only until adm
 turn is admitted, queued execution and supported recovery use the canonical event value rather than
 client connection, renderer, environment, configuration, or daemon-global state.
 
+The one exception narrows permission: a recorded `bypass` applies only while the session's runtime
+permission mode (daemon memory, never persisted) has not stepped out since. A queued turn starting
+after a step-out, or a turn resumed after a daemon restart before its session is stepped into bypass
+again, runs enforcing; the canonical event keeps the admitted value. See
+[Runtime session permission mode](permissions.md#runtime-session-permission-mode).
+
 ## Checklist captures in activity summaries
 
 At workflow prompt admission and terminal completion, the host performs a read-only bounded

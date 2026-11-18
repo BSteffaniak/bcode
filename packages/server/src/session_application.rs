@@ -956,6 +956,7 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         self.state
             .harness_configuration_views
             .retire_parent(session_id);
+        crate::permission_mode::forget(self.state, session_id);
         Ok(deleted)
     }
 
@@ -1332,6 +1333,23 @@ impl SessionApplication for SessionApplicationHandle<'_> {
                 ),
                 session_operations::SetModelError::Session(error) => session_failure(&error),
             })
+    }
+
+    async fn session_permission_mode(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_session_models::TurnPermissionMode, SessionApplicationFailure> {
+        self.selected_location(session_id).await?;
+        Ok(crate::permission_mode::current(self.state, session_id))
+    }
+
+    async fn set_session_permission_mode(
+        &self,
+        session_id: SessionId,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) -> Result<bcode_session_models::TurnPermissionMode, SessionApplicationFailure> {
+        self.selected_location(session_id).await?;
+        Ok(crate::permission_mode::set(self.state, session_id, mode).await)
     }
 
     async fn set_session_agent(

@@ -1091,6 +1091,14 @@ fn statusline_spans(
             .spans(width);
     }
     let mut line = ChromeLine::new(separator, muted);
+    // Whatever segments the theme shows, the line says when tools run without asking.
+    if app.permission_bypass_active() {
+        line = line.required(
+            crate::app::PERMISSION_BYPASS_INDICATOR.to_owned(),
+            theme.warning,
+            false,
+        );
+    }
     for segment in theme.status.segments.iter() {
         line = push_status_segment(line, segment, app, theme, position);
     }

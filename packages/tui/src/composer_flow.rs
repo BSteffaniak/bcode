@@ -201,7 +201,7 @@ pub fn stage_session_message(
             reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
             reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
             reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
-            execution: launch_options.turn_execution_options(),
+            execution: launch_options.session_turn_execution_options(chat.app.permission_mode()),
             event_sender: chat.event_sender.clone(),
         }),
     });

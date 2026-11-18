@@ -35,6 +35,12 @@ pub fn fixture() -> Fixture {
 /// [`fixture`], optionally with the bundled default agents deciding tool exposure and policy,
 /// with the agent and tool settings of `config_toml`.
 pub fn fixture_with_agents(default_agents: bool, config_toml: &str) -> Fixture {
+    fixture_with_options(default_agents, config_toml, false)
+}
+
+/// [`fixture_with_agents`], with the fake provider following every `tool-call` line of the
+/// prompt in turn when `scripted`.
+pub fn fixture_with_options(default_agents: bool, config_toml: &str, scripted: bool) -> Fixture {
     let workspace = tempfile::tempdir().expect("workspace");
     let sessions = SessionManager::persistent(workspace.path().join("sessions")).expect("sessions");
     let provider = crate::tests::shared_test_plugin(
@@ -50,6 +56,7 @@ pub fn fixture_with_agents(default_agents: bool, config_toml: &str) -> Fixture {
         toml::from_str(config_toml).expect("daemon configuration");
     state.startup_config.agent = overrides.agent;
     state.startup_config.tools = overrides.tools;
+    state.startup_config.permissions = overrides.permissions;
     let mut enabled = std::collections::BTreeSet::from([
         "bcode.fake-provider".to_owned(),
         "bcode.filesystem".to_owned(),
@@ -71,6 +78,12 @@ pub fn fixture_with_agents(default_agents: bool, config_toml: &str) -> Fixture {
         &plugins,
     )
     .expect("load plugins");
+    if scripted {
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_prompt_tool_directives".into(), "true".into());
+    }
     let state = Arc::new(state);
     let socket_dir = crate::tests::test_socket_dir().expect("socket dir");
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
@@ -110,7 +123,7 @@ fn tool(name: &str, policy: ClientToolPolicy) -> ClientToolDescriptor {
     }
 }
 
-async fn provider(fixture: &Fixture, policy: ClientToolPolicy) -> ClientToolProvider {
+pub async fn provider(fixture: &Fixture, policy: ClientToolPolicy) -> ClientToolProvider {
     fixture
         .client
         .client_tool_provider("app", vec![tool("app.lookup", policy)])
@@ -118,7 +131,7 @@ async fn provider(fixture: &Fixture, policy: ClientToolPolicy) -> ClientToolProv
         .expect("register client tools")
 }
 
-async fn app_session(fixture: &Fixture, provider: &mut ClientToolProvider) -> SessionId {
+pub async fn app_session(fixture: &Fixture, provider: &mut ClientToolProvider) -> SessionId {
     provider
         .create_session(
             Some("app session".to_owned()),
@@ -168,14 +181,14 @@ async fn start_lookup_turn_as(
     completion
 }
 
-async fn finish(completion: tokio::sync::oneshot::Receiver<crate::ModelTurnCompletion>) {
+pub async fn finish(completion: tokio::sync::oneshot::Receiver<crate::ModelTurnCompletion>) {
     tokio::time::timeout(Duration::from_secs(20), completion)
         .await
         .expect("turn finishes")
         .expect("completion channel");
 }
 
-async fn tool_results(
+pub async fn tool_results(
     state: &ServerState,
     session_id: SessionId,
 ) -> Vec<ToolInvocationResultRecord> {
@@ -192,7 +205,7 @@ async fn tool_results(
         .collect()
 }
 
-async fn pending_permission_ids(state: &ServerState, expected: usize) -> Vec<String> {
+pub async fn pending_permission_ids(state: &ServerState, expected: usize) -> Vec<String> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let pending = state.pending_permissions.lock().await;
@@ -208,7 +221,7 @@ async fn pending_permission_ids(state: &ServerState, expected: usize) -> Vec<Str
 }
 
 /// Answer the next invocation with the looked-up key and return the invocation.
-async fn answer_next(
+pub async fn answer_next(
     provider: &mut ClientToolProvider,
 ) -> bcode_tool::client_tool::ClientToolInvocation {
     let request = tokio::time::timeout(Duration::from_secs(10), provider.next_request())

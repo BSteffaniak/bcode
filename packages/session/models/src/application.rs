@@ -800,6 +800,51 @@ pub trait SessionApplication: Sync {
         external_auth_binding: Option<String>,
     ) -> impl Future<Output = Result<(), SessionApplicationFailure>> + Send;
 
+    /// The session's runtime permission mode: the mode turns admitted from now on run with
+    /// unless they ask for bypass themselves. [`crate::TurnPermissionMode::Enforce`] until a
+    /// client steps the session into bypass, and again after the daemon restarts.
+    ///
+    /// # Errors
+    /// Rejects unknown sessions, or reports the operation unsupported.
+    fn session_permission_mode(
+        &self,
+        session_id: SessionId,
+    ) -> impl Future<Output = Result<crate::TurnPermissionMode, SessionApplicationFailure>> + Send
+    {
+        let _ = session_id;
+        async {
+            Err(SessionApplicationFailure {
+                code: "unsupported".into(),
+                message: "runtime permission modes are unavailable".into(),
+            })
+        }
+    }
+
+    /// Step the session into or out of permission bypass at runtime; returns the mode now in
+    /// effect. Never persisted.
+    ///
+    /// Stepping in applies to turns admitted afterwards. Stepping out applies to turns admitted
+    /// afterwards and to queued turns when they start; with the default
+    /// `permissions.bypass_step_out = "immediate"` it also applies to the running turn's next
+    /// tool call.
+    ///
+    /// # Errors
+    /// Rejects unknown sessions, or reports the operation unsupported.
+    fn set_session_permission_mode(
+        &self,
+        session_id: SessionId,
+        mode: crate::TurnPermissionMode,
+    ) -> impl Future<Output = Result<crate::TurnPermissionMode, SessionApplicationFailure>> + Send
+    {
+        let _ = (session_id, mode);
+        async {
+            Err(SessionApplicationFailure {
+                code: "unsupported".into(),
+                message: "runtime permission modes are unavailable".into(),
+            })
+        }
+    }
+
     /// Resolve and persist an existing agent profile selection.
     ///
     /// # Errors

@@ -157,6 +157,9 @@ pub struct GuideConfig {
     pub required_sections: Option<Vec<String>>,
     /// Configured templates, by name.
     pub templates: BTreeMap<String, TemplateConfig>,
+    /// Agent whose tools and permission rules the guide agents narrow; the review assistant's
+    /// when `None`.
+    pub base_agent: Option<String>,
 }
 
 impl Default for GuideConfig {
@@ -182,12 +185,14 @@ impl Default for GuideConfig {
             template: "default".to_owned(),
             required_sections: None,
             templates: BTreeMap::new(),
+            base_agent: None,
         }
     }
 }
 
 /// Keys of the `guide` table.
 const KEYS: &[&str] = &[
+    "base_agent",
     "strategy",
     "depth",
     "single_max_files",
@@ -266,6 +271,18 @@ impl GuideConfig {
             .filter(|notes| !notes.is_empty());
         read.set("template", &mut config.template);
         read.set("required_sections", &mut config.required_sections);
+        let mut base_agent: Option<String> = None;
+        read.set("base_agent", &mut base_agent);
+        config.base_agent = base_agent.and_then(|agent| {
+            let agent = agent.trim();
+            if agent.is_empty() {
+                problems
+                    .push("guide.base_agent: must name an agent; using the assistant's".to_owned());
+                None
+            } else {
+                Some(agent.to_owned())
+            }
+        });
         if config.context_files.len() + config.context_dirs.len() > MAX_CONTEXT_ENTRIES {
             problems.push(format!(
                 "guide: at most {MAX_CONTEXT_ENTRIES} context files and directories are read; the rest are ignored"
@@ -358,6 +375,16 @@ mod tests {
         let (config, problems) = GuideConfig::from_value(None);
         assert_eq!(config, GuideConfig::default());
         assert_eq!(problems, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_guide_agents_base_agent_is_read_trimmed_and_a_blank_one_reported() {
+        let (config, problems) = GuideConfig::from_value(Some(&json!({"base_agent": " plan "})));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(config.base_agent.as_deref(), Some("plan"));
+        let (config, problems) = GuideConfig::from_value(Some(&json!({"base_agent": " "})));
+        assert_eq!(config.base_agent, None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     #[test]

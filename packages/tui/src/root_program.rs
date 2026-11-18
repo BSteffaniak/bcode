@@ -3226,6 +3226,11 @@ impl BcodeRuntimeModel {
         &mut self,
         handle: &bmux_tui_runtime::RuntimeHandle<BcodeRuntimeMessage>,
     ) -> Vec<bmux_tui_runtime::Command<BcodeRuntimeMessage>> {
+        super::permission_bypass::reconcile(
+            &mut self.loop_state.bypass,
+            &mut self.chat,
+            &self.settings,
+        );
         let (mut commands, notes) = self.loop_state.take_pending_effects(&mut self.chat, handle);
         commands.extend(super::model_switcher_host::commands(
             &mut self.loop_state,

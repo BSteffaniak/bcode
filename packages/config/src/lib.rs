@@ -35,12 +35,15 @@ pub mod execution;
 pub mod external_notices;
 pub mod model_choices;
 pub use execution::{ExecutionConfig, ExecutionPreference};
+pub mod bypass_confirmation;
 pub mod judgement;
 pub mod milestones;
+pub mod permissions;
 /// Verified declarative configuration restart recovery.
 pub mod recovery;
 pub mod shared_pools;
 pub use milestones::MilestonesConfig;
+pub use permissions::PermissionsConfig;
 /// Versioned remembered startup choices and optional fallback support.
 pub mod startup;
 pub use judgement::{JudgementConfig, JudgementMode};
@@ -229,6 +232,9 @@ pub struct BcodeConfig {
     /// the built-in defaults from `bcode_agent_policy::default_config` apply.
     #[serde(default)]
     pub agent: BTreeMap<String, bcode_agent_policy_models::AgentConfig>,
+    /// Stepping sessions into and out of permission bypass at runtime.
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
     #[serde(default)]
     pub auth: AuthConfig,
     /// First-run setup and automatic credential discovery preferences.
@@ -289,6 +295,7 @@ impl Default for BcodeConfig {
             judgement: JudgementConfig::default(),
             milestones: MilestonesConfig::default(),
             agent: BTreeMap::new(),
+            permissions: PermissionsConfig::default(),
             auth: AuthConfig::default(),
             onboarding: OnboardingConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -323,6 +330,7 @@ impl ConfigDocSchema for BcodeConfig {
     }
 
     fn field_docs() -> Vec<FieldDoc> {
+        let [agent, permissions] = permission_section_docs();
         vec![
             schema_section_doc::<contexts::ContextConfig>(
                 "contexts",
@@ -345,11 +353,8 @@ impl ConfigDocSchema for BcodeConfig {
                 "model",
                 "Model provider, profile, alias, metadata, retry, and compaction settings.",
             ),
-            dynamic_map_section_doc::<bcode_agent_policy_models::AgentConfig>(
-                "agent",
-                "Per-agent permission and tool policy configuration.",
-                "<agent-id>",
-            ),
+            agent,
+            permissions,
             schema_section_doc::<AuthConfig>(
                 "auth",
                 "Provider authentication profiles, pools, and runtime subscription behavior.",
@@ -427,6 +432,21 @@ impl ConfigDocSchema for BcodeConfig {
     fn default_values() -> BTreeMap<String, String> {
         BTreeMap::new()
     }
+}
+
+/// The top-level sections deciding tool permissions: per-agent policy and runtime bypass.
+fn permission_section_docs() -> [FieldDoc; 2] {
+    [
+        dynamic_map_section_doc::<bcode_agent_policy_models::AgentConfig>(
+            "agent",
+            "Per-agent permission and tool policy configuration.",
+            "<agent-id>",
+        ),
+        schema_section_doc::<PermissionsConfig>(
+            "permissions",
+            "Stepping sessions into and out of permission bypass at runtime.",
+        ),
+    ]
 }
 
 const fn section_doc(

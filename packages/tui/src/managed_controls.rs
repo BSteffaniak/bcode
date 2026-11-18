@@ -84,6 +84,8 @@ pub const fn builtin_support(id: BuiltinCommandId) -> ManagedCommandSupport {
         | BuiltinCommandId::Skill
         | BuiltinCommandId::Thinking
         | BuiltinCommandId::CancelRuntime
+        // The native executor decides its own permissions (`/agent accept-edits`).
+        | BuiltinCommandId::Yolo
         | BuiltinCommandId::Runtime => ManagedCommandSupport::Unavailable,
     }
 }

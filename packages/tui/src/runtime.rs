@@ -377,16 +377,11 @@ fn initialize_tui_with_presentation(
         .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
     let (event_sender, event_receiver) = history_flow::session_stream_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[]);
+    // The bypass indicator follows each session's mode (`BmuxApp::permission_mode`).
+    app.set_launch_permission_mode(launch_options.permission_mode);
     app.set_execution_mode_indicator(
-        match (launch_options.permission_mode, launch_options.tool_policy) {
-            (bcode_session_models::TurnPermissionMode::Bypass, _) => {
-                Some("DANGER: PERMISSION BYPASS ACTIVE".to_owned())
-            }
-            (_, bcode_session_models::TurnToolPolicy::Disabled) => {
-                Some("TOOLS DISABLED".to_owned())
-            }
-            _ => None,
-        },
+        (launch_options.tool_policy == bcode_session_models::TurnToolPolicy::Disabled)
+            .then(|| "TOOLS DISABLED".to_owned()),
     );
     match presentation {
         Ok(presentation) => app.set_plugin_presentation(Arc::new(presentation)),
@@ -480,6 +475,7 @@ fn apply_initial_config(
     chat.app
         .set_effective_keymap(settings.keymap().shared_registry());
     settings.set_completion_settings(config.presentation.completion);
+    settings.set_permissions(config.permissions);
     chat.app.apply_tui_config(config.tui.clone());
     chat_loop::apply_saved_appearance(chat, appearance.theme, appearance.profile);
     chat.app

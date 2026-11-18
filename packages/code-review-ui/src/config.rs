@@ -255,6 +255,9 @@ fn read_plugin_table(table: &toml::Table, loaded: &mut LoadedConfig) {
             .into_iter()
             .map(|problem| format!("plugins.config.\"{PLUGIN_ID}\".{problem}")),
     );
+    loaded
+        .diagnostics
+        .extend(crate::assistant::profile::guide_base_agent(&loaded.guide, &loaded.assistant).1);
     if let Some(stack) = table.get("stack") {
         match stack.clone().try_into::<ReviewStackLimit>() {
             Ok(limit) => loaded.stack_limit = limit,

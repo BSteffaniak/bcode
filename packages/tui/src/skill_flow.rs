@@ -232,7 +232,7 @@ pub fn start_skill_action(
             reasoning_effort_generation: (action == SkillActionKind::Invoke)
                 .then(|| chat.app.pending_reasoning_effort_generation())
                 .flatten(),
-            execution: launch_options.turn_execution_options(),
+            execution: launch_options.session_turn_execution_options(chat.app.permission_mode()),
             event_sender: chat.event_sender.clone(),
         }),
     });

@@ -446,6 +446,8 @@ pub struct ChatLoopState {
     typed_input_task: Option<tokio::task::JoinHandle<()>>,
     daemon_connection: DaemonConnectionMonitor,
     pub(super) permission_dialog: Option<PermissionDialogState>,
+    /// Stepping sessions into and out of permission bypass during this launch.
+    pub(super) bypass: super::permission_bypass::BypassLaunchState,
     /// The dock a docked permission dialog is painted into this frame, when the theme docks
     /// dialogs and one is shown.
     pub(super) permission_dock: Option<Rect>,
@@ -557,6 +559,7 @@ impl ChatLoopState {
             typed_input_task: None,
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
+            bypass: super::permission_bypass::BypassLaunchState::default(),
             permission_dock: None,
             thinking_dialog: None,
             appearance_picker: None,
@@ -3378,6 +3381,7 @@ pub struct TuiRuntimeSettings {
     selection_autoscroll: bool,
     selection: bcode_config::TuiSelectionConfig,
     completion_settings: bcode_config::CompletionConfig,
+    permissions: bcode_config::PermissionsConfig,
     frame_interval: Option<Duration>,
     runtime_config: bmux_tui_runtime::RuntimeConfig,
     metrics_enabled: bool,
@@ -3398,6 +3402,7 @@ impl TuiRuntimeSettings {
             selection_autoscroll: tui_config.mouse.selection_autoscroll,
             selection: tui_config.selection,
             completion_settings: bcode_config::CompletionConfig::default(),
+            permissions: bcode_config::PermissionsConfig::default(),
             frame_interval: tui_config.render.frame_interval(),
             runtime_config: super::runtime_adapter::config(&tui_config, false),
             metrics_enabled: false,
@@ -3411,6 +3416,17 @@ impl TuiRuntimeSettings {
     pub const fn with_launch_options(mut self, launch_options: super::TuiLaunchOptions) -> Self {
         self.launch_options = launch_options;
         self
+    }
+
+    /// Return how sessions step into and out of permission bypass.
+    #[must_use]
+    pub const fn permissions(&self) -> bcode_config::PermissionsConfig {
+        self.permissions
+    }
+
+    /// Replace how sessions step into and out of permission bypass.
+    pub const fn set_permissions(&mut self, permissions: bcode_config::PermissionsConfig) {
+        self.permissions = permissions;
     }
 
     /// Return renderer-neutral command completion preferences.
@@ -4367,6 +4383,11 @@ pub fn apply_effect_result_with_frontend(
                 result,
             );
         }
+        TuiEffectResult::PermissionMode {
+            session_id,
+            set,
+            result,
+        } => super::permission_bypass::apply_result(chat, settings, session_id, set, result),
         TuiEffectResult::SetSessionReasoning {
             session_id,
             effort,
@@ -4497,6 +4518,7 @@ pub fn apply_config_result(
                     .set_status(format!("keymap configuration invalid: {error}"));
             }
             settings.set_completion_settings(config.presentation.completion);
+            settings.set_permissions(config.permissions);
             loop_state.set_slash_palette_settings(settings.completion_settings());
             loop_state.invalidate_slash_palette_discovery();
             loop_state.refresh_slash_palette(chat);
@@ -5047,6 +5069,9 @@ fn apply_root_slash_command_outcome(
             chat.app
                 .set_status("Refreshing pending permissions…".to_owned());
         }
+        SlashCommandOutcome::PermissionBypass(request) => {
+            super::permission_bypass::request(&mut loop_state.bypass, chat, request);
+        }
         SlashCommandOutcome::OpenTimeline => {
             loop_state.milestone_requests.cancel();
             let entries = if chat.viewing_session_id().is_some() {
@@ -5115,7 +5140,9 @@ fn apply_root_slash_command_outcome(
                     reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
                     reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
                     reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
-                    execution: settings.launch_options().turn_execution_options(),
+                    execution: settings
+                        .launch_options()
+                        .session_turn_execution_options(chat.app.permission_mode()),
                     event_sender: chat.event_sender.clone(),
                 }),
             });
@@ -7031,6 +7058,8 @@ fn apply_session_stream_resynchronization(
     chat.app.apply_usage_summary(&attached.usage_summary);
     chat.agents
         .apply_runtime_selection(&mut chat.app, attached.runtime_selection.clone());
+    // A live mode change may have been missed while resynchronizing.
+    loop_state.bypass.resynced();
 
     if let Some(stream) = &mut loop_state.artifact_stream {
         stream.reset_session(attached.session.id);

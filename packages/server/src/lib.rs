@@ -45,6 +45,7 @@ mod model_check;
 mod model_evidence;
 mod model_ignores;
 mod model_request_target;
+mod permission_mode;
 pub use command_application::CommandApplicationHandle;
 mod activity_changes;
 mod activity_watch;
@@ -93,6 +94,8 @@ mod client_profiles_tests;
 mod client_tools;
 #[cfg(all(test, unix))]
 mod client_tools_tests;
+#[cfg(all(test, unix))]
+mod permission_mode_tests;
 mod session_operations;
 mod session_search_operations;
 mod settled_turn_observers;
@@ -597,6 +600,10 @@ pub struct ServerState {
     pending_permissions: Mutex<interaction_operations::PendingPermissions>,
     recovered_permissions: Mutex<BTreeMap<String, bcode_session::InvocationRecoveryCheckpoint>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
+    /// Runtime permission modes set by clients, by session (daemon memory only; a session
+    /// without one has none set since the daemon started). See [`permission_mode`].
+    session_permission_modes:
+        StdMutex<BTreeMap<SessionId, bcode_session_models::TurnPermissionMode>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
     recovered_interaction_owners:
         Mutex<BTreeMap<(SessionId, String), Arc<durable_interaction::RecoveredTurnBinding>>>,
@@ -1072,9 +1079,24 @@ pub struct TurnCancelState {
     judgement_observation: StdMutex<Option<judgement::TurnObservationHandle>>,
     settled_tool_observations: std::sync::atomic::AtomicUsize,
     process_admission_agents: StdMutex<BTreeMap<String, String>>,
+    /// The turn's permission bypass no longer applies: the session stepped out of bypass, or
+    /// the turn was admitted in bypass before the daemon restarted.
+    bypass_revoked: std::sync::atomic::AtomicBool,
 }
 
 impl TurnCancelState {
+    /// Stop the turn's permission bypass from applying to its later tool calls.
+    fn revoke_bypass(&self) {
+        self.bypass_revoked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the turn's permission bypass was revoked ([`Self::revoke_bypass`]).
+    fn bypass_revoked(&self) -> bool {
+        self.bypass_revoked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn observe_consumer(
         &self,
         feature: bcode_model::judgement::Feature,
@@ -2825,6 +2847,7 @@ impl ServerState {
             pending_permissions: Mutex::default(),
             recovered_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
+            session_permission_modes: StdMutex::default(),
             pending_tool_exchanges: Mutex::default(),
             recovered_interaction_owners: Mutex::default(),
             interaction_controllers: Mutex::default(),
@@ -7039,6 +7062,8 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::CompactSession { session_id }
         | Request::SetSessionModelWithAccount { session_id, .. }
         | Request::SetSessionModel { session_id, .. }
+        | Request::SessionPermissionMode { session_id }
+        | Request::SetSessionPermissionMode { session_id, .. }
         | Request::SetSessionReasoning { session_id, .. }
         | Request::AppendPresentationNote { session_id, .. }
         | Request::SessionModelStatus { session_id }
@@ -7335,6 +7360,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ProviderAccountModels => "provider_account_models",
         Request::SetSessionModelWithAccount { .. } => "set_session_model_with_account",
         Request::SetSessionModel { .. } => "set_session_model",
+        Request::SessionPermissionMode { .. } => "session_permission_mode",
+        Request::SetSessionPermissionMode { .. } => "set_session_permission_mode",
         Request::SetSessionReasoning { .. } => "set_session_reasoning",
         Request::AccountRouting { .. } => "account_routing",
         Request::SetAccountRouting { .. } => "set_account_routing",
@@ -11206,6 +11233,36 @@ async fn handle_core_runtime_request(
                 result.map_or_else(
                     |error| Response::Err(ErrorResponse::new(error.code, error.message)),
                     |()| Response::Ok(ResponsePayload::SessionModelSet),
+                ),
+            )
+            .await
+        }
+        CoreRuntimeRequest::SessionPermissionMode { session_id } => {
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .session_permission_mode(session_id)
+                .await;
+            send_response(
+                writer,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |mode| Response::Ok(ResponsePayload::SessionPermissionMode { mode }),
+                ),
+            )
+            .await
+        }
+        CoreRuntimeRequest::SetSessionPermissionMode { session_id, mode } => {
+            use bcode_session_models::SessionApplication as _;
+            let result = SessionApplicationHandle::new(state, client_id)
+                .set_session_permission_mode(session_id, mode)
+                .await;
+            send_response(
+                writer,
+                request_id,
+                result.map_or_else(
+                    |error| Response::Err(ErrorResponse::new(error.code, error.message)),
+                    |mode| Response::Ok(ResponsePayload::SessionPermissionMode { mode }),
                 ),
             )
             .await
@@ -17241,6 +17298,7 @@ async fn prepare_submission_admission(
     if admission.execution.agent_profile.is_none() {
         admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
     }
+    permission_mode::stamp(state, session_id, &mut admission.execution);
     if let Some(agent) = &admission.execution.agent_profile {
         ensure_agent_profile_available(state, agent).await?;
     }
@@ -17487,6 +17545,7 @@ async fn admit_turn_inner(
             .await,
         );
     }
+    permission_mode::stamp(state, session_id, &mut admission.execution);
     if let Some(agent) = &admission.execution.agent_profile {
         ensure_agent_profile_available(state, agent).await?;
     }
@@ -19466,10 +19525,11 @@ async fn process_skill_invocation_command(
             .and_then(|reasoning| reasoning.summary.clone())
             .or_else(|| skill_selection.reasoning_summary.clone()),
     }));
-    let admission = bcode_session_models::TurnAdmissionMetadata {
+    let mut admission = bcode_session_models::TurnAdmissionMetadata {
         execution,
         ..bcode_session_models::TurnAdmissionMetadata::default()
     };
+    permission_mode::stamp(state, permit.session_id(), &mut admission.execution);
     if let Err(error) = admission.validate() {
         append_skill_invocation_failed_event(
             state,
@@ -23112,12 +23172,14 @@ async fn prepare_turn_lifecycle(
         )
         .await;
     }
+    let mut execution = turn_execution_options(trigger_event);
+    permission_mode::start_turn(state, session_id, recovering, &cancel_state, &mut execution);
     begin_current_turn(
         command_context,
         client_id,
         turn_id.clone(),
         Arc::clone(&cancel_state),
-        turn_execution_options(trigger_event),
+        execution,
     )
     .await;
     if !recovering {
@@ -35673,6 +35735,13 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         }
     }
 
+    /// Whether the turn skips discretionary permission policy: admitted in bypass, and not
+    /// revoked since (the session stepped out, or the daemon restarted).
+    fn bypasses(self) -> bool {
+        self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass
+            && !self.cancel_state.bypass_revoked()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn authorize_one(
         self,
@@ -35707,7 +35776,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                 );
             }
         };
-        if self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass {
+        if self.bypasses() {
             append_trace_event(
                 self.state,
                 self.session_id,
@@ -35881,7 +35950,7 @@ impl ToolAuthorizationCoordinator for ServerAuthorizationCoordinator<'_> {
         _scope: &'a TurnScope,
     ) -> RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
         Box::pin(async move {
-            if self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass {
+            if self.bypasses() {
                 let decisions = futures::future::join_all(
                     requests
                         .iter()

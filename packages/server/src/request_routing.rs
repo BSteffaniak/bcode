@@ -916,6 +916,13 @@ pub enum CoreRuntimeRequest {
         session_id: SessionId,
     },
     ProviderAccountModels,
+    SessionPermissionMode {
+        session_id: SessionId,
+    },
+    SetSessionPermissionMode {
+        session_id: SessionId,
+        mode: bcode_session_models::TurnPermissionMode,
+    },
     SetSessionModelWithAccount {
         session_id: SessionId,
         provider_plugin_id: Option<String>,
@@ -2028,6 +2035,17 @@ impl RoutedRequest {
                 model_id,
                 account_reference,
             })),
+            Request::SessionPermissionMode { session_id } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SessionPermissionMode {
+                    session_id,
+                }))
+            }
+            Request::SetSessionPermissionMode { session_id, mode } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SetSessionPermissionMode {
+                    session_id,
+                    mode,
+                }))
+            }
             Request::SetSessionModel {
                 session_id,
                 provider_plugin_id,

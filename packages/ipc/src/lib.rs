@@ -155,7 +155,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 67 adds application turn context blocks and contributed agent profiles.
 /// Version 68 marks read-only agent profiles and counts native context compactions in session
 /// views.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 68;
+/// Version 69 adds the runtime session permission mode: reading and setting it, and its live
+/// change event.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 69;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1883,6 +1885,15 @@ pub enum Request {
     RegisterClientAgentProfiles {
         profiles: Vec<bcode_agent_profile::client_profile::ClientAgentProfile>,
     },
+    /// Read a session's runtime permission mode.
+    SessionPermissionMode {
+        session_id: SessionId,
+    },
+    /// Step a session into or out of permission bypass at runtime (never persisted).
+    SetSessionPermissionMode {
+        session_id: SessionId,
+        mode: bcode_session_models::TurnPermissionMode,
+    },
 }
 
 /// Server stop request policy.
@@ -3467,6 +3478,10 @@ pub enum ResponsePayload {
     ClientAgentProfilesRegistered {
         profile_count: usize,
     },
+    /// A session's runtime permission mode, now in effect.
+    SessionPermissionMode {
+        mode: bcode_session_models::TurnPermissionMode,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -5014,7 +5029,7 @@ mod tests {
             panic!("typed discovery response");
         };
         assert_eq!(actual, page);
-        assert_eq!(CURRENT_PROTOCOL_VERSION, 68);
+        assert_eq!(CURRENT_PROTOCOL_VERSION, 69);
         assert_ne!(ProtocolVersion(66), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(65), ProtocolVersion::current());
         assert_ne!(ProtocolVersion(56), ProtocolVersion::current());

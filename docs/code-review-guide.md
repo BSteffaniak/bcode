@@ -666,6 +666,7 @@ max_context_bytes = 65536
 notes = "We care most about backwards compatibility of the wire format."
 template = "default"           # default | explain | freeform | <name>
 required_sections = ["purpose", "scope", "reading_order"]
+# base_agent = "build"         # agent the guide agents narrow; the assistant's base_agent when unset
 
 [plugins.config."bcode.code_review".guide.templates.security]
 extends = "default"

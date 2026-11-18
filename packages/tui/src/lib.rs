@@ -74,6 +74,7 @@ pub(crate) mod onboarding_render;
 pub(crate) mod palette_flow;
 pub(crate) mod pending_submission;
 pub(crate) mod pending_submissions;
+pub(crate) mod permission_bypass;
 pub(crate) mod permission_dialog;
 pub(crate) mod permission_dialog_render;
 pub(crate) mod permission_present;
@@ -604,6 +605,19 @@ impl TuiLaunchOptions {
             permission_mode: self.permission_mode,
             tools: self.tool_policy,
             ..bcode_session_models::TurnExecutionOptions::default()
+        }
+    }
+
+    /// [`Self::turn_execution_options`] for a turn sent to a session running in
+    /// `permission_mode` (the session's runtime mode, which `--yolo` only starts in bypass).
+    #[must_use]
+    pub fn session_turn_execution_options(
+        self,
+        permission_mode: bcode_session_models::TurnPermissionMode,
+    ) -> bcode_session_models::TurnExecutionOptions {
+        bcode_session_models::TurnExecutionOptions {
+            permission_mode,
+            ..self.turn_execution_options()
         }
     }
 }

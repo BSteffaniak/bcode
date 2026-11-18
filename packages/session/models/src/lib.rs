@@ -3932,6 +3932,12 @@ pub enum SessionLiveEventKind {
     /// Draft fragments are observational presentation data. They are never valid for authorization
     /// or execution and are never persisted or replayed from durable history.
     ToolRequestDraft { event: ToolRequestDraftEvent },
+    /// The session's runtime permission mode changed. Never persisted: missed delivery is
+    /// recovered by reading the mode again after attach or resync.
+    PermissionModeChanged {
+        /// The mode turns admitted from now on run with.
+        mode: TurnPermissionMode,
+    },
 }
 
 const fn default_tool_request_draft_placement() -> ToolContributionPlacement {

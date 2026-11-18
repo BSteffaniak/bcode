@@ -13,9 +13,38 @@ bcode --disable-all-tools                   # alias: --no-tools
 
 The flags work with the default TUI, `--new`, `tui`, and `send`. They are rejected by commands that do not admit ordinary agent turns. They do not modify `bcode.toml`, runtime permission state, or a permanent session setting; relaunching without a flag restores normal behavior for future turns.
 
+In the TUI, `--dangerously-bypass-all-permissions` steps each session the launch creates or opens into bypass once, through the [runtime session permission mode](#runtime-session-permission-mode); `/yolo off` steps a session out, and switching back to it later in the same launch does not step it in again. `send` applies the flag to the turn it sends.
+
 `--dangerously-bypass-all-permissions` allows otherwise valid, available tool operations without evaluating configured agent or skill permission rules and without prompting. It can enable destructive commands, data loss, secret exposure, repository modification, and arbitrary effects from enabled tools. Canonical operation validation, tool and plugin availability, read-only or disabled turn/workflow ceilings, path confinement, provider authentication, and operating-system privileges still apply.
 
 `--disable-all-tools` exposes no agent tools to the model and rejects a tool call if a provider emits one anyway. Model generation, session context, project instructions, and non-tool application behavior remain available, so this mode is intentionally not described as hermetic.
+
+## Runtime session permission mode
+
+A client can step a running session into or out of permission bypass without relaunching (`SessionApplication::set_session_permission_mode`; IPC `SetSessionPermissionMode`, read with `SessionPermissionMode`). The daemon keeps the mode in memory per session: it is never written to `bcode.toml`, the runtime permission state file, or the session's history, and it is gone when the daemon restarts. A session with no mode set is `enforce`.
+
+* **Stepping in** applies to turns admitted afterwards: a turn admitted while its session is in bypass is admitted in bypass, exactly as if its client had asked for it. The running turn keeps the mode it started with.
+* **Stepping out** applies to turns admitted afterwards and to queued turns when they start. With `permissions.bypass_step_out = "immediate"` (the default) it also revokes the running turn's bypass before its next tool call, and the running turn then accepts steering messages from enforcing clients; with `"next_turn"` the running turn finishes as it started.
+* **Restarts.** A turn's permission mode is recorded with it, but a turn resumed after a daemon restart does not bypass until its session is stepped into bypass again. This includes turns started with `--dangerously-bypass-all-permissions`.
+* **Visibility.** Every client attached to the session receives a live `PermissionModeChanged` event when the mode changes; a client that missed it reads the mode again after attach or resync. Calls that skip permission policy are traced as `bypassed_by_turn_permission_mode`, as with the launch flag.
+* **Child sessions** do not inherit the mode: the application that creates a child sets the child's mode itself.
+* **Waiting prompts.** `permissions.bypass_waiting_prompts` tells frontends what stepping in does with the permission prompts the session is already waiting on: `approve` them once each, `ask` whether to (the default), or `leave` them.
+
+```toml
+[permissions]
+bypass_step_out = "immediate"     # immediate | next_turn
+bypass_waiting_prompts = "ask"    # approve | ask | leave
+```
+
+### In the TUI
+
+* `/yolo` toggles the attached session; `/yolo on` and `/yolo off` say which way. A draft has no session yet: send a message first.
+* The first step in of a launch asks first: `/yolo` again confirms it for the rest of the launch, and `/yolo always` steps in and stops asking. That choice is kept in `permission-bypass.toml` in the state directory (next to `permissions.toml`); delete it to be asked again.
+* While the viewed session is in bypass the status line shows `DANGER: PERMISSION BYPASS ACTIVE`, whichever client stepped it in.
+* With `bypass_waiting_prompts = "ask"`, stepping in while prompts wait opens the permission review; `approve` approves them once each.
+* `/yolo` is unavailable in managed external sessions, whose native executor decides its own permissions.
+
+The same structural checks as the launch flag still apply in bypass: canonical operation validation, tool and plugin availability, read-only or disabled ceilings, path confinement, provider authentication, and operating-system privileges.
 
 ## Config shape
 

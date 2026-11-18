@@ -37,6 +37,8 @@ pub enum BuiltinCommandId {
     CancelRuntime,
     Runtime,
     Permissions,
+    /// Step the session into or out of permission bypass.
+    Yolo,
     /// Leave Bcode, like the exit key.
     Exit,
 }
@@ -142,6 +144,21 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
             "/permissions",
             "Refresh and review pending permissions"
         )],
+    },
+    BuiltinCommandSpec {
+        id: BuiltinCommandId::Yolo,
+        names: &["yolo"],
+        completions: &[
+            completion!(
+                "/yolo",
+                "Step this session into or out of permission bypass"
+            ),
+            completion!("/yolo off", "Step this session out of permission bypass"),
+            completion!(
+                "/yolo always",
+                "Step into permission bypass and stop asking first"
+            ),
+        ],
     },
     BuiltinCommandSpec {
         id: BuiltinCommandId::Resync,

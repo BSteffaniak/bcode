@@ -1807,6 +1807,29 @@ impl bcode_session_models::SessionApplication for BcodeClient {
         .await
         .map_err(session_application_failure)
     }
+    async fn session_permission_mode(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        bcode_session_models::TurnPermissionMode,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::session_permission_mode(self, session_id)
+            .await
+            .map_err(session_application_failure)
+    }
+    async fn set_session_permission_mode(
+        &self,
+        session_id: SessionId,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) -> Result<
+        bcode_session_models::TurnPermissionMode,
+        bcode_session_models::SessionApplicationFailure,
+    > {
+        Self::set_session_permission_mode(self, session_id, mode)
+            .await
+            .map_err(session_application_failure)
+    }
     async fn set_session_agent(
         &self,
         session_id: SessionId,
@@ -6188,6 +6211,46 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionModelSet => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read a session's runtime permission mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request, such as for
+    /// an unknown session or a daemon without runtime permission modes.
+    pub async fn session_permission_mode(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bcode_session_models::TurnPermissionMode, ClientError> {
+        match self
+            .send_request(Request::SessionPermissionMode { session_id })
+            .await?
+        {
+            ResponsePayload::SessionPermissionMode { mode } => Ok(mode),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Step a session into or out of permission bypass at runtime; returns the mode now in
+    /// effect. Never persisted: the daemon forgets it when it restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request, such as for
+    /// an unknown session or a daemon without runtime permission modes.
+    pub async fn set_session_permission_mode(
+        &self,
+        session_id: SessionId,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) -> Result<bcode_session_models::TurnPermissionMode, ClientError> {
+        match self
+            .send_request(Request::SetSessionPermissionMode { session_id, mode })
+            .await?
+        {
+            ResponsePayload::SessionPermissionMode { mode } => Ok(mode),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

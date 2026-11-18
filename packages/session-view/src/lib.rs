@@ -15289,17 +15289,7 @@ impl SessionView {
                 }
             }
             SessionLiveEventKind::ToolInvocationProgress { event } => {
-                if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress
-                    && !self
-                        .tool_invocations
-                        .get(&event.invocation_id)
-                        .is_some_and(ToolInvocationAggregate::is_terminal)
-                {
-                    self.snapshot
-                        .active_invocations
-                        .insert(event.invocation_id.clone(), event.clone());
-                    self.bump_revision();
-                }
+                self.apply_live_invocation_progress(event);
             }
             SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
                 self.snapshot.runtime.provider_progress = Some(ProviderProgressView {
@@ -15321,6 +15311,26 @@ impl SessionView {
             SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
                 self.set_context_occupancy((**occupancy).clone());
             }
+            // Session state, not transcript content: frontends track it themselves.
+            SessionLiveEventKind::PermissionModeChanged { .. } => {}
+        }
+    }
+
+    /// Show live progress of an invocation that has not finished.
+    fn apply_live_invocation_progress(
+        &mut self,
+        event: &bcode_session_models::ToolInvocationLifecycleEvent,
+    ) {
+        if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress
+            && !self
+                .tool_invocations
+                .get(&event.invocation_id)
+                .is_some_and(ToolInvocationAggregate::is_terminal)
+        {
+            self.snapshot
+                .active_invocations
+                .insert(event.invocation_id.clone(), event.clone());
+            self.bump_revision();
         }
     }
 

@@ -240,6 +240,36 @@ fn status_segments_select_and_order_the_status_line() {
 }
 
 #[test]
+fn the_status_line_warns_of_permission_bypass_whatever_its_segments() {
+    use bcode_tui_theme::chrome::{StatusSegment, StatusSegments};
+    let status_row = |segments: Option<&[StatusSegment]>, bypass: bool| {
+        let mut app = app_with(|chrome| {
+            if let Some(segments) = segments {
+                chrome.status.segments = StatusSegments::new(segments).expect("segments");
+            }
+        });
+        if bypass {
+            app.set_session_permission_mode(bcode_session_models::TurnPermissionMode::Bypass);
+        }
+        let area = Rect::new(0, 0, 100, 20);
+        let layout = prepare_frame(&mut app, area).expect("layout");
+        let mut buffer = Buffer::empty(area);
+        render(&mut app, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        drop(app);
+        buffer
+            .row_symbols(layout.status().y)
+            .expect("row")
+            .trim_end()
+            .to_owned()
+    };
+    let warning = crate::app::PERMISSION_BYPASS_INDICATOR;
+    assert!(status_row(None, true).starts_with(warning));
+    assert!(status_row(Some(&[StatusSegment::Hints]), true).starts_with(warning));
+    assert!(status_row(Some(&[]), true).starts_with(warning));
+    assert!(!status_row(None, false).contains(warning));
+}
+
+#[test]
 fn finished_turns_leave_a_summary_only_when_the_theme_asks() {
     use bcode_tui_theme::chrome::{ChromeList, ChromeText};
     let finish = |edit: &dyn Fn(&mut TuiChrome)| {

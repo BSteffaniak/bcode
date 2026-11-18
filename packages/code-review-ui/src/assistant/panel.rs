@@ -1700,6 +1700,8 @@ impl Assistant {
         if !self.tools_asked {
             self.tools_asked = true;
             let config = self.services.assistant_config();
+            let guide = self.services.guide_config();
+            let (guide_agent, _) = super::profile::guide_base_agent(&guide, &config);
             // On the host that creates the sessions and submits their turns.
             self.tools = self
                 .services
@@ -1707,7 +1709,7 @@ impl Assistant {
                 .serve_client_tools(
                     super::profile::client_tools(),
                     std::iter::once(config.profile())
-                        .chain(super::profile::guide_profiles())
+                        .chain(super::profile::guide_profiles(guide_agent))
                         .collect(),
                 )
                 .ok();

@@ -1124,6 +1124,13 @@ pub enum TuiEffect {
         /// Enrolled provider account to apply atomically with the model.
         account_reference: Option<String>,
     },
+    /// Read the session's runtime permission mode, or step it into or out of bypass.
+    PermissionMode {
+        /// Session to read or update.
+        session_id: SessionId,
+        /// The mode to set; `None` reads it.
+        set: Option<bcode_session_models::TurnPermissionMode>,
+    },
     /// Set session reasoning preferences.
     SetSessionReasoning {
         /// Session to update.
@@ -1593,6 +1600,15 @@ pub enum TuiEffectResult {
         /// Daemon response.
         result: Result<(), ClientError>,
     },
+    /// The session's runtime permission mode was read or set.
+    PermissionMode {
+        /// Session read or updated.
+        session_id: SessionId,
+        /// The mode that was set; `None` when it was read.
+        set: Option<bcode_session_models::TurnPermissionMode>,
+        /// The mode now in effect.
+        result: Result<bcode_session_models::TurnPermissionMode, ClientError>,
+    },
     /// Session reasoning update completed.
     SetSessionReasoning {
         /// Session that was updated.
@@ -1746,6 +1762,7 @@ impl TuiEffectResult {
             Self::SetSessionReasoning { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
+            Self::PermissionMode { result, .. } => DaemonObservation::from_client_result(result),
             Self::AppendPresentationNote { result, .. } => {
                 DaemonObservation::from_client_result(result)
             }
@@ -1934,6 +1951,7 @@ enum EffectKey {
     SkillAction(SkillId),
     SetSessionModel(SessionId),
     SetSessionReasoning(SessionId),
+    PermissionMode(SessionId),
     AppendPresentationNote(SessionId, String),
     CancelRuntimeWork(SessionId),
     CompactContext(SessionId),
@@ -2077,6 +2095,11 @@ impl TuiEffect {
                 effort,
                 effort_generation,
                 status,
+                result: Err(client_error),
+            },
+            Self::PermissionMode { session_id, set } => TuiEffectResult::PermissionMode {
+                session_id,
+                set,
                 result: Err(client_error),
             },
             Self::AppendPresentationNote { session_id, .. } => {
@@ -2303,6 +2326,7 @@ impl TuiEffect {
             | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
             | Self::SetSessionReasoning { .. }
+            | Self::PermissionMode { .. }
             | Self::AppendPresentationNote { .. }
             | Self::CancelRuntimeWork { .. }
             | Self::CompactContext { .. }
@@ -2503,6 +2527,22 @@ impl TuiEffectQueue {
             TuiEffect::SubmitMessage { request } => Some(&request.execution),
             TuiEffect::SkillAction { request } => Some(&request.execution),
             _ => None,
+        })
+    }
+
+    /// Whether a read (`set` of `None`) or set of `session_id`'s permission mode is queued.
+    #[cfg(test)]
+    pub fn contains_permission_mode(
+        &self,
+        session_id: bcode_session_models::SessionId,
+        set: Option<bcode_session_models::TurnPermissionMode>,
+    ) -> bool {
+        self.effects.values().any(|entry| {
+            matches!(
+                &entry.effect,
+                TuiEffect::PermissionMode { session_id: queued, set: queued_set }
+                    if *queued == session_id && *queued_set == set
+            )
         })
     }
 
@@ -2732,6 +2772,7 @@ impl TuiEffect {
             Self::SetSessionReasoning { session_id, .. } => {
                 EffectKey::SetSessionReasoning(*session_id)
             }
+            Self::PermissionMode { session_id, .. } => EffectKey::PermissionMode(*session_id),
             Self::AppendPresentationNote {
                 session_id,
                 note_id,
@@ -3585,6 +3626,14 @@ impl TuiEffect {
                     )
                     .await
                     .map(|_| ())
+                },
+            },
+            Self::PermissionMode { session_id, set } => TuiEffectResult::PermissionMode {
+                session_id,
+                set,
+                result: match set {
+                    Some(mode) => client.set_session_permission_mode(session_id, mode).await,
+                    None => client.session_permission_mode(session_id).await,
                 },
             },
             Self::SetSessionReasoning {

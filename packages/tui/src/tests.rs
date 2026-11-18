@@ -86,6 +86,7 @@ fn composer_submission_carries_launch_execution_defaults() {
         permission_mode: TurnPermissionMode::Bypass,
         tool_policy: TurnToolPolicy::Disabled,
     };
+    chat.app.set_launch_permission_mode(launch.permission_mode);
 
     assert!(crate::composer_flow::stage_session_message(
         std::path::Path::new("."),
@@ -120,6 +121,7 @@ fn skill_invocation_carries_launch_execution_defaults() {
         permission_mode: TurnPermissionMode::Bypass,
         tool_policy: TurnToolPolicy::Disabled,
     };
+    chat.app.set_launch_permission_mode(launch.permission_mode);
 
     crate::skill_flow::start_skill_action(
         std::path::Path::new("."),
@@ -136,6 +138,162 @@ fn skill_invocation_carries_launch_execution_defaults() {
     assert_eq!(execution.permission_mode, TurnPermissionMode::Bypass);
     assert_eq!(execution.tools, TurnToolPolicy::Disabled);
     drop(chat);
+}
+
+fn attached_chat(session_id: SessionId) -> crate::session_flow::ActiveChat {
+    let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+    crate::session_flow::ActiveChat {
+        app: crate::app::BmuxApp::new_with_history(Some(session_id), &[], &[]),
+        agents: crate::session_flow::AgentCatalog::default(),
+        attachment: crate::session_flow::ChatSessionAttachment::Attached { session_id },
+        event_sender,
+        event_receiver,
+        event_task: None,
+        opening_session_progress: None,
+        pending_effects: crate::effects::TuiEffectQueue::default(),
+    }
+}
+
+#[test]
+fn turns_and_the_indicator_follow_the_sessions_runtime_permission_mode() {
+    let session_id = SessionId::new();
+    let mut chat = attached_chat(session_id);
+    chat.app
+        .set_launch_permission_mode(TurnPermissionMode::Bypass);
+    let launch = crate::TuiLaunchOptions {
+        permission_mode: TurnPermissionMode::Bypass,
+        tool_policy: TurnToolPolicy::Enabled,
+    };
+    // Until the daemon says, the launch's mode applies.
+    assert!(chat.app.permission_bypass_active());
+
+    // The session stepped out (here, or from another client): turns enforce, the warning goes.
+    let live = bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::PermissionModeChanged {
+            mode: TurnPermissionMode::Enforce,
+        },
+    };
+    chat.app.absorb_session_live_event(&live);
+    assert_eq!(chat.app.permission_mode(), TurnPermissionMode::Enforce);
+    assert!(!chat.app.permission_bypass_active());
+    chat.app.replace_composer_with("after stepping out");
+    chat.app.stage_submission();
+    assert!(crate::composer_flow::stage_session_message(
+        std::path::Path::new("."),
+        launch,
+        &mut chat,
+        bcode_ipc::PromptPlacement::FollowUp,
+    ));
+    let execution = chat
+        .pending_effects
+        .queued_execution_options()
+        .expect("queued submit execution options");
+    assert_eq!(execution.permission_mode, TurnPermissionMode::Enforce);
+    drop(chat);
+}
+
+#[test]
+fn yolo_confirms_once_then_steps_the_session_in_and_off_steps_it_out() {
+    let session_id = SessionId::new();
+    let mut chat = attached_chat(session_id);
+    let directory = tempfile::tempdir().unwrap();
+    let confirmation = directory.path().join("permission-bypass.toml");
+    let mut state =
+        crate::permission_bypass::BypassLaunchState::with_confirmation_path(confirmation.clone());
+    let toggle = crate::permission_bypass::BypassRequest::parse(&[]).unwrap();
+
+    // Asked first.
+    crate::permission_bypass::request(&mut state, &mut chat, toggle);
+    assert!(
+        !chat
+            .pending_effects
+            .contains_permission_mode(session_id, Some(TurnPermissionMode::Bypass)),
+        "nothing set before confirming"
+    );
+    assert!(
+        chat.app.status().contains("/yolo again"),
+        "{}",
+        chat.app.status()
+    );
+    crate::permission_bypass::request(&mut state, &mut chat, toggle);
+    assert!(
+        chat.pending_effects
+            .contains_permission_mode(session_id, Some(TurnPermissionMode::Bypass))
+    );
+
+    // Confirmed for the launch: stepping back in after stepping out does not ask again.
+    chat.pending_effects = crate::effects::TuiEffectQueue::default();
+    chat.app
+        .set_session_permission_mode(TurnPermissionMode::Bypass);
+    crate::permission_bypass::request(&mut state, &mut chat, toggle);
+    assert!(
+        chat.pending_effects
+            .contains_permission_mode(session_id, Some(TurnPermissionMode::Enforce))
+    );
+    chat.pending_effects = crate::effects::TuiEffectQueue::default();
+    chat.app
+        .set_session_permission_mode(TurnPermissionMode::Enforce);
+    crate::permission_bypass::request(&mut state, &mut chat, toggle);
+    assert!(
+        chat.pending_effects
+            .contains_permission_mode(session_id, Some(TurnPermissionMode::Bypass))
+    );
+
+    // `/yolo always` is remembered: a later launch steps in without asking.
+    let always = crate::permission_bypass::BypassRequest::parse(&["always"]).unwrap();
+    crate::permission_bypass::request(&mut state, &mut chat, always);
+    assert!(
+        bcode_config::bypass_confirmation::load_from(&confirmation)
+            .unwrap()
+            .dismissed
+    );
+    let mut next_launch =
+        crate::permission_bypass::BypassLaunchState::with_confirmation_path(confirmation);
+    chat.pending_effects = crate::effects::TuiEffectQueue::default();
+    crate::permission_bypass::request(&mut next_launch, &mut chat, toggle);
+    assert!(
+        chat.pending_effects
+            .contains_permission_mode(session_id, Some(TurnPermissionMode::Bypass))
+    );
+    drop(chat);
+}
+
+#[test]
+fn a_yolo_launch_steps_each_attached_session_in_once_and_reads_it_again_after_a_resync() {
+    let settings = crate::chat_loop::TuiRuntimeSettings::bootstrap(".".into(), &[])
+        .with_launch_options(crate::TuiLaunchOptions {
+            permission_mode: TurnPermissionMode::Bypass,
+            tool_policy: TurnToolPolicy::Enabled,
+        });
+    let first = SessionId::new();
+    let mut chat = attached_chat(first);
+    let mut state = crate::permission_bypass::BypassLaunchState::default();
+    crate::permission_bypass::reconcile(&mut state, &mut chat, &settings);
+    assert!(
+        chat.pending_effects
+            .contains_permission_mode(first, Some(TurnPermissionMode::Bypass))
+    );
+
+    // Nothing more while the same session stays attached; after a resync it is only read, so a
+    // session stepped out of bypass stays out.
+    chat.pending_effects = crate::effects::TuiEffectQueue::default();
+    crate::permission_bypass::reconcile(&mut state, &mut chat, &settings);
+    assert!(!chat.pending_effects.contains_permission_mode(first, None));
+    state.resynced();
+    crate::permission_bypass::reconcile(&mut state, &mut chat, &settings);
+    assert!(chat.pending_effects.contains_permission_mode(first, None));
+
+    // Another session the launch opens is stepped in too.
+    let second = SessionId::new();
+    let mut other = attached_chat(second);
+    crate::permission_bypass::reconcile(&mut state, &mut other, &settings);
+    assert!(
+        other
+            .pending_effects
+            .contains_permission_mode(second, Some(TurnPermissionMode::Bypass))
+    );
+    drop((chat, other));
 }
 
 #[test]

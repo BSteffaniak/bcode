@@ -1166,8 +1166,10 @@ bcode's own (`--print-config-paths` lists them in order):
   `find`, `grep`, `stat`, `exists`), `file_writes` (`filesystem.write`, `edit`, `multi_edit`)
   and `shell` (`shell.run`); `extra` lists exact names of other Bcode tools to expose, such as
   `"web.fetch"`. The app registers the agent profile `bcode.code-review.assistant` with the
-  selected tools when it starts; the profile is based on Bcode's `build` agent and can only
-  narrow it, so every call is still allowed, asked or denied by the `build` agent's rules
+  selected tools when it starts; the profile is based on Bcode's `build` agent (another with
+  `[plugins.config."bcode.code_review".assistant] base_agent`; guide agents follow it, or their
+  own `guide.base_agent`) and can only narrow it, so every call is still allowed, asked or denied
+  by that agent's rules
   (`[agent.build.permission.tools]`, for example `"code_review.mark_viewed" = "allow"`). With
   the defaults, reads and moves within the review run (except `code_review.pull_request`, which
   asks unless a web rule allows the repository's address; see [Tool

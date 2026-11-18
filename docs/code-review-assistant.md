@@ -589,19 +589,20 @@ The acceptance requests resolve as:
 ### Agent profile
 
 The app registers one contributed profile with its tools: `bcode.code-review.assistant`
-("Review assistant"), based on `build`, restrict-only. Every panel turn names it, so a turn
+("Review assistant"), based on `build` (or `assistant.base_agent`), restrict-only. Every panel turn names it, so a turn
 whose profile is unavailable fails closed (`agent_profile_unavailable`). Its instructions
 describe the context blocks, the tools and the recipes above, and say to ask before acting on
 anything the user did not ask for. AI cards keep the default agent.
 
-Two more profiles, also based on `build` and restrict-only, serve guide fan-out children (see
+Two more profiles, based on `guide.base_agent` (the assistant's base agent when unset) and
+restrict-only, serve guide fan-out children (see
 [Guided review](code-review-guide.md#fan-out-from-the-app)): `bcode.code-review.guide-writer`
 (review reads, the guide reads and writes, file reads) and `bcode.code-review.guide-verifier`
 (the same reads and `code_review.guide.write`, which its `Verify` grant limits to claim checks).
 Neither includes the app's own tools.
 
 The profile's tool selection is the union of the enabled categories. Restrict-only means
-Bcode's `build` policy decides every exposed call, and a category can only remove tools.
+the base agent's policy decides every exposed call, and a category can only remove tools.
 
 | Category | Tools | Default | Decided by default as |
 | --- | --- | --- | --- |
@@ -624,6 +625,7 @@ which happens on start and on reconnect):
                   # a dragged size, remembered across runs, overrides these until reset
 # model = "fake-echo"   # app default model until one is chosen (`provider/model` too)
 # effort = "high"       # app default reasoning effort until one is chosen
+# base_agent = "build"  # Bcode agent whose tools and permission rules the assistant narrows
 
 [plugins.config."bcode.code_review".assistant.tools]
 review_reads = true
@@ -646,6 +648,11 @@ Allow, ask and deny stay Bcode's, under the base agent, for every session that u
 "code_review.delete_review" = "deny"
 ```
 
+* `base_agent` names the Bcode agent the profile narrows: its permission rules decide every
+  call, and tools it does not expose stay hidden. Point it at an agent with looser rules (one
+  defined in `bcode.toml`) to have the assistant ask less. It must name a Bcode agent, not one
+  of the app's own profiles; anything else is reported and `build` is used. An agent Bcode does
+  not know fails the turn when it runs.
 * A category set to `false` removes its tools from the profile; a misspelled key or a non-boolean
   value is reported and the default is used. `extra` names that are not exposed by `build` stay
   hidden (restrict-only).

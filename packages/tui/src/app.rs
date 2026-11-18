@@ -274,6 +274,9 @@ pub struct ManagedSessionSettings {
     pub observed_model: Option<String>,
 }
 
+/// Status indicator shown while the session runs in permission bypass.
+pub const PERMISSION_BYPASS_INDICATOR: &str = "DANGER: PERMISSION BYPASS ACTIVE";
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
@@ -351,6 +354,10 @@ pub struct BmuxApp {
     busy_periods: u64,
     daemon_connection: DaemonConnectionState,
     execution_mode_indicator: Option<String>,
+    /// The attached session's runtime permission mode, once the daemon said it.
+    session_permission_mode: Option<bcode_session_models::TurnPermissionMode>,
+    /// The permission mode this launch starts sessions in (`--yolo`).
+    launch_permission_mode: bcode_session_models::TurnPermissionMode,
     #[cfg(test)]
     pending_external_override:
         Option<Vec<bcode_session_view_models::external::ExternalInteractionView>>,
@@ -531,6 +538,8 @@ impl BmuxApp {
             busy_periods: 0,
             daemon_connection: DaemonConnectionState::Connecting,
             execution_mode_indicator: None,
+            session_permission_mode: None,
+            launch_permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
             #[cfg(test)]
             pending_external_override: None,
             status: String::from("Connecting to daemon…"),
@@ -580,6 +589,10 @@ impl BmuxApp {
                 .clone_from(&source.managed_composer.placement);
         }
         self.apply_tui_config(source.tui_config().clone());
+        self.launch_permission_mode = source.launch_permission_mode;
+        if self.session_id == source.session_id {
+            self.session_permission_mode = source.session_permission_mode;
+        }
         self.set_daemon_connection(source.daemon_connection());
         self.set_agent_metadata_hydrated(source.is_agent_metadata_hydrated());
         self.plugin_presentation
@@ -2819,15 +2832,46 @@ impl BmuxApp {
         self.daemon_connection = daemon_connection;
     }
 
-    /// Return the persistent launch execution-mode indicator.
+    /// Return the persistent launch or managed execution-mode indicator. Permission bypass has
+    /// its own ([`Self::permission_bypass_active`]).
     #[must_use]
     pub fn execution_mode_indicator(&self) -> Option<&str> {
         self.execution_mode_indicator.as_deref()
     }
 
+    /// Whether turns sent from here run in permission bypass ([`PERMISSION_BYPASS_INDICATOR`]).
+    #[must_use]
+    pub fn permission_bypass_active(&self) -> bool {
+        self.permission_mode() == bcode_session_models::TurnPermissionMode::Bypass
+    }
+
     /// Set the persistent launch execution-mode indicator.
     pub fn set_execution_mode_indicator(&mut self, indicator: Option<String>) {
         self.execution_mode_indicator = indicator;
+    }
+
+    /// The permission mode turns sent from here run with: the attached session's runtime mode
+    /// once the daemon said it, else the mode this launch starts sessions in.
+    #[must_use]
+    pub fn permission_mode(&self) -> bcode_session_models::TurnPermissionMode {
+        self.session_permission_mode
+            .unwrap_or(self.launch_permission_mode)
+    }
+
+    /// Record the attached session's runtime permission mode.
+    pub const fn set_session_permission_mode(
+        &mut self,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) {
+        self.session_permission_mode = Some(mode);
+    }
+
+    /// Set the permission mode this launch starts sessions in.
+    pub const fn set_launch_permission_mode(
+        &mut self,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) {
+        self.launch_permission_mode = mode;
     }
 
     /// Return the current status line.
@@ -3419,6 +3463,9 @@ impl BmuxApp {
             | SessionLiveEventKind::RequestContextOccupancyChanged { .. }
             | SessionLiveEventKind::ToolRequestDraft { .. } => {
                 // SessionView already owns and projects the semantic update.
+            }
+            SessionLiveEventKind::PermissionModeChanged { mode } => {
+                self.set_session_permission_mode(*mode);
             }
             SessionLiveEventKind::ToolInvocationProgress { .. } => {
                 self.apply_shared_runtime_work_activity();
@@ -4234,6 +4281,17 @@ impl BmuxApp {
                 |status| format!("waiting permission · {status}"),
             );
         }
+    }
+
+    /// Ids of the permission prompts the viewed session waits on.
+    #[must_use]
+    pub fn pending_permission_ids(&self) -> Vec<String> {
+        self.session_view
+            .snapshot()
+            .permissions
+            .iter()
+            .map(|permission| permission.permission_id.clone())
+            .collect()
     }
 
     fn shared_permission_view(
