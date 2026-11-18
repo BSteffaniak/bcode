@@ -1657,3 +1657,4 @@ fn create_review_can_list_ignored_files_and_find_paths_flags_weak_matches() {
 }
 
 mod guide;
+mod guide_templates;
