@@ -435,10 +435,13 @@ whose estimate passes `confirm_above_tokens` needs confirmation.
   claims go back to the conversation with a `Refresh` grant for them.
 * **Stopping and resuming.** Stopping the conversation's turn, `shift+x` in the guide panel or
   "Guide: stop the child agents writing the guide" cancels the conversation and every child and
-  marks the version cancelled; written areas stay. A fan-out version that is not complete and
-  that this app is not running (stopped, or the app closed) shows "4/5 areas ready · f Resume":
-  areas not ready are queued again for new children (children of a closed app keep running on
-  their own), and once every area is ready the conversation is asked to synthesize.
+  marks the version cancelled; written areas stay. A child whose creation was still under way
+  when the fan-out stopped is not recorded running, and its turn is cancelled once it exists. A
+  fan-out version that is not complete and that this app is not running (stopped, or the app
+  closed) shows "4/5 areas ready · f Resume": the turns of children still recorded running are
+  cancelled first, so no area has two writers, then areas not ready are queued again for new
+  children, and once every area is ready the conversation is asked to synthesize. Resume waits
+  until the fan-out's earlier work (such as a stop) has finished.
 * **Layers.** While stepping through a stack's layers (`guide.follow_layer`), the panel shows the
   layer's own guide when it has one, and the stack guide when stepping to a layer without one.
 

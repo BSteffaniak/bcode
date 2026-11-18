@@ -43,6 +43,8 @@ use bcode_code_review_models::{
 use bmux_tui_components::status_bar::StatusSeverity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 /// Id of the stack guide's section that links each layer guide.
@@ -137,8 +139,8 @@ pub(super) struct FanOutUi {
     run: Option<FanOutRun>,
     /// A planned fan-out waiting for the reviewer's confirmation.
     confirm: Option<Prepared>,
-    /// Work is in flight; the next step waits for it.
-    busy: bool,
+    /// Fan-out tasks in flight; the next step (and Resume) waits for every one.
+    busy: usize,
     /// The assistant's conversation (the children's parent), once it has one.
     assistant: Option<String>,
     /// Whether the conversation's turn runs.
@@ -279,7 +281,7 @@ impl ReviewSurface {
                 });
             }
         };
-        if self.guide.fan_out.run.is_some() || self.guide.fan_out.busy {
+        if self.guide.fan_out.run.is_some() || self.guide.fan_out.busy > 0 {
             let message = "child agents are already writing the guide";
             self.set_status(message, StatusSeverity::Info);
             refuse(reply, message);
@@ -297,7 +299,7 @@ impl ReviewSurface {
         }
         self.guide.fan_out.reply = reply;
         self.guide.fan_out.confirm = None;
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         // The conversation starts and synthesizes the versions it fans out, not what an earlier
         // request granted it.
         self.set_guide_grant(None);
@@ -336,7 +338,7 @@ impl ReviewSurface {
         let Some(parent) = self.guide.fan_out.assistant.clone() else {
             return;
         };
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -352,7 +354,7 @@ impl ReviewSurface {
 
     /// Apply finished fan-out work.
     pub(super) fn fan_out_done(&mut self, done: FanOutDone, host: &UiContext) {
-        self.guide.fan_out.busy = false;
+        self.guide.fan_out.busy = self.guide.fan_out.busy.saturating_sub(1);
         match done {
             FanOutDone::Prepared(result) => self.fan_out_prepared(result, host),
             FanOutDone::Begun(result) => match result {
@@ -552,7 +554,7 @@ impl ReviewSurface {
     /// Take the fan-out's next step: finish areas whose child ended, stop at the budget, start
     /// queued areas, synthesize, verify. One step at a time; each writes the version.
     pub(super) fn pump_fan_out(&mut self, host: &UiContext) {
-        if self.guide.fan_out.busy {
+        if self.guide.fan_out.busy > 0 {
             return;
         }
         let Some(run) = self.guide.fan_out.run.as_ref() else {
@@ -647,7 +649,7 @@ impl ReviewSurface {
                 self.guide.fan_out.seen_working.remove(session);
             }
         }
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -686,7 +688,7 @@ impl ReviewSurface {
         host: &UiContext,
         change: impl FnMut(&mut GuideVersion) + Send + 'static,
     ) {
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -737,7 +739,7 @@ impl ReviewSurface {
             ),
         };
         let binding = self.child_binding(grant);
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -759,22 +761,38 @@ impl ReviewSurface {
                 )
                 .await;
                 let recorded_area = area_id.clone();
+                let child = session.as_ref().ok().cloned();
                 let (status, session, message) = match session {
                     Ok(session) => (GuideAreaStatus::Running, Some(session), None),
                     Err(error) => (GuideAreaStatus::Failed, None, Some(error)),
                 };
-                update(&services, repo, guide_id, version, move |stored| {
+                let stopped = Arc::new(AtomicBool::new(false));
+                let seen = Arc::clone(&stopped);
+                let updated = update(&services, repo, guide_id, version, move |stored| {
+                    let terminal = stored.status.is_terminal();
                     if let Some(area) = stored
                         .generation
                         .as_mut()
                         .and_then(|generation| generation.area_mut(&recorded_area))
                     {
+                        // Stopped while the child was being created: it is not recorded
+                        // running, and its turn is cancelled below.
+                        if terminal || area.status != GuideAreaStatus::Queued {
+                            seen.store(true, Ordering::Relaxed);
+                            return;
+                        }
                         area.status = status;
                         area.session_id.clone_from(&session);
                         area.message.clone_from(&message);
                     }
                 })
-                .await
+                .await;
+                if stopped.load(Ordering::Relaxed)
+                    && let Some(child) = child
+                {
+                    drop(services.host().cancel_turn(child).await);
+                }
+                updated
             }
             .await;
             inbox.push(Message::GuideFanOut(Box::new(FanOutDone::Spawned {
@@ -878,7 +896,7 @@ impl ReviewSurface {
             version: Some(run.version),
             mode: GrantMode::Verify,
         });
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -916,7 +934,7 @@ impl ReviewSurface {
 
     /// The verifier ended: read which sections have unsupported claims.
     fn read_checks(&mut self, run: &FanOutRun, host: &UiContext) {
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
@@ -964,13 +982,23 @@ impl ReviewSurface {
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
-        self.guide.fan_out.busy = true;
+        self.guide.fan_out.busy += 1;
         host.spawn(Box::pin(async move {
-            for session in sessions {
-                drop(services.host().cancel_turn(session).await);
-            }
-            let result = update(&services, repo, run.guide_id, run.version, |version| {
+            // Children recorded running by a spawn that finished after the run was read are
+            // stopped too.
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let found = Arc::clone(&recorded);
+            let result = update(&services, repo, run.guide_id, run.version, move |version| {
                 if let Some(generation) = version.generation.as_mut() {
+                    if let Ok(mut found) = found.lock() {
+                        found.extend(
+                            generation
+                                .areas
+                                .iter()
+                                .filter(|area| area.status == GuideAreaStatus::Running)
+                                .filter_map(|area| area.session_id.clone()),
+                        );
+                    }
                     fanout::cancel(generation);
                 }
                 if !version.status.is_terminal() {
@@ -978,6 +1006,16 @@ impl ReviewSurface {
                 }
             })
             .await;
+            if let Ok(found) = recorded.lock() {
+                for session in found.iter() {
+                    if !sessions.contains(session) {
+                        sessions.push(session.clone());
+                    }
+                }
+            }
+            for session in sessions {
+                drop(services.host().cancel_turn(session).await);
+            }
             inbox.push(Message::GuideFanOut(Box::new(FanOutDone::Updated(result))));
         }));
         self.bump_fan_out();
@@ -1011,6 +1049,13 @@ impl ReviewSurface {
 
     /// Resume the guide's unfinished fan-out: missing areas get new children, or synthesis runs.
     fn resume_fan_out(&mut self, host: &UiContext) {
+        if self.guide.fan_out.busy > 0 {
+            self.set_status(
+                "the fan-out is still settling; resume it in a moment",
+                StatusSeverity::Info,
+            );
+            return;
+        }
         let Some(active) = self.guide.state.active.as_ref() else {
             return;
         };
@@ -1023,6 +1068,14 @@ impl ReviewSurface {
         };
         let version = &active.version;
         let mut generation = version.generation.clone().unwrap_or_default();
+        // Children recorded running may still run (the screen was rebuilt while they did):
+        // they are stopped before new children write their areas, so no area has two writers.
+        let orphans: Vec<String> = generation
+            .areas
+            .iter()
+            .filter(|area| area.status == GuideAreaStatus::Running)
+            .filter_map(|area| area.session_id.clone())
+            .collect();
         fanout::requeue(&mut generation);
         let strategy = version.origin.strategy.unwrap_or(GuideStrategy::Areas);
         let run = FanOutRun {
@@ -1037,10 +1090,21 @@ impl ReviewSurface {
             synthesis: Synthesis::Waiting,
             verifier: Verifier::Idle,
         };
-        self.write_fan_out(&run, host, move |stored| {
-            stored.generation = Some(generation.clone());
-            stored.status = GuideStatus::Generating;
-        });
+        self.guide.fan_out.busy += 1;
+        let repo = self.note_scope().repo_path;
+        let (services, inbox) = (self.services.clone(), self.inbox.clone());
+        let (guide_id, number) = (run.guide_id.clone(), run.version);
+        host.spawn(Box::pin(async move {
+            for session in orphans {
+                drop(services.host().cancel_turn(session).await);
+            }
+            let result = update(&services, repo, guide_id, number, move |stored| {
+                stored.generation = Some(generation.clone());
+                stored.status = GuideStatus::Generating;
+            })
+            .await;
+            inbox.push(Message::GuideFanOut(Box::new(FanOutDone::Updated(result))));
+        }));
         self.guide.fan_out.run = Some(run);
         self.bump_fan_out();
         self.set_status("resuming the fan-out", StatusSeverity::Info);

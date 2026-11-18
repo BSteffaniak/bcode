@@ -900,3 +900,108 @@ fn synthesis_waits_for_its_own_turn_while_the_reviewer_chats() {
     });
     assert_eq!(stored(&setup, &guide_id).0, GuideStatus::Complete);
 }
+
+#[test]
+fn stop_while_a_child_is_being_created_stops_that_child_too() {
+    let mut setup = setup_with(backend(serial()), 170, 50, true);
+    let parent = conversation(&mut setup);
+    setup.scenario.key("esc");
+    setup.settle();
+    setup.scenario.key("alt+g");
+    setup.settle();
+    setup.scenario.key("f");
+    // Step until the run is on screen and its first child's creation is queued, not run.
+    for _ in 0..40 {
+        let running = setup
+            .app()
+            .review()
+            .is_some_and(crate::surface::ReviewSurface::fan_out_running);
+        if running
+            && setup.backend.host().child_sessions().is_empty()
+            && setup.scenario.host().pending_tasks() > 0
+        {
+            break;
+        }
+        setup.scenario.step_async();
+    }
+    assert!(setup.backend.host().child_sessions().is_empty());
+
+    // Stop before the child's creation ran: the creation finishes after the run was read.
+    setup.scenario.key("shift+x");
+    setup.settle();
+    let (_, child) = setup
+        .backend
+        .host()
+        .child_sessions()
+        .first()
+        .cloned()
+        .expect("the child was created");
+    let (guide_id, _, _) = progress(&setup).expect("progress");
+    settle_until(&mut setup, "the version is stopped", |setup| {
+        stored(setup, &guide_id).0 == GuideStatus::Cancelled
+    });
+    settle_until(&mut setup, "the late child is stopped", |setup| {
+        setup.backend.host().cancelled_turns().contains(&child)
+    });
+    let (_, generation) = stored(&setup, &guide_id);
+    assert!(
+        generation
+            .areas
+            .iter()
+            .all(|area| area.status != GuideAreaStatus::Running),
+        "no area of a stopped version shows running: {generation:?}"
+    );
+    assert!(
+        setup.backend.host().cancelled_turns().contains(&parent),
+        "the conversation's turn is stopped"
+    );
+    assert!(
+        setup
+            .app()
+            .review()
+            .is_some_and(|review| !review.fan_out_running())
+    );
+}
+
+#[test]
+fn resuming_stops_children_still_recorded_running_before_starting_new_ones() {
+    let mut setup = setup_with(backend(serial()), 170, 50, true);
+    let parent = conversation(&mut setup);
+    fan_out(&mut setup);
+    settle_until(&mut setup, "the first child runs", |setup| {
+        progress(setup).is_some_and(|(_, _, generation)| {
+            generation
+                .areas
+                .iter()
+                .any(|area| area.status == GuideAreaStatus::Running)
+        })
+    });
+    let (guide_id, _, _) = progress(&setup).expect("progress");
+    let (_, generation) = stored(&setup, &guide_id);
+    let old = generation
+        .areas
+        .iter()
+        .find_map(|area| area.session_id.clone())
+        .expect("a running child");
+
+    // The screen is rebuilt while the child runs: the run is dropped, the guide offers Resume.
+    setup.reopen(170, 50);
+    let mut reopened = setup;
+    let _ = parent;
+    conversation(&mut reopened);
+    reopened.scenario.key("esc");
+    reopened.settle();
+    reopened.scenario.key("alt+g");
+    settle_until(&mut reopened, "the guide is read", |setup| {
+        progress(setup).is_some()
+    });
+    let before = reopened.backend.host().child_sessions().len();
+    reopened.scenario.key("f");
+    settle_until(&mut reopened, "a new child writes the area", |setup| {
+        setup.backend.host().child_sessions().len() > before
+    });
+    assert!(
+        reopened.backend.host().cancelled_turns().contains(&old),
+        "the earlier child is stopped before the area gets a new one"
+    );
+}
