@@ -13,7 +13,7 @@ use crate::data::grep;
 use crate::guide::cite::{ReviewDataReader, check_citations};
 use crate::guide::config::{GuideConfig, StrategyChoice};
 use crate::guide::context::{GuideContext, read_context};
-use crate::guide::export::{ExportOptions, LinkStyle, render_markdown};
+use crate::guide::export::{ExportOptions, LinkStyle, forge_repositories, render_markdown};
 use crate::guide::freshness::assess_version;
 use crate::guide::lifecycle::SinceDelta;
 use crate::guide::lint::{LintItem, lint, lint_section};
@@ -1402,32 +1402,7 @@ impl ReviewTools<'_> {
                 record.version.version
             )));
         }
-        let repositories = review
-            .workspace
-            .sources
-            .iter()
-            .filter_map(|source| match &source.kind {
-                ReviewSourceKind::PullRequest {
-                    provider,
-                    repository,
-                    ..
-                }
-                | ReviewSourceKind::StackLayer {
-                    provider,
-                    repository,
-                    ..
-                }
-                | ReviewSourceKind::Stack {
-                    provider,
-                    repository,
-                    ..
-                } if provider == "github" => Some((
-                    source.id.clone(),
-                    format!("https://{}/{repository}", bcode_forge_host()),
-                )),
-                _ => None,
-            })
-            .collect();
+        let repositories = forge_repositories(&review.workspace.sources);
         Ok(render_markdown(
             &record.version,
             &ExportOptions {
@@ -1439,11 +1414,6 @@ impl ReviewTools<'_> {
             },
         ))
     }
-}
-
-/// The web host of GitHub pull request sources.
-const fn bcode_forge_host() -> &'static str {
-    "github.com"
 }
 
 /// Add the outline, the bodies of the `wanted` sections (every section when empty) and the

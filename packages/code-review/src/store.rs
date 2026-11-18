@@ -953,9 +953,9 @@ impl ReviewPublisher for MarkdownFilePublisher {
     fn preview(
         &self,
         bundle: &ReviewBundle,
-        _options: &serde_json::Value,
+        options: &serde_json::Value,
     ) -> Result<String, StoreError> {
-        Ok(publish_markdown(bundle))
+        Ok(markdown_document(options).map_or_else(|| publish_markdown(bundle), str::to_owned))
     }
 
     fn submit(
@@ -963,6 +963,9 @@ impl ReviewPublisher for MarkdownFilePublisher {
         bundle: &ReviewBundle,
         options: &serde_json::Value,
     ) -> Result<PublishReviewResponse, StoreError> {
+        if let Some(document) = markdown_document(options) {
+            return write_document_publish(self.manifest().id, bundle, options, document);
+        }
         write_file_publish(
             self.manifest().id,
             bundle,
@@ -971,6 +974,84 @@ impl ReviewPublisher for MarkdownFilePublisher {
             publish_markdown(bundle),
         )
     }
+}
+
+/// A ready-made markdown document to write instead of the review report (a guide export),
+/// from the publisher's `document` option.
+fn markdown_document(options: &serde_json::Value) -> Option<&str> {
+    options
+        .get("document")
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Write a ready-made `document` to `output_path`, which must stay inside the repository: a
+/// relative path without `..` whose existing ancestors do not lead outside the repository
+/// through a symbolic link. Without a path the document goes to `.bcode/reviews/<review>.md`.
+fn write_document_publish(
+    publisher_id: String,
+    bundle: &ReviewBundle,
+    options: &serde_json::Value,
+    document: &str,
+) -> Result<PublishReviewResponse, StoreError> {
+    let relative = options
+        .get("output_path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map_or_else(
+            || {
+                PathBuf::from(".bcode")
+                    .join("reviews")
+                    .join(format!("{}.md", safe_review_id(&bundle.review_id)))
+            },
+            PathBuf::from,
+        );
+    let path = confined_output_path(&bundle.repo_root, &relative)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    confined_output_path(&bundle.repo_root, &relative)?;
+    std::fs::write(&path, document)?;
+    Ok(PublishReviewResponse {
+        publisher_id,
+        submitted: true,
+        output: Some(path.display().to_string()),
+        message: format!("wrote {}", relative.display()),
+    })
+}
+
+/// `relative` under `repo_root`, or why it would leave the repository.
+fn confined_output_path(repo_root: &Path, relative: &Path) -> Result<PathBuf, StoreError> {
+    use std::path::Component;
+    let outside = || {
+        StoreError::InvalidRequest(format!(
+            "{} is outside the repository; give a path inside it",
+            relative.display()
+        ))
+    };
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(outside());
+    }
+    let root = repo_root.canonicalize()?;
+    let path = root.join(relative);
+    let mut existing = path.as_path();
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(outside)?;
+    }
+    if !existing.canonicalize()?.starts_with(&root) {
+        return Err(outside());
+    }
+    if path.exists() && !path.is_file() {
+        return Err(StoreError::InvalidRequest(format!(
+            "{} is not a file",
+            relative.display()
+        )));
+    }
+    Ok(path)
 }
 
 struct JsonFilePublisher;

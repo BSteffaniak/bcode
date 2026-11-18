@@ -2355,3 +2355,67 @@ fn insert_and_compact(repo: &Path, config: &CodeReviewConfig, rows: Vec<(&'stati
     })
     .expect("migrate");
 }
+
+#[test]
+fn a_markdown_document_is_written_only_inside_the_repository() {
+    let root = tempfile::tempdir().expect("repository");
+    let outside = tempfile::tempdir().expect("outside");
+    let bundle = ReviewBundle {
+        review_id: "review/1".to_owned(),
+        title: "Guide".to_owned(),
+        repo_root: root.path().to_path_buf(),
+        target: ReviewTarget::LastCommit,
+        files: Vec::new(),
+        surfaces: Vec::new(),
+        threads: Vec::new(),
+        generated_at_ms: 1,
+        pull_request: None,
+    };
+    let submit = |options: serde_json::Value| {
+        with_publisher("markdown_file", |publisher| {
+            publisher.submit(&bundle, &options)
+        })
+    };
+    let document = "# Walkthrough · v1\n";
+    let preview = with_publisher("markdown_file", |publisher| {
+        publisher.preview(&bundle, &serde_json::json!({ "document": document }))
+    })
+    .expect("preview");
+    assert_eq!(preview, document, "the preview is the document");
+
+    let written =
+        submit(serde_json::json!({ "document": document, "output_path": "docs/guide.md" }))
+            .expect("written");
+    assert!(written.submitted);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("docs/guide.md")).expect("file"),
+        document
+    );
+
+    for refused in [
+        serde_json::json!("../escape.md"),
+        serde_json::json!(outside.path().join("abs.md")),
+    ] {
+        let error = submit(serde_json::json!({ "document": document, "output_path": refused }))
+            .expect_err("outside the repository");
+        assert!(error.to_string().contains("outside the repository"), "{error}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).expect("link");
+        let error =
+            submit(serde_json::json!({ "document": document, "output_path": "link/guide.md" }))
+                .expect_err("through a link");
+        assert!(error.to_string().contains("outside the repository"), "{error}");
+        assert!(!outside.path().join("guide.md").exists());
+    }
+
+    let fallback = submit(serde_json::json!({ "document": document })).expect("default path");
+    assert!(
+        fallback
+            .output
+            .as_deref()
+            .is_some_and(|path| path.contains(".bcode/reviews/")),
+        "{fallback:?}"
+    );
+}

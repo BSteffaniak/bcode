@@ -6,8 +6,8 @@
 
 use super::write::body_tokens;
 use bcode_code_review_models::{
-    Citation, CitationRelation, FindingKind, GuideVersion, ReviewLineSide, RevisionRef, Section,
-    SectionState, Verification,
+    Citation, CitationRelation, FindingKind, GuideVersion, ReviewLineSide, ReviewSource,
+    ReviewSourceKind, RevisionRef, Section, SectionState, Verification,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -36,6 +36,39 @@ pub struct ExportOptions<'a> {
     pub include_unverified: bool,
     /// Sections to export (with their children); every section when empty.
     pub sections: Vec<String>,
+}
+
+/// Web host of GitHub pull request sources.
+const GITHUB_HOST: &str = "github.com";
+
+/// Web addresses of the forge repositories of `sources` (GitHub pull requests, stack layers and
+/// stacks), by source id, for [`ExportOptions::repositories`].
+#[must_use]
+pub fn forge_repositories(sources: &[ReviewSource]) -> BTreeMap<String, String> {
+    sources
+        .iter()
+        .filter_map(|source| match &source.kind {
+            ReviewSourceKind::PullRequest {
+                provider,
+                repository,
+                ..
+            }
+            | ReviewSourceKind::StackLayer {
+                provider,
+                repository,
+                ..
+            }
+            | ReviewSourceKind::Stack {
+                provider,
+                repository,
+                ..
+            } if provider == "github" => Some((
+                source.id.clone(),
+                format!("https://{GITHUB_HOST}/{repository}"),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `version` as markdown.
