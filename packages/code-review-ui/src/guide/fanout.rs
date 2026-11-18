@@ -282,7 +282,7 @@ pub fn synthesis_prompt(
              them: read them with code_review.guide.get (guide_id {guide_id}, include \
              [\"outline\", \"bodies\", \"citations\", \"areas\"]), then write the guide with \
              code_review.guide.write: purpose, scope and one reading order across the areas, \
-             citing the areas' citations by their ids (such as \"crates-net.c1\") instead of \
+             citing the areas' citations by their ids (such as \"crates-net-1f0c4a2e.c1\") instead of \
              citing again, and set_status complete.{note}",
             finished = finished.join(", "),
         ),
