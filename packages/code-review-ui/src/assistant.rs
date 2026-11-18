@@ -104,6 +104,9 @@ pub enum LinkRequest {
         /// Context blocks (the section and its citations).
         context: Vec<crate::host::ContextBlock>,
     },
+    /// Open the guide: its panel where the screen has room for it, else the assistant's Guide
+    /// tab.
+    OpenGuide,
 }
 
 impl ScreenLink {

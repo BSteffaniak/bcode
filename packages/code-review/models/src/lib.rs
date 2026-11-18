@@ -441,6 +441,10 @@ pub struct ReviewPanelState {
     /// Guide panel height, under the document, as a share of the body height.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide_bottom_share: Option<u16>,
+    /// The guide panel's outline height, beside the document, as a share of the rows the
+    /// outline and the current section share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_outline_share: Option<u16>,
 }
 
 /// Revealed context of one file.

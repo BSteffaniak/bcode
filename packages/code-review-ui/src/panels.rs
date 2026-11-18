@@ -154,6 +154,8 @@ struct Shares {
     guide_right: Option<u16>,
     /// Guide panel height under the document, of the body height.
     guide_bottom: Option<u16>,
+    /// The guide's outline height, of the rows it shares with the current section.
+    guide_outline: Option<u16>,
 }
 
 /// Cell sizes saved before sizes were proportional.
@@ -224,6 +226,7 @@ impl Panels {
             threads_bottom: state.threads_bottom_share,
             guide_right: state.guide_right_share,
             guide_bottom: state.guide_bottom_share,
+            guide_outline: state.guide_outline_share,
         };
         Self {
             files_choice: state.file_panel_visible,
@@ -254,7 +257,23 @@ impl Panels {
             guide_panel_visible: if self.guide_open { Some(true) } else { None },
             guide_right_share: self.shares.guide_right,
             guide_bottom_share: self.shares.guide_bottom,
+            guide_outline_share: self.shares.guide_outline,
         }
+    }
+
+    /// The guide's outline height as dragged, of the rows it shares with the current section
+    /// (parts of [`PANEL_SHARE_SCALE`]).
+    #[must_use]
+    pub const fn guide_outline_share(&self) -> Option<u16> {
+        self.shares.guide_outline
+    }
+
+    /// Keep the guide's outline height as dragged. Returns whether it changed.
+    pub fn set_guide_outline_share(&mut self, share: u16) -> bool {
+        let share = Some(share.min(PANEL_SHARE_SCALE));
+        let changed = self.shares.guide_outline != share;
+        self.shares.guide_outline = share;
+        changed
     }
 
     /// Whether the last layout converted sizes saved in cells into shares (the state to save

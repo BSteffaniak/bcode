@@ -214,6 +214,34 @@ pub fn split_state() -> PanelGroupState {
     PanelGroupState::new([PanelSize::Flex(2), PanelSize::Flex(3)])
 }
 
+/// The split with the outline at `share` (parts of `scale`) of the rows it shares with the
+/// current section, as restored from presentation state.
+#[must_use]
+pub fn split_state_at(share: u16, scale: u16) -> PanelGroupState {
+    let share = share.min(scale);
+    PanelGroupState::new([
+        PanelSize::Flex(share.max(1)),
+        PanelSize::Flex((scale - share).max(1)),
+    ])
+}
+
+/// The outline's share (parts of `scale`) of the rows it shares with the current section, once
+/// the split has been dragged; `None` while it has its first proportions.
+#[must_use]
+pub fn split_share(state: &PanelGroupState, scale: u16) -> Option<u16> {
+    if state.sizes() == split_state().sizes() {
+        return None;
+    }
+    match state.sizes() {
+        [PanelSize::Flex(outline), PanelSize::Flex(section)] => {
+            let (outline, section) = (u32::from((*outline).max(1)), u32::from((*section).max(1)));
+            let total = outline + section;
+            u16::try_from((outline * u32::from(scale) + total / 2) / total).ok()
+        }
+        _ => None,
+    }
+}
+
 /// The vertical group of the outline and the current section, its one-row divider the rule
 /// between them.
 const fn split_group() -> PanelGroup {

@@ -101,6 +101,9 @@ pub(super) struct GuideUi {
     /// A guide jump happened since the app last asked (it then shows the assistant's Guide tab
     /// when the guide cannot dock).
     pub(super) stepped: bool,
+    /// A guide was started (or its first section arrived) since the app last asked; it then
+    /// shows the assistant's Guide tab, once the guide is read, when the guide cannot dock.
+    pub(super) reveal: bool,
     /// The guide card as last built, with the state revision it was built at.
     pub(super) card: RefCell<Option<(u64, std::sync::Arc<crate::guide::GuideCard>)>>,
     /// Where the guide was painted on the assistant's Guide tab in the last frame.
@@ -147,6 +150,7 @@ impl GuideUi {
             pending_show: None,
             show_answer: None,
             stepped: false,
+            reveal: false,
             card: RefCell::new(None),
             tab_area: Cell::new(None),
             review: super::guide_review::GuideReviewState::default(),
@@ -995,6 +999,9 @@ impl ReviewSurface {
 
     /// The review's guide actions (keys that work from every pane). `None` for other actions.
     pub(super) fn guide_action(&mut self, action: &str, host: &UiContext) -> Option<Action> {
+        if let Some(done) = self.guide_share_action(action, host) {
+            return Some(done);
+        }
         Some(match action {
             "guide_toggle" => self.guide_toggle(),
             "guide_next" => self.guide_step(true, host),
@@ -1084,7 +1091,7 @@ impl ReviewSurface {
             "guide_cite_next" | "guide_cite_previous" => {
                 self.guide_cite(action == "guide_cite_next", host);
             }
-            "guide_copy" => self.guide_copy(),
+            "guide_copy" => self.guide_copy_markdown(true),
             "guide_refresh" => return Some(self.guide_refresh(false, host)),
             "guide_refresh_stale" => return Some(self.guide_refresh(true, host)),
             "guide_versions" => return Some(self.open_guide_versions()),
@@ -1175,29 +1182,22 @@ impl ReviewSurface {
         self.guide_show(selected, Some(cite), host);
     }
 
-    /// Copy the current section as markdown.
-    fn guide_copy(&mut self) {
-        let Some(active) = self.guide.state.active.as_ref() else {
-            return;
-        };
-        let Some(entry) = active.current() else {
-            return;
-        };
-        let markdown = bcode_code_review::guide::export::render_markdown(
-            &active.version,
-            &bcode_code_review::guide::export::ExportOptions {
-                title: &active.guide.title,
-                links: bcode_code_review::guide::export::LinkStyle::Relative,
-                include_unverified: true,
-                sections: vec![entry.id.clone()],
-                ..Default::default()
-            },
+    /// Keep the outline and section split as dragged with the review's presentation state.
+    fn keep_guide_split(&mut self) {
+        let share = panel::split_share(
+            &self.guide.split.borrow(),
+            bcode_code_review_models::PANEL_SHARE_SCALE,
         );
-        self.clipboard = Some((markdown, "guide section"));
+        if let Some(share) = share
+            && self.panels.set_guide_outline_share(share)
+        {
+            self.persist_panels();
+        }
     }
 
     /// Apply the clicks the panel collected.
     pub(super) fn after_guide_event(&mut self, host: &UiContext) -> bool {
+        self.keep_guide_split();
         let clicks: Vec<PanelClick> = self.guide.clicks.borrow_mut().drain(..).collect();
         let changed = !clicks.is_empty();
         for click in clicks {

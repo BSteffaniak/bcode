@@ -40,7 +40,7 @@ pub(super) struct Cited {
 /// A CJK and emoji title, to check cell-aware fitting.
 const WIDE_TITLE: &str = "変更された行 🚀 RetryBudget";
 
-fn section(id: &str, kind: SectionKind, title: &str, citations: &[&str]) -> Section {
+pub(super) fn section(id: &str, kind: SectionKind, title: &str, citations: &[&str]) -> Section {
     Section {
         id: id.to_owned(),
         kind,
@@ -55,7 +55,7 @@ fn section(id: &str, kind: SectionKind, title: &str, citations: &[&str]) -> Sect
     }
 }
 
-fn citation(
+pub(super) fn citation(
     id: &str,
     file: &FileRef,
     lines: (u32, u32),
@@ -289,7 +289,7 @@ fn guided_with(
     (setup, cited, fixture)
 }
 
-fn area(scenario: &Scenario<ReviewSurface>, id: &str) -> Option<Rect> {
+pub(super) fn area(scenario: &Scenario<ReviewSurface>, id: &str) -> Option<Rect> {
     scenario.surface().body_area(id)
 }
 
@@ -318,7 +318,7 @@ fn cursor_line(scenario: &Scenario<ReviewSurface>) -> Option<(FileRef, u32)> {
 }
 
 /// Hits of the guide panel's content.
-fn guide_hits(screen: &Screen) -> Vec<(String, Rect)> {
+pub(super) fn guide_hits(screen: &Screen) -> Vec<(String, Rect)> {
     screen
         .hits()
         .iter()

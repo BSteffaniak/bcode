@@ -117,6 +117,9 @@ impl ReviewSurface {
         }
         // What is being written shows: the current version, not an older one being read.
         self.guide.view = None;
+        if started || self.guide.state.active.is_none() {
+            self.guide.reveal = true;
+        }
         self.reload_guide();
         if started {
             self.guide.state.engaged = true;
@@ -160,6 +163,12 @@ impl ReviewSurface {
     /// Whether a guide jump happened since the last call.
     pub const fn take_guide_stepped(&mut self) -> bool {
         std::mem::replace(&mut self.guide.stepped, false)
+    }
+
+    /// Whether a guide was started (or its first section arrived) since the last call, once a
+    /// guide is on screen to show; until then it stays pending.
+    pub const fn take_guide_reveal(&mut self) -> bool {
+        self.guide.state.active.is_some() && std::mem::replace(&mut self.guide.reveal, false)
     }
 
     /// Open the guide panel and give it the keyboard (a guide card's Open, when it docks).

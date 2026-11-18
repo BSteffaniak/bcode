@@ -315,7 +315,8 @@ fn ai_answers_follow_up_copy_suggest_draft_and_decide_suggestions() {
             "ai_summarize",
             "ask",
             "guide_walkthrough",
-            "guide_walkthrough_directions"
+            "guide_walkthrough_directions",
+            "guide_walkthrough_template"
         ]
     );
     setup.scenario.key("enter");

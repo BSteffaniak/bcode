@@ -644,6 +644,31 @@ the review's only forge repository when it has one; others render as `path:12-40
 their tokens are left out. Writing a file goes through the markdown file publisher with an output
 path inside the repository, so write-path rules apply.
 
+On the review screen:
+
+* **Copy.** `y` in the guide panel copies the current section and the palette's `Guide: Copy as
+  markdown` the whole version, both with permalinks for GitHub pull request, stack layer and
+  stack sources.
+* **Export to file.** `Guide: Export to file` writes the same markdown to
+  `.bcode/guides/<guide>-v<N>.md` through the built-in `markdown_file` publisher, given the
+  document as its `document` option. With a document the publisher writes only inside the
+  repository: the output path must be relative, without `..`, and must not lead outside through
+  a symbolic link; the status line says where it went.
+* **Templates.** `Guide: walk me through this review, with a template…` (also in the AI menu)
+  lists the built-in and configured templates with the sections each requires; choosing one puts
+  "Walk me through this review using the `<name>` template. Directions: " in the assistant's
+  input, and the assistant passes the template to `plan` and `start`. Lint reports a template's
+  missing required sections with every write; `freeform` is complete with purpose alone. A guide
+  written with `explain` (the default for file-set and repository reviews) cites lines as in
+  review or outside review, and the panel's banner says `explaining files (no diff)`.
+* **Opening the guide.** Clicking the header's `Guide 3/9` pill opens the guide: its panel where
+  the body has room, else the assistant's Guide tab. Starting a guide (or its first section
+  arriving) where the panel has no room switches the assistant to its Guide tab; the Chat tab
+  keeps its dot while the conversation needs the reviewer.
+* **Outline split.** The dragged split between the outline and the current section is kept with
+  the review's presentation state (`guide_outline_share`, a share of the rows the two share) and
+  restored when the review opens again.
+
 ## Status
 
 | Phase | Scope | Built |
@@ -655,7 +680,7 @@ path inside the repository, so write-path rules apply.
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | Yes |
 | P6 | Freshness in the UI, refresh forks, versions picker, since guides | Yes |
 | P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | No |
-| P8 | Templates and lint, export to file | No |
+| P8 | Templates and lint, `explain` and `freeform`, copy and export to file as markdown | Yes |
 
 The app sets grants: expand (`Expand`) and restructure (`Restructure`) bind the assistant's
 conversation for one message, ask sessions are bound with `Ask`, and refresh (`Refresh`) and

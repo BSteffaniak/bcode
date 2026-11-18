@@ -389,6 +389,12 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.guide_versions_list", scope = "code-review", description = "Guide: versions…", defaults = [
     ] },
+    { id = "bcode.code_review.guide_walkthrough_template", scope = "code-review", description = "Guide: walk me through this review, with a template…", defaults = [
+    ] },
+    { id = "bcode.code_review.guide_copy_all", scope = "code-review", description = "Guide: Copy as markdown", defaults = [
+    ] },
+    { id = "bcode.code_review.guide_export", scope = "code-review", description = "Guide: Export to file", defaults = [
+    ] },
     { id = "bcode.code_review.guide_down", scope = "code-review-guide", description = "Next section", defaults = [
         "j",
         "down",

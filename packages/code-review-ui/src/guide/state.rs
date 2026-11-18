@@ -441,17 +441,26 @@ impl ActiveGuide {
                 hint(&self.keys.versions, "versions"),
             )));
         }
-        (!self.stale.is_empty()).then(|| {
+        if !self.stale.is_empty() {
             let count = self.stale.len();
-            Banner::problem(format!(
+            return Some(Banner::problem(format!(
                 "{count} section{} stale since {}{}{}{}",
                 if count == 1 { "" } else { "s" },
                 self.pinned_label(),
                 hint(&self.keys.refresh, "refresh"),
                 hint(&self.keys.refresh_stale, "refresh stale"),
                 hint(&self.keys.versions, "versions"),
-            ))
-        })
+            )));
+        }
+        self.explains_files()
+            .then(|| Banner::note("explaining files (no diff)".to_owned()))
+    }
+
+    /// Whether the version explains files rather than a diff (the `explain` template, for
+    /// file-set and repository reviews).
+    #[must_use]
+    pub fn explains_files(&self) -> bool {
+        self.version.origin.template.as_deref() == Some("explain")
     }
 
     /// The code the version is pinned to, briefly: its first source's label and head

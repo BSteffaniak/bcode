@@ -474,4 +474,48 @@ mod tests {
         );
         assert!(!markdown.contains("2. "), "{markdown}");
     }
+
+    #[test]
+    fn github_pull_request_sources_link_to_their_repository() {
+        let source = |id: &str, kind: ReviewSourceKind| ReviewSource {
+            id: id.to_owned(),
+            kind,
+            label: id.to_owned(),
+            included: true,
+        };
+        let repositories = forge_repositories(&[
+            source(
+                "pr",
+                ReviewSourceKind::PullRequest {
+                    provider: "github".to_owned(),
+                    repository: "o/r".to_owned(),
+                    number: 7,
+                },
+            ),
+            source(
+                "layer",
+                ReviewSourceKind::StackLayer {
+                    provider: "github".to_owned(),
+                    repository: "o/s".to_owned(),
+                    number: 8,
+                },
+            ),
+            source(
+                "elsewhere",
+                ReviewSourceKind::PullRequest {
+                    provider: "gitlab".to_owned(),
+                    repository: "o/r".to_owned(),
+                    number: 9,
+                },
+            ),
+            source("commit", ReviewSourceKind::LastCommit),
+        ]);
+        assert_eq!(
+            repositories,
+            BTreeMap::from([
+                ("layer".to_owned(), "https://github.com/o/s".to_owned()),
+                ("pr".to_owned(), "https://github.com/o/r".to_owned()),
+            ])
+        );
+    }
 }

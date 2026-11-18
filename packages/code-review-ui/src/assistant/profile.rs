@@ -410,7 +410,9 @@ versioned walkthrough of the review that the app shows beside the diff and steps
 one with the guide tools: code_review.guide.plan first (it says whether one writer suffices and \
 what depth asks for); then code_review.guide.start with the planned outline (purpose, scope, \
 reading_order with one step per stop in the diff, then only the adaptive sections the change \
-has evidence for) and the user's directions in `directions` (what to focus on or skip); then one \
+has evidence for) and the user's directions in `directions` (what to focus on or skip), and \
+the template the user names (\"using the security template\") in `template` for plan and start, \
+whose required sections the outline must have; then one \
 code_review.guide.write per section (put_section with its body and citations), so the reviewer \
 sees sections fill in; finally set_status complete. Cite every claim with exact lines and a \
 short `quote` copied from them; when a write reports citation problems, fix the citation with \

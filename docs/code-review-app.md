@@ -860,6 +860,9 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `backspace` | Guide: jump back to where the last guide jump left |
 | (palette, AI menu) | Guide: walk me through this review |
 | (palette, AI menu) | Guide: walk me through this review, with directions… |
+| (palette, AI menu) | Guide: walk me through this review, with a template… |
+| (palette) | Guide: Copy as markdown |
+| (palette) | Guide: Export to file |
 | `ctrl+k` | Ask AI: open, focus, or close the review assistant |
 | `c` | Comment on the line, range, or file (reply on a thread) |
 | `a` | Ask Bcode about the line, range, or file |

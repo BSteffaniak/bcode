@@ -19,6 +19,7 @@ mod guide;
 mod guide_assistant;
 mod guide_review;
 mod guide_lifecycle;
+mod guide_share;
 mod interaction;
 mod parity;
 mod publish;

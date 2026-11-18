@@ -303,6 +303,15 @@ impl ReviewApp {
         }
     }
 
+    /// The review, while shown, to change.
+    #[cfg(test)]
+    pub fn review_mut(&mut self) -> Option<&mut ReviewSurface> {
+        match &mut self.route {
+            Route::Review(review) => Some(review),
+            _ => None,
+        }
+    }
+
     /// The failure of the opening route, while shown.
     #[must_use]
     pub fn opening_error(&self) -> Option<&str> {
@@ -1616,6 +1625,18 @@ impl ReviewApp {
                 crate::assistant::LinkRequest::Effort(target) => {
                     self.assistant.cycle_effort(&target, host);
                 }
+                crate::assistant::LinkRequest::OpenGuide => {
+                    let docked = self.screen_shown;
+                    if let Route::Review(review) = &mut self.route {
+                        if docked && review.guide_docks() {
+                            review.open_guide_panel();
+                        } else {
+                            self.assistant.focus();
+                            self.share_guide(false);
+                            self.assistant.show_guide_tab();
+                        }
+                    }
+                }
                 crate::assistant::LinkRequest::Message { text, send } => {
                     self.assistant.focus();
                     if send {
@@ -1650,8 +1671,9 @@ impl ReviewApp {
     }
 
     /// Give the assistant the review's guide: its card, and the Chat and Guide tabs when the
-    /// screen (`screen_shown`) has no room to dock the guide panel. A guide jump shows the Guide
-    /// tab when the tabs show.
+    /// screen (`screen_shown`) has no room to dock the guide panel. A guide jump, or a guide just
+    /// started, shows the Guide tab when the tabs show; the Chat tab keeps its dot while the
+    /// conversation needs the reviewer.
     fn share_guide(&mut self, screen_shown: bool) {
         let Route::Review(review) = &mut self.route else {
             self.assistant.set_guide(None, false);
@@ -1659,7 +1681,9 @@ impl ReviewApp {
         };
         let tabs = review.has_guide() && (!screen_shown || !review.guide_docks());
         self.assistant.set_guide(review.guide_card(), tabs);
-        if review.take_guide_stepped() && tabs {
+        let stepped = review.take_guide_stepped();
+        let revealed = review.take_guide_reveal();
+        if (stepped || revealed) && tabs {
             self.assistant.show_guide_tab();
         }
     }

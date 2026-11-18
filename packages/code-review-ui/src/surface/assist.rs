@@ -849,7 +849,11 @@ impl ReviewSurface {
             .map(|command| command.action())
             .collect();
         actions.push("ask");
-        actions.extend(["guide_walkthrough", "guide_walkthrough_directions"]);
+        actions.extend([
+            "guide_walkthrough",
+            "guide_walkthrough_directions",
+            "guide_walkthrough_template",
+        ]);
         let entries = Self::menu_entries(&actions, host);
         self.overlay = Some(Overlay::new(OverlayKind::Menu, entries, &self.theme));
     }

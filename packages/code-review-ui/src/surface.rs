@@ -164,6 +164,7 @@ mod guide;
 mod guide_assist;
 mod guide_review;
 mod guide_lifecycle;
+mod guide_share;
 mod history;
 mod pointer;
 mod reconcile;
@@ -991,6 +992,12 @@ impl ReviewSurface {
         }
         if let Some(state) = &workspace.presentation {
             self.panels = Panels::restore(&state.panels);
+            if let Some(share) = self.panels.guide_outline_share() {
+                *self.guide.split.borrow_mut() = crate::guide::panel::split_state_at(
+                    share,
+                    bcode_code_review_models::PANEL_SHARE_SCALE,
+                );
+            }
             self.layer_positions.clone_from(&state.layer_positions);
             self.folds.hand.clone_from(&state.thread_folds);
             for thread_id in &state.collapsed_threads {
@@ -2151,6 +2158,7 @@ impl ReviewSurface {
             Message::GuideStopped(result) => self.guide_stop_written(result),
             Message::GuideReview(done) => self.guide_review_done(*done),
             Message::GuideLifecycle(done) => self.apply_guide_lifecycle(*done),
+            Message::GuideExported(result) => self.guide_exported(result),
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -3666,8 +3674,33 @@ impl ReviewSurface {
         hit
     }
 
+    /// The `Guide 3/9` pill in the header: a click opens the guide (its panel where the body
+    /// has room, else the assistant's Guide tab).
+    fn header_guide_click(&mut self, event: &Event) -> bool {
+        let Event::Mouse(mouse) = event else {
+            return false;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let position = mouse.position;
+        let hit = self.header.as_ref().is_some_and(|(row, plan)| {
+            plan.area(HeaderPart::Guide).is_some_and(|part| {
+                Rect::new(row.x + part.x, row.y, part.width, 1).contains(position)
+            })
+        });
+        if hit {
+            self.guide.state.engaged = true;
+            self.guide.state.bump();
+            self.link
+                .requests
+                .push(crate::assistant::LinkRequest::OpenGuide);
+        }
+        hit
+    }
+
     fn publish_input(&mut self, event: &Event, host: &UiContext) -> Action {
-        if self.header_threads_click(event) {
+        if self.header_threads_click(event) || self.header_guide_click(event) {
             return Action::Redraw;
         }
         let Some((row, plan)) = &self.header else {
