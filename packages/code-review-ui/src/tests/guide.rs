@@ -745,6 +745,79 @@ fn the_panel_fits_every_width_and_registers_hits_only_for_painted_rows() {
     }
 }
 
+#[test]
+fn fan_out_rows_fit_every_size_drop_before_the_outline_and_keep_hits_on_painted_rows() {
+    use crate::guide::fanout::{AreaRow, FanOutView, progress_rows};
+    use bcode_code_review_models::GuideAreaStatus;
+    let (setup, _, _fixture) = guided(150, 40);
+    let guide = setup.scenario.surface().guide().expect("guide").clone();
+    let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+    let view = FanOutView {
+        areas: vec![
+            AreaRow {
+                title: "crates/変更 🚀 net".to_owned(),
+                status: GuideAreaStatus::Running,
+                tokens: 42_000,
+            },
+            AreaRow {
+                title: "crates/db".to_owned(),
+                status: GuideAreaStatus::Complete,
+                tokens: 7_000,
+            },
+        ],
+        more: 3,
+        done: 1,
+        total: 5,
+        tokens: 49_000,
+        permission: Some("crates/net wants code_review.search_code".to_owned()),
+        ..FanOutView::default()
+    };
+    let mut model = panel::build_model(
+        &guide,
+        &std::collections::BTreeSet::new(),
+        &theme,
+        Placement::Beside,
+        1,
+    );
+    model.progress = progress_rows(&view, &theme, "y/a/n/d");
+    assert_eq!(
+        model.progress.len(),
+        5,
+        "summary, permission, two areas, more"
+    );
+    for width in [0_u16, 1, 2, 5, 12, 24, 36, 60] {
+        for height in [0_u16, 1, 2, 4, 6, 9, 30] {
+            let screen = panel_screen(&model, true, width, height);
+            for y in 0..height {
+                let row = screen.row_text(y);
+                assert!(
+                    bmux_tui::text_width::display_width(row.trim_end()) <= usize::from(width),
+                    "{width}x{height} row {y}: {row:?}"
+                );
+            }
+            for (id, rect) in &guide_hits(&screen) {
+                assert!(
+                    rect.right() <= width && rect.bottom() <= height,
+                    "{id} {rect:?} outside {width}x{height}"
+                );
+            }
+        }
+    }
+    // Tall: every progress row shows, with the area's tokens at the right; short: progress
+    // rows give way so the section keeps its rows.
+    let tall = panel_screen(&model, true, 60, 30);
+    assert!(tall.contains("areas 1/5"), "{}", tall.text());
+    assert!(
+        tall.contains("y/a/n/d  crates/net wants"),
+        "{}",
+        tall.text()
+    );
+    assert!(tall.contains("writing · 42k tok"), "{}", tall.text());
+    assert!(tall.contains("+3 more areas"), "{}", tall.text());
+    let short = panel_screen(&model, true, 60, 4);
+    assert!(!short.contains("+3 more areas"), "{}", short.text());
+}
+
 fn entry_index(guide: &crate::guide::ActiveGuide, id: &str) -> usize {
     guide
         .entries
