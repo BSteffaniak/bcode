@@ -118,6 +118,36 @@ fn writes_guide(turn: &Turn, card: &GuideCard, session: &str) -> bool {
     writes && !named && card.session.as_deref() == Some(session)
 }
 
+/// A guide card's progress, said briefly, and its style.
+fn card_progress(card: &GuideCard, theme: &ReviewTheme) -> (String, bmux_tui::style::Style) {
+    let icons = &theme.icons;
+    match card.status {
+        CardStatus::Writing => (
+            format!("{} writing {}/{}", icons.running, card.written, card.total),
+            theme.badge_draft,
+        ),
+        CardStatus::Finishing => (format!("{} finishing…", icons.running), theme.badge_draft),
+        CardStatus::Complete => (
+            format!(
+                "{} {} section{}",
+                icons.viewed,
+                card.total,
+                if card.total == 1 { "" } else { "s" }
+            ),
+            theme.badge_resolved,
+        ),
+        CardStatus::Stopped => (
+            format!("stopped · {}/{} written", card.written, card.total),
+            theme.muted,
+        ),
+        CardStatus::Failed => (
+            format!("failed · {}/{} written", card.written, card.total),
+            theme.error,
+        ),
+        CardStatus::OtherVersion => ("not the version shown".to_owned(), theme.muted),
+    }
+}
+
 /// The version of guide `card` that `turn` wrote: the last version its guide writes report
 /// (each start and write answers with the version it wrote), else the version a write names,
 /// else the card's own version.
@@ -501,31 +531,7 @@ impl Card<'_> {
     fn guide_card(&mut self, card: &GuideCard) {
         let theme = self.theme;
         let icons = &theme.icons;
-        let (status, style) = match card.status {
-            CardStatus::Writing => (
-                format!("{} writing {}/{}", icons.running, card.written, card.total),
-                theme.badge_draft,
-            ),
-            CardStatus::Finishing => (format!("{} finishing…", icons.running), theme.badge_draft),
-            CardStatus::Complete => (
-                format!(
-                    "{} {} section{}",
-                    icons.viewed,
-                    card.total,
-                    if card.total == 1 { "" } else { "s" }
-                ),
-                theme.badge_resolved,
-            ),
-            CardStatus::Stopped => (
-                format!("stopped · {}/{} written", card.written, card.total),
-                theme.muted,
-            ),
-            CardStatus::Failed => (
-                format!("failed · {}/{} written", card.written, card.total),
-                theme.error,
-            ),
-            CardStatus::OtherVersion => ("not the version shown".to_owned(), theme.muted),
-        };
+        let (status, style) = card_progress(card, theme);
         let stale_note = (card.stale > 0).then(|| {
             Span::styled(
                 format!(" {} {} stale", icons.guide_stale, card.stale),
@@ -1139,7 +1145,7 @@ mod tests {
         let bound = shown.for_version(turn_version(&older, &shown));
         assert_eq!(bound.version, 1);
         assert_eq!(bound.status, CardStatus::OtherVersion);
-        assert!(bound.sections.is_empty());
+        assert_eq!(bound.sections, Vec::new());
         assert_eq!(
             bound.stale, 0,
             "the counts of the version shown are not claimed"
