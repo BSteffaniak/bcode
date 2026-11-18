@@ -1987,10 +1987,47 @@ fn markdown(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> Vec<Li
     markdown_cut(text, width, max, theme).0
 }
 
+/// How raw HTML in markdown is shown (`[tui.markdown] html`): the
+/// [`bcode_markdown_render::MarkdownHtmlMode`] index, set once configuration loads.
+static MARKDOWN_HTML: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+const MARKDOWN_HTML_MODES: [bcode_markdown_render::MarkdownHtmlMode; 3] = [
+    bcode_markdown_render::MarkdownHtmlMode::Render,
+    bcode_markdown_render::MarkdownHtmlMode::Strip,
+    bcode_markdown_render::MarkdownHtmlMode::Raw,
+];
+
+/// Show raw HTML in every markdown text of the review as `mode`.
+pub fn set_markdown_html(mode: bcode_markdown_render::MarkdownHtmlMode) {
+    let index = MARKDOWN_HTML_MODES
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(0);
+    MARKDOWN_HTML.store(
+        u8::try_from(index).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The configured raw HTML presentation.
+fn markdown_html() -> bcode_markdown_render::MarkdownHtmlMode {
+    MARKDOWN_HTML_MODES
+        .get(usize::from(
+            MARKDOWN_HTML.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Markdown render options for `width` cells under the review's configuration.
+pub(crate) fn markdown_options(width: u16) -> bcode_markdown_render::MarkdownRenderOptions {
+    bcode_markdown_render::MarkdownRenderOptions::new(width).with_html(markdown_html())
+}
+
 /// [`markdown`], and whether rows were elided.
 fn markdown_cut(text: &str, width: usize, max: usize, theme: &ReviewTheme) -> (Vec<Line>, bool) {
     let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
-    let options = bcode_markdown_render::MarkdownRenderOptions::new(width);
+    let options = markdown_options(width);
     let mut lines = bcode_markdown_render::render_markdown(text, &options).lines;
     let cut = lines.len() > max;
     if cut {
@@ -2014,6 +2051,7 @@ struct RenderedMarkdown {
     text: String,
     width: u16,
     streaming: bool,
+    html: bcode_markdown_render::MarkdownHtmlMode,
     lines: std::rc::Rc<[Line]>,
 }
 
@@ -2030,16 +2068,20 @@ thread_local! {
 /// which are shown in full and rebuilt often.
 pub(crate) fn markdown_all_rows(text: &str, width: usize, streaming: bool) -> Vec<Line> {
     let width = u16::try_from(width.max(1)).unwrap_or(u16::MAX);
+    let html = markdown_html();
     let cached = RENDERED_MARKDOWN.with_borrow(|entries| {
         entries
             .iter()
             .find(|entry| {
-                entry.width == width && entry.streaming == streaming && entry.text == text
+                entry.width == width
+                    && entry.streaming == streaming
+                    && entry.html == html
+                    && entry.text == text
             })
             .map(|entry| entry.lines.clone())
     });
     let lines = cached.unwrap_or_else(|| {
-        let mut options = bcode_markdown_render::MarkdownRenderOptions::new(width);
+        let mut options = markdown_options(width);
         options.streaming = streaming;
         let lines: std::rc::Rc<[Line]> = bcode_markdown_render::render_markdown(text, &options)
             .lines
@@ -2052,6 +2094,7 @@ pub(crate) fn markdown_all_rows(text: &str, width: usize, streaming: bool) -> Ve
                 text: text.to_owned(),
                 width,
                 streaming,
+                html,
                 lines: lines.clone(),
             });
         });

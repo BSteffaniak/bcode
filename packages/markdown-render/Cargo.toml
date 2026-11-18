@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_markdown = { workspace = true }
+bmux_markdown = { workspace = true, features = ["html"] }
 
 [dev-dependencies]
 bcode_syntax_render = { workspace = true }

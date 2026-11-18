@@ -19,3 +19,25 @@ fn facade_preserves_shared_type_identity() {
         bcode_markdown_render::MermaidRenderMode::Disabled;
     let _: bmux_markdown::MermaidRenderMode = mode;
 }
+
+#[test]
+fn raw_html_renders_by_default_and_each_mode_is_selectable() {
+    use bcode_markdown_render::{MarkdownHtmlMode, render_markdown_lines};
+    let source = "<!-- note -->\nUse <b>bold</b> and <kbd>Esc</kbd>.";
+    let text = |options: MarkdownRenderOptions| {
+        render_markdown_lines(source, options)
+            .iter()
+            .map(bmux_tui::prelude::Line::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(text(MarkdownRenderOptions::new(40)), "Use bold and Esc.");
+    assert_eq!(
+        text(MarkdownRenderOptions::new(40).with_html(MarkdownHtmlMode::Strip)),
+        "Use bold and Esc."
+    );
+    assert!(
+        text(MarkdownRenderOptions::new(40).with_html(MarkdownHtmlMode::Raw))
+            .contains("<b>bold</b>")
+    );
+}

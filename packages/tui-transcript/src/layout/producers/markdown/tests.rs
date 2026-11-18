@@ -128,6 +128,38 @@ fn details_state_is_scoped_to_the_owning_document() {
     );
 }
 
+#[test]
+fn raw_html_follows_the_configured_presentation() {
+    use bcode_markdown_render::MarkdownHtmlMode;
+    let source = "<!-- template note -->\nPress <kbd>Ctrl</kbd>+<kbd>C</kbd>.\n\n\
+                  <p align=\"center\"><img src=\"https://example.com/demo.png\" alt=\"Demo\"></p>";
+    let request = MarkdownRequest::new(source, 40);
+    let painted = |html| {
+        let mut config = image_config();
+        config.markdown.html = html;
+        let (body, _) = project(&config, &request);
+        paint(&body, &layout(&body, 40)).join("\n")
+    };
+    let rendered = painted(MarkdownHtmlMode::Render);
+    assert!(rendered.contains("Press Ctrl+C."), "{rendered}");
+    assert!(rendered.contains("[image: Demo]"), "{rendered}");
+    assert!(!rendered.contains("template note"), "{rendered}");
+    assert!(!rendered.contains('<'), "{rendered}");
+    // The centered image keeps its reserved visual slot.
+    let mut config = image_config();
+    config.markdown.html = MarkdownHtmlMode::Render;
+    let (body, _) = project(&config, &request);
+    assert!(only_slot(&body, 40).rect.x > 0);
+
+    let stripped = painted(MarkdownHtmlMode::Strip);
+    assert!(stripped.contains("Press Ctrl+C."), "{stripped}");
+    assert!(stripped.contains("Demo"), "{stripped}");
+    assert!(!stripped.contains("[image:"), "{stripped}");
+
+    let raw = painted(MarkdownHtmlMode::Raw);
+    assert!(raw.contains("<kbd>Ctrl</kbd>"), "{raw}");
+}
+
 // ---- asynchronous visuals (L8) -------------------------------------------------------------
 
 const NO_IMAGES: [Rect; 0] = [];

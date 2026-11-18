@@ -659,6 +659,26 @@ pub const ROLES: &[RoleSpec] = &[
         Some(DerivedStyle::fg(BORDER)),
     ),
     role(
+        "markdown.keyboard",
+        RoleCategory::Markdown,
+        "keyboard keys (HTML <kbd>)",
+        Some(DerivedStyle {
+            fg: Some(TEXT),
+            bg: Some(BORDER),
+            modifiers: &[],
+        }),
+    ),
+    role(
+        "markdown.highlight",
+        RoleCategory::Markdown,
+        "highlighted text (HTML <mark>)",
+        Some(DerivedStyle {
+            fg: Some(TEXT),
+            bg: Some("mix(or($warning, $yellow, $accent), $background, 0.4)"),
+            modifiers: &[],
+        }),
+    ),
+    role(
         "markdown.code.text",
         RoleCategory::Markdown,
         "plain code in Markdown code blocks; unset uses syntax.text",

@@ -40,7 +40,9 @@ pub(crate) fn run(markdown: String, styled: bool) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("terminal writer is unavailable"))?,
         Rect::new(0, 0, width.max(1), height.max(1)),
     );
-    let mut pager = Pager::new(markdown, width, height, styled).with_keymap(keymap);
+    let mut pager = Pager::new(markdown, width, height, styled)
+        .with_html(crate::pager::html_mode(config.tui.markdown.html))
+        .with_keymap(keymap);
     pager.draw(&mut terminal)?;
 
     loop {

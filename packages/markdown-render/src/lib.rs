@@ -3,6 +3,9 @@
 //! All parsing, terminal projection, source provenance, and selection behavior is
 //! implemented by `bmux_markdown`. Reexports preserve existing Bcode imports and
 //! the identity of types shared with syntax and Mermaid rendering.
+//!
+//! Raw HTML embedded in Markdown is rendered (BMUX's `html` feature); callers select
+//! the presentation per render with `MarkdownRenderOptions::with_html`.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]

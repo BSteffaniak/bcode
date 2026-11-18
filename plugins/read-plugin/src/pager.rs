@@ -1,4 +1,6 @@
-use bcode_markdown_render::{MarkdownRenderOptions, MarkdownTheme, render_markdown_lines};
+use bcode_markdown_render::{
+    MarkdownHtmlMode, MarkdownRenderOptions, MarkdownTheme, render_markdown_lines,
+};
 #[cfg(test)]
 use bmux_keyboard::KeyCode;
 use bmux_keyboard::KeyStroke;
@@ -49,6 +51,7 @@ pub(crate) struct Pager {
     view_state: Cell<ScrollViewState>,
     presented_layout: RefCell<Option<LayoutNode>>,
     styled: bool,
+    html: MarkdownHtmlMode,
 }
 
 impl Pager {
@@ -66,6 +69,7 @@ impl Pager {
             }),
             presented_layout: RefCell::new(None),
             styled,
+            html: MarkdownHtmlMode::default(),
         };
         pager.render_markdown();
         pager
@@ -84,6 +88,15 @@ impl Pager {
         state.set_vertical_offset(state.vertical_offset().min(self.max_offset()));
         self.view_state.set(state);
         self.presented_layout.replace(None);
+    }
+
+    /// Show raw HTML in the document as `html`.
+    pub(crate) fn with_html(mut self, html: MarkdownHtmlMode) -> Self {
+        if self.html != html {
+            self.html = html;
+            self.render_markdown();
+        }
+        self
     }
 
     pub(crate) fn with_keymap(
@@ -208,7 +221,9 @@ impl Pager {
         };
         self.lines = render_markdown_lines(
             &self.markdown,
-            MarkdownRenderOptions::new(self.width).with_theme(theme),
+            MarkdownRenderOptions::new(self.width)
+                .with_theme(theme)
+                .with_html(self.html),
         );
     }
 
@@ -258,6 +273,15 @@ const fn pager_hint_styles(styled: bool) -> KeyHintBarStyles {
     }
 }
 
+/// The raw HTML presentation configured by `[tui.markdown] html`.
+pub(crate) const fn html_mode(mode: bcode_config::TuiMarkdownHtmlMode) -> MarkdownHtmlMode {
+    match mode {
+        bcode_config::TuiMarkdownHtmlMode::Render => MarkdownHtmlMode::Render,
+        bcode_config::TuiMarkdownHtmlMode::Strip => MarkdownHtmlMode::Strip,
+        bcode_config::TuiMarkdownHtmlMode::Raw => MarkdownHtmlMode::Raw,
+    }
+}
+
 const fn monochrome_theme() -> MarkdownTheme {
     let plain = Style::new();
     MarkdownTheme {
@@ -281,6 +305,8 @@ const fn monochrome_theme() -> MarkdownTheme {
         task_unchecked: plain,
         table_border: plain,
         horizontal_rule: plain,
+        keyboard: plain,
+        highlight: plain,
     }
 }
 

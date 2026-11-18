@@ -826,3 +826,38 @@ fn a_short_comment_offers_no_show_all() {
     assert!(screen.contains("Why this constant?"), "{}", screen.text());
     assert!(!screen.contains("Show all"), "{}", screen.text());
 }
+
+#[test]
+fn a_description_written_from_a_template_renders_its_html() {
+    let fixture = fixture();
+    let provider = FakeProvider::new(fixture.root()).with_conversation(everything());
+    let mut templated = activity();
+    templated.description = "<!-- Describe your change and link the issue. -->\n\
+        <p align=\"center\">\n  <img src=\"https://example.com/demo.png\" alt=\"Demo\" \
+        width=\"200\">\n</p>\n\nPress <kbd>Ctrl</kbd>+<kbd>C</kbd> to copy.<br>\nNext line.\n\n\
+        <details>\n<summary>Notes</summary>\n\nMore **context**.\n\n</details>"
+        .to_owned();
+    provider.set_activity(templated);
+    let backend = Arc::new(TestBackend::default().with_provider(provider));
+    let (_, screen) = open_pull(&backend, &fixture);
+    for shown in [
+        "[image: Demo]",
+        "Press Ctrl+C to copy.",
+        "Next line.",
+        "Notes",
+    ] {
+        assert!(screen.contains(shown), "{shown:?}:\n{}", screen.text());
+    }
+    for hidden in [
+        "<!--",
+        "Describe your change",
+        "<kbd>",
+        "<br>",
+        "<details>",
+        "<summary>",
+        "<img",
+        "<p ",
+    ] {
+        assert!(!screen.contains(hidden), "{hidden:?}:\n{}", screen.text());
+    }
+}

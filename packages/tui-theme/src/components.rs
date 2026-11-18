@@ -295,6 +295,8 @@ fn markdown_theme(
         task_unchecked: role("markdown.task_unchecked", muted),
         table_border: role("markdown.table_border", muted),
         horizontal_rule: role("markdown.horizontal_rule", muted),
+        keyboard: role("markdown.keyboard", defaults.keyboard),
+        highlight: role("markdown.highlight", defaults.highlight),
     }
 }
 

@@ -123,6 +123,8 @@ pub struct MarkdownOptions {
     /// Directory relative local link destinations resolve against (the session's working
     /// directory); without one they stay unresolved and inert.
     pub base_directory: Option<std::path::PathBuf>,
+    /// Presentation of raw HTML embedded in Markdown (`[tui.markdown] html`).
+    pub html: bcode_markdown_render::MarkdownHtmlMode,
 }
 
 impl MarkdownOptions {
@@ -150,10 +152,12 @@ impl MarkdownOptions {
             images,
             visuals: _,
             base_directory,
+            html,
         } = self;
         mermaid.hash(state);
         images.hash(state);
         base_directory.hash(state);
+        html.hash(state);
     }
 }
 

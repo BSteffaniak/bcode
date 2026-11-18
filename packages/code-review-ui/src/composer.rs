@@ -407,7 +407,7 @@ impl Composer {
             } else {
                 bcode_markdown_render::render_markdown(
                     &text,
-                    &bcode_markdown_render::MarkdownRenderOptions::new(inner.max(1)),
+                    &crate::rows::markdown_options(inner.max(1)),
                 )
                 .lines
             };

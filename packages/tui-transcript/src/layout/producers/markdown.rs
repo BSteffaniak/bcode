@@ -525,6 +525,8 @@ pub fn markdown_theme(theme: &ResolvedThemeDefinition) -> MarkdownTheme {
         task_unchecked: role(theme, "markdown.task_unchecked", muted),
         table_border: role(theme, "markdown.table_border", muted),
         horizontal_rule: role(theme, "markdown.horizontal_rule", muted),
+        keyboard: role(theme, "markdown.keyboard", defaults.keyboard),
+        highlight: role(theme, "markdown.highlight", defaults.highlight),
     }
 }
 
@@ -611,7 +613,8 @@ pub fn render_options(
         .with_presentation(markdown_presentation(cx.theme))
         .with_streaming(request.streaming)
         .with_link_destination_fallbacks(true)
-        .with_rich_reserved_rows(image_rows, MERMAID_RESERVED_ROWS);
+        .with_rich_reserved_rows(image_rows, MERMAID_RESERVED_ROWS)
+        .with_html(cx.markdown.html);
     if cx.markdown.mermaid {
         options = options.with_mermaid_contributions(MERMAID_PIXELS.0, MERMAID_PIXELS.1);
     }

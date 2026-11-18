@@ -58,6 +58,28 @@ use bcode_tui_transcript::units::structure::{
 use bcode_tui_transcript::viewport::ScrollbarMode;
 
 use super::TranscriptV2Host;
+
+/// Mermaid, diff viewer, link base directory, and raw HTML presentation.
+type SharedRenderInputs = (
+    bool,
+    TuiDiffViewerConfig,
+    Option<std::path::PathBuf>,
+    bcode_markdown_render::MarkdownHtmlMode,
+);
+
+/// The Markdown raw HTML presentation configured by `[tui.markdown] html`.
+#[must_use]
+pub const fn markdown_html_mode(
+    mode: bcode_config::TuiMarkdownHtmlMode,
+) -> bcode_markdown_render::MarkdownHtmlMode {
+    match mode {
+        bcode_config::TuiMarkdownHtmlMode::Render => {
+            bcode_markdown_render::MarkdownHtmlMode::Render
+        }
+        bcode_config::TuiMarkdownHtmlMode::Strip => bcode_markdown_render::MarkdownHtmlMode::Strip,
+        bcode_config::TuiMarkdownHtmlMode::Raw => bcode_markdown_render::MarkdownHtmlMode::Raw,
+    }
+}
 use crate::app::BmuxApp;
 
 /// The engine scrollbar of the `[tui] transcript_scrollbar` setting (VP4, X6).
@@ -87,9 +109,9 @@ pub struct RenderInputs {
     motion: Option<(bcode_tui_theme::chrome::Motion, bool)>,
     /// Structure inputs last applied.
     structure: Option<StructureInputs>,
-    /// Markdown and diff inputs last applied: Mermaid, diff viewer and the working directory
-    /// relative Markdown links resolve against.
-    shared: Option<(bool, TuiDiffViewerConfig, Option<std::path::PathBuf>)>,
+    /// Markdown and diff inputs last applied: Mermaid, diff viewer, the working directory
+    /// relative Markdown links resolve against, and raw HTML presentation.
+    shared: Option<SharedRenderInputs>,
     /// `<details>` open state by content key (`transcript:<unit>:...`).
     details_open: BTreeMap<String, bool>,
     /// The render configuration must be rebuilt (details or visuals changed).
@@ -191,6 +213,7 @@ impl TranscriptV2Host {
             app.tui_config().markdown.mermaid,
             app.effective_diff_viewer_config(),
             app.working_directory().map(std::path::Path::to_path_buf),
+            markdown_html_mode(app.tui_config().markdown.html),
         );
         if self.render.shared.as_ref() != Some(&shared) {
             self.render.shared = Some(shared);
@@ -245,7 +268,7 @@ impl TranscriptV2Host {
     }
 
     fn render_config(&self, theme: Arc<ResolvedThemeDefinition>) -> RenderConfig {
-        let (mermaid, diff, base_directory) = self.render.shared.clone().unwrap_or_default();
+        let (mermaid, diff, base_directory, html) = self.render.shared.clone().unwrap_or_default();
         RenderConfig {
             theme,
             markdown: MarkdownOptions {
@@ -254,6 +277,7 @@ impl TranscriptV2Host {
                 images: true,
                 visuals: self.visuals.accepted().clone(),
                 base_directory,
+                html,
             },
             diff_viewer: diff_viewer_options(diff),
             plugin_visuals: self.render.visuals.clone(),

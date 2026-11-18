@@ -221,6 +221,7 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .color_depth
         .resolve(TerminalCapabilities::detect().color_depth);
     loaded.view.color_depth = Some(color_depth);
+    crate::rows::set_markdown_html(loaded.markdown_html);
     let keymap = crate::keymap::registry(loaded.keybindings.clone())
         .map_err(|error| RunError::Keymap(format!("invalid review keybindings: {error}")))?;
     let mut diagnostics = loaded.diagnostics.clone();

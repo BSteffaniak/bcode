@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, IsTerminal as _};
 use std::path::PathBuf;
 
-use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
+use bcode_markdown_render::{MarkdownHtmlMode, MarkdownRenderOptions, render_markdown_lines};
 use bcode_plugin_sdk::{StaticCliFuture, StaticCliOutcome, StaticCliRegistration};
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 
@@ -71,7 +71,12 @@ fn run(cli: ReadCli) -> io::Result<()> {
     } else {
         80
     };
-    let lines = render_markdown_lines(&markdown, MarkdownRenderOptions::new(width));
+    // Configuration only refines presentation; reading never fails because of it.
+    let html = bcode_config::load_config().map_or_else(
+        |_| MarkdownHtmlMode::default(),
+        |config| crate::pager::html_mode(config.tui.markdown.html),
+    );
+    let lines = render_markdown_lines(&markdown, MarkdownRenderOptions::new(width).with_html(html));
     crate::output::write_lines(&mut std::io::stdout().lock(), &lines, styled)
 }
 

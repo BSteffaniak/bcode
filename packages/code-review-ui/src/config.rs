@@ -16,6 +16,8 @@
 //!   every saved one.
 //! * `[tui.diff_viewer]` — bcode's diff layout preference, which the review follows unless its
 //!   own table sets a layout ([`view`]).
+//! * `[tui.markdown] html` — how raw HTML in Markdown (descriptions, comments, answers) is shown:
+//!   `render` (the default), `strip`, or `raw`, as everywhere else in bcode.
 //!
 //! Files are discovered and composed by `bcode_config_layers`, the same policy bcode uses.
 
@@ -144,6 +146,8 @@ pub struct LoadedConfig {
     pub state_file: PathBuf,
     /// Terminal color depth from `[tui] color_depth`.
     pub color_depth: ColorDepthChoice,
+    /// Presentation of raw HTML in Markdown, from `[tui.markdown] html`.
+    pub markdown_html: bcode_markdown_render::MarkdownHtmlMode,
     /// Whether `[plugins] disabled` lists the code review plugin.
     pub plugin_disabled: bool,
     /// Problems found while loading; defaults are used for affected sections.
@@ -345,6 +349,14 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
             ),
         }
     }
+    if let Some(html) = lookup(bcode, &["tui", "markdown", "html"]) {
+        match html.as_str().and_then(markdown_html_mode) {
+            Some(mode) => loaded.markdown_html = mode,
+            None => loaded
+                .diagnostics
+                .push("tui.markdown.html: expected render, strip or raw".to_owned()),
+        }
+    }
     if let Some(theme) = lookup(bcode, &["tui", "theme"]) {
         match ThemePreferences::from_toml(theme) {
             Ok(theme) => loaded.theme = theme,
@@ -361,6 +373,17 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
         }
     }
     loaded
+}
+
+/// The raw HTML presentation named `name`, as bcode spells it.
+fn markdown_html_mode(name: &str) -> Option<bcode_markdown_render::MarkdownHtmlMode> {
+    use bcode_markdown_render::MarkdownHtmlMode;
+    Some(match name {
+        "render" => MarkdownHtmlMode::Render,
+        "strip" => MarkdownHtmlMode::Strip,
+        "raw" => MarkdownHtmlMode::Raw,
+        _ => return None,
+    })
 }
 
 /// The review's own theme settings (`[plugins.config."bcode.code_review".theme]`); each set
@@ -563,6 +586,30 @@ mod tests {
         assert_eq!(loaded.theme.name, "nord");
         assert_eq!(loaded.theme.overlays, ["high-contrast"]);
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+    }
+
+    #[test]
+    fn markdown_html_follows_bcode_and_defaults_to_render() {
+        use bcode_markdown_render::MarkdownHtmlMode;
+        let load = |source: &str| from_table(&table(source), PathBuf::from("/config"));
+        assert_eq!(load("").markdown_html, MarkdownHtmlMode::Render);
+        for (name, mode) in [
+            ("render", MarkdownHtmlMode::Render),
+            ("strip", MarkdownHtmlMode::Strip),
+            ("raw", MarkdownHtmlMode::Raw),
+        ] {
+            let loaded = load(&format!("[tui.markdown]\nhtml = \"{name}\"\n"));
+            assert_eq!(loaded.markdown_html, mode);
+            assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        }
+        let loaded = load("[tui.markdown]\nhtml = \"pretty\"\n");
+        assert_eq!(loaded.markdown_html, MarkdownHtmlMode::Render);
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("tui.markdown.html"))
+        );
     }
 
     #[test]
