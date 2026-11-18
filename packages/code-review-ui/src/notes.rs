@@ -288,7 +288,12 @@ pub struct ReviewNotes {
     running: Option<Mutation>,
     next_local: u64,
     revision: u64,
+    /// Threads of the drafts saved lately, by the local id they were added under.
+    saved_threads: std::collections::BTreeMap<String, String>,
 }
+
+/// Saved drafts whose threads are remembered by local id.
+const MAX_SAVED_THREADS: usize = 64;
 
 impl ReviewNotes {
     /// Changes whenever any annotation changed (rows showing annotations key on it).
@@ -718,6 +723,13 @@ impl ReviewNotes {
 
     /// Add a draft at once and queue its save. A reply joins `thread_id`; a new thread gets a
     /// local thread id until saved. Returns the local comment id.
+    /// The thread a draft added as `local` was saved under, once saved (the most recent
+    /// saves are remembered).
+    #[must_use]
+    pub fn saved_thread(&self, local: &str) -> Option<&str> {
+        self.saved_threads.get(local).map(String::as_str)
+    }
+
     pub fn add_draft(
         &mut self,
         anchor: DraftAnchor,
@@ -928,6 +940,11 @@ impl ReviewNotes {
         match (mutation, result) {
             (Mutation::Save { local, .. }, MutationResult::Saved(saved)) => {
                 let saved = *saved;
+                if self.saved_threads.len() >= MAX_SAVED_THREADS {
+                    self.saved_threads.pop_first();
+                }
+                self.saved_threads
+                    .insert(local.clone(), saved.thread_id.clone());
                 let local_thread = self
                     .drafts
                     .iter()

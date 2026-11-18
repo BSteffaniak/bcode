@@ -162,6 +162,7 @@ mod find;
 mod flows;
 mod guide;
 mod guide_assist;
+mod guide_review;
 mod history;
 mod pointer;
 mod reconcile;
@@ -181,6 +182,7 @@ pub use feed::FEED_SCOPE;
 pub use flows::Modal;
 pub use guide::{GUIDE_PANE_ID, GUIDE_SCOPE, PEEK_ID};
 pub use guide_assist::{GUIDE_TAB_VIEW_ID, GuideShowOutcome, WALKTHROUGH, WALKTHROUGH_DIRECTIONS};
+pub use guide_review::GuideReviewDone;
 pub use review_tools::{REVIEW_LIST_TOOLS, ToolsResult};
 
 pub use find::{SearchState, ThreadsFilter};
@@ -2145,6 +2147,7 @@ impl ReviewSurface {
             Message::Guide { generation, result } => self.apply_guide(generation, result),
             Message::Peek { citation, result } => self.apply_peek(&citation, result),
             Message::GuideStopped(result) => self.guide_stop_written(result),
+            Message::GuideReview(done) => self.guide_review_done(*done),
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -5729,6 +5732,7 @@ impl View for ReviewSurface {
         }
         self.refresh_search();
         self.update_viewed_marks();
+        self.sync_guide_review(host);
         self.persist_presentation(false);
         let before = self.outstanding_requests();
         self.pump(host);

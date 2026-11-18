@@ -59,6 +59,9 @@ pub enum Message {
     },
     /// How many guide versions a stopped turn was writing were marked stopped, or why not.
     GuideStopped(Result<usize, String>),
+    /// A guide review action (reviewed, comment, expand, ask, promote, discard,
+    /// restructure) finished.
+    GuideReview(Box<super::surface::GuideReviewDone>),
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

@@ -345,6 +345,8 @@ outcome), in which case the id is shared.
   does not require permission), under their own permission category `code_review.guide`; an
   exact-name rule such as `"code_review.guide.write" = "ask"` asks. The `build` agent is offered
   them; the read-only `plan` agent is not.
+* In the review assistant, guide writes are their own tool category, `guides` (chip `§ guides`),
+  on by default; turning review writes off for a conversation leaves them.
 * Every guide call declares what it reads, so read rules apply: `guide.write` and `guide.check`
   the files their citations name, `guide.start` and `guide.plan` the configured context files
   (an invocation reads only the context files its preparation declared), `search_code` its
@@ -447,9 +449,9 @@ written through the plugin tools.
   goes to the next section not reviewed; `'` shows the section citing the line at the cursor;
   `backspace` jumps back. The `code-review-guide` focus scope moves (`j` / `k`), shows the
   section and its first citation (`enter`), folds (`space`), steps citations (`]` / `[`), and
-  copies the section as markdown (`y`). Its keys for reviewed, expand, ask, draft comment,
-  promote, discard, refresh, restructure, and versions are reserved for the review actions and
-  say so until those are built.
+  copies the section as markdown (`y`). Its review action keys are
+  listed under [Review actions](#review-actions); refresh and versions are reserved and say so
+  until they are built.
 * **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
   `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
   review theme's tiers.
@@ -483,15 +485,46 @@ The review assistant writes a guide with one agent (see
 
 ## Review actions
 
-* **Reviewed** marks a section with its citation fingerprint. Files whose changed hunks are all
-  covered by reviewed sections become viewed through the ordinary viewed path
-  (`guide.mark_files_viewed`), and a section counts as reviewed when all its cited in-diff files
-  are viewed.
-* **Finding to comment** opens the comment composer on the finding's first in-diff citation,
-  prefilled with its text, kind and severity, and links the draft thread back.
-* **Expand** and **ask** add provisional content under one section; **promote** makes it written;
-  **discard** hides it. **Restructure** is the only path that grants restructuring, and writes a
-  new version.
+Keys of the `code-review-guide` scope; an older version is read-only and says so.
+
+* **Reviewed** (`v`) marks the current section with its citations' fingerprint (pressed again,
+  it un-reviews it). The files it marks viewed go through the ordinary viewed path, so they are
+  saved with the review and sync with home and other clients; `guide.mark_files_viewed` chooses
+  them (`guide::coverage`): `covered` (default) marks a cited in-diff file once every added and
+  removed line of its diff falls in ranges the reviewed sections cite on that side, `cited`
+  marks every in-diff file a reviewed section cites, `never` none. A section also counts as
+  reviewed when every in-diff file it cites is viewed. Un-viewing a file (from anywhere)
+  clears the marks of the sections citing it, and un-reviewing a section reviewed only through
+  its viewed files un-views them. A mark whose fingerprint no longer matches (the cited code
+  changed) does not count.
+* **Next unreviewed** (`n` in the panel, `alt+u` anywhere) steps to the next written section
+  not reviewed and shows its first citation.
+* **Finding to comment** (`c`) opens the comment composer on the current section's first
+  finding not drafted yet, at its first in-diff citation (at the review otherwise), prefilled
+  with its text, its kind (risk and suggestion as a finding thread, question, note) and
+  severity. Once the draft is saved, its thread is recorded on the finding
+  (`drafted_thread_id`), which shows `drafted → thread`.
+* **Expand** (`e`) sends "Expand §n …" to the assistant's conversation with the section (its
+  markdown and citations) as a `guide section` context block. For that message the conversation
+  is bound with an `Expand` grant on the section of the version shown; the next ordinary message
+  binds it without a grant again. What it writes is a provisional subsection under the section;
+  nothing else in the guide may change.
+* **Ask** (`a`) opens the question composer. The question goes to a session of its own titled
+  `Guide: §n …`, bound to the review with an `Ask` grant on the section, and is recorded as a
+  guide thread (question, section, session). Follow-ups about the same section go to the same
+  session. The section shows each open thread's question and its answer (the matching turn of
+  the session, followed live), and the threads are read again with the guide, so they stay
+  after reopening.
+* **Promote** (`p`) makes the current provisional section written (the app applies it through
+  the store, revision-checked). On a section with an open answer, it marks the thread promoted
+  and asks its session to write the answer as a cited expansion and promote it.
+* **Discard** (`x`) removes the current provisional section (its id is retired), or hides the
+  section's latest open answer. Neither calls a model.
+* **Restructure** (`shift+r`) asks for directions in the composer, forks the next version as a
+  copy of the version shown (`based_on` it, generating, with the directions in its origin),
+  makes it current, and sends the directions to the assistant bound with a `Restructure` grant
+  on that new version. The old version is kept unchanged. It is the only path that grants
+  restructuring.
 
 ## Stacks and comparisons
 
@@ -574,15 +607,15 @@ path inside the repository, so write-path rules apply.
 | P2 | Plugin tools, grants in the review assistant binding, configuration and context | Yes |
 | P3 | Read-only guide panel (markdown bodies, draggable outline split, header pill), diff markers, navigation | Yes |
 | P4 | Single-agent generation from the assistant, guide card, tab fallback, stop | Yes |
-| P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | No |
+| P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | Yes |
 | P6 | Freshness in the UI, refresh forks, versions picker, since guides | No |
 | P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | No |
 | P8 | Templates and lint, export to file | No |
 
-Within P1–P4 the app records no guide grant yet: every binding's `guide_grant` is empty, so
-sessions write the versions they started or resumed. The grant checks (a granted session writes
-only its guide and version, narrow writers never replace shared citations) are in place for the
-review actions of P5 and the fan-out children of P7, which set grants. Guide freshness is told in
+The review actions set grants: expand (`Expand`) and restructure (`Restructure`) bind the
+assistant's conversation for one message, and ask sessions are bound with `Ask`. Other sessions
+have no grant and write the versions they started or resumed. Fan-out children (P7) will set
+`Area` grants. Guide freshness is told in
 the panel (badges, tint and moved lines follow the review's current sources, and the peek of a
 moved citation reads the current revision); stale banners, refresh forks and the versions picker
 come with P6.

@@ -1090,6 +1090,9 @@ fn finding_line(
             spans.extend(badge_spans(number, active.citation_look(id).into(), theme));
         }
     }
+    if finding.drafted_thread_id.is_some() {
+        spans.push(Span::styled("  drafted → thread", theme.muted));
+    }
     Line::from_spans(spans)
 }
 

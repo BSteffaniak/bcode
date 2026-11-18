@@ -25,8 +25,9 @@ use bcode_code_review::document::{FileLoad, FileRef, ItemKey, ReviewItem};
 use bcode_code_review::guide::config::Markers;
 use bcode_code_review_models::{
     CitationRelation, GetGuideVersionRequest, GetGuideVersionResponse, GuideScope,
-    ListGuideSectionMarksRequest, ListGuideSectionMarksResponse, ListReviewGuidesRequest,
-    ListReviewGuidesResponse, ResolvedSource, ReviewLineInterval, ReviewLineSide, RevisionRef,
+    ListGuideSectionMarksRequest, ListGuideSectionMarksResponse, ListGuideThreadsRequest,
+    ListReviewGuidesRequest, ListReviewGuidesResponse, ResolvedSource, ReviewLineInterval,
+    ReviewLineSide, RevisionRef,
 };
 use bmux_keyboard::KeyStroke;
 use bmux_tui::geometry::Rect;
@@ -103,6 +104,8 @@ pub(super) struct GuideUi {
     pub(super) card: RefCell<Option<(u64, std::sync::Arc<crate::guide::GuideCard>)>>,
     /// Where the guide was painted on the assistant's Guide tab in the last frame.
     pub(super) tab_area: Cell<Option<Rect>>,
+    /// The review actions' state.
+    pub(super) review: super::guide_review::GuideReviewState,
 }
 
 /// Which guide the next load shows.
@@ -139,6 +142,7 @@ impl GuideUi {
             stepped: false,
             card: RefCell::new(None),
             tab_area: Cell::new(None),
+            review: super::guide_review::GuideReviewState::default(),
         }
     }
 }
@@ -179,6 +183,7 @@ async fn read_guide(
             active: None,
             marks: Vec::new(),
             freshness: None,
+            threads: Vec::new(),
         }));
     };
     let guide_id = chosen.guide.guide_id.clone();
@@ -196,6 +201,7 @@ async fn read_guide(
             active: None,
             marks: Vec::new(),
             freshness: None,
+            threads: Vec::new(),
         }));
     };
     let marks: ListGuideSectionMarksResponse = services
@@ -205,6 +211,15 @@ async fn read_guide(
         })
         .await
         .map_err(|error| error.message)?;
+    let threads = services
+        .call(ListGuideThreadsRequest {
+            repo_path: scope.repo_path.clone(),
+            guide_id: version.version.guide_id.clone(),
+            version: Some(version.version.version),
+        })
+        .await
+        .map_err(|error| error.message)?
+        .threads;
     let data = services.data();
     let repo = scope.repo_path.clone();
     let shown = version.version.clone();
@@ -224,6 +239,7 @@ async fn read_guide(
         active: Some((chosen, version)),
         marks: marks.marks,
         freshness,
+        threads,
     }))
 }
 
@@ -421,7 +437,11 @@ impl ReviewSurface {
         } else {
             Placement::Beside
         };
-        let stamp = (self.guide.state.revision, placement, self.paint_revision);
+        let stamp = (
+            self.guide.state.revision,
+            placement,
+            self.paint_revision ^ self.guide_threads_revision(),
+        );
         if self.guide.model_stamp == Some(stamp) {
             return;
         }
@@ -441,6 +461,13 @@ impl ReviewSurface {
                         self.guide.state.revision,
                     )
                 });
+        let extra = self.guide_review_lines();
+        self.guide.model.detail.extend(extra);
+        self.guide.model.revision = self
+            .guide
+            .model
+            .revision
+            .wrapping_add(self.guide_threads_revision().rotate_left(17));
         let assistant = self
             .action_keys
             .get("assistant_toggle")
@@ -970,13 +997,7 @@ impl ReviewSurface {
             return Some(Action::Redraw);
         }
         let unavailable = match action {
-            "guide_reviewed" => Some("marking sections reviewed"),
-            "guide_expand" => Some("expanding sections"),
-            "guide_ask" => Some("asking about sections"),
-            "guide_comment" => Some("drafting comments from findings"),
-            "guide_promote" | "guide_discard" => Some("provisional sections"),
             "guide_refresh" => Some("refreshing sections"),
-            "guide_restructure" => Some("restructuring the guide"),
             "guide_versions" => Some("guide versions"),
             _ => None,
         };
@@ -990,6 +1011,14 @@ impl ReviewSurface {
             } else {
                 self.no_guide();
             }
+            return Some(Action::Redraw);
+        }
+        let action = if action == "guide_unreviewed" {
+            "guide_next_unreviewed"
+        } else {
+            action
+        };
+        if self.guide_review_key(action, host).is_some() {
             return Some(Action::Redraw);
         }
         match action {

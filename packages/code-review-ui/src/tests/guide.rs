@@ -30,11 +30,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// What the seeded guide cites.
-struct Cited {
+pub(super) struct Cited {
     /// A changed line: its file and new-side line.
-    changed: (FileRef, u32),
+    pub(super) changed: (FileRef, u32),
     /// A line hidden in a gap of a diff file: its file and new-side line.
-    gap: (FileRef, u32),
+    pub(super) gap: (FileRef, u32),
 }
 
 /// A CJK and emoji title, to check cell-aware fitting.
@@ -89,7 +89,7 @@ fn citation(
 }
 
 /// A changed line and a gap line of the open review.
-fn cited(scenario: &Scenario<ReviewSurface>) -> Cited {
+pub(super) fn cited(scenario: &Scenario<ReviewSurface>) -> Cited {
     let doc = scenario.surface().document().expect("document");
     let mut changed = None;
     let mut gap = None;
@@ -119,7 +119,7 @@ fn cited(scenario: &Scenario<ReviewSurface>) -> Cited {
 
 /// Seed a guide for the review: a purpose, a reading order of three steps (a changed line, a
 /// line in a gap, and code outside the review), and a risks section.
-fn seed(setup: &mut Setup, cited: &Cited) {
+pub(super) fn seed(setup: &mut Setup, cited: &Cited) {
     let head = setup
         .scenario
         .surface()
@@ -224,10 +224,25 @@ fn setup_with(
     height: u16,
     markers: Markers,
 ) -> Setup {
-    let backend = Arc::new(TestBackend::default().with_guide_config(GuideConfig {
-        markers,
-        ..GuideConfig::default()
-    }));
+    setup_configured(
+        fixture,
+        width,
+        height,
+        GuideConfig {
+            markers,
+            ..GuideConfig::default()
+        },
+    )
+}
+
+/// A durable review at `width` x `height` with guide configuration `config`.
+pub(super) fn setup_configured(
+    fixture: &crate::testing::fixture::GitFixture,
+    width: u16,
+    height: u16,
+    config: GuideConfig,
+) -> Setup {
+    let backend = Arc::new(TestBackend::default().with_guide_config(config));
     let workspace = ReviewWorkspace {
         id: "guide-review".to_owned(),
         ..ReviewWorkspace::from_target(
@@ -275,7 +290,7 @@ fn area(scenario: &Scenario<ReviewSurface>, id: &str) -> Option<Rect> {
     scenario.surface().body_area(id)
 }
 
-fn entry_of(scenario: &Scenario<ReviewSurface>, id: &str) -> usize {
+pub(super) fn entry_of(scenario: &Scenario<ReviewSurface>, id: &str) -> usize {
     scenario
         .surface()
         .guide()
@@ -283,7 +298,7 @@ fn entry_of(scenario: &Scenario<ReviewSurface>, id: &str) -> usize {
         .expect("section")
 }
 
-fn selected(scenario: &Scenario<ReviewSurface>) -> String {
+pub(super) fn selected(scenario: &Scenario<ReviewSurface>) -> String {
     let guide = scenario.surface().guide().expect("guide");
     guide.entries[guide.selected].id.clone()
 }
@@ -474,7 +489,7 @@ fn alt_down_moves_to_the_cited_line_with_its_tint_and_backspace_returns() {
 }
 
 /// Press `alt+down` until section `id` is the current one.
-fn step_to(scenario: &mut Scenario<ReviewSurface>, id: &str) -> Screen {
+pub(super) fn step_to(scenario: &mut Scenario<ReviewSurface>, id: &str) -> Screen {
     for _ in 0..16 {
         scenario.key("alt+down");
         let screen = stable(scenario);
@@ -619,14 +634,14 @@ fn panel_keys_reserved_for_later_say_so_instead_of_acting_on_the_review() {
         .next()
         .cloned()
         .unwrap();
-    setup.scenario.key("v");
+    setup.scenario.key("r");
     let screen = stable(&mut setup.scenario);
     assert!(screen.contains("not available yet"), "{}", screen.text());
     let doc = setup.scenario.surface().document().unwrap();
     assert!(
         !doc.viewed_state(&first)
             .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed),
-        "`v` in the guide marks no file viewed"
+        "`r` in the guide marks no file viewed"
     );
 }
 

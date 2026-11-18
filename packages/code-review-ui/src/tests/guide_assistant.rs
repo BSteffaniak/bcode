@@ -719,3 +719,82 @@ fn a_second_walkthrough_in_the_same_conversation_is_sent_and_starts_a_new_versio
             .is_some_and(|active| active.version.version == 2)
     });
 }
+
+#[test]
+fn expand_binds_the_conversation_to_the_section_for_that_message_only() {
+    let mut setup = setup(260, 50, true);
+    setup.scenario.key("alt+g");
+    setup.settle();
+    setup.scenario.key("enter");
+    setup.settle();
+    let (session, _) = setup
+        .backend
+        .host()
+        .turns()
+        .last()
+        .cloned()
+        .expect("the walkthrough was sent");
+    let mut turn = Turn::new(&session, crate::surface::WALKTHROUGH);
+    turn.plan_and_start(&mut setup);
+    turn.items.push(super::assistant::answer("Done."));
+    let finished = snapshot(turn.items.clone());
+    setup.deliver(&session, finished);
+    settle_until(&mut setup, "the guide is shown", |setup| {
+        setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .is_some()
+    });
+
+    // Back to the review's guide panel (it kept the keyboard), onto the step, and expand it.
+    setup.scenario.key("esc");
+    setup.settle();
+    for _ in 0..8 {
+        let on_step = setup
+            .app()
+            .review()
+            .and_then(|review| review.guide())
+            .and_then(|guide| guide.current().map(|entry| entry.id == "s3.1"))
+            .unwrap_or(false);
+        if on_step {
+            break;
+        }
+        setup.scenario.key("j");
+        setup.settle();
+    }
+    setup.scenario.key("e");
+    let screen = setup.settle();
+    let turns = setup.backend.host().turns();
+    let (to, request) = turns.last().cloned().expect("sent");
+    assert_eq!(to, session, "into the same conversation");
+    assert!(request.text.starts_with("Expand §3.1"), "{}", screen.text());
+    assert!(
+        request
+            .context
+            .iter()
+            .any(|block| block.label == "guide section" && block.text.contains("s3.1")),
+        "{request:?}"
+    );
+    let grant = setup
+        .binding(&session)
+        .and_then(|binding| binding.guide_grant)
+        .expect("bound with a grant");
+    assert_eq!(
+        grant.mode,
+        bcode_code_review_models::GrantMode::Expand {
+            section_id: "s3.1".to_owned()
+        }
+    );
+
+    // The next ordinary message binds it without one again.
+    setup.scenario.paste("Thanks.");
+    setup.scenario.key("enter");
+    setup.settle();
+    assert_eq!(
+        setup
+            .binding(&session)
+            .and_then(|binding| binding.guide_grant),
+        None
+    );
+}

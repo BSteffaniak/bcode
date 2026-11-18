@@ -110,12 +110,13 @@ impl ReviewSurface {
                 inbox.push(Message::Asked(Box::new(result)));
             }));
         }
-        let sessions: Vec<String> = self
+        let mut sessions: Vec<String> = self
             .notes
             .exchanges()
             .iter()
             .filter_map(|exchange| exchange.session_id.clone())
             .collect();
+        sessions.extend(self.guide_thread_sessions());
         if self
             .agents
             .ensure(host, sessions.iter().map(String::as_str))
@@ -293,8 +294,10 @@ impl ReviewSurface {
         }
         let result = match mode {
             ComposerMode::Comment => {
-                self.notes
-                    .add_draft(anchor.to_draft_anchor(), text, None, Some(classify), now);
+                let local =
+                    self.notes
+                        .add_draft(anchor.to_draft_anchor(), text, None, Some(classify), now);
+                self.guide_comment_drafted(&anchor, local);
                 Ok("draft saved")
             }
             ComposerMode::Reply { thread_id } if remote_reply.is_some() => {
@@ -324,8 +327,11 @@ impl ReviewSurface {
                 .update_draft(&comment_id, text)
                 .map(|()| "comment updated"),
             ComposerMode::Ask => {
-                self.ask_about(&anchor, text, now, thread.as_deref());
-                Ok(ASKING_STATUS)
+                let guided = self.guide_composed(&anchor, text.clone());
+                if guided.is_none() {
+                    self.ask_about(&anchor, text, now, thread.as_deref());
+                }
+                Ok(guided.unwrap_or(ASKING_STATUS))
             }
         };
         match result {

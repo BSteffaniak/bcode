@@ -8,9 +8,9 @@
 use bcode_code_review::document::ItemKey;
 use bcode_code_review::guide::freshness::GuideFreshness;
 use bcode_code_review_models::{
-    Citation, CitationRelation, Freshness, GuideRecord, GuideSectionMark, GuideStatus,
-    GuideVersion, GuideVersionRecord, ReviewGuide, ReviewLineInterval, ReviewLineSide, RevisionRef,
-    Section, SectionKind, SectionState, Verification,
+    Citation, CitationRelation, Freshness, GuideRecord, GuideSectionMark, GuideStatus, GuideThread,
+    GuideThreadStatus, GuideVersion, GuideVersionRecord, ReviewGuide, ReviewLineInterval,
+    ReviewLineSide, RevisionRef, Section, SectionKind, SectionState, Verification,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +42,8 @@ pub struct GuideLoaded {
     pub marks: Vec<GuideSectionMark>,
     /// Whether its citations still match the review, when that could be told.
     pub freshness: Option<GuideFreshness>,
+    /// The ask threads about the version shown, oldest first.
+    pub threads: Vec<GuideThread>,
 }
 
 /// One section of the version shown, in reading order.
@@ -152,6 +154,10 @@ pub struct ActiveGuide {
     pub selected: usize,
     /// The citation of the selected section last shown, by position in its citations.
     pub cite: Option<usize>,
+    /// The ask threads about the version, oldest first.
+    pub threads: Vec<GuideThread>,
+    /// In-diff files the guide cites that the review shows viewed (source id, path).
+    pub viewed: BTreeSet<(String, String)>,
 }
 
 impl ActiveGuide {
@@ -195,7 +201,30 @@ impl ActiveGuide {
             numbers,
             selected: 0,
             cite: None,
+            threads: Vec::new(),
+            viewed: BTreeSet::new(),
         }
+    }
+
+    /// The open ask threads about section `id`, oldest first.
+    pub fn open_threads(&self, id: &str) -> impl Iterator<Item = &GuideThread> {
+        self.threads.iter().filter(move |thread| {
+            thread.section_id == id && thread.status == GuideThreadStatus::Open
+        })
+    }
+
+    /// Whether section `id` is marked reviewed with its citations as they were then.
+    #[must_use]
+    pub fn marked(&self, id: &str) -> bool {
+        let Some(mark) = self.marks.get(id) else {
+            return false;
+        };
+        self.section(id).is_some_and(|section| {
+            bcode_code_review::guide::document::section_fingerprint(
+                section,
+                &self.version.citations,
+            ) == mark.fingerprint
+        })
     }
 
     /// The selected section.
@@ -237,18 +266,15 @@ impl ActiveGuide {
         self.version.version < self.guide.current_version
     }
 
-    /// Whether section `id` is reviewed: marked, with its citations as they were then.
+    /// Whether section `id` is reviewed: marked with its citations as they were then, or
+    /// every in-diff file it cites is viewed.
     #[must_use]
     pub fn reviewed(&self, id: &str) -> bool {
-        let Some(mark) = self.marks.get(id) else {
-            return false;
-        };
-        self.section(id).is_some_and(|section| {
-            bcode_code_review::guide::document::section_fingerprint(
-                section,
-                &self.version.citations,
-            ) == mark.fingerprint
-        })
+        if self.marked(id) {
+            return true;
+        }
+        let files = bcode_code_review::guide::coverage::cited_files(&self.version, id);
+        !files.is_empty() && files.is_subset(&self.viewed)
     }
 
     /// Where citation `id` is, at the lines it moved to when it moved.
@@ -519,8 +545,15 @@ impl GuideState {
             .and_then(|active| active.current().map(|entry| entry.id.clone()));
         self.guides = loaded.guides;
         self.active = loaded.active.map(|(guide, version)| {
+            let viewed = self
+                .active
+                .as_ref()
+                .map(|active| active.viewed.clone())
+                .unwrap_or_default();
             let mut active =
                 ActiveGuide::new(guide.guide, version.version, loaded.marks, loaded.freshness);
+            active.threads = loaded.threads;
+            active.viewed = viewed;
             if let Some(index) =
                 keep.and_then(|id| active.entries.iter().position(|entry| entry.id == id))
             {

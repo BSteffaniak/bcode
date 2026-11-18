@@ -303,7 +303,7 @@ mod tests {
                 MarkFilesViewed::Covered,
                 hunks
             ),
-            [file("a.rs")].into_iter().collect()
+            std::iter::once(file("a.rs")).collect()
         );
         assert_eq!(
             files_to_view(
@@ -330,11 +330,11 @@ mod tests {
     fn un_viewing_a_file_names_the_sections_citing_it() {
         let version = version();
         assert_eq!(
-            sections_citing(&version, &[file("a.rs")].into_iter().collect()),
+            sections_citing(&version, &std::iter::once(file("a.rs")).collect()),
             ["s1", "s2"]
         );
         assert_eq!(
-            sections_citing(&version, &[file("c.rs")].into_iter().collect()),
+            sections_citing(&version, &std::iter::once(file("c.rs")).collect()),
             Vec::<String>::new(),
             "outside-review citations do not count"
         );

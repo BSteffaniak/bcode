@@ -255,7 +255,7 @@ from it, is in [code review assistant](code-review-assistant.md).
 * **Model, effort and permissions.** The chips row also names the model (`● <model> ▾`; `Bcode's
   model (<name>)` until one is chosen), its reasoning effort (`◆ effort <value>`, only for a
   model with effort settings), the permission categories (`✎ review`, `▤ files`, `$ shell`,
-  `⇪ publish`, `→ move`) and `⚒ tools`. `alt+m` (or a click on the model chip) opens a filterable
+  `⇪ publish`, `→ move`, `§ guides`) and `⚒ tools`. `alt+m` (or a click on the model chip) opens a filterable
   picker of the models Bcode offers, Bcode's default first, with each model's context window,
   prices and effort range (a provider that cannot list says why). `shift+tab` cycles the effort,
   wrapping. `alt+p` (or a click on a category chip) turns a category off or on for this
@@ -973,7 +973,14 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `]` | Next citation of the section |
 | `[` | Previous citation of the section |
 | `y` | Copy the section as markdown |
-| `v`, `e`, `a`, `c`, `p`, `x`, `r`, `shift+r`, `shift+v` | Reserved for the review actions (reviewed, expand, ask, draft comment, promote, discard, refresh, restructure, versions); not available yet |
+| `v` | Mark the section reviewed (marks its files viewed), or not |
+| `n` | Next section not reviewed |
+| `c` | Draft a comment from the section's finding |
+| `e` | Ask the assistant to expand the section |
+| `a` | Ask about the section |
+| `p` / `x` | Promote / discard the provisional section or answer |
+| `shift+r` | Restructure the guide as a new version (asks for directions) |
+| `r`, `shift+v` | Reserved for refresh and versions; not available yet |
 | `esc` | Back to the review |
 
 See [Guided review](code-review-guide.md#presentation) for the panel and the diff's citation
@@ -1072,7 +1079,8 @@ bcode's own (`--print-config-paths` lists them in order):
   use, by category, every one `true` by default: `review_reads` (the review read tools, the
   app's `current_view` and `find_pull_requests`), `review_writes` (comments, replies,
   resolution, suggestions, viewed marks, creating, changing and deleting reviews, and the app's
-  `complete_pass`), `publish` (`code_review.publish` and the app's `publish` and
+  `complete_pass`), `guides` (`code_review.guide.start` and `guide.write`, allowed by default),
+  `publish` (`code_review.publish` and the app's `publish` and
   `pull_request_review`), `navigation` (the app's `go_to`, `set_comparison`, `set_view`,
   `refresh` and `open_review`), `file_reads` (`filesystem.read`, `list`,
   `find`, `grep`, `stat`, `exists`), `file_writes` (`filesystem.write`, `edit`, `multi_edit`)
