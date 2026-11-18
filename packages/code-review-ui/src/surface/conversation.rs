@@ -124,6 +124,11 @@ pub struct ConversationUi {
     pub card_clicks: Vec<(String, CardAction)>,
     /// Saves of the pull request threads for the review tools.
     pub thread_saves: conv::ThreadSaves,
+    /// The threads placed last, on every source they place on.
+    pub placed: Vec<(PullKey, PlacedThread)>,
+    /// The placed threads should be saved again for the review tools on the next poll (the
+    /// sources shown changed).
+    pub resave_threads: bool,
     /// Stops the provider watches when the review goes away.
     pub watch_cancel: WatchCancel,
 }
@@ -308,12 +313,9 @@ impl ReviewSurface {
                 if revision != self.talk.data.revision {
                     return;
                 }
-                let config = self.services.conversation_config();
-                let notes = conv::remote_notes(&placed, &self.talk.data, &self.talk.seen, &config);
-                if self.notes.set_remote(notes) {
-                    self.sync_notes();
-                }
-                self.save_pull_threads(&placed, host);
+                self.talk.placed = placed;
+                self.place_notes();
+                self.save_pull_threads(host);
             }
             ConversationMessage::Due => {
                 self.talk.data.due();
@@ -349,13 +351,10 @@ impl ReviewSurface {
         }
     }
 
-    /// Keep the placed pull request threads in the review store, where the review tools read
-    /// them, when they (or where they are kept) changed, or they were read again well after the
-    /// kept read; saves run one at a time, in order.
-    ///
-    /// A thread placed more than once (a stack's pull request shows both in its layer and in the
-    /// whole-stack diff) is kept once, where the review shows it now.
-    fn save_pull_threads(&mut self, placed: &[(PullKey, PlacedThread)], host: &UiContext) {
+    /// The placed threads, each once: a thread placed on more than one source (a stack's pull
+    /// request shows both in its layer and in the whole-stack diff) keeps the placement on a
+    /// source the review shows now, else its first.
+    fn shown_placements(&self) -> Vec<&(PullKey, PlacedThread)> {
         let shown = |placed: &PlacedThread| {
             placed.anchor.source_id.as_deref().is_none_or(|source| {
                 !self
@@ -364,25 +363,48 @@ impl ReviewSurface {
                     .is_some_and(|review| review.doc.source_alternate(source))
             })
         };
-        // Thread id → index into `placed` of the placement kept.
+        // Thread id → index into the placements of the one kept.
         let mut kept: BTreeMap<String, usize> = BTreeMap::new();
-        for (index, (key, thread)) in placed.iter().enumerate() {
+        for (index, (key, thread)) in self.talk.placed.iter().enumerate() {
             let id = bcode_code_review_models::pull_thread_ref(
                 &key.repository,
                 key.number,
                 &thread.thread.id,
             );
             let slot = kept.entry(id).or_insert(index);
-            if !shown(&placed[*slot].1) && shown(thread) {
+            if !shown(&self.talk.placed[*slot].1) && shown(thread) {
                 *slot = index;
             }
         }
         let kept: BTreeSet<usize> = kept.into_values().collect();
-        let threads: Vec<bcode_code_review_models::PullThreadRecord> = placed
+        self.talk
+            .placed
             .iter()
             .enumerate()
             .filter(|(index, _)| kept.contains(index))
             .map(|(_, entry)| entry)
+            .collect()
+    }
+
+    /// Show the placed threads in the document, each once ([`Self::shown_placements`]).
+    pub(super) fn place_notes(&mut self) {
+        let config = self.services.conversation_config();
+        let placed: Vec<(PullKey, PlacedThread)> =
+            self.shown_placements().into_iter().cloned().collect();
+        let notes = conv::remote_notes(&placed, &self.talk.data, &self.talk.seen, &config);
+        if self.notes.set_remote(notes) {
+            self.sync_notes();
+        }
+    }
+
+    /// Keep the placed pull request threads in the review store, where the review tools read
+    /// them, when they (or where they are kept) changed, or they were read again well after the
+    /// kept read; saves run one at a time, in order. Each thread is kept once
+    /// ([`Self::shown_placements`]).
+    fn save_pull_threads(&mut self, host: &UiContext) {
+        let placed = self.shown_placements();
+        let threads: Vec<bcode_code_review_models::PullThreadRecord> = placed
+            .into_iter()
             .map(|(key, placed)| bcode_code_review_models::PullThreadRecord {
                 id: bcode_code_review_models::pull_thread_ref(
                     &key.repository,
@@ -588,7 +610,11 @@ impl ReviewSurface {
     pub(super) fn flush_conversations(&mut self, host: &UiContext) -> bool {
         let signals = std::mem::take(&mut self.talk.signals);
         let queued = std::mem::take(&mut self.talk.queue);
+        let resave = std::mem::take(&mut self.talk.resave_threads);
         let any = !signals.is_empty() || !queued.is_empty();
+        if resave {
+            self.save_pull_threads(host);
+        }
         if !signals.is_empty() {
             self.signal_conversations(signals, host);
         }

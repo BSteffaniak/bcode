@@ -422,3 +422,47 @@ fn blank_values_are_dropped_from_every_object_and_nothing_else() {
     assert_eq!(crate::app::without_blank_arguments(""), "{}");
     assert_eq!(crate::app::without_blank_arguments("[1]"), "[1]");
 }
+
+/// The comments of the pull request thread the review tools name `id`, as the review shows
+/// them, each with whether the source it is placed on is shown.
+fn shown_comments(scenario: &Scenario<ReviewApp>, id: &str) -> Vec<(String, bool)> {
+    let review = scenario.surface().review().expect("review");
+    let notes = review.notes();
+    let thread = notes.thread_for_tool_id(id).expect("thread known");
+    let doc = review.document().expect("document");
+    notes
+        .thread(&thread)
+        .into_iter()
+        .map(|comment| {
+            let shown = comment
+                .anchor
+                .source_id
+                .as_deref()
+                .is_none_or(|source| !doc.source_alternate(source));
+            (comment.body.clone(), shown)
+        })
+        .collect()
+}
+
+#[test]
+fn a_stack_shows_each_pull_request_comment_once_in_every_view() {
+    let (_fixture, _backend, mut scenario, ids) = stack_with_threads();
+    let current = id_of(&ids, "PRRT_current").to_owned();
+    assert_eq!(
+        ids.iter().filter(|id| **id == current).count(),
+        1,
+        "{ids:?}"
+    );
+    for view in ["one_pr", "whole", "all_prs", "whole", "one_pr"] {
+        done(call(
+            &mut scenario,
+            actions::SET_COMPARISON,
+            &format!(r#"{{"stack_view":"{view}"}}"#),
+        ));
+        assert_eq!(
+            shown_comments(&scenario, &current),
+            vec![("About PRRT_current".to_owned(), true)],
+            "in the {view} view"
+        );
+    }
+}

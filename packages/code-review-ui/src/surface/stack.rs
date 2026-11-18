@@ -228,9 +228,15 @@ impl ReviewSurface {
         let swapped = review.doc.set_alternate_sources(alternates);
         let focused = review.doc.set_focus(focus);
         if swapped {
-            // The sources shown changed: compare the ones now shown.
+            // The sources shown changed: compare the ones now shown, and show each pull
+            // request thread on them.
             self.comparing.layers_moved();
+            self.place_notes();
+            self.talk.resave_threads = true;
         }
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
         if swapped || focused {
             review.note_splices();
             review.totals = review.doc.totals();
