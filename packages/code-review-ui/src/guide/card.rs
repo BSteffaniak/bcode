@@ -24,6 +24,9 @@ pub enum CardStatus {
     Failed,
     /// Writing was stopped; written sections stay.
     Stopped,
+    /// Another version than the one on screen (the card of a turn that wrote it): its
+    /// sections are not listed.
+    OtherVersion,
 }
 
 /// How a listed section stands.
@@ -77,6 +80,8 @@ pub struct GuideCard {
     pub sections: Vec<CardSection>,
     /// Sections left out of the list.
     pub more: usize,
+    /// Sections whose code changed since they were written.
+    pub stale: usize,
     /// Changes whenever anything the card shows changes.
     pub revision: u64,
 }
@@ -141,8 +146,30 @@ impl GuideCard {
             total,
             sections,
             more,
+            stale: active.stale.len(),
             revision,
         }
+    }
+
+    /// The card of version `version` of this card's guide: this card when it shows that
+    /// version, else a card naming that version without listing sections (the screen shows
+    /// another version), so a turn's card always names the version the turn wrote.
+    #[must_use]
+    pub fn for_version(&self, version: u32) -> std::borrow::Cow<'_, Self> {
+        if version == self.version {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(Self {
+            version,
+            status: CardStatus::OtherVersion,
+            session: None,
+            written: 0,
+            total: 0,
+            sections: Vec::new(),
+            more: 0,
+            stale: 0,
+            ..self.clone()
+        })
     }
 
     /// Whether writing is under way.

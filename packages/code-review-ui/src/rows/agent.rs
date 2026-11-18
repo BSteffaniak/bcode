@@ -118,6 +118,52 @@ fn writes_guide(turn: &Turn, card: &GuideCard, session: &str) -> bool {
     writes && !named && card.session.as_deref() == Some(session)
 }
 
+/// The version of guide `card` that `turn` wrote: the last version its guide writes report
+/// (each start and write answers with the version it wrote), else the version a write names,
+/// else the card's own version.
+fn turn_version(turn: &Turn, card: &GuideCard) -> u32 {
+    let mut found = None;
+    for item in &turn.items {
+        let FeedItem::Tool(tool) = item else {
+            continue;
+        };
+        if !GUIDE_WRITE_TOOLS.contains(&tool.name.as_str())
+            || tool.state == ToolState::Failed
+            || guide_id_of(&tool.arguments).is_some_and(|id| id != card.guide_id)
+        {
+            continue;
+        }
+        if let Some(version) = reported_version(&tool.output).or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&tool.arguments)
+                .ok()
+                .and_then(|arguments| arguments.get("version")?.as_u64())
+                .and_then(|version| u32::try_from(version).ok())
+        }) {
+            found = Some(version);
+        }
+    }
+    found.unwrap_or(card.version)
+}
+
+/// The top-level `version` of a guide write's pretty JSON answer (its last kept lines).
+fn reported_version(output: &[String]) -> Option<u32> {
+    if let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(&output.join("\n"))
+    {
+        return object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok());
+    }
+    // A cut answer: its top-level keys are the lines indented once.
+    output.iter().find_map(|line| {
+        line.strip_prefix("  \"version\": ")?
+            .trim_end_matches(',')
+            .parse()
+            .ok()
+    })
+}
+
 /// The turn an exchange's card shows, and whether it is the session's newest turn.
 ///
 /// It is the newest turn asking the exchange's question, else (when the question is no longer
@@ -478,19 +524,33 @@ impl Card<'_> {
                 format!("failed · {}/{} written", card.written, card.total),
                 theme.error,
             ),
+            CardStatus::OtherVersion => ("not the version shown".to_owned(), theme.muted),
         };
-        self.push(vec![
-            Span::styled(icons.guide_marker, theme.accent),
-            Span::raw(" "),
+        let stale_note = (card.stale > 0).then(|| {
             Span::styled(
-                format!("Guide v{} ", card.version),
-                theme.accent.add_modifier(Modifier::BOLD),
-            ),
-            // Progress before the title, so a narrow panel cuts the title, not the progress.
-            Span::styled(status, style),
-            Span::styled(theme.icons.separator, theme.tiers.dim),
-            Span::styled(card.title.clone(), theme.tiers.strong),
-        ]);
+                format!(" {} {} stale", icons.guide_stale, card.stale),
+                theme.guide.problem,
+            )
+        });
+        self.push(
+            vec![
+                Span::styled(icons.guide_marker, theme.accent),
+                Span::raw(" "),
+                Span::styled(
+                    format!("Guide v{} ", card.version),
+                    theme.accent.add_modifier(Modifier::BOLD),
+                ),
+                // Progress before the title, so a narrow panel cuts the title, not the progress.
+                Span::styled(status, style),
+            ]
+            .into_iter()
+            .chain(stale_note)
+            .chain([
+                Span::styled(theme.icons.separator, theme.tiers.dim),
+                Span::styled(card.title.clone(), theme.tiers.strong),
+            ])
+            .collect(),
+        );
         let mut writing_marked = !card.busy();
         for section in &card.sections {
             let (glyph, glyph_style, title_style) = match section.state {
@@ -748,13 +808,15 @@ pub fn dock_rows(
         if !turn.question.is_empty() {
             card.question(&turn.question);
         }
-        let guide = guide.filter(|guide| writes_guide(turn, guide, session));
+        let guide = guide
+            .filter(|guide| writes_guide(turn, guide, session))
+            .map(|guide| guide.for_version(turn_version(turn, guide)));
         card.turn(
             turn,
             &key,
             folds,
             index * crate::agent::feed::MAX_TURN_ITEMS,
-            guide,
+            guide.as_deref(),
         );
     }
     if let Some(permission) = &state.feed.permission {
@@ -1020,7 +1082,105 @@ fn card_buttons(card: &CardButtons<'_>) -> Vec<(String, ItemAction)> {
 
 #[cfg(test)]
 mod tests {
-    use super::guide_id_of;
+    use super::{guide_id_of, turn_version};
+    use crate::agent::feed::{FeedItem, ToolLine, ToolState, Turn};
+    use crate::guide::{CardStatus, GuideCard};
+
+    fn tool(name: &str, arguments: &str, output: &str, state: ToolState) -> FeedItem {
+        FeedItem::Tool(ToolLine {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            summary: String::new(),
+            arguments: arguments.to_owned(),
+            state,
+            output: output.lines().map(str::to_owned).collect(),
+            total_lines: output.lines().count(),
+        })
+    }
+
+    fn card(version: u32) -> GuideCard {
+        GuideCard {
+            guide_id: "g".to_owned(),
+            title: "Walkthrough".to_owned(),
+            version,
+            session: Some("s".to_owned()),
+            status: CardStatus::Complete,
+            written: 3,
+            total: 3,
+            sections: Vec::new(),
+            more: 0,
+            stale: 1,
+            revision: 0,
+        }
+    }
+
+    #[test]
+    fn a_turns_card_names_the_version_that_turn_wrote() {
+        let started = serde_json::to_string_pretty(&serde_json::json!({
+            "guide_id": "g", "version": 1, "grant": {"mode": "generate", "version": 1},
+        }))
+        .unwrap();
+        let older = Turn {
+            question: "walk me through".to_owned(),
+            items: vec![
+                tool("code_review.guide.start", "{}", &started, ToolState::Done),
+                tool(
+                    "code_review.guide.write",
+                    r#"{"guide_id":"g","ops":[]}"#,
+                    "{\n  \"citations\": [],\n  \"version\": 1,\n  \"written\": true\n}",
+                    ToolState::Done,
+                ),
+            ],
+            earlier: 0,
+        };
+        // The screen shows v2 (a refresh forked it): the older turn's card names v1.
+        let shown = card(2);
+        assert_eq!(turn_version(&older, &shown), 1);
+        let bound = shown.for_version(turn_version(&older, &shown));
+        assert_eq!(bound.version, 1);
+        assert_eq!(bound.status, CardStatus::OtherVersion);
+        assert!(bound.sections.is_empty());
+        assert_eq!(
+            bound.stale, 0,
+            "the counts of the version shown are not claimed"
+        );
+        // A turn that wrote v2 (an answer cut to its last lines still names it) shows the card.
+        let newer = Turn {
+            question: "refresh".to_owned(),
+            items: vec![tool(
+                "code_review.guide.write",
+                r#"{"guide_id":"g","version":2,"ops":[]}"#,
+                "  \"status\": \"complete\",\n  \"version\": 2,\n  \"written\": true\n}",
+                ToolState::Done,
+            )],
+            earlier: 0,
+        };
+        assert_eq!(turn_version(&newer, &shown), 2);
+        assert!(matches!(
+            shown.for_version(2),
+            std::borrow::Cow::Borrowed(card) if card.status == CardStatus::Complete
+        ));
+        // A failed write, or one of another guide, says nothing; the card's version stands.
+        let failed = Turn {
+            question: String::new(),
+            items: vec![
+                tool(
+                    "code_review.guide.write",
+                    r#"{"guide_id":"g","version":1}"#,
+                    "",
+                    ToolState::Failed,
+                ),
+                tool(
+                    "code_review.guide.write",
+                    r#"{"guide_id":"other","version":1}"#,
+                    "",
+                    ToolState::Done,
+                ),
+            ],
+            earlier: 0,
+        };
+        assert_eq!(turn_version(&failed, &shown), 2);
+    }
 
     #[test]
     fn a_guide_id_is_read_from_whole_or_cut_arguments() {
