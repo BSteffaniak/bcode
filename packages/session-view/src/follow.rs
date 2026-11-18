@@ -294,6 +294,8 @@ async fn attach_once(
     if let Ok(runtime_work) = client.list_runtime_work(follow.session_id).await {
         view.set_runtime_work_snapshots(&runtime_work);
     }
+    // Live changes arrive as events; a daemon without runtime modes leaves it unknown.
+    view.set_permission_mode(client.session_permission_mode(follow.session_id).await.ok());
     if let Ok(interactions) = load_pending_interactions(
         client,
         follow.session_id,

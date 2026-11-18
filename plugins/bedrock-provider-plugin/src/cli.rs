@@ -43,6 +43,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| false,
         command: ProviderCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 

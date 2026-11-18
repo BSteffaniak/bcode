@@ -170,6 +170,8 @@ pub fn inspect_runtime(
         provider_progress,
         submission_queue,
         submission_queue_unavailable: _,
+        // A fixed-size enum value: no owned content to bound.
+        permission_mode: _,
     } = value;
     let mut walker = Walker::new(limits, 4)?;
     walker.nested(inspect_cost(cost, limits)?, 1)?;

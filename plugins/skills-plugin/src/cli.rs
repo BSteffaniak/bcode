@@ -45,6 +45,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| true,
         command: SkillCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 

@@ -575,10 +575,11 @@ async fn dispatch_selected_cli(
     if let Some(plugin) = plugin_cli::matched(matches, registrations)
         && let Some((_, subcommand_matches)) = matches.subcommand()
     {
-        if exceptional_execution_mode {
-            return Err(CliError::InvalidArguments(
-                "execution-mode flags are not supported by plugin CLI commands".to_owned(),
-            ));
+        if exceptional_execution_mode && !plugin.admits_execution() {
+            return Err(CliError::InvalidArguments(format!(
+                "execution-mode flags are not supported by `bcode {}`",
+                plugin.command().get_name()
+            )));
         }
         if let Some(extension) = plugin.extension() {
             let request = bcode_command::cli::CliArgvRequest {
@@ -606,8 +607,25 @@ async fn dispatch_selected_cli(
         if plugin.requires_daemon(subcommand_matches) {
             ensure_server_running().await?;
         }
-        let outcome = plugin
-            .invoke(subcommand_matches.clone())
+        let execution = bcode_plugin_sdk::StaticCliExecution {
+            permission_mode: if matches.get_flag("dangerously_bypass_all_permissions") {
+                bcode_session_models::TurnPermissionMode::Bypass
+            } else {
+                bcode_session_models::TurnPermissionMode::Enforce
+            },
+            tool_policy: if matches.get_flag("disable_all_tools") {
+                bcode_session_models::TurnToolPolicy::Disabled
+            } else {
+                bcode_session_models::TurnToolPolicy::Enabled
+            },
+        };
+        let invocation = if exceptional_execution_mode {
+            plugin.invoke_with_execution(subcommand_matches.clone(), execution)
+        } else {
+            None
+        };
+        let outcome = invocation
+            .unwrap_or_else(|| plugin.invoke(subcommand_matches.clone()))
             .await
             .map_err(CliError::PluginCli)?;
         match outcome.host_action {

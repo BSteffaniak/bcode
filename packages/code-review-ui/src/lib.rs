@@ -41,6 +41,7 @@ pub mod agent;
 pub mod app;
 pub mod appearance;
 pub mod assistant;
+pub mod bypass;
 pub mod chrome;
 pub mod cli;
 pub mod compare_bar;
@@ -84,5 +85,5 @@ mod testing;
 mod tests;
 
 pub use app::{ReviewApp, RouteName};
-pub use run::{RunError, RunOptions, build_app, render_text, run};
+pub use run::{ReviewLaunch, RunError, RunOptions, build_app, render_text, run};
 pub use surface::{Focus, ReviewSurface, SCOPE};

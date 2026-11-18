@@ -41,6 +41,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| true,
         command: MetricsCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 

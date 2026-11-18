@@ -1238,13 +1238,14 @@ async fn ask_in_session(
             title,
             scope.repo_path.clone(),
             crate::host::review_session_origin(
-                crate::host::ReviewSessionPurpose::Question,
+                crate::host::ReviewSessionPurpose::Guide,
                 Some(&workspace),
                 None,
             ),
         )
         .await
         .map_err(|error| error.message)?;
+    crate::bypass::start_session(services, &session, crate::bypass::AgentKind::Guide).await;
     drop(
         crate::assistant::models::apply_default(services, scope.repo_path.clone(), &session).await,
     );

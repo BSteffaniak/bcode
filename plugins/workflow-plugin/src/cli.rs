@@ -159,6 +159,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| true,
         command: WorkflowCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 

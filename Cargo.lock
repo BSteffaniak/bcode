@@ -2036,6 +2036,7 @@ dependencies = [
  "bcode_code_review_github",
  "bcode_code_review_graphite",
  "bcode_code_review_models",
+ "bcode_config",
  "bcode_config_layers",
  "bcode_default_agents_plugin",
  "bcode_ipc",

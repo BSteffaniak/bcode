@@ -71,6 +71,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| true,
         command: BlimsCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 use std::fmt::Write as _;

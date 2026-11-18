@@ -24,6 +24,7 @@ mod guide_share;
 mod interaction;
 mod panel_controls;
 mod parity;
+mod permission_bypass;
 mod publish;
 mod screen;
 mod uncommitted;

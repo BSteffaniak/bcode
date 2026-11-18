@@ -272,6 +272,12 @@ fn header(
     }
     state_chip.push(Span::styled(label, style));
     let mut chips = vec![state_chip];
+    if live.is_some_and(|(state, _)| state.bypass()) {
+        chips.push(vec![Span::styled(
+            "bypass: tools run without asking",
+            theme.pill_warning,
+        )]);
+    }
     if let Some((state, clock)) = live {
         let mut usage = Vec::new();
         if state.feed.tokens > 0 {

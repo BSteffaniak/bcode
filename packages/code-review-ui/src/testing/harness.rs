@@ -93,6 +93,8 @@ pub struct ScriptedHost {
     models: Mutex<Result<crate::host::ModelCatalog, String>>,
     /// Each session's chosen provider, model and effort.
     session_models: Mutex<BTreeMap<String, SessionChoice>>,
+    /// Runtime permission modes set, by session id.
+    permission_modes: Mutex<BTreeMap<String, bcode_session_models::TurnPermissionMode>>,
     /// Model, effort and submit calls in call order (`model <session> <model>`, `effort
     /// <session> <effort>`, `submit <session> <model> <effort>` for every message sent).
     model_log: Mutex<Vec<String>>,
@@ -193,6 +195,7 @@ impl ScriptedHost {
             client_tools: Mutex::default(),
             models: Mutex::new(Err("this host offers no models".to_owned())),
             session_models: Mutex::default(),
+            permission_modes: Mutex::default(),
             model_log: Mutex::default(),
             refused_models: Mutex::default(),
             refused_deletes: Mutex::default(),
@@ -521,6 +524,21 @@ impl ScriptedHost {
     /// Panics when the turns lock is poisoned.
     pub fn turns(&self) -> Vec<(String, crate::host::TurnRequest)> {
         self.turns.lock().expect("turns lock").clone()
+    }
+
+    /// `session_id`'s runtime permission mode as the app last set it (enforce when never).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the modes lock is poisoned.
+    #[must_use]
+    pub fn permission_mode(&self, session_id: &str) -> bcode_session_models::TurnPermissionMode {
+        self.permission_modes
+            .lock()
+            .expect("modes lock")
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Report `pending` as the daemon's pending permission requests.
@@ -981,6 +999,26 @@ impl ReviewHost for ScriptedHost {
         Box::pin(async { Ok(()) })
     }
 
+    fn session_permission_mode(
+        &self,
+        session_id: String,
+    ) -> HostFuture<bcode_session_models::TurnPermissionMode> {
+        let mode = self.permission_mode(&session_id);
+        Box::pin(async move { Ok(mode) })
+    }
+
+    fn set_session_permission_mode(
+        &self,
+        session_id: String,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) -> HostFuture<bcode_session_models::TurnPermissionMode> {
+        self.permission_modes
+            .lock()
+            .expect("modes lock")
+            .insert(session_id, mode);
+        Box::pin(async move { Ok(mode) })
+    }
+
     fn set_session_reasoning(&self, session_id: String, effort: Option<String>) -> HostFuture<()> {
         self.log_model(format!(
             "effort {session_id} {}",
@@ -1035,9 +1073,25 @@ impl ReviewHost for ScriptedHost {
         session_ids: Vec<String>,
     ) -> HostFuture<Vec<Option<crate::host::AppSession>>> {
         let catalog = self.catalog.lock().expect("catalog lock");
+        let children = self.children.lock().expect("children lock");
+        // Child sessions exist without an origin, as Bcode reports them.
         let summaries = session_ids
             .iter()
-            .map(|id| catalog.get(id).cloned())
+            .map(|id| {
+                catalog.get(id).cloned().or_else(|| {
+                    children
+                        .iter()
+                        .any(|(_, child)| child == id)
+                        .then(|| crate::host::AppSession {
+                            id: id.clone(),
+                            title: None,
+                            created_at_ms: 0,
+                            updated_at_ms: 0,
+                            origin_app: None,
+                            origin_context: std::collections::BTreeMap::new(),
+                        })
+                })
+            })
             .collect();
         Box::pin(async move { Ok(summaries) })
     }

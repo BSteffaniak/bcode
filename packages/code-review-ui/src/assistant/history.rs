@@ -221,7 +221,10 @@ fn row(
         .origin_context
         .get(ORIGIN_PURPOSE)
         .map(String::as_str);
-    let kind = if purpose == Some(ReviewSessionPurpose::Question.as_str()) {
+    // A guide writer's conversation lists like a question's: it belongs to a place in the review.
+    let kind = if purpose == Some(ReviewSessionPurpose::Question.as_str())
+        || purpose == Some(ReviewSessionPurpose::Guide.as_str())
+    {
         Kind::Card
     } else {
         Kind::Assistant

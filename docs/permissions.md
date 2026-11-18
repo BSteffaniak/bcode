@@ -11,7 +11,7 @@ bcode --dangerously-bypass-all-permissions  # alias: --yolo
 bcode --disable-all-tools                   # alias: --no-tools
 ```
 
-The flags work with the default TUI, `--new`, `tui`, and `send`. They are rejected by commands that do not admit ordinary agent turns. They do not modify `bcode.toml`, runtime permission state, or a permanent session setting; relaunching without a flag restores normal behavior for future turns.
+The flags work with the default TUI, `--new`, `tui`, `send`, and plugin commands that admit agent turns (`review` takes `--dangerously-bypass-all-permissions`). They are rejected by commands that do not admit ordinary agent turns. They do not modify `bcode.toml`, runtime permission state, or a permanent session setting; relaunching without a flag restores normal behavior for future turns.
 
 In the TUI, `--dangerously-bypass-all-permissions` steps each session the launch creates or opens into bypass once, through the [runtime session permission mode](#runtime-session-permission-mode); `/yolo off` steps a session out, and switching back to it later in the same launch does not step it in again. `send` applies the flag to the turn it sends.
 
@@ -43,6 +43,19 @@ bypass_waiting_prompts = "ask"    # approve | ask | leave
 * While the viewed session is in bypass the status line shows `DANGER: PERMISSION BYPASS ACTIVE`, whichever client stepped it in.
 * With `bypass_waiting_prompts = "ask"`, stepping in while prompts wait opens the permission review; `approve` approves them once each.
 * `/yolo` is unavailable in managed external sessions, whose native executor decides its own permissions.
+
+### In the code review app
+
+The review app steps its own agents in and out: review-wide, per AI card, per assistant
+conversation, with guide agents included or not, and starts with review-wide bypass on under
+`bcode review --yolo` (see [Permission bypass](code-review-app.md#permission-bypass)).
+
+### Plugin commands
+
+A plugin CLI command that admits agent turns opts into the launch's execution mode with
+`StaticCliRegistration::invoke_with_execution`, which receives a typed `StaticCliExecution`
+(permission mode and tool policy). Commands without it reject `--dangerously-bypass-all-permissions`
+and `--disable-all-tools`.
 
 The same structural checks as the launch flag still apply in bypass: canonical operation validation, tool and plugin availability, read-only or disabled ceilings, path confinement, provider authentication, and operating-system privileges.
 

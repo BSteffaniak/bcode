@@ -74,6 +74,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| true,
         command: UsageCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 fn write_page(

@@ -38,6 +38,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| false,
         command: Cli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {

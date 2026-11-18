@@ -32,6 +32,8 @@ pub enum ChipId {
     Category(Category),
     /// The assistant's tools.
     Tools,
+    /// The conversation runs in permission bypass (pressing it steps out).
+    Bypass,
 }
 
 /// One chip: its full and short labels and how late it is dropped (higher is later).

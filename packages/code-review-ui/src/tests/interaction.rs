@@ -62,6 +62,24 @@ pub(super) fn build(
     .with_workspace(workspace.clone())
 }
 
+/// The review of `setup` opened again on the same backend (as in the same launch).
+pub(super) fn setup_with_backend(
+    _fixture: &GitFixture,
+    setup: &Setup,
+    width: u16,
+    height: u16,
+) -> Setup {
+    let backend = Arc::clone(&setup.backend);
+    let workspace = setup.workspace.clone();
+    let mut scenario = Scenario::new(build(&backend, &workspace, Duration::ZERO), width, height);
+    stable(&mut scenario);
+    Setup {
+        scenario,
+        backend,
+        workspace,
+    }
+}
+
 /// A durable workspace (stored first) opened at `width` x `height`.
 pub(super) fn setup(fixture: &GitFixture, width: u16, height: u16) -> Setup {
     let backend = Arc::new(TestBackend::default());

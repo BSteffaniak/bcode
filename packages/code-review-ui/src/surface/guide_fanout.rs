@@ -1610,6 +1610,7 @@ async fn spawn_child(
         .create_child_session(parent.to_owned(), title, repo.to_path_buf())
         .await
         .map_err(|error| error.message)?;
+    crate::bypass::start_session(services, &child, crate::bypass::AgentKind::Guide).await;
     if let Some(model) = model {
         let id = model
             .requested

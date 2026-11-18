@@ -4,7 +4,9 @@
 //! this process exactly as the standalone `bcode-review` binary does.
 
 use bcode_code_review_ui::cli::{ReviewCli, requires_daemon};
-use bcode_plugin_sdk::{StaticCliFuture, StaticCliOutcome, StaticCliRegistration};
+use bcode_plugin_sdk::{
+    StaticCliExecution, StaticCliFuture, StaticCliOutcome, StaticCliRegistration,
+};
 use clap::{CommandFactory, FromArgMatches};
 
 pub fn registration() -> StaticCliRegistration {
@@ -15,17 +17,40 @@ pub fn registration() -> StaticCliRegistration {
         },
         command: ReviewCli::command,
         invoke,
+        invoke_with_execution: Some(invoke_with_execution),
     }
 }
 
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
+    invoke_with_execution(matches, StaticCliExecution::default())
+}
+
+/// `bcode review` under the launch's execution mode: `--dangerously-bypass-all-permissions`
+/// starts the app with review-wide permission bypass on; `--disable-all-tools` does not apply,
+/// since the review's agents work through their tools.
+fn invoke_with_execution(
+    matches: clap::ArgMatches,
+    execution: StaticCliExecution,
+) -> StaticCliFuture {
     Box::pin(async move {
+        if execution.disables_tools() {
+            return Err(
+                "`bcode review` does not support --disable-all-tools: its agents work through their tools"
+                    .to_owned(),
+            );
+        }
         let cli = ReviewCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
         // Sessions opened from the review run in this same bcode program.
         let bcode = std::env::current_exe().ok();
-        bcode_code_review_ui::cli::run(cli.command, bcode)
-            .await
-            .map_err(|error| error.to_string())?;
+        let launch =
+            bcode_code_review_ui::ReviewLaunch::with_bypass(execution.bypasses_permissions());
+        Box::pin(bcode_code_review_ui::cli::run_with(
+            cli.command,
+            bcode,
+            launch,
+        ))
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(StaticCliOutcome::default())
     })
 }
@@ -33,6 +58,11 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_takes_the_launchs_execution_mode() {
+        assert!(registration().invoke_with_execution.is_some());
+    }
 
     #[test]
     fn no_review_command_needs_the_daemon_before_it_runs() {

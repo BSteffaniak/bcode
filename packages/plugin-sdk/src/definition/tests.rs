@@ -330,6 +330,7 @@ fn cli() -> crate::StaticCliRegistration {
         command: || clap::Command::new("example"),
         requires_daemon: |_| false,
         invoke: |_| Box::pin(async { Ok(crate::StaticCliOutcome::default()) }),
+        invoke_with_execution: None,
     }
 }
 

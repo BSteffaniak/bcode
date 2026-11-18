@@ -2502,6 +2502,33 @@ pub struct StaticCliRegistration {
     pub requires_daemon: fn(&clap::ArgMatches) -> bool,
     /// Invoke the plugin command using matches from the composed root parser.
     pub invoke: fn(clap::ArgMatches) -> StaticCliFuture,
+    /// Invoke the plugin command under the launch's execution mode
+    /// (`--dangerously-bypass-all-permissions` or `--disable-all-tools`), for commands that
+    /// admit agent turns. `None` rejects those flags for the command.
+    pub invoke_with_execution: Option<fn(clap::ArgMatches, StaticCliExecution) -> StaticCliFuture>,
+}
+
+/// The execution mode a CLI launch asked for, handed to plugin commands that admit agent turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StaticCliExecution {
+    /// Permission authorization for the turns the command admits.
+    pub permission_mode: bcode_session_models::TurnPermissionMode,
+    /// Tool availability for the turns the command admits.
+    pub tool_policy: bcode_session_models::TurnToolPolicy,
+}
+
+impl StaticCliExecution {
+    /// Whether the launch bypasses permission policy.
+    #[must_use]
+    pub fn bypasses_permissions(self) -> bool {
+        self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass
+    }
+
+    /// Whether the launch disables agent tools.
+    #[must_use]
+    pub fn disables_tools(self) -> bool {
+        self.tool_policy == bcode_session_models::TurnToolPolicy::Disabled
+    }
 }
 
 impl std::fmt::Debug for StaticCliRegistration {

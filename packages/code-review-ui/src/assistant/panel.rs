@@ -224,6 +224,12 @@ enum Done {
     Attached(Result<(), String>),
     History(Result<super::picker::HistoryLoad, String>),
     Turns(Vec<(String, crate::host::TurnCount)>),
+    /// The conversation stepped into or out of permission bypass.
+    Bypass {
+        mode: bcode_session_models::TurnPermissionMode,
+        result: Result<bcode_session_models::TurnPermissionMode, String>,
+        waiting: crate::bypass::Waiting,
+    },
     Renamed {
         session: String,
         title: String,
@@ -1570,6 +1576,12 @@ impl Assistant {
                     .create_tool_session(title, repo.clone(), origin)
                     .await
                     .map_err(|error| error.message)?;
+                crate::bypass::start_session(
+                    &services,
+                    &session,
+                    crate::bypass::AgentKind::Assistant,
+                )
+                .await;
                 push(
                     &inbox,
                     Done::Created {
@@ -1942,6 +1954,16 @@ impl Assistant {
                 if let Some(picker) = self.picker.as_mut() {
                     picker.turns.extend(turns);
                 }
+            }
+            Done::Bypass {
+                mode,
+                result,
+                waiting,
+            } => {
+                self.notice = Some(match result {
+                    Err(error) => (format!("permission bypass unavailable: {error}"), true),
+                    Ok(_) => (bypass_notice(mode, waiting), false),
+                });
             }
             Done::Renamed {
                 session,
@@ -2598,6 +2620,7 @@ impl Assistant {
             ChipId::Model => self.run_action("assistant_model", place, ui),
             ChipId::Effort => self.run_action("assistant_effort", place, ui),
             ChipId::Tools => self.run_action("assistant_tools", place, ui),
+            ChipId::Bypass => self.run_action("assistant_permission_bypass", place, ui),
             ChipId::Category(category) => {
                 self.toggle_category(category);
                 Outcome::Redraw
@@ -3389,6 +3412,52 @@ impl Assistant {
         self.touch();
     }
 
+    /// Step the conversation into permission bypass (asking first once per launch) or out of it.
+    fn toggle_bypass(&mut self, ui: &UiContext) {
+        let Some(session) = self.session.clone() else {
+            self.notice = Some(("start or open a conversation first".to_owned(), false));
+            return;
+        };
+        let on = !self
+            .agents
+            .state(&session)
+            .is_some_and(crate::agent::AgentState::bypass);
+        if on {
+            let (go, problem) = self.services.confirm_bypass(false);
+            if !go {
+                self.notice = Some((crate::bypass::CONFIRMATION.to_owned(), false));
+                return;
+            }
+            if let Some(problem) = problem {
+                self.notice = Some((problem, true));
+            }
+        }
+        let mode = if on {
+            bcode_session_models::TurnPermissionMode::Bypass
+        } else {
+            bcode_session_models::TurnPermissionMode::Enforce
+        };
+        let services = self.services.clone();
+        let inbox = Arc::clone(&self.inbox);
+        ui.spawn(Box::pin(async move {
+            let sessions = vec![session.clone()];
+            let waiting = crate::bypass::waiting(&services, &sessions, mode).await;
+            let result = services
+                .host()
+                .set_session_permission_mode(session, mode)
+                .await
+                .map_err(|error| error.message);
+            push(
+                &inbox,
+                Done::Bypass {
+                    mode,
+                    result,
+                    waiting,
+                },
+            );
+        }));
+    }
+
     fn open_tools(&mut self) {
         use crate::palette::OverlayEntry;
         let configured = self.services.assistant_config();
@@ -3532,6 +3601,7 @@ impl Assistant {
             "assistant_effort" => self.cycle_effort(&Target::Conversation, ui),
             "assistant_permissions" => self.open_permissions(),
             "assistant_tools" => self.open_tools(),
+            "assistant_permission_bypass" => self.toggle_bypass(ui),
             "assistant_reset_size" => self.reset_size(),
             "assistant_guide_tab" => {
                 if !self.guide.available {
@@ -4360,6 +4430,23 @@ impl Assistant {
             short: text("⚒".to_owned(), theme.muted),
             keep: 10,
         });
+        if session
+            .and_then(|session| self.agents.state(session))
+            .is_some_and(crate::agent::AgentState::bypass)
+        {
+            chips.insert(
+                0,
+                Chip {
+                    id: ChipId::Bypass,
+                    full: text(
+                        "⚠ bypass: tools run without asking".to_owned(),
+                        theme.pill_warning,
+                    ),
+                    short: text("⚠ bypass".to_owned(), theme.pill_warning),
+                    keep: 90,
+                },
+            );
+        }
         chips
     }
 
@@ -4602,6 +4689,20 @@ pub const fn single_line_policy() -> TextInputPolicy {
 
 fn empty_input() -> TextInputState {
     TextInputState::new(bmux_text_edit::TextEditBuffer::new())
+}
+
+/// What the panel says after the conversation stepped into or out of bypass.
+fn bypass_notice(
+    mode: bcode_session_models::TurnPermissionMode,
+    waiting: crate::bypass::Waiting,
+) -> String {
+    if mode != bcode_session_models::TurnPermissionMode::Bypass {
+        return "permission bypass off: tools ask again".to_owned();
+    }
+    format!(
+        "permission bypass on: this conversation's tools run without asking{}",
+        waiting.suffix("below")
+    )
 }
 
 fn push(inbox: &Arc<Mutex<Vec<Done>>>, done: Done) {

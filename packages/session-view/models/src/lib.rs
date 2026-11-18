@@ -1805,6 +1805,9 @@ impl SessionCostSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeViewState {
+    /// The session's runtime permission mode, once known (read at attach, then live).
+    #[serde(default)]
+    pub permission_mode: Option<bcode_session_models::TurnPermissionMode>,
     /// Exact explicit model account reference, independent of default authentication.
     #[serde(default)]
     pub account_reference: Option<String>,

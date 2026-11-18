@@ -647,6 +647,7 @@ pub async fn ask(
             )
             .await
             .map_err(|error| error.message)?;
+        crate::bypass::start_session(&services, &session, crate::bypass::AgentKind::Question).await;
         // The app default applies before the question; the card says why Bcode refused one.
         refused = refused_default(&services, scope.repo_path.clone(), &session).await;
         services
@@ -739,6 +740,8 @@ pub struct AgentState {
     pub cancelling: bool,
     /// Whether following the session stopped (the daemon went away, or it never started).
     pub disconnected: bool,
+    /// The session's runtime permission mode, as it last reported it.
+    pub permission_mode: bcode_session_models::TurnPermissionMode,
 }
 
 impl AgentState {
@@ -756,6 +759,7 @@ impl AgentState {
             working: false,
             cancelling: false,
             disconnected: false,
+            permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
         }
     }
 
@@ -771,6 +775,12 @@ impl AgentState {
         }
     }
 
+    /// Whether the session runs in permission bypass (its tools run without asking).
+    #[must_use]
+    pub fn bypass(&self) -> bool {
+        self.permission_mode == bcode_session_models::TurnPermissionMode::Bypass
+    }
+
     /// Whether the session waits for the reviewer (a pending permission request).
     #[must_use]
     pub const fn needs_you(&self) -> bool {
@@ -780,6 +790,14 @@ impl AgentState {
     /// State derived from a session snapshot.
     #[must_use]
     pub fn from_snapshot(snapshot: &SessionViewSnapshot) -> Self {
+        Self {
+            permission_mode: snapshot.runtime.permission_mode.unwrap_or_default(),
+            ..Self::from_snapshot_progress(snapshot)
+        }
+    }
+
+    /// [`Self::from_snapshot`] without the permission mode.
+    fn from_snapshot_progress(snapshot: &SessionViewSnapshot) -> Self {
         let mut feed = Feed::from_snapshot(snapshot);
         let answer = snapshot
             .transcript
@@ -818,6 +836,7 @@ impl AgentState {
                 working: false,
                 cancelling: false,
                 disconnected: false,
+                permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
             };
         }
         let failed = !working
@@ -861,6 +880,7 @@ impl AgentState {
             working: working || phase == AgentPhase::Working,
             cancelling,
             disconnected: false,
+            permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
         }
     }
 
@@ -878,6 +898,7 @@ impl AgentState {
             answer: last.answer.clone(),
             feed,
             disconnected: true,
+            permission_mode: last.permission_mode,
             ..Self::failed_quietly(message)
         }
     }

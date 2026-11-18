@@ -32,6 +32,7 @@ pub const PALETTE_ACTIONS: &[&str] = &[
     "assistant_effort",
     "assistant_permissions",
     "assistant_tools",
+    "assistant_permission_bypass",
     "assistant_new",
     "assistant_history",
     "assistant_open",

@@ -40,6 +40,7 @@ pub(crate) fn registration() -> StaticCliRegistration {
         requires_daemon: |_| false,
         command: ReadCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 

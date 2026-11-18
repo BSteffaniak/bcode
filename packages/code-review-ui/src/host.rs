@@ -98,6 +98,8 @@ pub enum ReviewSessionPurpose {
     Question,
     /// The review assistant dock's conversation.
     Assistant,
+    /// A guide writer the review started (a guided review written by one agent).
+    Guide,
 }
 
 impl ReviewSessionPurpose {
@@ -107,6 +109,7 @@ impl ReviewSessionPurpose {
         match self {
             Self::Question => "question",
             Self::Assistant => "assistant",
+            Self::Guide => "guide",
         }
     }
 }
@@ -509,6 +512,33 @@ pub trait ReviewHost: Send + Sync {
         Box::pin(async {
             Err(HostError::failed(
                 "this host cannot choose reasoning effort",
+            ))
+        })
+    }
+
+    /// `session_id`'s runtime permission mode: what its turns run with from now on.
+    fn session_permission_mode(
+        &self,
+        session_id: String,
+    ) -> HostFuture<bcode_session_models::TurnPermissionMode> {
+        let _ = session_id;
+        Box::pin(async {
+            Err(HostError::failed(
+                "this host cannot change permission modes",
+            ))
+        })
+    }
+
+    /// Step `session_id` into or out of permission bypass; returns the mode now in effect.
+    fn set_session_permission_mode(
+        &self,
+        session_id: String,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) -> HostFuture<bcode_session_models::TurnPermissionMode> {
+        let _ = (session_id, mode);
+        Box::pin(async {
+            Err(HostError::failed(
+                "this host cannot change permission modes",
             ))
         })
     }
@@ -1209,6 +1239,39 @@ impl ReviewHost for StandaloneHost {
                 .client()
                 .await?
                 .set_session_reasoning(id, effort, None)
+                .await
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn session_permission_mode(
+        &self,
+        session_id: String,
+    ) -> HostFuture<bcode_session_models::TurnPermissionMode> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            bcode
+                .client()
+                .await?
+                .session_permission_mode(id)
+                .await
+                .map_err(|error| bcode.failure(&error))
+        })
+    }
+
+    fn set_session_permission_mode(
+        &self,
+        session_id: String,
+        mode: bcode_session_models::TurnPermissionMode,
+    ) -> HostFuture<bcode_session_models::TurnPermissionMode> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            bcode
+                .client()
+                .await?
+                .set_session_permission_mode(id, mode)
                 .await
                 .map_err(|error| bcode.failure(&error))
         })

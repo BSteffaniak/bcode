@@ -150,6 +150,8 @@ pub enum Message {
     Feed(crate::agent::FeedOutcome),
     /// Reflection work for finished review tool calls finished.
     Tools(Box<super::surface::ToolsResult>),
+    /// Permission bypass was set on some of the review's agent sessions.
+    Bypass(Box<super::surface::bypass::BypassDone>),
     /// An AI question finished: the linked exchange, or the exchange as recorded and the error.
     Asked(
         Box<

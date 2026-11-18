@@ -152,6 +152,7 @@ enum Phase {
 mod annotate;
 mod assist;
 mod assistant_actions;
+pub(crate) mod bypass;
 mod compare;
 mod compare_legend;
 mod compare_view;
@@ -2140,8 +2141,13 @@ impl ReviewSurface {
             Message::Opened(opened) => {
                 self.apply_opened(*opened);
                 self.refresh_conversations(host);
+                // Review-wide bypass of this launch reaches every review it opens.
+                if self.review_bypass() {
+                    self.apply_review_bypass(bypass::BypassScope::Review, host);
+                }
             }
             Message::Arrived(arrived) => self.apply_arrived(*arrived),
+            Message::Bypass(done) => self.apply_bypass(*done),
             Message::SourceFailed(diagnostic) => self.apply_source_failed(diagnostic),
             Message::StackConfirmed(news) => self.apply_stack_news(*news),
             Message::Filling(note) => self.filling_note = note,
@@ -2998,6 +3004,10 @@ impl ReviewSurface {
             "attention_next" => self.attention_next(),
             "copy_report" => self.copy_report(),
             "stack_view" => self.toggle_stack_view(),
+            "permission_bypass" => self.toggle_review_bypass(false, host),
+            "permission_bypass_always" => self.toggle_review_bypass(true, host),
+            "permission_bypass_guides" => self.toggle_guides_bypass(host),
+            "permission_bypass_card" => self.toggle_card_bypass(host),
             "dismiss_notifications" => {
                 if !self.toasts.dismiss_all() {
                     self.set_status("No notifications", StatusSeverity::Info);
@@ -4391,6 +4401,7 @@ impl ReviewSurface {
             unsaved: self.is_transient(),
             mode,
             guide: self.guide_chip(),
+            bypass: self.review_bypass(),
         }
     }
 

@@ -1005,3 +1005,79 @@ fn resuming_stops_children_still_recorded_running_before_starting_new_ones() {
         "the earlier child is stopped before the area gets a new one"
     );
 }
+
+/// Run the palette command whose description starts with `description`.
+fn palette(setup: &mut Setup, description: &str) {
+    setup.scenario.key(":");
+    setup.settle();
+    setup.scenario.paste(description);
+    setup.settle();
+    setup.scenario.key("enter");
+    setup.settle();
+}
+
+#[test]
+fn review_wide_bypass_starts_guide_agents_in_it_unless_they_are_left_out() {
+    use bcode_session_models::TurnPermissionMode;
+    for include_guides in [true, false] {
+        let mut setup = setup_with(backend(serial()), 170, 50, true);
+        let parent = conversation(&mut setup);
+        setup.scenario.key("esc");
+        setup.settle();
+        if !include_guides {
+            palette(&mut setup, "Permission bypass: include guide agents");
+        }
+        let review = "Permission bypass: step this review's agents in or out";
+        palette(&mut setup, review);
+        palette(&mut setup, review);
+        let host = setup.backend.host();
+        assert_eq!(host.permission_mode(&parent), TurnPermissionMode::Bypass);
+        // The review has the keyboard already: open the guide panel and fan out.
+        setup.scenario.key("alt+g");
+        setup.settle();
+        setup.scenario.key("f");
+        setup.settle();
+        settle_until(&mut setup, "the fan-out starts", |setup| {
+            !setup.backend.host().child_sessions().is_empty()
+        });
+        let (_, child) = host.child_sessions()[0].clone();
+        assert_eq!(
+            host.permission_mode(&child),
+            if include_guides {
+                TurnPermissionMode::Bypass
+            } else {
+                TurnPermissionMode::Enforce
+            },
+            "guide agents included: {include_guides}"
+        );
+    }
+}
+
+#[test]
+fn the_assistant_conversation_steps_in_and_out_and_its_chip_says_so() {
+    use bcode_session_models::TurnPermissionMode;
+    let mut setup = setup_with(backend(serial()), 170, 50, true);
+    let parent = conversation(&mut setup);
+    setup.scenario.key("esc");
+    setup.settle();
+    let conversation_bypass = "Assistant: Permission bypass: step this conversation";
+    palette(&mut setup, conversation_bypass);
+    let host = setup.backend.host();
+    assert_eq!(
+        host.permission_mode(&parent),
+        TurnPermissionMode::Enforce,
+        "asked first"
+    );
+    palette(&mut setup, conversation_bypass);
+    assert_eq!(host.permission_mode(&parent), TurnPermissionMode::Bypass);
+
+    // The chip follows the session's reported mode.
+    let mut reported = snapshot(vec![user("Hello"), answer("Hi.")]);
+    reported.runtime.permission_mode = Some(TurnPermissionMode::Bypass);
+    setup.deliver(&parent, reported);
+    let screen = setup.settle();
+    assert!(screen.contains("⚠ bypass"), "{}", screen.text());
+
+    palette(&mut setup, conversation_bypass);
+    assert_eq!(host.permission_mode(&parent), TurnPermissionMode::Enforce);
+}

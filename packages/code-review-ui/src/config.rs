@@ -124,6 +124,8 @@ pub struct LoadedConfig {
     pub assistant: crate::assistant::profile::AssistantConfig,
     /// Guided reviews, from the plugin table's `guide` table.
     pub guide: bcode_code_review::guide::config::GuideConfig,
+    /// How sessions step into and out of permission bypass (`[permissions]`).
+    pub permissions: bcode_config::PermissionsConfig,
     /// bcode's diff layout preference (`[tui.diff_viewer]`), when configured.
     pub diff_layout: Option<DiffLayout>,
     /// Configured theme selection (`[tui.theme]`).
@@ -304,6 +306,14 @@ pub fn from_table(bcode: &toml::Table, config_dir: PathBuf) -> LoadedConfig {
     loaded.plugin_disabled = string_list(lookup(bcode, &["plugins", "disabled"]))
         .iter()
         .any(|id| id == PLUGIN_ID);
+    if let Some(permissions) = lookup(bcode, &["permissions"]) {
+        match permissions.clone().try_into() {
+            Ok(permissions) => loaded.permissions = permissions,
+            Err(error) => loaded
+                .diagnostics
+                .push(format!("permissions: {}", first_line(&error.to_string()))),
+        }
+    }
     if let Some(value) = lookup(bcode, &["plugins", "config", PLUGIN_ID]) {
         match value.as_table() {
             Some(table) => read_plugin_table(table, &mut loaded),

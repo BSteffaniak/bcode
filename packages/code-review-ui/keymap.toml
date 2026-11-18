@@ -341,6 +341,16 @@ keymap_actions = [
     ] },
     { id = "bcode.code_review.dismiss_notifications", scope = "code-review", description = "Dismiss notifications", defaults = [
     ] },
+    { id = "bcode.code_review.permission_bypass", scope = "code-review", description = "Permission bypass: step this review's agents in or out (their tools run without asking)", defaults = [
+    ] },
+    { id = "bcode.code_review.permission_bypass_always", scope = "code-review", description = "Permission bypass: step this review's agents in and don't ask again", defaults = [
+    ] },
+    { id = "bcode.code_review.permission_bypass_guides", scope = "code-review", description = "Permission bypass: include guide agents or leave them out", defaults = [
+    ] },
+    { id = "bcode.code_review.permission_bypass_card", scope = "code-review", description = "Permission bypass: step the AI card's agent in or out", defaults = [
+    ] },
+    { id = "bcode.code_review.assistant_permission_bypass", scope = "code-review-assistant", description = "Permission bypass: step this conversation in or out", defaults = [
+    ] },
     { id = "bcode.code_review.edit_sources", scope = "code-review", description = "Edit the review's sources…", defaults = [
     ] },
     { id = "bcode.code_review.uncommitted_marks", scope = "code-review", description = "Show / hide uncommitted changes (lines changed since HEAD) in whole files", defaults = [

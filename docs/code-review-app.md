@@ -427,6 +427,37 @@ Set each tool to `allow`, `ask`, or `deny` per agent with exact-name rules, or t
 When a prompt offers Always or Never, the answer is remembered as a rule for the session's
 agent. See [`permissions.md`](permissions.md) for how rules layer.
 
+### Permission bypass
+
+The review's agents (AI cards, the assistant's conversations, and guide agents) can run with
+their tools allowed without asking, through Bcode's runtime session permission mode (see
+[Permissions](permissions.md#runtime-session-permission-mode)). Nothing is saved: the mode is
+each Bcode session's, and it ends when the daemon restarts.
+
+* **Review-wide** (palette: *Permission bypass: step this review's agents in or out*): every agent
+  session bound to the review steps in, and every agent the app starts during this launch begins
+  in bypass (in any review it opens). The header shows `⚠ agents bypass permissions` while it is
+  on. Doing it again steps every one of the review's agents out.
+* **Guide agents** (fan-out writers and verifiers, and a guide written by one agent) are included
+  unless *Permission bypass: include guide agents or leave them out* turns that off; it can change
+  at any time, and while review-wide bypass is on it steps them in or out at once.
+* **One card** (*Permission bypass: step the AI card's agent in or out*, on the card at the cursor)
+  or **one conversation** (*Assistant: Permission bypass: step this conversation in or out*, or
+  its `⚠ bypass` chip). A card or conversation in bypass says so in its header, whichever client
+  stepped it in.
+* **Asking first.** The first step in of a launch only says what it does; doing it again steps
+  in. *…step this review's agents in and don't ask again* steps in and stops asking, remembered
+  in `permission-bypass.toml` in Bcode's state directory (shared with the TUI's `/yolo always`).
+* **Prompts already waiting** when agents step in follow `[permissions] bypass_waiting_prompts`:
+  approved once each (`approve`), left to answer on their cards with a count (`ask`, the
+  default), or left alone (`leave`).
+* **`bcode review --yolo`** (or `--dangerously-bypass-all-permissions`; `bcode-review --yolo`
+  too) starts with review-wide bypass on, confirmed by the flag. `--disable-all-tools` is refused:
+  the review's agents work through their tools.
+
+Each agent's base agent (`assistant.base_agent`, `guide.base_agent`) still decides which tools
+it has; bypass only skips asking.
+
 ### Comment composer
 
 Typing `@` and part of a path in the comment composer suggests repository paths (tracked and
@@ -1013,6 +1044,10 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | palette only | Pull request: open its web page |
 | palette only | Pull request: read its conversation again |
 | palette only | Stack: approve every fully viewed layer… |
+| palette only | Permission bypass: step this review's agents in or out (their tools run without asking) |
+| palette only | Permission bypass: step this review's agents in and don't ask again |
+| palette only | Permission bypass: include guide agents or leave them out |
+| palette only | Permission bypass: step the AI card's agent in or out |
 | `shift+b` | Stack history: how each pull request changed in each push (compares in place) |
 | `w` | Show / hide uncommitted changes (lines changed since HEAD) in whole files |
 | `alt+i` | Show / hide ignored files in folder, glob, and repository sources |
@@ -1112,6 +1147,7 @@ markers.
 | `alt+g` | Switch between the conversation and the guide (when the screen has no room for the guide panel) |
 | `alt+z`, `alt+c`, `alt+w`, `alt+=`, `alt+-`, `alt+0` | Panel: maximize, minimize, close, grow, shrink, reset size (see Panel controls) |
 | (palette) | Delete every conversation the review app started (asks first) |
+| (palette), the `⚠ bypass` chip | Permission bypass: step this conversation in or out |
 
 ### Conversation history (`code-review-assistant-history`)
 

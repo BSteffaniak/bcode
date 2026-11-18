@@ -30,12 +30,14 @@ impl Default for TestBackend {
             state_dir: Some(state.path().to_path_buf()),
         });
         let host = Arc::new(ScriptedHost::new());
+        let confirmation = state.path().join("permission-bypass.toml");
         // The services keep the state directory alive as long as any screen uses them.
         let services = ReviewServices::inline(
             store,
             Arc::clone(&host) as Arc<dyn ReviewHost>,
             Arc::new(state),
-        );
+        )
+        .with_bypass_confirmation_at(confirmation);
         Self { host, services }
     }
 }
@@ -151,6 +153,12 @@ impl TestBackend {
     #[must_use]
     pub fn sessions(&self) -> Vec<(String, String)> {
         self.host.sessions()
+    }
+
+    /// `session_id`'s runtime permission mode as the app last set it.
+    #[must_use]
+    pub fn permission_mode(&self, session_id: &str) -> bcode_session_models::TurnPermissionMode {
+        self.host.permission_mode(session_id)
     }
 
     /// Origins recorded on session creation so far, in request order.

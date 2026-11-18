@@ -17,6 +17,7 @@ bcode_code_review = { workspace = true }
 bcode_code_review_github = { workspace = true }
 bcode_code_review_graphite = { workspace = true }
 bcode_code_review_models = { workspace = true }
+bcode_config = { workspace = true }
 bcode_config_layers = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_keymap = { workspace = true }
@@ -77,7 +78,7 @@ toml = { workspace = true }
 bcode_agent_policy          = { workspace = true }
 bcode_code_review           = { workspace = true, features = ["testing"] }
 bcode_default_agents_plugin = { workspace = true }
-tempfile          = { workspace = true }
+tempfile                    = { workspace = true }
 
 [features]
 default          = []

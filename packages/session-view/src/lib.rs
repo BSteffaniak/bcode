@@ -5407,6 +5407,14 @@ impl SessionView {
     }
 
     /// Replace authoritative request-context occupancy when it is newer than current state.
+    /// Record the session's runtime permission mode (`None` while unknown).
+    pub fn set_permission_mode(&mut self, mode: Option<bcode_session_models::TurnPermissionMode>) {
+        if self.snapshot.runtime.permission_mode != mode {
+            self.snapshot.runtime.permission_mode = mode;
+            self.bump_revision();
+        }
+    }
+
     pub fn set_context_occupancy(
         &mut self,
         occupancy: Option<bcode_session_models::RequestContextOccupancy>,
@@ -15311,8 +15319,9 @@ impl SessionView {
             SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
                 self.set_context_occupancy((**occupancy).clone());
             }
-            // Session state, not transcript content: frontends track it themselves.
-            SessionLiveEventKind::PermissionModeChanged { .. } => {}
+            SessionLiveEventKind::PermissionModeChanged { mode } => {
+                self.set_permission_mode(Some(*mode));
+            }
         }
     }
 

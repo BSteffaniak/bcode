@@ -70,6 +70,31 @@ pub struct RunOptions {
     /// binary) uses the user's installed Bcode (`BCODE_BIN`, else `bcode` on the path), whose
     /// daemon it verifies and starts when needed, since this executable cannot serve as one.
     pub bcode_program: Option<PathBuf>,
+    /// What the launch asked for (`--dangerously-bypass-all-permissions`).
+    pub launch: ReviewLaunch,
+}
+
+/// What a review launch asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewLaunch {
+    /// `Bypass` starts the app with review-wide permission bypass on (the flag is the
+    /// confirmation): every review's agents step in when it opens, and every agent the app
+    /// starts begins in it.
+    pub permission_mode: bcode_session_models::TurnPermissionMode,
+}
+
+impl ReviewLaunch {
+    /// A launch with review-wide permission bypass on (`bypass`) or off.
+    #[must_use]
+    pub const fn with_bypass(bypass: bool) -> Self {
+        Self {
+            permission_mode: if bypass {
+                bcode_session_models::TurnPermissionMode::Bypass
+            } else {
+                bcode_session_models::TurnPermissionMode::Enforce
+            },
+        }
+    }
 }
 
 /// Failure starting or running the app.
@@ -275,6 +300,8 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         .with_compare(loaded.compare)
         .with_assistant(loaded.assistant.clone())
         .with_guide(loaded.guide.clone())
+        .with_permissions(loaded.permissions)
+        .with_launch(options.launch)
         // Disposable: a review opens from what an earlier run computed and learned, then confirms
         // it (`BCODE_CODE_REVIEW_CACHE=off` disables it).
         .with_cache(Arc::new(bcode_code_review::cache::ReviewCache::for_user()))
@@ -639,6 +666,7 @@ mod tests {
             host,
             entry: Entry::Home,
             bcode_program: None,
+            launch: ReviewLaunch::default(),
         }
     }
 

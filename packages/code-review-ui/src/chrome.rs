@@ -83,12 +83,14 @@ pub enum HeaderPart {
     Publish,
     /// `Guide 3/9` chip, while the review's guide is open but its panel has no room.
     Guide,
+    /// Warning badge while the review's agents run in permission bypass.
+    Bypass,
 }
 
 /// Header parts in the order they are dropped when the row is too narrow (first dropped
 /// first). Source chips after the first collapse into a `+N` chip before anything else goes;
 /// the title is never dropped.
-pub const HEADER_ELISION_ORDER: [HeaderPart; 10] = [
+pub const HEADER_ELISION_ORDER: [HeaderPart; 11] = [
     HeaderPart::Publish,
     HeaderPart::Chip(1),
     HeaderPart::Drafts,
@@ -99,6 +101,7 @@ pub const HEADER_ELISION_ORDER: [HeaderPart; 10] = [
     HeaderPart::Mode,
     HeaderPart::Guide,
     HeaderPart::Viewed,
+    HeaderPart::Bypass,
 ];
 
 /// What the header shows.
@@ -122,6 +125,8 @@ pub struct HeaderModel {
     pub mode: String,
     /// Where the guide stands (`Guide 3/9`), while it is open but its panel has no room.
     pub guide: Option<String>,
+    /// Whether the review's agents run in permission bypass.
+    pub bypass: bool,
 }
 
 impl HeaderModel {
@@ -218,6 +223,16 @@ fn chip(label: &str) -> BadgeComponent<'_> {
         .severity(BadgeSeverity::Info)
 }
 
+/// The warning that the review's agents run in permission bypass.
+fn bypass_badge() -> BadgeComponent<'static> {
+    BadgeComponent::new("review.bypass", "⚠ agents bypass permissions")
+        .policy(BadgePolicy {
+            padding: 1,
+            ..BadgePolicy::bare()
+        })
+        .severity(BadgeSeverity::Warning)
+}
+
 fn component_width(component: &impl Component, room: u16) -> u16 {
     let node = component.layout(Constraints::loose(Size::new(room, 1)), &mut LayoutCx::new());
     u16::try_from(node.size.width).unwrap_or(u16::MAX)
@@ -236,6 +251,7 @@ fn right_parts(
 ) -> Vec<(HeaderPart, u16)> {
     let guide_label = model.guide.clone().unwrap_or_default();
     vec![
+        (HeaderPart::Bypass, component_width(&bypass_badge(), width)),
         (
             HeaderPart::Guide,
             component_width(&chip(&guide_label), width),
@@ -290,6 +306,7 @@ pub fn plan_header(model: &HeaderModel, width: u16, theme: &ReviewTheme) -> Head
         .map(|(part, _)| *part)
         .filter(|part| *part != HeaderPart::Threads || model.threads.1 > 0)
         .filter(|part| *part != HeaderPart::Guide || model.guide.is_some())
+        .filter(|part| *part != HeaderPart::Bypass || model.bypass)
         .collect();
     let used = |shown: &[HeaderPart]| -> u16 {
         let mut total = 0_u16;
@@ -445,6 +462,7 @@ pub fn paint_header(
             HeaderPart::Publish => {
                 publish_button(&items, theme).paint(PUBLISH_ID, rect, publish, cx);
             }
+            HeaderPart::Bypass => cx.paint_component(&bypass_badge().styles(theme.badges), rect),
         }
     }
 }
@@ -840,6 +858,7 @@ mod tests {
             unsaved: false,
             mode: "unified".to_owned(),
             guide: Some("Guide 3/9".to_owned()),
+            bypass: true,
         }
     }
 
@@ -900,6 +919,7 @@ mod tests {
         let drafts_style = |unsaved: bool| {
             let model = HeaderModel {
                 unsaved,
+                bypass: false,
                 ..model_of(1)
             };
             let plan = plan_header(&model, 160, &theme);

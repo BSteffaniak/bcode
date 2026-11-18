@@ -307,6 +307,12 @@ pub struct ReviewServices {
     assistant: Arc<crate::assistant::profile::AssistantConfig>,
     compare: crate::config::compare::CompareConfig,
     guide: Arc<bcode_code_review::guide::config::GuideConfig>,
+    /// How sessions step into and out of permission bypass.
+    permissions: bcode_config::PermissionsConfig,
+    /// Which of the review's sessions run in permission bypass during this launch.
+    bypass: Arc<Mutex<crate::bypass::BypassPolicy>>,
+    /// Whether stepping into bypass was confirmed during this launch.
+    bypass_confirmation: Arc<Mutex<crate::bypass::Confirmation>>,
     /// Providers and contributors: built-in ones, plus plugin-backed ones once found.
     providers: Arc<Mutex<ProviderRegistry>>,
     /// Whether plugin-backed providers were looked for (once, in the background).
@@ -341,6 +347,9 @@ impl ReviewServices {
             assistant: Arc::default(),
             compare: crate::config::compare::CompareConfig::default(),
             guide: Arc::default(),
+            permissions: bcode_config::PermissionsConfig::default(),
+            bypass: Arc::default(),
+            bypass_confirmation: Arc::default(),
             providers: Arc::default(),
             plugins_sought: Arc::default(),
             #[cfg(test)]
@@ -520,6 +529,69 @@ impl ReviewServices {
     #[must_use]
     pub fn guide_config(&self) -> Arc<bcode_code_review::guide::config::GuideConfig> {
         Arc::clone(&self.guide)
+    }
+
+    /// How sessions step into and out of permission bypass.
+    #[must_use]
+    pub const fn permissions(&self) -> bcode_config::PermissionsConfig {
+        self.permissions
+    }
+
+    /// Use `permissions` for stepping sessions into and out of permission bypass.
+    #[must_use]
+    pub const fn with_permissions(mut self, permissions: bcode_config::PermissionsConfig) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// Which of the review's sessions run in permission bypass during this launch.
+    #[must_use]
+    pub fn bypass_policy(&self) -> crate::bypass::BypassPolicy {
+        self.bypass
+            .lock()
+            .map_or_else(|poisoned| *poisoned.into_inner(), |policy| *policy)
+    }
+
+    /// Whether stepping into bypass may go ahead now (see
+    /// [`crate::bypass::Confirmation::step_in`]).
+    #[must_use]
+    pub fn confirm_bypass(&self, dont_ask_again: bool) -> (bool, Option<String>) {
+        match self.bypass_confirmation.lock() {
+            Ok(mut confirmation) => confirmation.step_in(dont_ask_again),
+            Err(poisoned) => poisoned.into_inner().step_in(dont_ask_again),
+        }
+    }
+
+    /// Keep the choice not to be asked before stepping into bypass at `path`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_bypass_confirmation_at(mut self, path: std::path::PathBuf) -> Self {
+        self.bypass_confirmation = Arc::new(Mutex::new(crate::bypass::Confirmation::at(path)));
+        self
+    }
+
+    /// Start as `launch` asked: with review-wide bypass on, confirmed by the flag itself.
+    #[must_use]
+    pub fn with_launch(self, launch: crate::ReviewLaunch) -> Self {
+        if launch.permission_mode == bcode_session_models::TurnPermissionMode::Bypass {
+            self.set_bypass_policy(crate::bypass::BypassPolicy {
+                review_wide: true,
+                ..self.bypass_policy()
+            });
+            match self.bypass_confirmation.lock() {
+                Ok(mut confirmation) => confirmation.confirm(),
+                Err(poisoned) => poisoned.into_inner().confirm(),
+            }
+        }
+        self
+    }
+
+    /// Replace which of the review's sessions run in permission bypass.
+    pub fn set_bypass_policy(&self, policy: crate::bypass::BypassPolicy) {
+        match self.bypass.lock() {
+            Ok(mut current) => *current = policy,
+            Err(poisoned) => *poisoned.into_inner() = policy,
+        }
     }
 
     /// Use `config` for guided reviews.

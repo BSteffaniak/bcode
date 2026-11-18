@@ -85,6 +85,7 @@ pub fn registration() -> StaticCliRegistration {
         requires_daemon: |_| true,
         command: WorktreeCli::command,
         invoke,
+        invoke_with_execution: None,
     }
 }
 

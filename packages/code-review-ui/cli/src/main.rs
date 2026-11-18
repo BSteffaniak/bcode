@@ -24,6 +24,9 @@ struct Args {
     /// Print which configuration files are read, in order, and exit.
     #[arg(long)]
     print_config_paths: bool,
+    /// Start with every review's agents in permission bypass: their tools run without asking.
+    #[arg(long = "dangerously-bypass-all-permissions", visible_alias = "yolo")]
+    dangerously_bypass_all_permissions: bool,
     /// What to open or do; the review home when absent.
     #[command(subcommand)]
     command: Option<ReviewCommand>,
@@ -70,11 +73,38 @@ async fn run() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    match bcode_code_review_ui::cli::run(args.command, None).await {
+    let launch =
+        bcode_code_review_ui::ReviewLaunch::with_bypass(args.dangerously_bypass_all_permissions);
+    match Box::pin(bcode_code_review_ui::cli::run_with(
+        args.command,
+        None,
+        launch,
+    ))
+    .await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bcode-review: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yolo_starts_the_review_with_its_agents_in_permission_bypass() {
+        let args = Args::try_parse_from(["bcode-review", "--yolo"]).expect("--yolo parses");
+        assert!(args.dangerously_bypass_all_permissions);
+        let args = Args::try_parse_from(["bcode-review", "--dangerously-bypass-all-permissions"])
+            .expect("the long form parses");
+        assert!(args.dangerously_bypass_all_permissions);
+        assert!(
+            !Args::try_parse_from(["bcode-review"])
+                .unwrap()
+                .dangerously_bypass_all_permissions
+        );
     }
 }

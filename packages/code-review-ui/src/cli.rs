@@ -182,6 +182,24 @@ pub async fn run(
     command: Option<ReviewCommand>,
     bcode_program: Option<PathBuf>,
 ) -> Result<(), CliError> {
+    Box::pin(run_with(
+        command,
+        bcode_program,
+        crate::ReviewLaunch::default(),
+    ))
+    .await
+}
+
+/// [`run`] as `launch` asked (`--dangerously-bypass-all-permissions`).
+///
+/// # Errors
+///
+/// Returns [`CliError`] as [`run`] does.
+pub async fn run_with(
+    command: Option<ReviewCommand>,
+    bcode_program: Option<PathBuf>,
+    launch: crate::ReviewLaunch,
+) -> Result<(), CliError> {
     match invocation(command)? {
         Invocation::Open { repo, entry } => {
             let config = crate::config::load(&repo);
@@ -196,6 +214,7 @@ pub async fn run(
                 host: None,
                 entry,
                 bcode_program,
+                launch,
             })
             .await?;
             Ok(())

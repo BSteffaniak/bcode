@@ -23,6 +23,8 @@ pub struct Contribution {
     command_name: String,
     requires_daemon: fn(&clap::ArgMatches) -> bool,
     invoke: fn(clap::ArgMatches) -> StaticCliFuture,
+    invoke_with_execution:
+        Option<fn(clap::ArgMatches, bcode_plugin_sdk::StaticCliExecution) -> StaticCliFuture>,
     command: Command,
     extension: Option<crate::plugin_cli_extension::SelectedCliExtension>,
 }
@@ -42,6 +44,7 @@ pub fn registrations(
             command_name: command.get_name().to_owned(),
             requires_daemon: registration.requires_daemon,
             invoke: registration.invoke,
+            invoke_with_execution: registration.invoke_with_execution,
             command,
             extension: None,
         });
@@ -271,6 +274,7 @@ pub async fn add_extensions(
             invoke: |_| {
                 Box::pin(async { Err("native CLI requires extension dispatch".to_owned()) })
             },
+            invoke_with_execution: None,
             command,
             extension: Some(extension.clone()),
         });
@@ -299,6 +303,23 @@ impl Contribution {
     pub fn invoke(&self, matches: clap::ArgMatches) -> StaticCliFuture {
         (self.invoke)(matches)
     }
+
+    /// Whether the plugin command admits agent turns, so the launch's execution-mode flags apply
+    /// to it.
+    pub const fn admits_execution(&self) -> bool {
+        self.invoke_with_execution.is_some() && self.extension.is_none()
+    }
+
+    /// Invoke the plugin command under `execution`, when it admits agent turns; `None` when it
+    /// does not (the launch's execution-mode flags do not apply to it).
+    pub fn invoke_with_execution(
+        &self,
+        matches: clap::ArgMatches,
+        execution: bcode_plugin_sdk::StaticCliExecution,
+    ) -> Option<StaticCliFuture> {
+        self.invoke_with_execution
+            .map(|invoke| invoke(matches, execution))
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +336,7 @@ mod tests {
             command_name: command.get_name().to_owned(),
             requires_daemon: |_| false,
             invoke: unused_invoke,
+            invoke_with_execution: None,
             command,
             extension: None,
         }
@@ -351,6 +373,23 @@ mod tests {
                 .get_one::<std::path::PathBuf>("config_only")
                 .map(std::path::PathBuf::as_path),
             Some(std::path::Path::new("/tmp/selected.toml"))
+        );
+    }
+
+    #[test]
+    fn execution_mode_flags_apply_only_to_commands_that_admit_agent_turns() {
+        let mut review = contribution("bcode.code_review", Command::new("review"));
+        assert!(!review.admits_execution());
+        review.invoke_with_execution =
+            Some(|_, _| Box::pin(async { Ok(bcode_plugin_sdk::StaticCliOutcome::default()) }));
+        assert!(review.admits_execution());
+        assert!(
+            review
+                .invoke_with_execution(
+                    clap::ArgMatches::default(),
+                    bcode_plugin_sdk::StaticCliExecution::default()
+                )
+                .is_some()
         );
     }
 

@@ -1625,11 +1625,15 @@ impl ReviewApp {
         for request in requests {
             match request {
                 crate::assistant::LinkRequest::Action(name) => {
-                    let overlay = matches!(
+                    // Overlays and the bypass toggle leave the keyboard where it is.
+                    let keeps_focus = matches!(
                         name.as_str(),
-                        "assistant_model" | "assistant_permissions" | "assistant_tools"
+                        "assistant_model"
+                            | "assistant_permissions"
+                            | "assistant_tools"
+                            | "assistant_permission_bypass"
                     );
-                    if !overlay {
+                    if !keeps_focus {
                         self.assistant.focus();
                     }
                     let place = self.place(true);
