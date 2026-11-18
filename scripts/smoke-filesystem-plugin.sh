@@ -15,10 +15,10 @@ cd "${root}"
 
 cargo build --quiet -p bcode --features distribution
 
-# Package the filesystem backend as a shared-ABI thin wrapper and stage it with its
-# verbatim declaration. `plugin check` loads the staged wrapper itself; service calls go
+# Package the filesystem crate's backend (no wrapper crate) and stage it with its
+# verbatim declaration. `plugin check` loads the staged artifact itself; service calls go
 # through the CLI host, where this distribution's bundled registration takes precedence.
-python3 scripts/stage-plugin-wrapper.py plugins/filesystem-plugin "${workdir}/plugins/filesystem" >/dev/null
+python3 scripts/stage-plugin.py plugins/filesystem-plugin "${workdir}/plugins/filesystem" >/dev/null
 
 export BCODE_CONFIG="${workdir}/bcode.toml"
 cat >"${BCODE_CONFIG}" <<EOF

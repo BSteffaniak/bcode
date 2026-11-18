@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare shared native acceptance wrappers; compilation requires explicit --build.
+"""Run BMUX's shared native acceptance driver over this Bcode worktree.
 
-Delegate to tooling selected by the same SDK patch or BMUX_PLUGIN_PACKAGER used
-for ordinary Bcode packaging. No installation, runtime launch or provider call.
+The driver comes from the same BMUX revision as the selected packager
+(scripts/package-plugin.py: the git-pinned SDK checkout); compilation requires an
+explicit --build. No installation, runtime launch or provider call. Bcode's own
+test fixtures are packaged by scripts/package-plugin-fixtures.py instead.
 """
 from pathlib import Path
 import runpy

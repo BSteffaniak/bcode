@@ -59,7 +59,11 @@ bcode_session        = { workspace = true }
 bcode_session_models = { workspace = true }
 
 [features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
 default = ["native"]
+dynamic-backend = []
+dynamic-frontend = []
 embedded-javascript = ["dep:tree-sitter", "dep:tree-sitter-javascript"]
 embedded-languages = ["embedded-python", "embedded-javascript"]
 embedded-python = [

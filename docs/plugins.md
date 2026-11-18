@@ -130,18 +130,10 @@ The host includes the resolved theme fingerprint in serialized visual context an
 
 
 ```sh
-cargo build -p bcode_hello_plugin
+python3 scripts/stage-plugin.py examples/hello-plugin <discovery-root>/hello
 ```
 
-The built library name is platform-specific:
-
-```text
-target/debug/libbcode_hello_plugin.dylib  # macOS
-target/debug/libbcode_hello_plugin.so     # Linux
-target/debug/bcode_hello_plugin.dll       # Windows
-```
-
-Place the library and an adjusted `bcode-plugin.toml` together under a discovery root, then run `bcode plugin check` before enabling it. The repository's [`smoke-native-plugin.sh`](../scripts/smoke-native-plugin.sh) demonstrates discovery, loading, service invocation, daemon routing, and event delivery.
+This packages the crate's backend through BMUX's packager; see [Dynamic plugin packaging](dynamic-plugin-packaging.md). It then stages the library next to the verbatim `bcode-plugin.toml` under the declared library name. Run `bcode plugin check` before enabling it. The repository's [`smoke-native-plugin.sh`](../scripts/smoke-native-plugin.sh) demonstrates discovery, loading, service invocation, daemon routing, and event delivery.
 
 ## Plugin-owned authentication
 

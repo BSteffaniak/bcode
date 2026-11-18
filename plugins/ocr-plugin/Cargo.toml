@@ -31,6 +31,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 
 [features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
 _bundled-tesseract-runtime = ["dep:bcode_tesseract_ocr", "dep:image"]
 bundled-tesseract = ["bundled-tesseract-default"]
 bundled-tesseract-all = [
@@ -55,6 +57,8 @@ bundled-tesseract-v5-5-2 = [
     "bcode_tesseract_ocr/bundled-tesseract-v5-5-2",
 ]
 default = []
+dynamic-backend = []
+dynamic-frontend = []
 external-tesseract-cli = []
 fail-on-warnings = []
 system-tesseract = [

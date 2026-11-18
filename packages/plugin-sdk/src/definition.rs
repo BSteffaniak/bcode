@@ -1308,8 +1308,14 @@ pub fn concurrent_plugin_definition_from_manifest<P: ConcurrentRustPlugin>(
     Ok(definition)
 }
 
-/// Declare a product implementation without exporting ABI symbols. Dynamic
-/// packaging targets use BMUX's separate `export_plugin_entrypoint!` macro.
+/// Declare a product implementation: emits `plugin_definition()`, and the
+/// single dynamic-library entry symbol when the BMUX packager builds the crate.
+///
+/// The packager runs `cargo rustc --crate-type cdylib --features dynamic-<role>`
+/// with `--cfg bmux_plugin_dylib`; only then does the expansion export the entry,
+/// restricted to that role, exactly as BMUX's `plugin!` does. Workspace and
+/// bundled builds export nothing. Plugin crates declare the
+/// `dynamic-backend`/`dynamic-frontend` role features and never name the cfg.
 #[macro_export]
 macro_rules! define_plugin {
     (concurrent $plugin:ty, metadata = $metadata:expr, registrations = $registrations:expr $(,)?) => {
@@ -1317,24 +1323,28 @@ macro_rules! define_plugin {
             $crate::definition::concurrent_plugin_definition_with_registrations::<$plugin>(
                 $metadata, $registrations, |_| std::sync::Arc::new($crate::definition::SharedInvocationHost))
         }
+        $crate::__shared::packaged_entry!(plugin_definition);
     };
     ($plugin:ty, metadata = $metadata:expr, registrations = $registrations:expr $(,)?) => {
         pub fn plugin_definition() -> $crate::definition::PluginDefinition {
             $crate::definition::rust_plugin_definition_with_registrations::<$plugin>(
                 $metadata, $registrations, |_| std::sync::Arc::new($crate::definition::SharedInvocationHost))
         }
+        $crate::__shared::packaged_entry!(plugin_definition);
     };
     (serial $plugin:ty, $manifest:expr, registrations = $registrations:expr $(,)?) => {
         pub fn plugin_definition() -> $crate::definition::PluginDefinition {
             $crate::definition::rust_plugin_definition_from_manifest::<$plugin>($manifest, $registrations)
                 .expect("embedded Bcode plugin declaration must be valid")
         }
+        $crate::__shared::packaged_entry!(plugin_definition);
     };
     (concurrent $plugin:ty, $manifest:expr, registrations = $registrations:expr $(,)?) => {
         pub fn plugin_definition() -> $crate::definition::PluginDefinition {
             $crate::definition::concurrent_plugin_definition_from_manifest::<$plugin>($manifest, $registrations)
                 .expect("embedded Bcode plugin declaration must be valid")
         }
+        $crate::__shared::packaged_entry!(plugin_definition);
     };
     (serial $plugin:ty, $manifest:expr $(,)?) => {
         $crate::define_plugin!(serial $plugin, $manifest,

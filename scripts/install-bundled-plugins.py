@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Build selected bundled definitions as shared-ABI dynamic components.
+"""Package selected bundled plugin crates as shared-ABI dynamic components.
 
-Artifacts are installed immutably. This does not activate plugins, replace a
+Each crate packages itself (role features plus `define_plugin!`) through the
+selected shared packager; no wrapper crate is generated. Artifacts are installed
+immutably, with the crate's embedded declaration as their sidecar. This does not activate plugins, replace a
 running daemon, or silently override bundled selection.
 """
 import argparse
@@ -19,7 +21,6 @@ def main() -> None:
     parser.add_argument("--plugin", action="append", default=[], help="bundled Cargo dependency name; repeatable")
     parser.add_argument("--all", action="store_true", help="package every declared bundled plugin")
     parser.add_argument("--component", choices=["backend", "frontend"], default="backend")
-    parser.add_argument("--sdk-manifest", type=Path, help="selected shared SDK Cargo.toml")
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--target")
     args = parser.parse_args()
@@ -36,12 +37,6 @@ def main() -> None:
     unknown = set(selected) - declared
     if unknown:
         parser.error(f"not bundled implementation dependencies: {sorted(unknown)}")
-    sdk = args.sdk_manifest
-    if sdk is None:
-        patch = workspace.get("patch", {}).get("crates-io", {}).get("bmux_plugin_sdk", {})
-        if "path" not in patch:
-            parser.error("--sdk-manifest is required without a local shared SDK patch")
-        sdk = (root / patch["path"]) / "Cargo.toml"
     packager = runpy.run_path(str(root / "scripts/package-plugin.py"))["shared_packager"]()
     for package in dict.fromkeys(selected):
         dependency = dependencies[package]
@@ -49,10 +44,8 @@ def main() -> None:
             parser.error(f"{package} has no declared local implementation path")
         implementation = (root / dependency["path"]).resolve()
         command = [sys.executable, str(packager), "--implementation-manifest", str(implementation / "Cargo.toml"),
-                   "--sdk-manifest", str(sdk.resolve()), "--output",
-                   str(root / "target/plugin-packaging" / package / args.component),
-                   "--component", args.component, "--build", "--install-root", str(args.install_root.resolve()),
-                   "--declaration", str(implementation / "bcode-plugin.toml")]
+                   "--output", str(root / "target/plugin-packaging" / package / args.component),
+                   "--component", args.component, "--build", "--install-root", str(args.install_root.resolve())]
         if args.release:
             command.append("--release")
         if args.target:

@@ -32,5 +32,9 @@ tempfile = { workspace = true }
 toml     = { workspace = true }
 
 [features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
 default          = []
+dynamic-backend  = []
+dynamic-frontend = []
 fail-on-warnings = []

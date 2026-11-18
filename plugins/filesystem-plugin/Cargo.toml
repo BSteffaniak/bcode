@@ -58,7 +58,11 @@ sha2 = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
 default = ["native"]
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = []
 native = [
     "dep:bcode_confined_fs",

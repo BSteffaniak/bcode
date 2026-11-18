@@ -25,5 +25,9 @@ serde_json                 = { workspace = true }
 tokio                      = { workspace = true, features = ["rt", "time"] }
 
 [features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
 default          = []
+dynamic-backend  = []
+dynamic-frontend = []
 fail-on-warnings = []

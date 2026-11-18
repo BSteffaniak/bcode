@@ -35,7 +35,11 @@ tempfile                     = { workspace = true }
 tokio                        = { workspace = true, features = ["sync"] }
 
 [features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
 default          = []
+dynamic-backend  = []
+dynamic-frontend = []
 fail-on-warnings = []
 # Process-local script gate and compaction signal controls used by host tests.
 script-controls = []

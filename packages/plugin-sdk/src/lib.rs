@@ -26,6 +26,10 @@ pub mod tui_visual;
 pub mod workspace_access;
 pub use workspace_access::WorkspaceContext;
 
+/// The shared SDK, for macro expansions in plugin crates (`define_plugin!`).
+#[doc(hidden)]
+pub use bmux_plugin_sdk as __shared;
+
 pub use bcode_agent_profile::{ToolPolicyIdentity, ToolPolicyOperation, ToolPolicyPreparation};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;

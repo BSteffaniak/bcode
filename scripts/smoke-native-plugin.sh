@@ -22,9 +22,9 @@ cargo build --quiet -p bcode --features "distribution${BCODE_SMOKE_EXTRA_FEATURE
 
 plugin_dir="${workdir}/plugins/hello"
 daemon_plugin_dir="${workdir}/config/bcode/plugins/hello"
-# Build the hello backend as a shared-ABI thin wrapper through the shared packager and
-# stage it with its verbatim declaration; the implementation crate is export-free.
-python3 scripts/stage-plugin-wrapper.py examples/hello-plugin "${plugin_dir}" >/dev/null
+# Package the hello crate's backend through the shared packager (no wrapper crate)
+# and stage it with its verbatim declaration.
+python3 scripts/stage-plugin.py examples/hello-plugin "${plugin_dir}" >/dev/null
 mkdir -p "${daemon_plugin_dir}"
 cp "${plugin_dir}"/* "${daemon_plugin_dir}/"
 
