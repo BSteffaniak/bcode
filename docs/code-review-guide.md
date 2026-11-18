@@ -450,8 +450,8 @@ written through the plugin tools.
   `backspace` jumps back. The `code-review-guide` focus scope moves (`j` / `k`), shows the
   section and its first citation (`enter`), folds (`space`), steps citations (`]` / `[`), and
   copies the section as markdown (`y`). Its review action keys are
-  listed under [Review actions](#review-actions); refresh and versions are reserved and say so
-  until they are built.
+  listed under [Review actions](#review-actions); refresh (`r`, `alt+r`) and versions
+  (`shift+v`) under [Lifecycle and comparisons](#lifecycle-and-comparisons).
 * **Theme roles.** `guide.focus` (the gutter tint), `guide.badge`, `guide.unverified`,
   `guide.context` (unchanged and outside-review labels), and `guide.problem` derive from the
   review theme's tiers.

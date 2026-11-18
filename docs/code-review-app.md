@@ -863,6 +863,9 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | (palette, AI menu) | Guide: walk me through this review, with a template… |
 | (palette) | Guide: Copy as markdown |
 | (palette) | Guide: Export to file |
+| (palette) | Guide: refresh stale sections |
+| (palette) | Guide: walk me through what changed since I last looked |
+| (palette) | Guide: versions… |
 | `ctrl+k` | Ask AI: open, focus, or close the review assistant |
 | `c` | Comment on the line, range, or file (reply on a thread) |
 | `a` | Ask Bcode about the line, range, or file |
@@ -983,7 +986,9 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `a` | Ask about the section |
 | `p` / `x` | Promote / discard the provisional section or answer |
 | `shift+r` | Restructure the guide as a new version (asks for directions) |
-| `r`, `shift+v` | Reserved for refresh and versions; not available yet |
+| `r` | Refresh the section (a new version when the code moved on) |
+| `alt+r` | Refresh every stale section |
+| `shift+v` | Versions of the guide (older ones read-only) |
 | `esc` | Back to the review |
 
 See [Guided review](code-review-guide.md#presentation) for the panel and the diff's citation
