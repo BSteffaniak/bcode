@@ -1015,6 +1015,9 @@ pub(super) fn agent_rows(
     let owned = card_buttons(&CardButtons {
         keys: agents.keys(),
         model: session.and_then(|session| agents.model_label(session)),
+        bypass: session
+            .and_then(|session| agents.state(session))
+            .is_some_and(crate::agent::AgentState::bypass),
         linked: session.is_some(),
         exchange: exchange.is_some(),
         mode,
@@ -1063,6 +1066,8 @@ struct CardButtons<'a> {
     keys: &'a crate::agent::FeedKeys,
     /// The session's `model · effort`, once known.
     model: Option<&'a str>,
+    /// The session runs in permission bypass.
+    bypass: bool,
     linked: bool,
     exchange: bool,
     mode: CardMode,
@@ -1088,6 +1093,16 @@ fn card_buttons(card: &CardButtons<'_>) -> Vec<(String, ItemAction)> {
                 .collect();
             buttons.push((format!("● {model}"), agent(AgentAction::Model)));
         }
+        // Offered in every state: a waiting prompt is when it matters most.
+        buttons.push((
+            if card.bypass {
+                "⚠ Stop bypass"
+            } else {
+                "Bypass"
+            }
+            .to_owned(),
+            agent(AgentAction::Bypass),
+        ));
     }
     let (answered, retry) = match card.mode {
         CardMode::Prompting => return buttons,

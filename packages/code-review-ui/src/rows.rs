@@ -254,6 +254,8 @@ pub enum AgentAction {
     Never,
     /// Stop the session's running turn.
     Stop,
+    /// Step the session into permission bypass, or out of it.
+    Bypass,
     /// Choose the model of the session.
     Model,
     /// Open or close the feed item at this index of the card's turn (reasoning, tool output).

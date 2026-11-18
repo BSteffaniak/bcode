@@ -665,6 +665,14 @@ impl Toasts {
         self.insert(severity, title.into(), body, None, Some(tag));
     }
 
+    /// Drop the toasts tagged `tag` because what they asked about is settled (not a dismissal:
+    /// [`Self::take_dismissed`] does not report them). Returns whether any was shown.
+    pub fn remove_tagged(&mut self, tag: &'static str) -> bool {
+        let before = self.shown.len();
+        self.shown.retain(|toast| toast.tag != Some(tag));
+        self.shown.len() != before
+    }
+
     /// Tags of tagged toasts dismissed since the last call.
     pub fn take_dismissed(&mut self) -> Vec<&'static str> {
         std::mem::take(&mut self.dismissed)

@@ -147,6 +147,22 @@ pub async fn start_session(services: &ReviewServices, session_id: &str, kind: Ag
     }
 }
 
+/// Step a new question's session into bypass when the asker chose it (`chosen`) or review-wide
+/// bypass covers questions; call before its first turn.
+pub async fn start_question(services: &ReviewServices, session_id: &str, chosen: bool) {
+    if chosen {
+        // A host or daemon without runtime modes leaves the session as it is.
+        drop(
+            services
+                .host()
+                .set_session_permission_mode(session_id.to_owned(), TurnPermissionMode::Bypass)
+                .await,
+        );
+    } else {
+        start_session(services, session_id, AgentKind::Question).await;
+    }
+}
+
 /// The review's agent sessions: the sessions bound to workspace `workspace_id`, with their
 /// kinds.
 ///

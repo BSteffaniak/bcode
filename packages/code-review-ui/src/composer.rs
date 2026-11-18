@@ -75,6 +75,8 @@ pub enum ComposerButton {
     Cancel,
     /// Choose the model a question is asked with.
     Model,
+    /// Step the question's session into permission bypass, or out of it.
+    Bypass,
     /// Accept the `@path` suggestion at this index.
     Suggestion(u16),
 }
@@ -135,6 +137,9 @@ pub struct Composer {
     pub thread: Option<String>,
     /// The model and effort a question is asked with, as the assistant names them.
     pub model_label: Option<String>,
+    /// Whether the question runs in permission bypass: its session's mode for a follow-up, the
+    /// new session's for a new question; `None` when not asking.
+    pub bypass: Option<bool>,
     policy: TextInputPolicy,
     revision: u64,
     completion_generation: u64,
@@ -161,6 +166,7 @@ impl Composer {
             remote_reply: None,
             thread: None,
             model_label: None,
+            bypass: None,
             policy,
             revision: 0,
             completion_generation: 0,
@@ -171,6 +177,14 @@ impl Composer {
     pub fn set_model_label(&mut self, label: Option<String>) {
         if self.model_label != label {
             self.model_label = label;
+            self.touch();
+        }
+    }
+
+    /// Show whether the question runs in permission bypass (`None` when not asking).
+    pub fn set_bypass(&mut self, bypass: Option<bool>) {
+        if self.bypass != bypass {
+            self.bypass = bypass;
             self.touch();
         }
     }
@@ -514,6 +528,17 @@ impl Composer {
                 .collect();
             parts.push((format!(" ● {label} ▾ "), Some(ComposerButton::Model)));
         }
+        if let (ComposerMode::Ask, Some(on)) = (&self.mode, self.bypass) {
+            parts.push((
+                if on {
+                    " ⚠ bypass "
+                } else {
+                    " ◇ asks first "
+                }
+                .to_owned(),
+                Some(ComposerButton::Bypass),
+            ));
+        }
         let width = usize::from(width);
         let mut x = usize::from(indent);
         let mut spans = vec![Span::raw(" ".repeat(x.min(width)))];
@@ -523,10 +548,10 @@ impl Composer {
             if x + cells > width {
                 break;
             }
-            let style = if button == Some(ComposerButton::Submit) {
-                theme.pill_accent
-            } else {
-                theme.pill
+            let style = match button {
+                Some(ComposerButton::Submit) => theme.pill_accent,
+                Some(ComposerButton::Bypass) if self.bypass == Some(true) => theme.pill_warning,
+                _ => theme.pill,
             };
             spans.push(Span::styled(text, style));
             if let Some(button) = button {

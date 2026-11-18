@@ -171,3 +171,112 @@ fn a_bypass_launch_steps_the_reviews_agents_in_when_it_opens_and_new_ones_withou
         screen.text()
     );
 }
+
+/// Click the first place `needle` is painted.
+fn click(setup: &mut Setup, needle: &str) {
+    let screen = setup.scenario.render();
+    let at = screen
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} is not painted:\n{}", screen.text()));
+    setup.scenario.click(at.x, at.y);
+    stable(&mut setup.scenario);
+}
+
+/// Report `session` in bypass, as its followed session view would.
+fn report_bypass(setup: &mut Setup, session: &str) {
+    let mut snapshot = bcode_session_view_models::SessionViewSnapshot::empty();
+    snapshot.runtime.permission_mode = Some(TurnPermissionMode::Bypass);
+    setup
+        .scenario
+        .host()
+        .session_view(session)
+        .expect("subscribed")
+        .try_send(bcode_session_view::follow::SessionViewFollowUpdate::Snapshot(Box::new(snapshot)))
+        .unwrap();
+    stable(&mut setup.scenario);
+}
+
+#[test]
+fn a_new_questions_agent_starts_in_bypass_from_the_composer_chip() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 140, 40);
+    let index = find(&setup.scenario, 0, added_line);
+    move_to(&mut setup.scenario, index);
+    setup.scenario.key("a");
+    stable(&mut setup.scenario);
+    // Asked first, then on for this question.
+    click(&mut setup, "◇ asks first");
+    click(&mut setup, "◇ asks first");
+    let screen = setup.scenario.render();
+    assert!(screen.contains("⚠ bypass"), "{}", screen.text());
+    setup
+        .scenario
+        .paste("Go fix this on the right pull request and restack");
+    setup.scenario.key("enter");
+    stable(&mut setup.scenario);
+    let session = setup
+        .backend
+        .sessions()
+        .last()
+        .expect("a session")
+        .0
+        .clone();
+    assert_eq!(
+        setup.backend.permission_mode(&session),
+        TurnPermissionMode::Bypass
+    );
+    assert!(
+        !setup.scenario.surface().review_bypass(),
+        "only this question"
+    );
+}
+
+#[test]
+fn a_follow_up_flips_its_cards_session_from_the_composer_chip() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 140, 40);
+    let session = ask(&mut setup, 0, "Why this change?");
+    // `Follow up` on the card opens the composer for the same session.
+    click(&mut setup, "Follow up");
+    click(&mut setup, "◇ asks first");
+    click(&mut setup, "◇ asks first");
+    assert_eq!(
+        setup.backend.permission_mode(&session),
+        TurnPermissionMode::Bypass
+    );
+    // The chip shows the session's own mode once it reports it.
+    report_bypass(&mut setup, &session);
+    let screen = setup.scenario.render();
+    assert!(screen.contains("⚠ bypass"), "{}", screen.text());
+    click(&mut setup, "⚠ bypass");
+    assert_eq!(
+        setup.backend.permission_mode(&session),
+        TurnPermissionMode::Enforce
+    );
+}
+
+#[test]
+fn the_cards_button_steps_its_session_in_and_out() {
+    let fixture = fixture();
+    let mut setup = setup(&fixture, 160, 40);
+    let session = ask(&mut setup, 0, "Why this change?");
+    click(&mut setup, "Bypass ·");
+    assert_eq!(
+        setup.backend.permission_mode(&session),
+        TurnPermissionMode::Enforce,
+        "asked first"
+    );
+    click(&mut setup, "Bypass ·");
+    assert_eq!(
+        setup.backend.permission_mode(&session),
+        TurnPermissionMode::Bypass
+    );
+    let screen = setup.scenario.render();
+    assert!(!screen.contains("not on yet"), "settled: {}", screen.text());
+    report_bypass(&mut setup, &session);
+    click(&mut setup, "⚠ Stop bypass");
+    assert_eq!(
+        setup.backend.permission_mode(&session),
+        TurnPermissionMode::Enforce
+    );
+}

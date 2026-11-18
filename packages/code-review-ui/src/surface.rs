@@ -3007,7 +3007,7 @@ impl ReviewSurface {
             "permission_bypass" => self.toggle_review_bypass(false, host),
             "permission_bypass_always" => self.toggle_review_bypass(true, host),
             "permission_bypass_guides" => self.toggle_guides_bypass(host),
-            "permission_bypass_card" => self.toggle_card_bypass(host),
+            "permission_bypass_card" => self.toggle_card_bypass(),
             "dismiss_notifications" => {
                 if !self.toasts.dismiss_all() {
                     self.set_status("No notifications", StatusSeverity::Info);
@@ -6012,6 +6012,11 @@ impl View for ReviewSurface {
         let mut changed = self.drain(host);
         changed |= self.flush_clipboard(host);
         changed |= self.flush_conversations(host);
+        // The composer's bypass chip follows the session it asks, and appears or goes as
+        // the composer switches between asking and commenting.
+        let chip = self.composer.as_ref().map(|composer| composer.bypass);
+        self.sync_composer_bypass();
+        changed |= chip != self.composer.as_ref().map(|composer| composer.bypass);
         for url in std::mem::take(&mut self.talk.urls) {
             if let Err(error) = host.host().open_external(&url) {
                 self.set_status(

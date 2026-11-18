@@ -42,6 +42,9 @@ pub enum BypassScope {
     Card,
 }
 
+/// Tag of the toast that asks before stepping into bypass.
+const CONFIRMATION_TAG: &str = "permission-bypass-confirmation";
+
 impl ReviewSurface {
     /// Step the review's agents into bypass (asking first once per launch), or out of it.
     /// `dont_ask_again` steps in and stops asking.
@@ -76,18 +79,63 @@ impl ReviewSurface {
     }
 
     /// Step the AI card at the cursor into bypass (asking first once per launch), or out of it.
-    pub(super) fn toggle_card_bypass(&mut self, host: &UiContext) {
-        let Some(session) = self
-            .agent_at_cursor()
-            .and_then(|exchange| self.notes.exchange(&exchange))
-            .and_then(|exchange| exchange.session_id.clone())
-        else {
-            self.set_status(
+    pub(super) fn toggle_card_bypass(&mut self) {
+        match self.card_at_cursor() {
+            Some((_, session)) => self.request_session_bypass(session),
+            None => self.set_status(
                 "move to an AI card with a session first",
                 StatusSeverity::Warning,
-            );
+            ),
+        }
+    }
+
+    /// The composer's bypass chip: step the follow-up's session in or out at once, or choose
+    /// whether a new question's session starts in bypass. Stepping in asks first once per launch.
+    pub(super) fn toggle_composer_bypass(&mut self) {
+        if let Some(session) = self.composer_session() {
+            self.request_session_bypass(session);
             return;
-        };
+        }
+        let on = !self
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.bypass)
+            .unwrap_or(false);
+        if on && !self.confirm_bypass(false) {
+            return;
+        }
+        if let Some(composer) = self.composer.as_mut() {
+            composer.set_bypass(Some(on));
+        }
+        self.set_status(
+            if on {
+                "This question's agent starts in permission bypass: its tools run without asking"
+            } else {
+                "This question's agent asks before its tools run"
+            },
+            StatusSeverity::Info,
+        );
+    }
+
+    /// Show in the composer whether its question runs in bypass: the follow-up's session as it
+    /// reports itself, else the new question's choice (review-wide bypass to begin with).
+    pub(super) fn sync_composer_bypass(&mut self) {
+        let session = self.composer_session().map(|session| {
+            self.agents
+                .state(&session)
+                .is_some_and(crate::agent::AgentState::bypass)
+        });
+        let covered = self.services.bypass_policy().covers(AgentKind::Question);
+        if let Some(composer) = self.composer.as_mut() {
+            let bypass = matches!(composer.mode, crate::composer::ComposerMode::Ask)
+                .then(|| session.unwrap_or_else(|| composer.bypass.unwrap_or(covered)));
+            composer.set_bypass(bypass);
+        }
+    }
+
+    /// Step `session` into bypass (asking first once per launch) or out of it, as it reports
+    /// itself now; sent on the next poll.
+    pub(super) fn request_session_bypass(&mut self, session: String) {
         let on = !self
             .agents
             .state(&session)
@@ -100,6 +148,17 @@ impl ReviewSurface {
         } else {
             TurnPermissionMode::Enforce
         };
+        self.feed_requests
+            .push_back(super::feed::FeedRequest::Bypass { session, mode });
+    }
+
+    /// Set `mode` on one card's `session`, handling prompts already waiting.
+    pub(super) fn spawn_session_bypass(
+        &self,
+        session: String,
+        mode: TurnPermissionMode,
+        host: &UiContext,
+    ) {
         let services = self.services.clone();
         let inbox = self.inbox.clone();
         host.spawn(Box::pin(async move {
@@ -122,11 +181,14 @@ impl ReviewSurface {
         if let Some(problem) = problem {
             self.toasts.push(ToastSeverity::Warning, problem, None);
         }
-        if !go {
-            self.toasts.push_sticky(
+        if go {
+            self.toasts.remove_tagged(CONFIRMATION_TAG);
+        } else {
+            self.toasts.push_sticky_tagged(
                 ToastSeverity::Warning,
                 "Permission bypass is not on yet",
                 Some(bypass::CONFIRMATION.to_owned()),
+                CONFIRMATION_TAG,
             );
         }
         go

@@ -281,6 +281,7 @@ impl ReviewSurface {
         let classify = (composer.kind, composer.severity);
         let remote_reply = composer.remote_reply;
         let thread = composer.thread.clone();
+        let bypass = composer.bypass == Some(true);
         self.close_composer();
         let now = now_ms();
         let look = match mode {
@@ -330,7 +331,7 @@ impl ReviewSurface {
             ComposerMode::Ask => {
                 let guided = self.guide_composed(&anchor, text.clone());
                 if guided.is_none() {
-                    self.ask_about(&anchor, text, now, thread.as_deref());
+                    self.ask_about(&anchor, text, now, thread.as_deref(), bypass);
                 }
                 Ok(guided.unwrap_or(ASKING_STATUS))
             }
@@ -442,6 +443,7 @@ impl ReviewSurface {
                     .requests
                     .push(crate::assistant::LinkRequest::Model(target));
             }
+            ComposerButton::Bypass => self.toggle_composer_bypass(),
             ComposerButton::Suggestion(index) => composer.accept_suggestion(index),
         }
     }
@@ -757,6 +759,7 @@ impl ReviewSurface {
             AgentAction::Suggest => self.suggest_from_answer(),
             AgentAction::Draft => self.draft_from_answer(),
             AgentAction::Copy => self.copy_answer(),
+            AgentAction::Bypass => self.toggle_card_bypass(),
             AgentAction::Model => {
                 let target = self.card_at_cursor().map_or(
                     crate::assistant::models::Target::AppDefault,
@@ -822,7 +825,7 @@ impl ReviewSurface {
     /// anchor already has a linked session (an earlier question, or a linked thread), the
     /// question is a follow-up in that session.
     pub(super) fn ask_question(&mut self, anchor: &DocAnchor, question: String, now: u64) {
-        self.ask_about(anchor, question, now, None);
+        self.ask_about(anchor, question, now, None, false);
     }
 
     /// The session a question about `anchor` goes to: the anchor's latest question's, else a
@@ -870,6 +873,7 @@ impl ReviewSurface {
         question: String,
         now: u64,
         thread_id: Option<&str>,
+        bypass: bool,
     ) {
         self.next_exchange += 1;
         let draft_anchor = anchor.to_draft_anchor();
@@ -923,6 +927,7 @@ impl ReviewSurface {
         let asked = agent::Asked {
             prompt: agent::prompt(&context),
             title: agent::session_title(&context),
+            bypass,
         };
         self.asks.push_back((exchange, asked));
         self.sync_notes();

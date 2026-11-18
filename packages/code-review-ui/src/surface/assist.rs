@@ -530,6 +530,7 @@ impl ReviewSurface {
             command.instruction().to_owned(),
             now_ms(),
             thread.as_deref(),
+            false,
         );
         self.sync_notes();
         self.set_status(

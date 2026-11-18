@@ -441,10 +441,15 @@ each Bcode session's, and it ends when the daemon restarts.
 * **Guide agents** (fan-out writers and verifiers, and a guide written by one agent) are included
   unless *Permission bypass: include guide agents or leave them out* turns that off; it can change
   at any time, and while review-wide bypass is on it steps them in or out at once.
-* **One card** (*Permission bypass: step the AI card's agent in or out*, on the card at the cursor)
-  or **one conversation** (*Assistant: Permission bypass: step this conversation in or out*, or
-  its `⚠ bypass` chip). A card or conversation in bypass says so in its header, whichever client
-  stepped it in.
+* **One question.** The Ask composer's chip, after the model chip, reads `◇ asks first` or
+  `⚠ bypass`. On a follow-up it steps the card's session in or out at once (it shows the
+  session's mode, wherever it was changed); on a new question it chooses whether the new session
+  starts in bypass.
+* **One card**: its **Bypass** / **⚠ Stop bypass** button (offered in every state,
+  a waiting permission prompt included), or *Permission bypass: step the AI card's agent in or
+  out* on the card at the cursor. **One conversation**: *Assistant: Permission bypass: step this
+  conversation in or out*, or its `⚠ bypass` chip. A card or conversation in bypass says so in its
+  header, whichever client stepped it in.
 * **Asking first.** The first step in of a launch only says what it does; doing it again steps
   in. *…step this review's agents in and don't ask again* steps in and stops asking, remembered
   in `permission-bypass.toml` in Bcode's state directory (shared with the TUI's `/yolo always`).

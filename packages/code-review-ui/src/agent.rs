@@ -580,6 +580,8 @@ pub struct Asked {
     pub prompt: String,
     /// The new session's title ([`session_title`]).
     pub title: String,
+    /// Start a new session in permission bypass (the asker chose it in the composer).
+    pub bypass: bool,
 }
 
 /// Ask: persist the exchange, create the session and bind it to the review (`binding`, whose
@@ -622,6 +624,7 @@ pub async fn ask(
     let Asked {
         prompt: text,
         title,
+        bypass,
     } = question;
     let follow_up = exchange.session_id.clone();
     let mut refused = None;
@@ -647,7 +650,7 @@ pub async fn ask(
             )
             .await
             .map_err(|error| error.message)?;
-        crate::bypass::start_session(&services, &session, crate::bypass::AgentKind::Question).await;
+        crate::bypass::start_question(&services, &session, bypass).await;
         // The app default applies before the question; the card says why Bcode refused one.
         refused = refused_default(&services, scope.repo_path.clone(), &session).await;
         services

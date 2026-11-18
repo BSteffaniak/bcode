@@ -40,6 +40,11 @@ pub(super) enum FeedRequest {
     },
     /// Stop the running turn.
     Stop { session: String },
+    /// Step the session into permission bypass, or out of it.
+    Bypass {
+        session: String,
+        mode: bcode_session_models::TurnPermissionMode,
+    },
 }
 
 impl ReviewSurface {
@@ -187,6 +192,7 @@ impl ReviewSurface {
         for (session, label) in sessions {
             self.agents.set_model_label(&session, label);
         }
+        self.sync_composer_bypass();
     }
 
     /// Answer the permission request of the cursor card's session, stop its turn, or open or
@@ -276,6 +282,13 @@ impl ReviewSurface {
     /// Send queued feed requests.
     pub(super) fn pump_feed(&mut self, host: &UiContext) {
         while let Some(request) = self.feed_requests.pop_front() {
+            let request = match request {
+                FeedRequest::Bypass { session, mode } => {
+                    self.spawn_session_bypass(session, mode, host);
+                    continue;
+                }
+                request => request,
+            };
             let host_ref = std::sync::Arc::clone(host.host());
             let inbox = self.inbox.clone();
             host.spawn(Box::pin(async move {
@@ -303,6 +316,7 @@ impl ReviewSurface {
                         session,
                         permission_id: None,
                     },
+                    FeedRequest::Bypass { .. } => return,
                 };
                 inbox.push(Message::Feed(outcome));
             }));
