@@ -3333,6 +3333,11 @@ pub struct TuiMarkdownConfig {
     /// Permit process-isolated Mermaid rendering for visible resident transcript items.
     #[serde(default = "default_tui_markdown_mermaid")]
     pub mermaid: bool,
+    /// How raw HTML embedded in Markdown is shown on every Bcode Markdown surface (chat
+    /// transcript, review app, read pager): `render` (GitHub's sanitized subset, the default),
+    /// `strip` (tags removed, text kept), or `raw` (HTML source as text).
+    #[serde(default)]
+    pub html: TuiMarkdownHtmlMode,
 }
 
 impl Default for TuiMarkdownConfig {
@@ -3340,6 +3345,33 @@ impl Default for TuiMarkdownConfig {
         Self {
             network_images: false,
             mermaid: default_tui_markdown_mermaid(),
+            html: TuiMarkdownHtmlMode::default(),
+        }
+    }
+}
+
+/// Presentation of raw HTML embedded in Markdown (`[tui.markdown] html`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiMarkdownHtmlMode {
+    /// Render the element subset GitHub keeps after sanitizing (formatting, links, images,
+    /// tables, alignment, `<details>`); comments and scripts are removed.
+    #[default]
+    Render,
+    /// Remove tags and keep their text; comments and scripts are removed.
+    Strip,
+    /// Show HTML source as text.
+    Raw,
+}
+
+impl TuiMarkdownHtmlMode {
+    /// The configuration spelling of this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Render => "render",
+            Self::Strip => "strip",
+            Self::Raw => "raw",
         }
     }
 }
@@ -8755,6 +8787,8 @@ fn write_tui_markdown_toml(output: &mut String, markdown: TuiMarkdownConfig) {
     writeln!(output, "network_images = {}", markdown.network_images)
         .expect("writing to string should not fail");
     writeln!(output, "mermaid = {}", markdown.mermaid).expect("writing to string should not fail");
+    writeln!(output, "html = \"{}\"", markdown.html.as_str())
+        .expect("writing to string should not fail");
 }
 
 fn write_tui_mouse_toml(output: &mut String, mouse: &TuiMouseConfig) {
@@ -10044,8 +10078,8 @@ command_policy = { version = 1, layers = [{ command = { z = "deny" } }, { comman
         ProactiveCompactionThreshold, PromptProfileLayerConfig, PromptProfileTextMode,
         RuntimeAuthSubscriptionPool, RuntimeAuthSubscriptions, ToolDescriptionOverrideConfig,
         TuiAccentTransitionCurve, TuiAgentAccentPolicy, TuiInteractionOffscreenFocus,
-        TuiInteractionPlacement, TuiMouseConfig, TuiRenderConfig, TuiThemeVariant,
-        TuiVisualAdapterConfig, clear_tui_streaming_presentation_override,
+        TuiInteractionPlacement, TuiMarkdownHtmlMode, TuiMouseConfig, TuiRenderConfig,
+        TuiThemeVariant, TuiVisualAdapterConfig, clear_tui_streaming_presentation_override,
         clear_tui_theme_selection, default_config_paths_from, default_permissions_state_path,
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, load_tui_streaming_presentation_override_from,
@@ -11809,17 +11843,31 @@ message_contains = "Unsupported content type"
         let defaults = BcodeConfig::default().tui.markdown;
         assert!(!defaults.network_images);
         assert!(defaults.mermaid);
+        assert_eq!(defaults.html, TuiMarkdownHtmlMode::Render);
 
         let config: BcodeConfig = toml::from_str(
-            r"
+            r#"
 [tui.markdown]
 network_images = true
 mermaid = false
-",
+html = "strip"
+"#,
         )
         .expect("config should parse");
         assert!(config.tui.markdown.network_images);
         assert!(!config.tui.markdown.mermaid);
+        assert_eq!(config.tui.markdown.html, TuiMarkdownHtmlMode::Strip);
+        for mode in [
+            TuiMarkdownHtmlMode::Render,
+            TuiMarkdownHtmlMode::Strip,
+            TuiMarkdownHtmlMode::Raw,
+        ] {
+            let parsed: BcodeConfig =
+                toml::from_str(&format!("[tui.markdown]\nhtml = \"{}\"\n", mode.as_str()))
+                    .expect("mode should parse");
+            assert_eq!(parsed.tui.markdown.html, mode);
+        }
+        assert!(toml::from_str::<BcodeConfig>("[tui.markdown]\nhtml = \"pretty\"\n").is_err());
     }
 
     #[test]
