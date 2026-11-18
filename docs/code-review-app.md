@@ -373,6 +373,7 @@ and what is on screen now (`current_view`'s sections `screen`, `review`, `stack`
 | `bcode.code-review.complete_pass` | mutating | Marks the review pass complete (`shift+m`). |
 | `bcode.code-review.pull_request_review` | mutating | Opens the dialog to `approve`, `request_changes`, `comment` or `approve_viewed_layers`; you confirm it. |
 | `bcode.code-review.publish` | mutating | Opens the publish dialog (`shift+p`); you confirm it. |
+| `bcode.code-review.guide_fan_out` | mutating | Writes the review's guide with child agents, one per area or stack layer, children of the conversation with its model and effort; asks the user to confirm a costly fan-out, and later asks the conversation to synthesize. See [Guided review](code-review-guide.md#fan-out-from-the-app). |
 | `bcode.code-review.guide_show` | read-only | Opens the review's guide (its panel, or the assistant's Guide tab when the screen has no room for it) and moves through it as the guide keys do: a `section`, a `citation`, or a `step` (`next`, `previous`, `next_unreviewed`). See [Guided review](code-review-guide.md#writing-a-guide-from-the-assistant). |
 
 Read-only app tools run without asking: they change what is shown, not what is stored. Mutating
@@ -861,6 +862,8 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | (palette, AI menu) | Guide: walk me through this review |
 | (palette, AI menu) | Guide: walk me through this review, with directions… |
 | (palette, AI menu) | Guide: walk me through this review, with a template… |
+| (palette, AI menu) | Guide: walk me through this review with child agents (or resume their fan-out) |
+| (palette) | Guide: stop the child agents writing the guide |
 | (palette) | Guide: Copy as markdown |
 | (palette) | Guide: Export to file |
 | (palette) | Guide: refresh stale sections |
@@ -989,7 +992,9 @@ keys (see [Files, folders and the repository as they are now](#files-folders-and
 | `r` | Refresh the section (a new version when the code moved on) |
 | `alt+r` | Refresh every stale section |
 | `shift+v` | Versions of the guide (older ones read-only) |
-| `esc` | Back to the review |
+| `f` | Write the guide with child agents, confirm their fan-out, or resume it |
+| `shift+x` | Stop the child agents writing the guide |
+| `esc` | Back to the review (drops a fan-out waiting for confirmation) |
 
 See [Guided review](code-review-guide.md#presentation) for the panel and the diff's citation
 markers.

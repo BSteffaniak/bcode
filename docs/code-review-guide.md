@@ -358,8 +358,8 @@ outcome), in which case the id is shared.
 ### App client tools (`bcode.code-review.*`)
 
 Only actions that need the live screen or the host's session APIs are app tools:
-`guide_show` (open the panel and step through the guide exactly as the keys do) and, with
-orchestration, `guide_fan_out`. `current_view` reports the active guide, version, current section,
+`guide_show` (open the panel and step through the guide exactly as the keys do) and
+`guide_fan_out` (write the guide with child agents; see [Fan-out from the app](#fan-out-from-the-app)). `current_view` reports the active guide, version, current section,
 and counts of reviewed, verified and stale sections.
 
 ## Orchestration
@@ -382,18 +382,65 @@ whose estimate passes `confirm_above_tokens` needs confirmation.
 * **Streaming.** The writer calls `start` with a planned outline, then one `write` per section.
   Each finished call reaches the review app through tool reflection, which reloads just that
   version, so sections fill in one at a time.
-* **Fan-out** uses app-driven child sessions: each child is a real child of the assistant
-  session, with the parent's model and effort, bound to the review with an `Area` grant, writing
-  only its own area row. At most `max_parallel` run at once. When every area is terminal, the app
-  asks the parent to synthesize, reusing the areas' citation ids. If the app closes mid-run, the
-  version stays generating with its finished areas and the panel offers Resume. Moving fan-out
-  onto workflow task groups is a later step.
+* **Fan-out** uses app-driven child sessions (below). Moving fan-out onto workflow task groups is
+  a later step.
 * **Cancellation** is end to end: stopping cancels the parent and every child turn, marks the
   version cancelled, and keeps what was written.
 * **Cost** is estimated before fan-out from diff size, depth, children and catalog prices; above
   `confirm_above_tokens` the reviewer confirms, and `budget_tokens` is a soft cap.
 * **Deep mode** runs a verifier child that records claim checks; unsupported claims go back to the
   writer under a `Refresh` grant.
+
+### Fan-out from the app
+
+* **Starting.** `f` in the guide panel (or "Guide: walk me through this review with child agents"
+  in the palette and the AI menu) is a fan-out the reviewer asked for: it is not a tool call, so it
+  does not prompt, and it fans out even where one writer would do. The assistant starts one with
+  `bcode.code-review.guide_fan_out` (`strategy` auto, `per_layer` or `areas`; `depth`,
+  `directions`, `title`), which is mutating, so Bcode's permission rules ask unless allowed; with
+  `auto` a review the plan gives one writer is refused with the reason, for the assistant to
+  write directly. The children are children of the assistant's conversation, so it must have one.
+* **Confirming.** The app plans the review from the conversation's binding. When the estimate
+  passes `confirm_above_tokens`, the panel (and a waiting tool call's answer) shows
+  "Fan out: 5 agents · ~350k tok · ≈$1.05 on <model>", the cost from the model's catalog input
+  price; `f` or `enter` starts it and `esc` drops it.
+* **Versions.** The conversation starts the version (strategy `areas` or `per_layer`) with the
+  core outline. By layer, the version is a stack guide's and each layer gets its own layer guide
+  (`parent_guide_id` the stack guide). The areas are recorded queued in the version's fan-out
+  progress (`generation`: each area's paths or layer, child session, status, tokens and message;
+  the budget, `max_parallel`, whether a verifier runs, and a note), which is what survives the app.
+* **Children.** One at a time, up to `max_parallel` running, the app creates a child of the
+  conversation (`ReviewHost::create_child_session`, IPC `CreateChildSession`), gives it the
+  conversation's model and effort, binds it to the review with `Area {area_id}` on the version
+  (by layer, `Generate` on its layer guide), and submits its prompt under the
+  `bcode.code-review.guide-writer` profile. Children are followed like AI cards: their tokens
+  show per area, and a child's permission request shows in the panel and the guide card with the
+  feed keys (`y`/`a`/`n`/`d`), which answer it from the guide panel. When a child's turn ends, its
+  area is ready when its area row (by layer, its layer guide) is written, else failed.
+* **Citations.** An area writer's citation ids carry the area's prefix (`crates-net.c1`), so the
+  ids of every area are distinct; a version write naming an area citation by id (in a citation
+  list, a finding, or a body token) copies it into the version as it was checked.
+* **Synthesis.** When every area is done the version is marked synthesizing and the conversation
+  is asked, with a `Generate` grant for that message, to write purpose, scope and one reading
+  order across the areas, citing the areas' citations by id (by layer: the stack guide across the
+  layer guides; the app adds a Layers section of `LayerLink` sections, one per written layer
+  guide, and `enter` on one shows that layer's guide). When the conversation's turn ends the
+  version is complete.
+* **Budget.** Children's tokens add up in the progress; past `budget_tokens`, queued areas stop
+  with a note and the guide is synthesized from what exists, the note telling the writer so.
+* **Verifier.** When a verifier runs (`verify`), a child under `bcode.code-review.guide-verifier`
+  bound with `Verify` records claim checks. Checks render under the section ("Checked claims":
+  the verified glyph for supported, the problem glyph for unsupported, the dimmed unverified
+  glyph for unclear, with the note) and never replace its content. Sections with unsupported
+  claims go back to the conversation with a `Refresh` grant for them.
+* **Stopping and resuming.** Stopping the conversation's turn, `shift+x` in the guide panel or
+  "Guide: stop the child agents writing the guide" cancels the conversation and every child and
+  marks the version cancelled; written areas stay. A fan-out version that is not complete and
+  that this app is not running (stopped, or the app closed) shows "4/5 areas ready · f Resume":
+  areas not ready are queued again for new children (children of a closed app keep running on
+  their own), and once every area is ready the conversation is asked to synthesize.
+* **Layers.** While stepping through a stack's layers (`guide.follow_layer`), the panel shows the
+  layer's own guide when it has one, and the stack guide when stepping to a layer without one.
 
 ## Presentation
 
@@ -679,14 +726,15 @@ On the review screen:
 | P4 | Single-agent generation from the assistant, guide card, tab fallback, stop | Yes |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | Yes |
 | P6 | Freshness in the UI, refresh forks, versions picker, since guides | Yes |
-| P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | No |
+| P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | Yes |
 | P8 | Templates and lint, `explain` and `freeform`, copy and export to file as markdown | Yes |
 
 The app sets grants: expand (`Expand`) and restructure (`Restructure`) bind the assistant's
 conversation for one message, ask sessions are bound with `Ask`, and refresh (`Refresh`) and
 since guides (`Generate`) are recorded on the review's binding until a new walkthrough. Other
-sessions have no grant and write the versions they started or resumed. Fan-out children (P7)
-will set `Area` grants. Guide freshness is told in
+sessions have no grant and write the versions they started or resumed. Fan-out children are
+bound with `Area` (by layer, `Generate` on their layer guide) and the verifier with `Verify`; the
+conversation synthesizes under `Generate` for one message. Guide freshness is told in
 the panel (badges, tint and moved lines follow the review's current sources, and the peek of a
 moved citation reads the current revision), and stale banners, refresh forks and the versions
 picker are described under [Lifecycle and comparisons](#lifecycle-and-comparisons).

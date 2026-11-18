@@ -471,6 +471,7 @@ unsupported source instead of silently reviewing the whole repository.
 | `bcode.code-review.complete_pass` | review writes | mutating | Marks the review pass complete, as `shift+m`. | Needs the resolved revisions on screen. |
 | `bcode.code-review.pull_request_review` | publish | mutating | Approves, requests changes or comments on a pull request of the open review, or approves every fully viewed stack layer. | Forge providers in the app. |
 | `bcode.code-review.publish` | publish | mutating | Previews or publishes the review's comments with a publisher plugin (GitHub), as `shift+p`. | Publisher plugins are reached through the app. |
+| `bcode.code-review.guide_fan_out` | guides | mutating | Writes the review's guide with child agents (one per area, or per layer of a stack stepped through three or more layers), children of this conversation with its model and effort, at most `max_parallel` at once; above `confirm_above_tokens` the user confirms the estimate first. When every child is done the conversation is asked to synthesize the guide from their areas, reusing their citation ids. Arguments: `strategy` (`auto`, `per_layer`, `areas`), `depth`, `directions`, `title`. | What started, or that the user is asked to confirm. |
 | `bcode.code-review.guide_show` | navigation | read-only | Opens the review's guide (its panel, or the panel's Guide tab when the screen has no room) and moves through it as the guide keys do: `section` (id or outline number), `citation`, `step` (`next`, `previous`, `next_unreviewed`), `focus`; `guide_id` and `version` must name the guide and version on screen (a guide not read yet is read first and shown once read). Returns the screen and where the reviewer is in the guide. | Screen state. |
 
 Every client tool answers with what it did (or why not, checked before acting, as the app's own
@@ -574,6 +575,12 @@ whose profile is unavailable fails closed (`agent_profile_unavailable`). Its ins
 describe the context blocks, the tools and the recipes above, and say to ask before acting on
 anything the user did not ask for. AI cards keep the default agent.
 
+Two more profiles, also based on `build` and restrict-only, serve guide fan-out children (see
+[Guided review](code-review-guide.md#fan-out-from-the-app)): `bcode.code-review.guide-writer`
+(review reads, the guide reads and writes, file reads) and `bcode.code-review.guide-verifier`
+(the same reads and `code_review.guide.write`, which its `Verify` grant limits to claim checks).
+Neither includes the app's own tools.
+
 The profile's tool selection is the union of the enabled categories. Restrict-only means
 Bcode's `build` policy decides every exposed call, and a category can only remove tools.
 
@@ -581,7 +588,7 @@ Bcode's `build` policy decides every exposed call, and a category can only remov
 | --- | --- | --- | --- |
 | `review_reads` | read plugin tools (`find_paths`, the code reads and the guide reads among them), `current_view`, `find_pull_requests` | on | allowed (read-only); `code_review.pull_request` declares the repository's web address, so it asks unless a web rule allows it |
 | `review_writes` | write plugin tools and `complete_pass` | on | asks (mutating) |
-| `guides` | the guide writes (`guide.start`, `guide.write`) | on | allowed unless a `code_review.guide` rule says otherwise; turning `review_writes` off leaves them |
+| `guides` | the guide writes (`guide.start`, `guide.write`) and `guide_fan_out` | on | allowed unless a `code_review.guide` rule says otherwise; turning `review_writes` off leaves them |
 | `publish` | `code_review.publish`, `bcode.code-review.publish`, `pull_request_review` | on | asks every time in the panel (Always is not offered) |
 | `navigation` | `go_to`, `set_comparison`, `set_view`, `refresh`, `open_review`, `guide_show` | on | allowed; `open_review` asks (it changes the screen) |
 | `file_reads` | `filesystem.read`, `list`, `find`, `grep`, `stat`, `exists` | on | Bcode `read` rules (allowed) |
