@@ -13,6 +13,7 @@ The terminal renderer supports the CommonMark and GitHub-oriented syntax used by
 * tables with alignment, Unicode display-width handling, body-row dividers, multiline visual-row alignment, and a stacked narrow-width fallback;
 * links, images, footnotes, inline/display math, thematic breaks, and Mermaid fences;
 * safe `<details><summary>…</summary>…</details>` blocks, including nesting;
+* embedded raw HTML, rendered like GitHub's sanitized subset (see [Raw HTML](#raw-html));
 * readable best-effort output for incomplete streaming Markdown.
 
 Renderer-owned options are included in a versioned layout signature so width, theme, trusted document context, Mermaid bounds, streaming state, and semantic contributions invalidate retained rows correctly.
@@ -66,7 +67,33 @@ A terminal cannot reproduce browser layout or behavior exactly. Bcode uses expli
 * Footnote references render as stable numbers and definitions render in a Footnotes section with return markers.
 * Inline and display math use bounded Unicode-oriented terminal projection and preserve source when no faithful conversion exists.
 * Wide tables become labeled stacked rows when they cannot fit the available columns.
-* Safe raw HTML may remain visible as text. Scripts, event handlers, dangerous markup, and Mermaid directives are never executed.
+* Raw HTML is presented according to `[tui.markdown] html` (see below). Scripts, event handlers, dangerous markup, and Mermaid directives are never executed.
+
+## Raw HTML
+
+`[tui.markdown] html` selects how raw HTML embedded in Markdown is shown on every Bcode Markdown
+surface: the chat transcript, the review app (descriptions, comments, assistant answers, the
+composer preview), and `bcode read`.
+
+```toml
+[tui.markdown]
+html = "render" # or "strip" or "raw"
+```
+
+* `render` (default) follows the element and attribute subset GitHub keeps after sanitizing:
+  inline formatting (`b`, `strong`, `i`, `em`, `code`, `kbd`, `mark`, `ins`, `del`, `sub`,
+  `sup`, `q`, `small`, `span`, …), `br`, links, images and `picture`, headings, lists,
+  definition lists, block quotes, `pre`, `hr`, tables (header rows, `align`, `colspan`),
+  `p`/`div`/heading `align="center"`/`"right"`, and interactive `<details>`. Comments and
+  `script`/`style`/`iframe`-like elements are removed with their contents; other tags are
+  removed and their text kept; character references are decoded. Markdown after a blank line
+  inside an element (a `<details>` body, a centered `<div>`) belongs to that element. Links and
+  images follow the same destination classification and image policy as Markdown links and
+  images (remote images still need `network_images`). The `markdown.keyboard` and
+  `markdown.highlight` theme roles style `<kbd>` and `<mark>`.
+* `strip` removes every tag and keeps the text; block elements still start new rows and `<br>`
+  still breaks. Comments and script-like elements are removed.
+* `raw` shows HTML source as text; `<details>` blocks keep their disclosure.
 
 ## Link policy
 

@@ -680,7 +680,9 @@ without importing anything. See [`review-forge-conversation.md`](review-forge-co
   holds the title, the status line with the same buttons and a ▾/▸ toggle (`z` on the card also
   folds it), the description, each reviewer's latest verdict (and whether it was given on an
   older version, or before a rebase that keeps it current), who is still asked, failing checks
-  with links, and the conversation, with **Show all**. A stack also gets **Approve N reviewed
+  with links, and the conversation, with **Show all**. Raw HTML in descriptions and comments
+  (pull request templates' comments, `<details>`, `<img>`, `<p align="center">`, `<kbd>`, HTML
+  tables) renders like the forge shows it, following `[tui.markdown] html`. A stack also gets **Approve N reviewed
   layers**, and a whole-stack review gets one status line per layer. Cards start open; the
   `overview` setting can start them folded, or folded unless something is new.
 * **Threads** from the forge sit on their lines in the diff, placed on the code the review shows:
@@ -1242,6 +1244,10 @@ bcode's own (`--print-config-paths` lists them in order):
   derives every color the app uses from the chosen theme.
 * `[plugins.config."bcode.code_review".theme]`: `name`, `profile`, `overlays` and `paths` for
   the review only; each set field replaces the `[tui.theme]` one.
+* `[tui.markdown] html`: how raw HTML in markdown (descriptions, comments, assistant answers,
+  the composer preview) is shown, as in bcode's chat interface: `render` (default; GitHub's
+  sanitized subset, comments and scripts removed), `strip` (tags removed, text kept) or `raw`
+  (the HTML source as text).
 
 #### Appearance: the review's own, or bcode's
 
