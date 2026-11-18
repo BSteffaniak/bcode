@@ -204,25 +204,7 @@ async fn read_guide(
     let wanted = view
         .filter(|(id, number)| *id == guide_id && *number != chosen.guide.current_version)
         .map(|(_, number)| number);
-    let mut version: GetGuideVersionResponse = services
-        .call(GetGuideVersionRequest {
-            repo_path: scope.repo_path.clone(),
-            guide_id: guide_id.clone(),
-            version: wanted,
-        })
-        .await
-        .map_err(|error| error.message)?;
-    if version.version.is_none() && wanted.is_some() {
-        // A version the guide does not have: its current one shows.
-        version = services
-            .call(GetGuideVersionRequest {
-                repo_path: scope.repo_path.clone(),
-                guide_id: guide_id.clone(),
-                version: None,
-            })
-            .await
-            .map_err(|error| error.message)?;
-    }
+    let version = read_version(&services, &scope, &guide_id, wanted).await?;
     let versions = services
         .call(ListGuideVersionsRequest {
             repo_path: scope.repo_path.clone(),
@@ -279,6 +261,28 @@ async fn read_guide(
         threads,
         versions,
     }))
+}
+
+/// Read version `wanted` of `guide_id`, or its current version when `wanted` is absent or
+/// the guide does not have it.
+async fn read_version(
+    services: &ReviewServices,
+    scope: &NoteScope,
+    guide_id: &str,
+    wanted: Option<u32>,
+) -> Result<GetGuideVersionResponse, String> {
+    let read = |version| {
+        services.call(GetGuideVersionRequest {
+            repo_path: scope.repo_path.clone(),
+            guide_id: guide_id.to_owned(),
+            version,
+        })
+    };
+    let found: GetGuideVersionResponse = read(wanted).await.map_err(|error| error.message)?;
+    if found.version.is_none() && wanted.is_some() {
+        return read(None).await.map_err(|error| error.message);
+    }
+    Ok(found)
 }
 
 /// Whether the distinct sources of `doc`, in order, are `assessed`.
@@ -509,44 +513,53 @@ impl ReviewSurface {
             .model
             .revision
             .wrapping_add(self.guide_threads_revision().rotate_left(17));
+        self.guide.empty = self.guide_empty_lines();
+    }
+
+    /// What the panel says when no guide is shown.
+    fn guide_empty_lines(&self) -> Vec<Line> {
+        let theme = &self.theme;
         let assistant = self
             .action_keys
             .get("assistant_toggle")
             .cloned()
             .unwrap_or_else(|| "the Ask AI button".to_owned());
-        self.guide.empty =
-            match &self.guide.state.load {
-                GuideLoad::Failed(error) => vec![Line::from_spans(vec![Span::styled(
-                    format!("The guide could not be read: {error}"),
-                    theme.error,
-                )])],
-                GuideLoad::Idle | GuideLoad::Loading => vec![Line::from_spans(vec![Span::styled(
-                    "Reading the guide…",
-                    theme.muted,
-                )])],
-                GuideLoad::Ready => {
-                    let directions = self
-                        .action_keys
-                        .get("guide_walkthrough_directions")
-                        .cloned()
-                        .filter(|key| !key.is_empty());
-                    let mut lines = Vec::new();
-                    if self.comparing.active() {
-                        lines.push(Line::from_spans(vec![
-                            Span::styled("enter", theme.accent),
-                            Span::styled(
-                                format!(
-                                    " guides these changes (since {})",
-                                    self.baseline_labels()[1]
-                                ),
-                                theme.muted,
+        match &self.guide.state.load {
+            GuideLoad::Failed(error) => vec![Line::from_spans(vec![Span::styled(
+                format!("The guide could not be read: {error}"),
+                theme.error,
+            )])],
+            GuideLoad::Idle | GuideLoad::Loading => vec![Line::from_spans(vec![Span::styled(
+                "Reading the guide…",
+                theme.muted,
+            )])],
+            GuideLoad::Ready => {
+                let directions = self
+                    .action_keys
+                    .get("guide_walkthrough_directions")
+                    .cloned()
+                    .filter(|key| !key.is_empty());
+                let mut lines = Vec::new();
+                if self.comparing.active() {
+                    lines.push(Line::from_spans(vec![
+                        Span::styled("enter", theme.accent),
+                        Span::styled(
+                            format!(
+                                " guides these changes (since {})",
+                                self.baseline_labels()[1]
                             ),
-                        ]));
-                    }
-                    lines.extend([
+                            theme.muted,
+                        ),
+                    ]));
+                }
+                lines.extend([
                     Line::from_spans(vec![
                         Span::styled(
-                            if self.comparing.active() { "palette" } else { "enter" },
+                            if self.comparing.active() {
+                                "palette"
+                            } else {
+                                "enter"
+                            },
                             theme.accent,
                         ),
                         Span::styled(
@@ -568,15 +581,15 @@ impl ReviewSurface {
                         theme.muted,
                     )]),
                 ]);
-                    if self.is_transient() {
-                        lines.push(Line::from_spans(vec![Span::styled(
-                            "Save the review to keep its guide.",
-                            theme.notice,
-                        )]));
-                    }
-                    lines
+                if self.is_transient() {
+                    lines.push(Line::from_spans(vec![Span::styled(
+                        "Save the review to keep its guide.",
+                        theme.notice,
+                    )]));
                 }
-            };
+                lines
+            }
+        }
     }
 
     /// The guide panel's title and status.
