@@ -242,9 +242,9 @@ from it, is in [code review assistant](code-review-assistant.md).
   unbinds each session, and reports the ones Bcode kept.
 * **Title row.** `↗` (and `ctrl+o`) opens the conversation in `bcode tui` once it has a session
   (before that, `ctrl+o` says to start or open one). The panel controls follow, as on every
-  panel ([Panel controls](#panel-controls)): `▁` minimizes it to its title row (bottom dock) or a
-  strip (right dock), `□` maximizes it over the whole screen (as does a double click on the
-  title), `✕` closes it, and `alt+c`, `alt+z`, `alt+w`, `alt+=`, `alt+-` and `alt+0` do the same
+  panel ([Panel controls](#panel-controls)): `▾` minimizes it to its title row (bottom dock) or a
+  strip (right dock), `⤢` maximizes it over the whole screen (as does a double click on the
+  title), `×` closes it, and `alt+c`, `alt+z`, `alt+w`, `alt+=`, `alt+-` and `alt+0` do the same
   from the keyboard. Without room to dock, a minimized panel is hidden and the screen keeps the
   keyboard; `ctrl+k` restores it. The screens'
   palettes list the assistant's actions ("Assistant: …").
@@ -777,16 +777,25 @@ what is saved) is `packages/code-review-ui/src/panel_controls.rs`:
 
 | Control | Glyph (ASCII) | Click | Key (focused panel) |
 |---|---|---|---|
-| Minimize / restore | `▁` / `❐` (`_` / `=`) | the title row's control | `alt+c` |
-| Maximize / restore | `□` / `❐` (`+` / `=`) | the title row's control, or a double click on the title | `alt+z`; `esc` also restores |
-| Close | `✕` (`x`) | the title row's control | `alt+w` |
+| Minimize / restore | `▾` / `▸` (`v` / `>`) | the title row's control | `alt+c` |
+| Maximize / restore | `⤢` / `⤡` (`+` / `=`) | the title row's control, or a double click on the title | `alt+z`; `esc` also restores |
+| Close | `×` (`x`) | the title row's control | `alt+w` |
 | Grow / shrink | | drag the panel's edge | `alt+=` / `alt+-` (a count repeats) |
 | Reset size | | | `alt+0` |
 
-* **Title row.** The controls are the last actions of the title row, in the order above. When
-  the row is too narrow the leftmost actions drop first (the assistant's own `+ new`, `⟲`, `↗`
-  and tabs, then minimize, then maximize; close goes last), and the title is clipped to the room
-  left, never overlapped. Their click targets are the cells they are painted on.
+* **Title row.** The controls are the last actions of the title row, in the order above, in one
+  muted cluster joined to the border and set off from the panel's status:
+  `╭─ Guide ──── ✓0/3 ◈0/0 ─┤ ▾ ⤢ × ├─╮` (maximized `⤡`; the caps follow the theme's border, `|`
+  with ASCII icons). The control under the pointer takes the accent colour, close the error
+  colour. When the row is too narrow the leftmost actions drop first (the assistant's own
+  `+ new`, `⟲`, `↗` and tabs, then minimize, then maximize; close goes last, with the caps), and
+  the title is clipped to the room left, never overlapped. Their click targets are the cells
+  they are painted on.
+* **Visibility.** The controls show only on the focused panel and the panel under the pointer;
+  the other panels' title rows give the room to their status. Keys and double clicks on a title
+  work on every panel. A minimized panel always shows its restore control (`┤ ▸ ├` on its row,
+  `▸` atop its strip), so it can be restored by pointer. A press where hidden controls would be
+  is a press on the title.
 * **Minimize** collapses a panel along its group: to its title row when stacked (the threads or
   guide panel under the document, the guide over the threads, the assistant docked at the
   bottom), to a strip with its restore control and its name down the strip when side by side
