@@ -1,6 +1,8 @@
 //! Guided review: what the guide tools check, plan, write, and render (see
 //! `docs/code-review-guide.md`).
 //!
+//! * [`coverage`] tells which review files reviewed sections mark viewed, and which sections
+//!   un-viewing a file un-reviews.
 //! * [`document`] checks a guide document against its bounds and structure before it is
 //!   stored, and fingerprints sections for reviewed marks.
 //! * [`cite`] checks a requested citation against the revisions a guide is pinned to, through
@@ -17,6 +19,7 @@
 pub mod cite;
 pub mod config;
 pub mod context;
+pub mod coverage;
 pub mod document;
 pub mod export;
 pub mod freshness;
