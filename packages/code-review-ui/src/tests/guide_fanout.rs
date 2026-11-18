@@ -868,7 +868,7 @@ fn synthesis_waits_for_its_own_turn_while_the_reviewer_chats() {
     );
 
     // The reviewer's turn ends: the synthesis is sent, and the run waits for its turn.
-    let mut ended = chat.clone();
+    let mut ended = chat;
     ended.push(answer("Two areas."));
     setup.deliver(&parent, snapshot(ended.clone()));
     settle_until(&mut setup, "synthesis is asked for", asked);
@@ -924,7 +924,7 @@ fn stop_while_a_child_is_being_created_stops_that_child_too() {
         }
         setup.scenario.step_async();
     }
-    assert!(setup.backend.host().child_sessions().is_empty());
+    assert_eq!(setup.backend.host().child_sessions().len(), 0);
 
     // Stop before the child's creation ran: the creation finishes after the run was read.
     setup.scenario.key("shift+x");

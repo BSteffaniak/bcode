@@ -194,9 +194,10 @@ pub fn new_guide_id(workspace_id: &str, now_ms: u64) -> String {
         })
 }
 
-/// A since guide's `pairs` compared up to the heads a version of it is pinned to: a refreshed
-/// version is pinned to newer heads than the guide was started at, and its citations' lines are
-/// at those heads. Each pair whose layer (by `numbers`, source id to pull request number) the
+/// A since guide's `pairs` compared up to the heads a version of it is pinned to.
+///
+/// A refreshed version is pinned to newer heads than the guide was started at, and its
+/// citations' lines are at those heads. Each pair whose layer (by `numbers`, source id to pull request number) the
 /// version pins to another commit compares to that commit, from the same baseline, with the
 /// pinned base as where the layer's own change starts.
 #[must_use]

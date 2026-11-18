@@ -1750,23 +1750,28 @@ impl Assistant {
         changed | (self.agents.revision() != before)
     }
 
-    fn finish(&mut self, done: Done, ui: &UiContext) {
-        self.touch();
+    /// Count a send or session start answered, and forget the message of one that failed.
+    fn account_sent(&mut self, done: &Done) {
         if matches!(done, Done::Sent { .. } | Done::Started { .. }) {
             self.in_flight.set(self.in_flight.get().saturating_sub(1));
         }
         if matches!(
-            &done,
+            done,
             Done::Sent { result: Err(error), retried, .. }
                 if *retried || error.code != crate::host::REQUEST_ONLY_CONTEXT_UNAVAILABLE
         ) {
             // The message's turn will not run: its newest unsettled entry is dropped.
             self.unsettled.pop_back();
         }
-        if matches!(&done, Done::Started { epoch, result: Err(_) } if *epoch == self.epoch) {
+        if matches!(done, Done::Started { epoch, result: Err(_) } if *epoch == self.epoch) {
             // No session: none of the conversation's messages runs.
             self.unsettled.clear();
         }
+    }
+
+    fn finish(&mut self, done: Done, ui: &UiContext) {
+        self.touch();
+        self.account_sent(&done);
         match done {
             Done::Created { epoch, session } => {
                 if epoch == self.epoch {

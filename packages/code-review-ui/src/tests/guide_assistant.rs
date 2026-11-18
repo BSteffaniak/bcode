@@ -721,6 +721,7 @@ fn a_second_walkthrough_in_the_same_conversation_is_sent_and_starts_a_new_versio
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn expand_binds_the_conversation_to_the_section_for_that_message_only() {
     let mut setup = setup(260, 50, true);
     setup.scenario.key("alt+g");

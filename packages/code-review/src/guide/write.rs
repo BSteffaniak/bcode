@@ -466,12 +466,8 @@ pub fn area_citation_prefix(area_id: &str) -> String {
         tag.push_str("area");
     }
     let digest = Sha256::digest(id.as_bytes());
-    let hash: String = digest
-        .iter()
-        .take(4)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{tag}-{hash}.")
+    let hash = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    format!("{tag}-{hash:08x}.")
 }
 
 /// Every inline citation of `ops`, in order.

@@ -1074,7 +1074,9 @@ fn fan_out_children_write_only_their_area_and_synthesis_reuses_their_citation_id
     );
     let id = area["citations"][0]["id"].as_str().expect("id").to_owned();
     assert!(
-        id.starts_with("crates-net-") && id.ends_with(".c1"),
+        id.strip_prefix("crates-net-")
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(hash, local)| hash.len() == 8 && local == "c1"),
         "{area}"
     );
 
