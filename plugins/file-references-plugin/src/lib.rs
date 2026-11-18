@@ -55,9 +55,7 @@ pub fn file_references_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistr
     registry
 }
 
-// Both consumers generate this transport from the contract-only schema owner. Generated
-// dispatch matches on the operation name however few operations the interface has.
-#[allow(clippy::single_match_else)]
+// Both consumers generate this transport from the contract-only schema owner.
 pub mod path_search_transport {
     include!(concat!(env!("OUT_DIR"), "/path_search.rs"));
 }
