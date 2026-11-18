@@ -15,12 +15,13 @@ use crate::guide::config::{GuideConfig, StrategyChoice};
 use crate::guide::context::{GuideContext, read_context};
 use crate::guide::export::{ExportOptions, LinkStyle, render_markdown};
 use crate::guide::freshness::assess_version;
+use crate::guide::lifecycle::SinceDelta;
 use crate::guide::lint::{LintItem, lint, lint_section};
 use crate::guide::plan::{GuidePlan, PlanFile, PlanInput, PlanLayer, plan};
 use crate::guide::template::{ResolvedTemplate, resolve_template};
 use crate::guide::write::{
     ApplyOutcome, AreaStatusInput, Doc, GuideOp, MAX_OPS, OUTSIDE_GRANT, OpError, OutlineInput,
-    SectionWrite, Writer, apply, apply_area_sections, batch_citations,
+    SectionWrite, Writer, apply, apply_area_sections, batch_citations, inline_citations,
 };
 use crate::store::StoreError;
 use bcode_code_review_models::{
@@ -51,6 +52,8 @@ const MAX_MANIFESTS: usize = 5_000;
 
 /// Refusal code: the version changed since the revision the writer named.
 pub const GUIDE_CONFLICT: &str = "conflict";
+/// Refusal code: a since guide cited lines not new since its baseline.
+pub const GUIDE_OUTSIDE_DELTA: &str = "outside_delta";
 /// Refusal code: a strict write had citation problems.
 pub const GUIDE_CITATION_PROBLEMS: &str = "citation_problems";
 /// Refusal code: the document the batch would write is over a bound or inconsistent.
@@ -822,6 +825,19 @@ impl ReviewTools<'_> {
                 "citations": numbered_checks(&checks),
             })));
         }
+        if let GuideScope::Since { pairs, .. } = &guide.guide.scope
+            && !pairs.is_empty()
+        {
+            let errors = self.outside_delta(review, pairs, &ops, &checks)?;
+            if !errors.is_empty() {
+                return Ok(GuideWriteOutcome::Refused(json!({
+                    "written": false,
+                    "code": GUIDE_OUTSIDE_DELTA,
+                    "message": "this guide walks through what changed since the comparison baseline, so it cites only lines new since then; nothing was written. Cite the new lines named, or leave the point out, and write again",
+                    "errors": errors,
+                })));
+            }
+        }
         let grant = review.guide_grant.clone();
         let caller = session.map(str::to_owned);
         let guide_row = guide.guide;
@@ -872,6 +888,44 @@ impl ReviewTools<'_> {
             "citations": outcome.citations.iter().map(citation_view).collect::<Vec<_>>(),
             "lint": lint,
         })))
+    }
+
+    /// The citations of `ops` (checked as `checks`, in batch order) that a since guide of
+    /// `pairs` may not cite: lines not new since the baseline.
+    fn outside_delta(
+        &self,
+        review: &OpenReview,
+        pairs: &[bcode_code_review_models::LayerPair],
+        ops: &[GuideOp],
+        checks: &[CitationCheck],
+    ) -> Result<Vec<OpError>, AssistantError> {
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let numbers = Self::pinned(review, None).numbers;
+        let since = SinceDelta::compute(self.data, &review.repo_root, pairs, &numbers)?;
+        let primary = review
+            .resolved
+            .first()
+            .map(|source| source.source_id.as_str());
+        let mut errors = Vec::new();
+        let mut at = 0;
+        for (op_index, op) in ops.iter().enumerate() {
+            let count = inline_citations(op).len();
+            for check in checks.iter().skip(at).take(count) {
+                if let Some(message) =
+                    since.outside(self.data, &review.repo_root, &check.citation, primary)
+                {
+                    errors.push(OpError {
+                        op_index,
+                        code: GUIDE_OUTSIDE_DELTA,
+                        message,
+                    });
+                }
+            }
+            at += count;
+        }
+        Ok(errors)
     }
 
     fn write_area(
