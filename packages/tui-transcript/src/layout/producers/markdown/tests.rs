@@ -341,7 +341,7 @@ fn l8_visual_applies_only_on_exact_source_match() {
 }
 
 #[test]
-fn l8_notice_replaces_slot_rows_and_clips_at_the_width() {
+fn l8_notice_replaces_slot_rows_and_wraps_within_the_width() {
     let mut config = image_config();
     let (placeholder, _) = project(&config, &image_request());
     let slot = only_slot(&placeholder, 30);
@@ -351,12 +351,103 @@ fn l8_notice_replaces_slot_rows_and_clips_at_the_width() {
     let node = layout(&body, 30);
     let rows = paint(&body, &node);
     let start = usize::try_from(slot.rect.y).expect("row");
-    assert!(rows[start].starts_with("[a cat — image failed"));
-    assert!(display_width(rows[start].trim_end()) <= 30);
-    assert_eq!(rows[start + 1].trim_end(), "second");
-    assert_eq!(rows[start + 2].trim(), "");
+    let slot_rows = &rows[start..start + usize::from(IMAGE_RESERVED_ROWS)];
+    assert!(slot_rows[0].starts_with("[a cat — image failed"));
+    assert!(
+        slot_rows
+            .iter()
+            .all(|row| display_width(row.trim_end()) <= 30)
+    );
+    let shown = slot_rows
+        .iter()
+        .map(|row| row.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(shown.contains("overflows]"), "{shown}");
+    assert!(shown.ends_with("second"), "{shown}");
     assert_eq!(painted_images(&body, &node, 0, 20), NO_IMAGES);
     assert_eq!(body.rows(), placeholder.rows());
+}
+
+#[test]
+fn l8_notice_needing_more_rows_than_reserved_ends_with_an_ellipsis() {
+    let mut config = image_config();
+    let (placeholder, _) = project(&config, &image_request());
+    let slot = only_slot(&placeholder, 30);
+    let notice = "one two three four five six seven eight nine ten eleven twelve thirteen \
+                  fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+    config.markdown.visuals = accepted(&slot, 1, MarkdownVisual::Notice(Arc::from(notice)));
+    let (body, _) = project(&config, &image_request());
+    let rows = paint(&body, &layout(&body, 30));
+    let start = usize::try_from(slot.rect.y).expect("row");
+    let last = &rows[start + usize::from(IMAGE_RESERVED_ROWS) - 1];
+    assert!(last.trim_end().ends_with('…'), "{rows:?}");
+    assert!(display_width(last.trim_end()) <= 30);
+    assert_eq!(body.rows(), placeholder.rows());
+}
+
+#[test]
+fn l8_notice_of_a_centered_image_takes_back_the_padding_and_shows_no_stray_ellipsis() {
+    use bcode_markdown_render::MarkdownHtmlMode;
+    let source = "<p align=\"center\"><img src=\"https://example.com/logo.png\" alt=\"Project logo\"></p>\n\nAfter";
+    let request = MarkdownRequest::new(source, 60).document("transcript:item:c");
+    let mut config = image_config();
+    config.markdown.html = MarkdownHtmlMode::Render;
+    let (placeholder, _) = project(&config, &request);
+    let slot = only_slot(&placeholder, 60);
+    assert!(slot.rect.x > 0, "the image is centered");
+    let notice = "[Project logo — image network disabled; source: https://example.com/logo.png]";
+    config.markdown.visuals = accepted(&slot, 1, MarkdownVisual::Notice(Arc::from(notice)));
+    let (body, _) = project(&config, &request);
+    let rows = paint(&body, &layout(&body, 60));
+    let start = usize::try_from(slot.rect.y).expect("row");
+    let slot_rows = &rows[start..start + usize::from(IMAGE_RESERVED_ROWS)];
+    assert!(
+        slot_rows.iter().all(|row| !row.contains('…')),
+        "nothing is cut: {slot_rows:?}"
+    );
+    assert!(
+        slot_rows
+            .iter()
+            .all(|row| display_width(row.trim_end()) <= 60)
+    );
+    let first = &slot_rows[0];
+    let column = display_width(&first[..first.find('[').expect("notice shown")]);
+    assert!(
+        u64::try_from(column).expect("column") < slot.rect.x,
+        "the notice starts left of the slot over its padding: {slot_rows:?}"
+    );
+    let shown = slot_rows
+        .iter()
+        .map(|row| row.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(shown.contains("image network disabled"), "{shown}");
+    assert!(shown.contains("logo.png]"), "{shown}");
+}
+
+#[test]
+fn l8_notice_keeps_the_cells_left_of_a_quoted_image() {
+    let source = "> ![a cat](https://example.com/cat.png)";
+    let request = MarkdownRequest::new(source, 30).document("transcript:item:q");
+    let mut config = image_config();
+    let (placeholder, _) = project(&config, &request);
+    let slot = only_slot(&placeholder, 30);
+    assert!(slot.rect.x > 0, "the quote marker sits left of the slot");
+    let before = paint(&placeholder, &layout(&placeholder, 30));
+    let start = usize::try_from(slot.rect.y).expect("row");
+    let marker: String = before[start]
+        .chars()
+        .take(usize::try_from(slot.rect.x).expect("x"))
+        .collect();
+    let notice = "[a cat — image network disabled; source: https://example.com/cat.png]";
+    config.markdown.visuals = accepted(&slot, 1, MarkdownVisual::Notice(Arc::from(notice)));
+    let (body, _) = project(&config, &request);
+    let rows = paint(&body, &layout(&body, 30));
+    let end = start + usize::try_from(slot.rect.height).expect("rows");
+    for row in &rows[start..end] {
+        assert!(row.starts_with(marker.trim_end()), "marker kept: {row:?}");
+    }
 }
 
 #[test]

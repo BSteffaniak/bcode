@@ -48,7 +48,9 @@
 //!   node while painting, so placements exist only for painted, correctly positioned content
 //!   and are clipped by the painting context (a scrolled-out unit contributes none).
 //! * [`MarkdownVisual::Notice`]: the reserved rows show the notice lines (failures, disabled
-//!   network loading), clipped at the slot.
+//!   network loading), wrapped at word boundaries from the slot to the right edge. A notice
+//!   too wide for a slot that starts after blank padding (a centered image) starts further
+//!   left, over that padding only; one that needs more rows than are reserved ends with `…`.
 //!
 //! Either way the rows are rendered rows without source correspondence (ambiguity 10).
 //!
@@ -162,7 +164,7 @@ pub struct VisualSlot {
 pub enum MarkdownVisual {
     /// Decoded image content placed over the slot (contained, aspect ratio preserved).
     Image(Arc<ImagePayload>),
-    /// Text rows replacing the slot's rows (one row per line, clipped at the slot).
+    /// Text replacing the slot's rows (each line wrapped at word boundaries within the row).
     Notice(Arc<str>),
 }
 
@@ -914,40 +916,101 @@ impl MarkdownBody {
     }
 }
 
-/// Replace the rows of `slot` by `accepted`: each row keeps its cells left of the slot, then
-/// shows the notice line of that row (none for images). Replaced rows lose their anchors.
+/// Replace the rows of `slot` by `accepted`: each row keeps its cells left of the slot exactly
+/// (no ellipsis), then shows the notice row of that row (none for images). Replaced rows lose
+/// their anchors.
 fn apply_visual(
     lines: &mut [Line],
     line_sources: &mut [Option<u64>],
     slot: &VisualSlot,
     accepted: &AcceptedMarkdownVisual,
 ) {
-    let prefix = usize::try_from(slot.rect.x).unwrap_or(usize::MAX);
-    let mut notice = match &accepted.visual {
-        MarkdownVisual::Image(_) => None,
-        MarkdownVisual::Notice(text) => Some(text.lines()),
-    };
+    let cells = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+    let prefix = cells(slot.rect.x);
+    let first = cells(slot.rect.y);
+    let rows = first..first.saturating_add(cells(slot.rect.height));
     let style = lines
-        .get(usize::try_from(slot.rect.y).unwrap_or(usize::MAX))
+        .get(first)
         .and_then(|line| line.spans.first())
         .map(|span| span.style)
         .unwrap_or_default();
-    for row in slot.rect.y..slot.rect.y + slot.rect.height {
-        let Ok(row) = usize::try_from(row) else {
-            break;
-        };
+    let (start, notice) = match &accepted.visual {
+        MarkdownVisual::Image(_) => (prefix, Vec::new()),
+        MarkdownVisual::Notice(text) => {
+            let reclaimable = rows
+                .clone()
+                .filter_map(|row| lines.get(row))
+                .map(|line| blank_tail(line, prefix))
+                .min()
+                .unwrap_or(0);
+            let width = cells(slot.rect.x.saturating_add(slot.rect.width));
+            notice_rows(text, style, prefix, reclaimable, width, rows.len())
+        }
+    };
+    for (index, row) in rows.enumerate() {
         let Some(line) = lines.get_mut(row) else {
             break;
         };
-        let mut replaced = line.truncate(prefix);
-        if let Some(text) = notice.as_mut().and_then(Iterator::next) {
-            replaced.spans.push(Span::styled(text.to_owned(), style));
+        let mut replaced = line.viewport(0, start);
+        if let Some(text) = notice.get(index) {
+            replaced.spans.extend(text.spans.iter().cloned());
         }
         *line = replaced;
         if let Some(source) = line_sources.get_mut(row) {
             *source = None;
         }
     }
+}
+
+/// Blank cells at the end of the first `prefix` cells of `line` (cells past its end count as
+/// blank): padding a notice may take back, such as the offset of a centered image.
+fn blank_tail(line: &Line, prefix: usize) -> usize {
+    let kept = line.viewport(0, prefix);
+    let text = kept.plain_text();
+    let trailing = text.len() - text.trim_end_matches(' ').len();
+    prefix.saturating_sub(kept.width()) + trailing
+}
+
+/// The column a notice starts at and its rows. The notice starts at the slot (`prefix`) and
+/// moves left over up to `reclaimable` blank cells when its widest line does not fit before
+/// `width`. Its lines wrap at word boundaries within the room left; when they need more than
+/// `rows` rows, the last row ends with an ellipsis.
+fn notice_rows(
+    text: &str,
+    style: Style,
+    prefix: usize,
+    reclaimable: usize,
+    width: usize,
+    rows: usize,
+) -> (usize, Vec<Line>) {
+    let lines: Vec<Line> = text
+        .lines()
+        .map(|line| Line::from_spans([Span::styled(line.to_owned(), style)]))
+        .collect();
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+    let room = width.saturating_sub(prefix);
+    let start = prefix - reclaimable.min(prefix).min(widest.saturating_sub(room));
+    let room = width.saturating_sub(start);
+    if room == 0 || rows == 0 {
+        return (start, Vec::new());
+    }
+    let mut wrapped: Vec<Line> = lines
+        .iter()
+        .flat_map(|line| {
+            if line.width() == 0 {
+                vec![line.clone()]
+            } else {
+                line.wrap_word(room)
+            }
+        })
+        .collect();
+    if wrapped.len() > rows {
+        let mut last = wrapped[rows - 1].viewport(0, room - 1);
+        last.push_span(Span::styled("…", style));
+        wrapped.truncate(rows - 1);
+        wrapped.push(last);
+    }
+    (start, wrapped)
 }
 
 impl Component for MarkdownBody {
