@@ -2414,6 +2414,27 @@ fn a_markdown_document_is_written_only_inside_the_repository() {
             "{error}"
         );
         assert!(!outside.path().join("guide.md").exists());
+
+        let missing = outside.path().join("authorized_keys");
+        std::fs::create_dir_all(root.path().join("docs")).expect("docs");
+        std::os::unix::fs::symlink(&missing, root.path().join("docs/dangling.md"))
+            .expect("dangling link");
+        let error =
+            submit(serde_json::json!({ "document": document, "output_path": "docs/dangling.md" }))
+                .expect_err("through a dangling link");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        assert!(!missing.exists(), "nothing is written through the link");
+
+        std::os::unix::fs::symlink(outside.path().join("gone"), root.path().join("gone"))
+            .expect("dangling directory link");
+        let error =
+            submit(serde_json::json!({ "document": document, "output_path": "gone/guide.md" }))
+                .expect_err("under a dangling link");
+        assert!(
+            error.to_string().contains("outside the repository"),
+            "{error}"
+        );
+        assert!(!outside.path().join("gone").exists());
     }
 
     let fallback = submit(serde_json::json!({ "document": document })).expect("default path");

@@ -984,7 +984,7 @@ fn markdown_document(options: &serde_json::Value) -> Option<&str> {
 
 /// Write a ready-made `document` to `output_path`, which must stay inside the repository: a
 /// relative path without `..` whose existing ancestors do not lead outside the repository
-/// through a symbolic link. Without a path the document goes to `.bcode/reviews/<review>.md`.
+/// through a symbolic link and which is not itself a symbolic link. Without a path the document goes to `.bcode/reviews/<review>.md`.
 fn write_document_publish(
     publisher_id: String,
     bundle: &ReviewBundle,
@@ -1036,11 +1036,22 @@ fn confined_output_path(repo_root: &Path, relative: &Path) -> Result<PathBuf, St
     }
     let root = repo_root.canonicalize()?;
     let path = root.join(relative);
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(StoreError::InvalidRequest(format!(
+            "{} is a symbolic link; give a path to a regular file",
+            relative.display()
+        )));
+    }
+    // `symlink_metadata` sees a link itself, dangling or not, so a link is never skipped as
+    // missing and then followed by the write.
     let mut existing = path.as_path();
-    while !existing.exists() {
+    while std::fs::symlink_metadata(existing).is_err() {
         existing = existing.parent().ok_or_else(outside)?;
     }
-    if !existing.canonicalize()?.starts_with(&root) {
+    if !existing
+        .canonicalize()
+        .is_ok_and(|resolved| resolved.starts_with(&root))
+    {
         return Err(outside());
     }
     if path.exists() && !path.is_file() {
