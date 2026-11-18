@@ -2322,43 +2322,51 @@ fn load_presentation_fallback(
 
 /// Load persistent presentation state for TUI client-side visual adapters.
 ///
+/// Every selected statically bundled plugin that contributes TUI surfaces, visual adapters or
+/// composer contributions is deployed as its own frontend component from its shared definition,
+/// beside the backend instance that serves its tools. Discovered dynamic plugins keep reaching
+/// their adapters through the backend's TUI visual service.
+///
 /// # Errors
 ///
-/// Returns plugin loading errors from discovery, loading, or activation.
+/// Returns plugin loading errors from discovery, loading, activation, or frontend admission.
 pub fn load_default_presentation_with_static_bundled(
     selection: &bcode_plugin::PluginSelection,
     visual_adapter_config: bcode_config::TuiVisualAdapterConfig,
     static_plugins: &[StaticBundledPlugin],
 ) -> Result<PluginTuiPresentation, PluginLoadError> {
     let host = load_default_host_with_static_bundled(selection, static_plugins)?;
-    // This function runs on the blocking presentation-preparation worker. Resolve the actual
-    // selected component, not a registry with a matching bundled logical ID.
-    let handle =
-        tokio::runtime::Handle::try_current().map_err(|_| PluginLoadError::TuiSurfaceOpen {
-            plugin_id: "<frontend>".to_owned(),
-            message: "frontend resolution requires the presentation preparation runtime".to_owned(),
-        })?;
-    let selected = handle.block_on(async {
-        let mut selected = BTreeMap::new();
-        for plugin in host.loaded_plugins() {
+    let definitions: BTreeMap<String, StaticBundledPlugin> =
+        bcode_plugin::static_bundled_plugin_ids(static_plugins)?
+            .into_iter()
+            .zip(static_plugins.iter().copied())
+            .collect();
+    let deployments = host
+        .loaded_plugins()
+        .iter()
+        .filter_map(|plugin| {
             let manifest = plugin.manifest();
-            if manifest.tui_surfaces.is_empty() && manifest.visual_adapters.is_empty()
-                && manifest.composer_contributions.is_empty() {
-                continue;
+            if manifest.tui_surfaces.is_empty()
+                && manifest.visual_adapters.is_empty()
+                && manifest.composer_contributions.is_empty()
+            {
+                return None;
             }
-            let owner = plugin.product_extensions()?;
-            let frontend = owner.resolve_frontend(None).await.map_err(|_| PluginLoadError::TuiSurfaceOpen {
-                plugin_id: manifest.id.clone(),
-                message: "selected frontend could not be resolved; dynamic sources require a negotiated rich presentation proxy".to_owned(),
-            })?;
-            selected.insert(manifest.id.clone(), frontend);
-        }
-        Ok::<_, PluginLoadError>(selected)
-    })?;
-    let mut presentation =
-        PluginTuiPresentation::with_runtime_config(host.into(), visual_adapter_config);
-    presentation.selected_frontends = selected;
-    Ok(presentation)
+            let definition = definitions.get(&manifest.id)?.definition();
+            Some(SelectedFrontendDeployment {
+                manifest: manifest.clone(),
+                deployment: bcode_plugin::FrontendDeployment::Static(definition()),
+                config: plugin.config().clone(),
+            })
+        })
+        .collect();
+    let runtime = PluginRuntimeHost::from(host);
+    PluginTuiPresentation::with_selected_frontend_deployments(
+        runtime,
+        visual_adapter_config,
+        deployments,
+        None,
+    )
 }
 
 /// Load the default local plugin runtime for TUI client-side services.
@@ -3465,6 +3473,46 @@ library = "libcomposer_fixture.dylib"
             .await
             .unwrap();
         assert!(command.invoke().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bundled_presentation_routes_static_plugin_visuals_and_live_recordings() {
+        let plugins = vec![
+            StaticBundledPlugin::from_definition(
+                include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+                bcode_shell_plugin::plugin_definition,
+            ),
+            StaticBundledPlugin::from_definition(
+                include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+                bcode_filesystem_plugin::plugin_definition,
+            ),
+        ];
+        let presentation = tokio::task::spawn_blocking(move || {
+            load_default_presentation_with_static_bundled(
+                &bcode_plugin::PluginSelection::all_enabled(),
+                bcode_config::TuiVisualAdapterConfig::default(),
+                &plugins,
+            )
+        })
+        .await
+        .unwrap()
+        .expect("bundled plugins deploy as frontends");
+        for plugin_id in ["bcode.shell", "bcode.filesystem"] {
+            assert!(presentation.registry(plugin_id).is_some(), "{plugin_id}");
+        }
+        assert!(
+            presentation
+                .visual_route("bcode.shell.run", 1, Some("bcode.shell"))
+                .is_some()
+        );
+        assert!(presentation.accepts_artifact_reference(
+            "bcode.shell",
+            "bcode.shell.run",
+            1,
+            "shell_recording",
+            Some("application/x-bcode-shell-recording; version=3"),
+        ));
+        drop(presentation);
     }
 
     #[tokio::test(flavor = "current_thread")]
