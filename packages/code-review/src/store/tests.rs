@@ -2398,7 +2398,10 @@ fn a_markdown_document_is_written_only_inside_the_repository() {
     ] {
         let error = submit(serde_json::json!({ "document": document, "output_path": refused }))
             .expect_err("outside the repository");
-        assert!(error.to_string().contains("outside the repository"), "{error}");
+        assert!(
+            error.to_string().contains("outside the repository"),
+            "{error}"
+        );
     }
     #[cfg(unix)]
     {
@@ -2406,7 +2409,10 @@ fn a_markdown_document_is_written_only_inside_the_repository() {
         let error =
             submit(serde_json::json!({ "document": document, "output_path": "link/guide.md" }))
                 .expect_err("through a link");
-        assert!(error.to_string().contains("outside the repository"), "{error}");
+        assert!(
+            error.to_string().contains("outside the repository"),
+            "{error}"
+        );
         assert!(!outside.path().join("guide.md").exists());
     }
 

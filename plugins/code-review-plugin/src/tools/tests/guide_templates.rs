@@ -235,7 +235,10 @@ fn a_file_set_review_is_explained_with_in_review_and_outside_review_citations() 
         SESSION,
     );
     assert_eq!(written["written"], true, "{written}");
-    assert_eq!(written["citations"][0]["relation"], "in_review", "{written}");
+    assert_eq!(
+        written["citations"][0]["relation"], "in_review",
+        "{written}"
+    );
     assert_eq!(
         written["citations"][1]["relation"], "outside_review",
         "{written}"

@@ -125,7 +125,10 @@ impl ReviewSurface {
         };
         let services = self.services.clone();
         let inbox = self.inbox.clone();
-        self.set_status(format!("exporting the guide to {file}…"), StatusSeverity::Info);
+        self.set_status(
+            format!("exporting the guide to {file}…"),
+            StatusSeverity::Info,
+        );
         host.spawn(Box::pin(async move {
             let result = export(&services, bundle, markdown, file).await;
             inbox.push(Message::GuideExported(result));
@@ -135,7 +138,10 @@ impl ReviewSurface {
     /// A guide export finished: say where it went, or why it did not.
     pub(super) fn guide_exported(&mut self, result: Result<String, String>) {
         match result {
-            Ok(path) => self.set_status(format!("exported the guide to {path}"), StatusSeverity::Info),
+            Ok(path) => self.set_status(
+                format!("exported the guide to {path}"),
+                StatusSeverity::Info,
+            ),
             Err(error) => self.set_status(
                 format!("could not export the guide: {error}"),
                 StatusSeverity::Warning,
@@ -155,7 +161,10 @@ impl ReviewSurface {
                 let label = resolve_template(&config, Some(&name), false).map_or_else(
                     |error| format!("{name} · {error}"),
                     |template| {
-                        format!("{name} · requires {}", template.required_sections.join(", "))
+                        format!(
+                            "{name} · requires {}",
+                            template.required_sections.join(", ")
+                        )
                     },
                 );
                 OverlayEntry {

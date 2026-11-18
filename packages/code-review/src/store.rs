@@ -979,9 +979,7 @@ impl ReviewPublisher for MarkdownFilePublisher {
 /// A ready-made markdown document to write instead of the review report (a guide export),
 /// from the publisher's `document` option.
 fn markdown_document(options: &serde_json::Value) -> Option<&str> {
-    options
-        .get("document")
-        .and_then(serde_json::Value::as_str)
+    options.get("document").and_then(serde_json::Value::as_str)
 }
 
 /// Write a ready-made `document` to `output_path`, which must stay inside the repository: a

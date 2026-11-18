@@ -7,9 +7,7 @@ use super::guide::{area, guide_hits, guided};
 use super::stable;
 use crate::surface::GUIDE_PANE_ID;
 use crate::testing::harness::{Scenario, Screen};
-use bcode_code_review_models::{
-    GetGuideVersionRequest, ReviewWorkspace, SaveGuideVersionRequest,
-};
+use bcode_code_review_models::{GetGuideVersionRequest, ReviewWorkspace, SaveGuideVersionRequest};
 use bmux_tui::event::{MouseButton, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use std::time::Duration;
@@ -41,7 +39,10 @@ fn a_section_or_the_whole_guide_is_copied_as_markdown() {
     stable(&mut setup.scenario);
     let copied = setup.scenario.host().clipboard();
     let section = copied.last().expect("the section is copied");
-    assert!(section.starts_with("# Fixture walkthrough · v1"), "{section}");
+    assert!(
+        section.starts_with("# Fixture walkthrough · v1"),
+        "{section}"
+    );
     assert!(section.contains("Purpose"), "{section}");
     assert!(
         !section.contains("Reading order"),
@@ -73,7 +74,10 @@ fn the_guide_is_exported_to_a_file_in_the_repository_through_the_publisher() {
         stable(&mut setup.scenario);
     }
     let written = std::fs::read_to_string(&path).expect("the export is written");
-    assert!(written.starts_with("# Fixture walkthrough · v1"), "{written}");
+    assert!(
+        written.starts_with("# Fixture walkthrough · v1"),
+        "{written}"
+    );
     assert!(written.contains("Risks"), "{written}");
     let screen = stable(&mut setup.scenario);
     assert!(
