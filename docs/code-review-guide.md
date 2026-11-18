@@ -572,9 +572,17 @@ path inside the repository, so write-path rules apply.
 |---|---|---|
 | P1 | Models, store, citation checks, freshness | Yes |
 | P2 | Plugin tools, grants in the review assistant binding, configuration and context | Yes |
-| P3 | Read-only guide panel, diff markers, navigation | Yes |
-| P4 | Single-agent generation from the assistant, guide card, tab fallback | Yes |
+| P3 | Read-only guide panel (markdown bodies, draggable outline split, header pill), diff markers, navigation | Yes |
+| P4 | Single-agent generation from the assistant, guide card, tab fallback, stop | Yes |
 | P5 | Reviewed and viewed, finding to comment, expand, ask, promote, discard, restructure | No |
 | P6 | Freshness in the UI, refresh forks, versions picker, since guides | No |
 | P7 | Fan-out child sessions, synthesis, cost confirmation, Resume, verifier | No |
 | P8 | Templates and lint, export to file | No |
+
+Within P1–P4 the app records no guide grant yet: every binding's `guide_grant` is empty, so
+sessions write the versions they started or resumed. The grant checks (a granted session writes
+only its guide and version, narrow writers never replace shared citations) are in place for the
+review actions of P5 and the fan-out children of P7, which set grants. Guide freshness is told in
+the panel (badges, tint and moved lines follow the review's current sources, and the peek of a
+moved citation reads the current revision); stale banners, refresh forks and the versions picker
+come with P6.
