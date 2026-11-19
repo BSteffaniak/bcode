@@ -1,0 +1,158 @@
+# Upstream reference for the `ayu-mirage` palette. Values are copied exactly from
+# `file` at `revision`; see attribution/UPSTREAM.md.
+#
+# ayu's canonical palette (ayu-theme/ayu-colors, themes/*.yaml) defines most
+# editor colors as OKLCH lightness steps, translucent colors, and culori
+# gamut-mapped modifiers, and ships no resolved artifact in git (the hex values
+# are generated into the npm package only). Re-implementing that pipeline exactly
+# is not possible from the repository alone, so the colors come from
+# Shatur/neovim-ayu, the Neovim port listed in sources.toml, whose
+# lua/ayu/colors.lua carries ayu's colors as resolved opaque hex per style
+# (dark, mirage, light), and whose lua/ayu/init.lua maps them to highlight
+# groups. Tree-sitter captures the port leaves undefined follow Neovim's
+# compiled-in default links (neovim/neovim v0.12.6, src/nvim/highlight_group.c):
+# @keyword -> Keyword -> Statement, @number -> Number -> Constant,
+# @punctuation.delimiter -> @punctuation -> Delimiter, @markup.raw and
+# @markup.list -> @markup -> Special.
+#
+# Hue names follow ayu's syntax palette: blue = entity, cyan = regexp,
+# green = string, magenta = constant, orange = keyword, red = markup,
+# yellow = func. ayu has no separate violet. muted is ayu's idle foreground
+# (fg_idle). Omitted slots: markup_link (@markup.link links to Underlined,
+# which the port gives only an underline color), markup_code_bg
+# (@markup.raw.markdown_inline has no background).
+palette  = "ayu-mirage"
+scheme   = "ayu (mirage)"
+source   = "https://github.com/Shatur/neovim-ayu"
+revision = "e5a9f0fa2918d6b5f57c21b3ac014314ee5e41c8"
+license  = "GPL-3.0"
+
+[variants.dark]
+file = "lua/ayu/colors.lua (colors.generate, mirage) + lua/ayu/init.lua"
+
+[variants.dark.colors]
+"@function.fg"                   = "#ffd173"
+"@keyword.fg"                    = "#ffad66"
+"@markup.heading.fg"             = "#ffad66"
+"@markup.list.fg"                = "#ffcc66"
+"@markup.raw.fg"                 = "#ffcc66"
+"@markup.raw.markdown_inline.fg" = "#ffcc66"
+"@number.fg"                     = "#dfbfff"
+"@operator.fg"                   = "#f29e74"
+"@punctuation.delimiter.fg"      = "#ffdfb3"
+"@string.fg"                     = "#d5ff80"
+"@type.fg"                       = "#73d0ff"
+"@variable.fg"                   = "#cccac2"
+"Comment.fg"                     = "#6c7a8b"
+"CursorLine.bg"                  = "#171b24"
+"DiagnosticError.fg"             = "#ff6666"
+"DiagnosticInfo.fg"              = "#5ccfe6"
+"DiagnosticWarn.fg"              = "#ffad66"
+"DiffAdd.bg"                     = "#313d37"
+"DiffAdded.fg"                   = "#87d96c"
+"DiffDelete.bg"                  = "#3e373a"
+"DiffRemoved.fg"                 = "#f27983"
+"FloatBorder.fg"                 = "#6c7a8b"
+"LineNr.fg"                      = "#323843"
+"Normal.bg"                      = "#1f2430"
+"Normal.fg"                      = "#cccac2"
+"NormalFloat.bg"                 = "#1f2430"
+"Visual.bg"                      = "#23344b"
+"WinSeparator.fg"                = "#101521"
+accent                           = "#ffcc66"
+bg                               = "#1f2430"
+comment                          = "#6c7a8b"
+constant                         = "#dfbfff"
+entity                           = "#73d0ff"
+error                            = "#ff6666"
+fg                               = "#cccac2"
+fg_idle                          = "#707a8c"
+func                             = "#ffd173"
+guide_normal                     = "#323843"
+keyword                          = "#ffad66"
+line                             = "#171b24"
+markup                           = "#f28779"
+panel_border                     = "#101521"
+regexp                           = "#95e6cb"
+selection_inactive               = "#23344b"
+string                           = "#d5ff80"
+tag                              = "#5ccfe6"
+vcs_added                        = "#87d96c"
+vcs_added_bg                     = "#313d37"
+vcs_removed                      = "#f27983"
+vcs_removed_bg                   = "#3e373a"
+
+[variants.dark.slots]
+background         = "bg"
+text               = "fg"
+accent             = "accent"
+blue               = "entity"
+cyan               = "regexp"
+green              = "string"
+magenta            = "constant"
+orange             = "keyword"
+red                = "markup"
+yellow             = "func"
+info               = "tag"
+warning            = "keyword"
+error              = "error"
+muted              = "fg_idle"
+comment            = "comment"
+border             = "panel_border"
+border_focused     = "comment"
+surface            = "bg"
+selection          = "selection_inactive"
+line_highlight     = "line"
+gutter             = "guide_normal"
+diff_add           = "vcs_added"
+diff_remove        = "vcs_removed"
+diff_add_bg        = "vcs_added_bg"
+diff_remove_bg     = "vcs_removed_bg"
+syntax_keyword     = "@keyword.fg"
+syntax_function    = "@function.fg"
+syntax_variable    = "@variable.fg"
+syntax_string      = "@string.fg"
+syntax_number      = "@number.fg"
+syntax_type        = "@type.fg"
+syntax_operator    = "@operator.fg"
+syntax_punctuation = "@punctuation.delimiter.fg"
+markup_heading     = "@markup.heading.fg"
+markup_raw         = "@markup.raw.fg"
+markup_code        = "@markup.raw.markdown_inline.fg"
+markup_list        = "@markup.list.fg"
+
+[variants.dark.roles]
+"canvas.bg"               = "Normal.bg"
+"canvas.fg"               = "Normal.fg"
+"text.primary.fg"         = "Normal.fg"
+"markdown.text.fg"        = "Normal.fg"
+"syntax.text.fg"          = "Normal.fg"
+"state.info.fg"           = "DiagnosticInfo.fg"
+"state.warning.fg"        = "DiagnosticWarn.fg"
+"state.error.fg"          = "DiagnosticError.fg"
+"text.muted.fg"           = "fg_idle"
+"syntax.comment.fg"       = "Comment.fg"
+"border.default.fg"       = "WinSeparator.fg"
+"border.focused.fg"       = "FloatBorder.fg"
+"surface.raised.bg"       = "NormalFloat.bg"
+"surface.overlay.bg"      = "NormalFloat.bg"
+"selection.active.bg"     = "Visual.bg"
+"selection.inactive.bg"   = "CursorLine.bg"
+"source.gutter.fg"        = "LineNr.fg"
+"diff.added.fg"           = "DiffAdded.fg"
+"diff.removed.fg"         = "DiffRemoved.fg"
+"diff.added_row.bg"       = "DiffAdd.bg"
+"diff.removed_row.bg"     = "DiffDelete.bg"
+"syntax.keyword.fg"       = "@keyword.fg"
+"syntax.function.fg"      = "@function.fg"
+"syntax.variable.fg"      = "@variable.fg"
+"syntax.string.fg"        = "@string.fg"
+"syntax.number.fg"        = "@number.fg"
+"syntax.type.fg"          = "@type.fg"
+"syntax.operator.fg"      = "@operator.fg"
+"syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"markdown.heading.fg"     = "@markup.heading.fg"
+"syntax.heading.fg"       = "@markup.heading.fg"
+"syntax.raw.fg"           = "@markup.raw.fg"
+"markdown.inline_code.fg" = "@markup.raw.markdown_inline.fg"
+"markdown.list_marker.fg" = "@markup.list.fg"
