@@ -22,7 +22,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `everforest` | Everforest (medium background) | github.com/sainnhe/everforest | MIT |
 | `one` | One Dark / One Light | github.com/atom/atom (one-dark-syntax) | MIT |
 | `solarized` | Solarized | github.com/altercation/solarized | MIT |
-| `github*` | GitHub Primer themes | github.com/primer/github-vscode-theme | MIT |
+| `github*` | GitHub (dark default, light default, dark dimmed) | github.com/projekt0n/github-nvim-theme | MIT |
 | `ayu*` | Ayu | github.com/ayu-theme/ayu-colors | MIT |
 | `nightfox` | Nightfox / Dawnfox | github.com/EdenEast/nightfox.nvim | MIT |
 | `oxocarbon` | Oxocarbon | github.com/nyoom-engineering/oxocarbon.nvim | MIT |
