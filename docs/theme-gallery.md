@@ -1074,7 +1074,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `blueprint-studio` | `#0d2a4a` | `#e6f1ff` | `#899cb3` | `#7fd4ff` | `#3f5774` | `#173352` | `#2c587c` | `#7fd4ff` | `#9ef0c3` | `#ffe08a` | `#ff8a80` |
 | `brutal-modus` | `#000000` | `#ffffff` | `#808080` | `#2fafff` | `#222222` | `#000000` | `#031c2e` | `#2fafff` | `#44bc44` | `#d0bc00` | `#ff5f59` |
 | `catppuccin-frappe` | `#303446` | `#c6d0f5` | `#868dab` | `#ca9ee6` | `#52576e` | `#373b4e` | `#5b5272` | `#8caaee` | `#a6d189` | `#e5c890` | `#e78284` |
-| `catppuccin-latte` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
+| `catppuccin-latte` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1e66f5` | `#40a02b` | `#df8e1d` | `#d20f39` |
 | `catppuccin-macchiato` | `#24273a` | `#cad3f5` | `#8289a5` | `#c6a0f6` | `#494d64` | `#2b2e42` | `#50486d` | `#8aadf4` | `#a6da95` | `#eed49f` | `#ed8796` |
 | `catppuccin-mocha` | `#1e1e2e` | `#cdd6f4` | `#81869f` | `#cba6f7` | `#44465a` | `#252636` | `#4c4364` | `#89b4fa` | `#a6e3a1` | `#f9e2af` | `#f38ba8` |
 | `claude-code` | — | *default* | `#999999` | `#b1b9f9` | `#888888` | — | — | `#b1b9f9` | `#4eba65` | `#ffc107` | `#ff6b80` |
@@ -1082,13 +1082,13 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `dracula` | `#282a36` | `#f8f8f2` | `#9e9fa2` | `#bd93f9` | `#565861` | `#31333e` | `#51486b` | `#bd93f9` | `#50fa7b` | `#f1fa8c` | `#ff5555` |
 | `dusk` | `#1c1726` | `#e8def5` | `#8f879b` | `#f2a7c3` | `#484254` | `#241f2f` | `#553e51` | `#9bb4f5` | `#a8d8a0` | `#f5d58a` | `#f28b9a` |
 | `ember` | `#160e0c` | `#f1e3d8` | `#91857d` | `#ff7a45` | `#453b37` | `#1f1614` | `#532c1e` | `#8fa8c8` | `#b8c46a` | `#ffc857` | `#ff4d4d` |
-| `everforest` | `#2d353b` | `#d3c6aa` | `#8c887c` | `#a7c080` | `#535655` | `#343b40` | `#4e5c50` | `#7fbbb3` | `#a7c080` | `#dbbc7f` | `#e67e80` |
-| `flexoki` | `#100f0f` | `#cecdc3` | `#7a7974` | `#4385be` | `#393735` | `#181716` | `#202f3d` | `#4385be` | `#879a39` | `#d0a215` | `#d34e42` |
-| `forest-floor` | `#2d353b` | `#d3c6aa` | `#8c887c` | `#a7c080` | `#535655` | `#343b40` | `#4e5c50` | `#7fbbb3` | `#a7c080` | `#dbbc7f` | `#e67e80` |
+| `everforest` | `#2d353b` | `#d3c6aa` | `#8c887c` | `#a7c080` | `#535655` | `#343b40` | `#4a574c` | `#7fbbb3` | `#a7c080` | `#dbbc7f` | `#e67e80` |
+| `flexoki` | `#100f0f` | `#cecdc3` | `#7a7974` | `#4385be` | `#393735` | `#181716` | `#202f3d` | `#4385be` | `#879a39` | `#d0a215` | `#d14d41` |
+| `forest-floor` | `#2d353b` | `#d3c6aa` | `#8c887c` | `#a7c080` | `#535655` | `#343b40` | `#4a574c` | `#7fbbb3` | `#a7c080` | `#dbbc7f` | `#e67e80` |
 | `github` | `#0d1117` | `#e6edf3` | `#868c92` | `#58a6ff` | `#3b4046` | `#151a20` | `#233953` | `#58a6ff` | `#3fb950` | `#d29922` | `#ff7b72` |
 | `github-dimmed` | `#22272e` | `#adbac7` | `#717b85` | `#539bf5` | `#414851` | `#282d35` | `#324764` | `#539bf5` | `#57ab5a` | `#c69026` | `#f47067` |
 | `glacier` | `#0e1a22` | `#dceef7` | `#81919a` | `#6fd3ff` | `#3a4851` | `#16232b` | `#284b5c` | `#6fb6ff` | `#8fe3c0` | `#f2e38a` | `#ff8fa3` |
-| `gruvbox` | `#282828` | `#ebdbb2` | `#978e77` | `#fabd2f` | `#535047` | `#30302e` | `#605134` | `#83a598` | `#b8bb26` | `#fabd2f` | `#ff4f39` |
+| `gruvbox` | `#282828` | `#ebdbb2` | `#978e77` | `#fabd2f` | `#535047` | `#30302e` | `#605134` | `#83a598` | `#b8bb26` | `#fabd2f` | `#fb4934` |
 | `gruvbox-material` | `#292828` | `#d4be98` | `#8a7e69` | `#d8a657` | `#4f4a42` | `#302e2d` | `#594b38` | `#7daea3` | `#a9b665` | `#d8a657` | `#ea6962` |
 | `high-contrast` | *black* | *bright white* | *white* | *bright cyan* | *bright white* | *black* | *bright white* | *bright blue* | *bright green* | *bright yellow* | *bright red* |
 | `kanagawa` | `#1f1f28` | `#dcd7ba` | `#8a877c` | `#7e9cd8` | `#484849` | `#27272e` | `#3a4158` | `#7e9cd8` | `#98bb6c` | `#e6c384` | `#ff5d62` |
@@ -1096,33 +1096,33 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `melange` | `#292522` | `#ece1d7` | `#988f88` | `#ebc06d` | `#544f4a` | `#312d2a` | `#5d4f39` | `#a3a9ce` | `#85b695` | `#ebc06d` | `#d47766` |
 | `modus` | `#000000` | `#ffffff` | `#808080` | `#2fafff` | `#222222` | `#000000` | `#031c2e` | `#2fafff` | `#44bc44` | `#d0bc00` | `#ff5f59` |
 | `monochrome` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | — | — | — | — |
-| `monokai-classic` | `#272822` | `#f8f8f2` | `#9d9e97` | `#a6e22e` | `#555650` | `#30312b` | `#4a5a2f` | `#66d9ef` | `#a6e22e` | `#e6db74` | `#ff447d` |
+| `monokai-classic` | `#272822` | `#f8f8f2` | `#9d9e97` | `#a6e22e` | `#555650` | `#30312b` | `#4a5a2f` | `#66d9ef` | `#a6e22e` | `#e6db74` | `#f92672` |
 | `moss` | `#141a14` | `#dbe4d0` | `#838c7d` | `#9ccf6e` | `#3f463c` | `#1c221c` | `#384a2e` | `#7fa8b8` | `#9ccf6e` | `#d9c46a` | `#e57c6a` |
 | `neon` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
 | `neon-noir` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
 | `newsroom` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
 | `night-owl` | `#011627` | `#d6deeb` | `#788797` | `#82aaff` | `#2e4253` | `#081e2f` | `#223e61` | `#82aaff` | `#addb67` | `#ecc48d` | `#ef5350` |
-| `night-shift` | `#24283b` | `#c0caf5` | `#7d84a5` | `#7aa2f7` | `#474c65` | `#2b2f43` | `#3c4a6e` | `#7aa2f7` | `#9ece6a` | `#e0af68` | `#f7768e` |
-| `nightfox` | `#192330` | `#cdcecf` | `#7f848b` | `#719cd6` | `#414954` | `#212a37` | `#31445d` | `#719cd6` | `#81b29a` | `#dbc074` | `#db607c` |
+| `night-shift` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
+| `nightfox` | `#192330` | `#cdcecf` | `#7f848b` | `#719cd6` | `#414954` | `#212a37` | `#31445d` | `#719cd6` | `#81b29a` | `#dbc074` | `#c94f6d` |
 | `nord` | `#2e3440` | `#eceff4` | `#8492aa` | `#88c0d0` | `#4c566a` | `#3b4252` | `#434c5e` | `#81a1c1` | `#a3be8c` | `#ebcb8b` | `#e17f87` |
-| `one` | `#282c34` | `#abb2bf` | `#737984` | `#61afef` | `#464a54` | `#2e323a` | `#3a5067` | `#61afef` | `#98c379` | `#e5c07b` | `#e36e77` |
+| `one` | `#282c34` | `#abb2bf` | `#737984` | `#61afef` | `#464a54` | `#2e323a` | `#31465d` | `#61afef` | `#98c379` | `#e5c07b` | `#e06c75` |
 | `oxocarbon` | `#161616` | `#f2f4f8` | `#919294` | `#be95ff` | `#454546` | `#1f1f1f` | `#423953` | `#78a9ff` | `#42be65` | `#ffe97b` | `#ee5396` |
 | `paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
 | `phosphor` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
-| `poimandres` | `#1b1e28` | `#a6accd` | `#6a6f86` | `#5de4c7` | `#3a3e4d` | `#21242f` | `#325353` | `#add7ff` | `#5de4c7` | `#fffac2` | `#d0679d` |
+| `poimandres` | `#1b1e28` | `#a6accd` | `#6a6f86` | `#5de4c7` | `#3a3e4d` | `#21242f` | `#274748` | `#add7ff` | `#5de4c7` | `#fffac2` | `#d0679d` |
 | `quiet` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
 | `rice-mocha` | `#1e1e2e` | `#cdd6f4` | `#81869f` | `#cba6f7` | `#44465a` | `#252636` | `#4c4364` | `#89b4fa` | `#a6e3a1` | `#f9e2af` | `#f38ba8` |
-| `rose-pine` | `#191724` | `#e0def4` | `#89879a` | `#c4a7e7` | `#444252` | `#211f2d` | `#463d58` | `#4789a4` | `#9ccfd8` | `#f6c177` | `#eb6f92` |
-| `rose-pine-moon` | `#232136` | `#e0def4` | `#8e8ca3` | `#c4a7e7` | `#4c4b61` | `#2b293e` | `#4e4566` | `#4293b4` | `#9ccfd8` | `#f6c177` | `#eb6f92` |
-| `solarized` | `#002b36` | `#93a1a1` | `#5c7479` | `#3093da` | `#27464f` | `#08303b` | `#074661` | `#3093da` | `#859900` | `#b58900` | `#f95148` |
+| `rose-pine` | `#191724` | `#e0def4` | `#89879a` | `#c4a7e7` | `#444252` | `#211f2d` | `#463d58` | `#31748f` | `#9ccfd8` | `#f6c177` | `#eb6f92` |
+| `rose-pine-moon` | `#232136` | `#e0def4` | `#8e8ca3` | `#c4a7e7` | `#4c4b61` | `#2b293e` | `#4e4566` | `#3e8fb0` | `#9ccfd8` | `#f6c177` | `#eb6f92` |
+| `solarized` | `#002b36` | `#93a1a1` | `#5c7479` | `#268bd2` | `#27464f` | `#08303b` | `#003a53` | `#268bd2` | `#859900` | `#b58900` | `#dc322f` |
 | `terminal-native` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
 | `terminal-native-structured` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
-| `tokyonight` | `#1a1b26` | `#c0caf5` | `#787e9b` | `#7aa2f7` | `#3e4153` | `#21222f` | `#35405e` | `#7aa2f7` | `#9ece6a` | `#e0af68` | `#f7768e` |
-| `tokyonight-moon` | `#222436` | `#c8d3f5` | `#8087a3` | `#82aaff` | `#474b61` | `#292b3e` | `#3d496d` | `#82aaff` | `#c3e88d` | `#ffc777` | `#ff757f` |
-| `tokyonight-storm` | `#24283b` | `#c0caf5` | `#7d84a5` | `#7aa2f7` | `#474c65` | `#2b2f43` | `#3c4a6e` | `#7aa2f7` | `#9ece6a` | `#e0af68` | `#f7768e` |
+| `tokyonight` | `#1a1b26` | `#c0caf5` | `#a9b1d6` | `#27a1b9` | `#15161e` | `#16161e` | `#283457` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
+| `tokyonight-moon` | `#222436` | `#c8d3f5` | `#828bb8` | `#589ed7` | `#1b1d2b` | `#1e2030` | `#2d3f76` | `#0db9d7` | `#c3e88d` | `#ffc777` | `#c53b53` |
+| `tokyonight-storm` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
 | `vesper` | `#101010` | `#ffffff` | `#959595` | `#ffc799` | `#424242` | `#191919` | `#4e4035` | `#a0b8d8` | `#99ffe4` | `#ffc799` | `#ff8080` |
 | `zen-paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
-| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#63635f` | `#464645` | `#706b5f` | `#8cd0d3` | `#91b291` | `#f0dfaf` | `#d59b9b` |
+| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#63635f` | `#464645` | `#656055` | `#8cd0d3` | `#7f9f7f` | `#f0dfaf` | `#cc9393` |
 
 ## Light variant swatches
 
@@ -1131,7 +1131,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `amber` | `#0d0700` | `#ffc469` | `#937036` | `#ffb000` | `#3f2e0f` | `#160e01` | `#4b3200` | `#ffcf80` | `#ffd27a` | `#ffb000` | `#ff6a3d` |
 | `amber-terminal` | `#0d0700` | `#ffc469` | `#937036` | `#ffb000` | `#3f2e0f` | `#160e01` | `#4b3200` | `#ffcf80` | `#ffd27a` | `#ffb000` | `#ff6a3d` |
 | `aurora` | `#0b1021` | `#dfe7ff` | `#81889e` | `#7cf4c6` | `#373e52` | `#13192a` | `#294c4f` | `#6fa8ff` | `#7cf4c6` | `#f9f871` | `#ff6f91` |
-| `ayu` | `#fcfcfc` | `#5c6166` | `#919396` | `#a46700` | `#d1d3d4` | `#f3f4f4` | `#ffe5c8` | `#007abf` | `#5f7f00` | `#a06900` | `#d33e41` |
+| `ayu` | `#fcfcfc` | `#5c6166` | `#919396` | `#ffaa33` | `#d1d3d4` | `#f3f4f4` | `#ffe5c8` | `#399ee6` | `#86b300` | `#f2ae49` | `#e65050` |
 | `ayu-mirage` | `#1f2430` | `#cccac2` | `#818284` | `#ffcc66` | `#454952` | `#262b37` | `#5a5245` | `#73d0ff` | `#d5ff80` | `#ffd173` | `#ff6666` |
 | `bcode` | `#f8fafc` | `#0f172a` | `#475569` | `#0369a1` | `#94a3b8` | `#e2e8f0` | `#bae6fd` | `#0369a1` | `#15803d` | `#a16207` | `#be123c` |
 | `bcode-dark` | `#0b1020` | `#e2e8f0` | `#94a3b8` | `#7dd3fc` | `#334155` | `#172033` | `#243454` | `#38bdf8` | `#4ade80` | `#fbbf24` | `#fb7185` |
@@ -1140,52 +1140,52 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `blueprint-studio` | `#0d2a4a` | `#e6f1ff` | `#899cb3` | `#7fd4ff` | `#3f5774` | `#173352` | `#2c587c` | `#7fd4ff` | `#9ef0c3` | `#ffe08a` | `#ff8a80` |
 | `brutal-modus` | `#ffffff` | `#000000` | `#484848` | `#0031a9` | `#aeaeae` | `#eeeeee` | `#afc3ea` | `#0031a9` | `#006800` | `#6f5500` | `#a60000` |
 | `catppuccin-frappe` | `#303446` | `#c6d0f5` | `#868dab` | `#ca9ee6` | `#52576e` | `#373b4e` | `#5b5272` | `#8caaee` | `#a6d189` | `#e5c890` | `#e78284` |
-| `catppuccin-latte` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
+| `catppuccin-latte` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1e66f5` | `#40a02b` | `#df8e1d` | `#d20f39` |
 | `catppuccin-macchiato` | `#24273a` | `#cad3f5` | `#8289a5` | `#c6a0f6` | `#494d64` | `#2b2e42` | `#50486d` | `#8aadf4` | `#a6da95` | `#eed49f` | `#ed8796` |
-| `catppuccin-mocha` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
+| `catppuccin-mocha` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1e66f5` | `#40a02b` | `#df8e1d` | `#d20f39` |
 | `claude-code` | — | *default* | `#666666` | `#5769f7` | `#8a8a8a` | — | — | `#5769f7` | `#2c7a39` | `#966c1e` | `#ab2b3f` |
 | `crt` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
 | `dracula` | `#fffbeb` | `#1f1f1f` | `#706e69` | `#644ac9` | `#c1beb2` | `#f2efdf` | `#cbc7e6` | `#644ac9` | `#14710a` | `#846e15` | `#cb3a2a` |
 | `dusk` | `#1c1726` | `#e8def5` | `#8f879b` | `#f2a7c3` | `#484254` | `#241f2f` | `#553e51` | `#9bb4f5` | `#a8d8a0` | `#f5d58a` | `#f28b9a` |
 | `ember` | `#160e0c` | `#f1e3d8` | `#91857d` | `#ff7a45` | `#453b37` | `#1f1614` | `#532c1e` | `#8fa8c8` | `#b8c46a` | `#ffc857` | `#ff4d4d` |
-| `everforest` | `#fdf6e3` | `#5c6a72` | `#8a908f` | `#697800` | `#d2d1c6` | `#f4efdd` | `#daddad` | `#1478a8` | `#697800` | `#956900` | `#d53135` |
-| `flexoki` | `#fffcf0` | `#100f0f` | `#64625e` | `#205ea6` | `#bbb9b0` | `#f1eee3` | `#bbccdc` | `#205ea6` | `#657e07` | `#946f00` | `#af3029` |
-| `forest-floor` | `#fdf6e3` | `#5c6a72` | `#8a908f` | `#697800` | `#d2d1c6` | `#f4efdd` | `#daddad` | `#1478a8` | `#697800` | `#956900` | `#d53135` |
+| `everforest` | `#fdf6e3` | `#5c6a72` | `#8a908f` | `#8da101` | `#d2d1c6` | `#f4efdd` | `#e7ebba` | `#3a94c5` | `#8da101` | `#dfa000` | `#f85552` |
+| `flexoki` | `#fffcf0` | `#100f0f` | `#64625e` | `#205ea6` | `#bbb9b0` | `#f1eee3` | `#bbccdc` | `#205ea6` | `#66800b` | `#ad8301` | `#af3029` |
+| `forest-floor` | `#fdf6e3` | `#5c6a72` | `#8a908f` | `#8da101` | `#d2d1c6` | `#f4efdd` | `#e7ebba` | `#3a94c5` | `#8da101` | `#dfa000` | `#f85552` |
 | `github` | `#ffffff` | `#1f2328` | `#707376` | `#0969da` | `#c1c2c4` | `#f2f3f3` | `#bbd4f8` | `#0969da` | `#1a7f37` | `#9a6700` | `#cf222e` |
 | `github-dimmed` | `#22272e` | `#adbac7` | `#717b85` | `#539bf5` | `#414851` | `#282d35` | `#324764` | `#539bf5` | `#57ab5a` | `#c69026` | `#f47067` |
 | `glacier` | `#eef6fa` | `#14303f` | `#657985` | `#0b6fa4` | `#b3c0c8` | `#e2ebf0` | `#b0cde1` | `#1d5fb8` | `#1f7a52` | `#7a6200` | `#b4233c` |
-| `gruvbox` | `#fbf1c7` | `#3c3836` | `#837c6c` | `#9a6100` | `#c7bfa0` | `#f0e7bf` | `#e7cb97` | `#076678` | `#767006` | `#9a6100` | `#9d0006` |
-| `gruvbox-material` | `#fbf1c7` | `#654735` | `#9f876c` | `#9c6000` | `#d4c4a0` | `#f3e8bf` | `#e7ca95` | `#45707a` | `#687329` | `#9c6000` | `#bc4646` |
+| `gruvbox` | `#fbf1c7` | `#3c3836` | `#837c6c` | `#b57614` | `#c7bfa0` | `#f0e7bf` | `#e7cb97` | `#076678` | `#79740e` | `#b57614` | `#9d0006` |
+| `gruvbox-material` | `#fbf1c7` | `#654735` | `#9f876c` | `#b47109` | `#d4c4a0` | `#f3e8bf` | `#e7ca95` | `#45707a` | `#6c782e` | `#b47109` | `#c14a4a` |
 | `high-contrast` | *black* | *bright white* | *white* | *bright cyan* | *bright white* | *black* | *bright white* | *bright blue* | *bright green* | *bright yellow* | *bright red* |
-| `kanagawa` | `#f2ecbc` | `#545464` | `#888781` | `#4d699b` | `#c8c4a6` | `#e9e4b8` | `#bec4b5` | `#4d699b` | `#597238` | `#726b3a` | `#bf384c` |
+| `kanagawa` | `#f2ecbc` | `#545464` | `#888781` | `#4d699b` | `#c8c4a6` | `#e9e4b8` | `#c5ccbc` | `#4d699b` | `#6f894e` | `#77713f` | `#c84053` |
 | `kanagawa-dragon` | `#181616` | `#c5c9c5` | `#797b78` | `#8ba4b0` | `#3e3d3c` | `#1f1d1d` | `#373c3f` | `#8ba4b0` | `#8a9a7b` | `#c4b28a` | `#c4746e` |
-| `melange` | `#f1f1f1` | `#54433a` | `#90847e` | `#946500` | `#c7c2c0` | `#e9e7e7` | `#d9c9b2` | `#465aa4` | `#3a684a` | `#946500` | `#bf0021` |
+| `melange` | `#f1f1f1` | `#54433a` | `#90847e` | `#a06d00` | `#c7c2c0` | `#e9e7e7` | `#d9c9b2` | `#465aa4` | `#3a684a` | `#a06d00` | `#bf0021` |
 | `modus` | `#ffffff` | `#000000` | `#484848` | `#0031a9` | `#aeaeae` | `#eeeeee` | `#afc3ea` | `#0031a9` | `#006800` | `#6f5500` | `#a60000` |
 | `monochrome` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | — | — | — | — |
-| `monokai-classic` | `#272822` | `#f8f8f2` | `#9d9e97` | `#a6e22e` | `#555650` | `#30312b` | `#4a5a2f` | `#66d9ef` | `#a6e22e` | `#e6db74` | `#ff447d` |
+| `monokai-classic` | `#272822` | `#f8f8f2` | `#9d9e97` | `#a6e22e` | `#555650` | `#30312b` | `#4a5a2f` | `#66d9ef` | `#a6e22e` | `#e6db74` | `#f92672` |
 | `moss` | `#141a14` | `#dbe4d0` | `#838c7d` | `#9ccf6e` | `#3f463c` | `#1c221c` | `#384a2e` | `#7fa8b8` | `#9ccf6e` | `#d9c46a` | `#e57c6a` |
 | `neon` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
 | `neon-noir` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
 | `newsroom` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
 | `night-owl` | `#011627` | `#d6deeb` | `#788797` | `#82aaff` | `#2e4253` | `#081e2f` | `#223e61` | `#82aaff` | `#addb67` | `#ecc48d` | `#ef5350` |
-| `night-shift` | `#24283b` | `#c0caf5` | `#7d84a5` | `#7aa2f7` | `#474c65` | `#2b2f43` | `#3c4a6e` | `#7aa2f7` | `#9ece6a` | `#e0af68` | `#f7768e` |
-| `nightfox` | `#faf4ed` | `#575279` | `#8f8ba2` | `#286983` | `#cec9d0` | `#f1ebe7` | `#bbc9cd` | `#286983` | `#537866` | `#9e6300` | `#a7586f` |
+| `night-shift` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
+| `nightfox` | `#faf4ed` | `#575279` | `#8f8ba2` | `#286983` | `#cec9d0` | `#f1ebe7` | `#c0ced2` | `#286983` | `#618774` | `#ea9d34` | `#b4637a` |
 | `nord` | `#2e3440` | `#eceff4` | `#8492aa` | `#88c0d0` | `#4c566a` | `#3b4252` | `#434c5e` | `#81a1c1` | `#a3be8c` | `#ebcb8b` | `#e17f87` |
-| `one` | `#fafafa` | `#383a42` | `#808187` | `#366ce5` | `#c5c6c8` | `#efeff0` | `#c1d5fb` | `#366ce5` | `#318332` | `#9c6900` | `#ce4237` |
+| `one` | `#fafafa` | `#383a42` | `#808187` | `#4078f2` | `#c5c6c8` | `#efeff0` | `#c1d5fb` | `#4078f2` | `#50a14f` | `#c18401` | `#e45649` |
 | `oxocarbon` | `#161616` | `#f2f4f8` | `#919294` | `#be95ff` | `#454546` | `#1f1f1f` | `#423953` | `#78a9ff` | `#42be65` | `#ffe97b` | `#ee5396` |
 | `paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
 | `phosphor` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
-| `poimandres` | `#1b1e28` | `#a6accd` | `#6a6f86` | `#5de4c7` | `#3a3e4d` | `#21242f` | `#325353` | `#add7ff` | `#5de4c7` | `#fffac2` | `#d0679d` |
+| `poimandres` | `#1b1e28` | `#a6accd` | `#6a6f86` | `#5de4c7` | `#3a3e4d` | `#21242f` | `#274748` | `#add7ff` | `#5de4c7` | `#fffac2` | `#d0679d` |
 | `quiet` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
-| `rice-mocha` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1b63f2` | `#207f00` | `#9d6000` | `#d20f39` |
-| `rose-pine` | `#faf4ed` | `#575279` | `#8f8ba2` | `#7d6795` | `#cec9d0` | `#f1ebe7` | `#d9ced9` | `#286983` | `#3b7984` | `#9e6300` | `#a7586f` |
-| `rose-pine-moon` | `#232136` | `#e0def4` | `#8e8ca3` | `#c4a7e7` | `#4c4b61` | `#2b293e` | `#4e4566` | `#4293b4` | `#9ccfd8` | `#f6c177` | `#eb6f92` |
-| `solarized` | `#fdf6e3` | `#576c73` | `#879190` | `#0076bb` | `#d1d2c7` | `#f4efdd` | `#c2d7e1` | `#0076bb` | `#687900` | `#8f6c00` | `#d72d2b` |
+| `rice-mocha` | `#eff1f5` | `#4c4f69` | `#888a9d` | `#8839ef` | `#c3c6d0` | `#e6e8ee` | `#cdc0f8` | `#1e66f5` | `#40a02b` | `#df8e1d` | `#d20f39` |
+| `rose-pine` | `#faf4ed` | `#575279` | `#8f8ba2` | `#907aa9` | `#cec9d0` | `#f1ebe7` | `#d9ced9` | `#286983` | `#56949f` | `#ea9d34` | `#b4637a` |
+| `rose-pine-moon` | `#232136` | `#e0def4` | `#8e8ca3` | `#c4a7e7` | `#4c4b61` | `#2b293e` | `#4e4566` | `#3e8fb0` | `#9ccfd8` | `#f6c177` | `#eb6f92` |
+| `solarized` | `#fdf6e3` | `#586e75` | `#879190` | `#268bd2` | `#d1d2c7` | `#f4efdd` | `#d9eff9` | `#268bd2` | `#859900` | `#b58900` | `#dc322f` |
 | `terminal-native` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
 | `terminal-native-structured` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
-| `tokyonight` | `#e1e2e7` | `#3158b7` | `#6481bc` | `#0961cb` | `#b4c2df` | `#d8dce6` | `#aec5eb` | `#0961cb` | `#516d32` | `#7f5f31` | `#c9004c` |
-| `tokyonight-moon` | `#222436` | `#c8d3f5` | `#8087a3` | `#82aaff` | `#474b61` | `#292b3e` | `#3d496d` | `#82aaff` | `#c3e88d` | `#ffc777` | `#ff757f` |
-| `tokyonight-storm` | `#24283b` | `#c0caf5` | `#7d84a5` | `#7aa2f7` | `#474c65` | `#2b2f43` | `#3c4a6e` | `#7aa2f7` | `#9ece6a` | `#e0af68` | `#f7768e` |
+| `tokyonight` | `#e1e2e7` | `#3760bf` | `#6172b0` | `#4094a3` | `#b4b5b9` | `#d0d5e3` | `#b7c1e3` | `#07879d` | `#587539` | `#8c6c3e` | `#c64343` |
+| `tokyonight-moon` | `#222436` | `#c8d3f5` | `#828bb8` | `#589ed7` | `#1b1d2b` | `#1e2030` | `#2d3f76` | `#0db9d7` | `#c3e88d` | `#ffc777` | `#c53b53` |
+| `tokyonight-storm` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
 | `vesper` | `#101010` | `#ffffff` | `#959595` | `#ffc799` | `#424242` | `#191919` | `#4e4035` | `#a0b8d8` | `#99ffe4` | `#ffc799` | `#ff8080` |
 | `zen-paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
-| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#63635f` | `#464645` | `#706b5f` | `#8cd0d3` | `#91b291` | `#f0dfaf` | `#d59b9b` |
+| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#63635f` | `#464645` | `#656055` | `#8cd0d3` | `#7f9f7f` | `#f0dfaf` | `#cc9393` |
