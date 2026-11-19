@@ -4,6 +4,11 @@
 //! document maps each one onto its file and anchor line. An anchor whose line no longer exists,
 //! or is no longer the same kind of line, is labeled outdated and shown at the file level; it is
 //! never moved to a different line.
+//!
+//! An AI exchange asked from a thread (`ReviewAiExchange::thread_id`) is shown with that thread
+//! while the thread is among the annotations: at the thread's anchor, whatever moved it there (a
+//! pull request thread follows its code across pushes), directly after the thread and after its
+//! earlier exchanges. Without that thread it is placed at its own anchor like any other.
 
 use super::keys::{FileRef, ItemKey};
 use bcode_code_review_models::{
@@ -266,13 +271,26 @@ pub fn collect(annotations: &Annotations) -> Vec<Annotation> {
             session_id: draft.session_id.clone(),
         });
     }
+    // Exchange id → the thread it is shown with.
+    let mut owned: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
     for exchange in &annotations.exchanges {
+        let owner = exchange
+            .thread_id
+            .as_deref()
+            .and_then(|thread_id| threads.get_key_value(thread_id));
+        let (anchor, target) = match owner {
+            Some((thread_id, &index)) => {
+                owned.insert(&exchange.exchange_id, thread_id);
+                (out[index].anchor.clone(), out[index].target.clone())
+            }
+            None => (exchange.anchor.clone(), target_of(&exchange.anchor)),
+        };
         out.push(Annotation {
             key: ItemKey::AgentThread {
                 id: exchange.exchange_id.clone(),
             },
-            anchor: exchange.anchor.clone(),
-            target: target_of(&exchange.anchor),
+            anchor,
+            target,
             created_at_ms: exchange.created_at_ms,
             body: AnnotationBody::Agent {
                 exchange_id: Some(exchange.exchange_id.clone()),
@@ -315,6 +333,47 @@ pub fn collect(annotations: &Annotations) -> Vec<Annotation> {
         });
     }
     out.sort_by(|a, b| (a.created_at_ms, &a.key).cmp(&(b.created_at_ms, &b.key)));
+    if owned.is_empty() {
+        return out;
+    }
+    follow_threads(out, &owned)
+}
+
+/// `sorted` with every exchange of `owned` moved directly after its thread, keeping the
+/// exchanges of one thread in their order.
+fn follow_threads(
+    sorted: Vec<Annotation>,
+    owned: &std::collections::BTreeMap<&str, &str>,
+) -> Vec<Annotation> {
+    let owner_of = |annotation: &Annotation| match &annotation.body {
+        AnnotationBody::Agent {
+            exchange_id: Some(exchange_id),
+        } => owned.get(exchange_id.as_str()).copied(),
+        AnnotationBody::Agent { exchange_id: None } | AnnotationBody::Thread { .. } => None,
+    };
+    let mut followers: std::collections::BTreeMap<String, Vec<Annotation>> =
+        std::collections::BTreeMap::new();
+    let mut rest = Vec::with_capacity(sorted.len());
+    for annotation in sorted {
+        match owner_of(&annotation) {
+            Some(thread_id) => followers
+                .entry(thread_id.to_owned())
+                .or_default()
+                .push(annotation),
+            None => rest.push(annotation),
+        }
+    }
+    let mut out = Vec::with_capacity(rest.len() + followers.len());
+    for annotation in rest {
+        let thread_id = match &annotation.key {
+            ItemKey::Thread { thread_id } => Some(thread_id.clone()),
+            _ => None,
+        };
+        out.push(annotation);
+        if let Some(following) = thread_id.and_then(|thread_id| followers.remove(&thread_id)) {
+            out.extend(following);
+        }
+    }
     out
 }
 

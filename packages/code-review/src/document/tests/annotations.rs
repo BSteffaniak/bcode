@@ -352,6 +352,7 @@ fn exchanges_and_suggestions_group_by_session_and_anchor() {
             schema_version: 1,
             exchange_id: "x".into(),
             anchor: at.clone(),
+            thread_id: None,
             question: "why?".into(),
             session_id: Some("session".into()),
             status: ReviewAiExchangeStatus::Linked,
@@ -401,6 +402,129 @@ fn exchanges_and_suggestions_group_by_session_and_anchor() {
         })
         .expect("orphan suggestion item");
     assert_eq!(orphan.exchange_id, None);
+}
+
+fn exchange(id: &str, anchor: DraftAnchor, thread: Option<&str>, created: u64) -> ReviewAiExchange {
+    ReviewAiExchange {
+        schema_version: 1,
+        exchange_id: id.into(),
+        anchor,
+        thread_id: thread.map(str::to_owned),
+        question: "why?".into(),
+        session_id: None,
+        status: ReviewAiExchangeStatus::Linked,
+        error: None,
+        created_at_ms: created,
+        updated_at_ms: created,
+    }
+}
+
+fn agent(id: &str) -> ItemKey {
+    ItemKey::AgentThread { id: id.to_string() }
+}
+
+/// The keys of the annotations shown, in document order.
+fn annotation_keys(items: &[ReviewItem]) -> Vec<ItemKey> {
+    items
+        .iter()
+        .filter(|item| matches!(item, ReviewItem::Thread(_) | ReviewItem::AgentThread(_)))
+        .map(ReviewItem::key)
+        .collect()
+}
+
+#[test]
+fn an_exchange_asked_from_a_thread_is_shown_with_it_wherever_the_thread_is() {
+    let fake = sample();
+    let file = || std::sync::Arc::new(fake.file("a.rs"));
+    let line = |line| ItemKey::Line {
+        file: file(),
+        side: ReviewLineSide::New,
+        line,
+    };
+    // Asked on new line 10 of content that has changed since: alone, outdated.
+    let mut asked_at = anchor("a.rs", ReviewLineKind::Added, None, Some(10));
+    asked_at.blob_oid = Some("f".repeat(40));
+    let place = |thread_anchor: Option<DraftAnchor>| {
+        let mut drafts = vec![draft(
+            "later",
+            anchor("a.rs", ReviewLineKind::Added, None, Some(11)),
+            2,
+        )];
+        drafts.extend(thread_anchor.map(|at| draft("t", at, 1)));
+        let annotations = Annotations {
+            drafts,
+            exchanges: vec![
+                exchange("first", asked_at.clone(), Some("t"), 3),
+                exchange("second", asked_at.clone(), Some("t"), 4),
+                exchange("plain", asked_at.clone(), None, 5),
+            ],
+            ..Annotations::default()
+        };
+        let mut doc = fake.document(DocumentConfig::default());
+        doc.set_annotations(&annotations);
+        fake.load_all(&mut doc);
+        items(&doc)
+    };
+
+    // With its thread on line 11: right after the thread, before a later thread on that line.
+    let all = place(Some(anchor("a.rs", ReviewLineKind::Added, None, Some(11))));
+    let keys = annotation_keys(&all);
+    let at = |key: &ItemKey| keys.iter().position(|shown| shown == key).expect("shown");
+    assert_eq!(at(&agent("first")), at(&thread("t")) + 1, "{keys:?}");
+    assert_eq!(at(&agent("second")), at(&thread("t")) + 2, "{keys:?}");
+    assert_eq!(at(&thread("later")), at(&thread("t")) + 3, "{keys:?}");
+    for id in ["first", "second"] {
+        assert_eq!(
+            placement_of(&all, &agent(id)),
+            (AnchorPlacement::Line, line(11)),
+            "{id}"
+        );
+    }
+    // An exchange asked from no thread stays at its own anchor.
+    assert_eq!(
+        placement_of(&all, &agent("plain")).0,
+        AnchorPlacement::Outdated(OutdatedReason::ContentChanged)
+    );
+
+    // The thread moved to line 12: the exchanges move with it.
+    let all = place(Some(anchor("a.rs", ReviewLineKind::Added, None, Some(12))));
+    assert_eq!(
+        placement_of(&all, &agent("first")),
+        (AnchorPlacement::Line, line(12))
+    );
+
+    // The thread on its file only: so are its exchanges, right after it.
+    let mut on_file = anchor("a.rs", ReviewLineKind::Context, None, None);
+    on_file.kind = ReviewAnchorKind::File;
+    let all = place(Some(on_file));
+    let keys = annotation_keys(&all);
+    let at = |key: &ItemKey| keys.iter().position(|shown| shown == key).expect("shown");
+    assert_eq!(at(&agent("first")), at(&thread("t")) + 1, "{keys:?}");
+    assert_eq!(placement_of(&all, &agent("first")).0, AnchorPlacement::File);
+
+    // The thread on the review as a whole (a pull request thread on its layer): the same.
+    let mut on_review = anchor("<review>", ReviewLineKind::Context, None, None);
+    on_review.kind = ReviewAnchorKind::Review;
+    let all = place(Some(on_review));
+    assert_eq!(
+        annotation_keys(&all)[..3],
+        [thread("t"), agent("first"), agent("second")]
+    );
+    assert!(
+        matches!(&all[1], ReviewItem::AgentThread(agent) if agent.placement == AnchorPlacement::Review),
+        "{:?}",
+        all[1]
+    );
+
+    // The thread is gone: each exchange falls back to its own anchor, outdated.
+    let all = place(None);
+    for id in ["first", "second"] {
+        assert_eq!(
+            placement_of(&all, &agent(id)).0,
+            AnchorPlacement::Outdated(OutdatedReason::ContentChanged),
+            "{id}"
+        );
+    }
 }
 
 #[test]
