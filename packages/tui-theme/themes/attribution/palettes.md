@@ -15,11 +15,11 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `catppuccin-*` | Catppuccin (frappe, latte, macchiato, mocha) | github.com/catppuccin/nvim | MIT |
 | `tokyonight*` | Tokyo Night (night, day, moon, storm) | github.com/folke/tokyonight.nvim | Apache-2.0 |
 | `gruvbox` | Gruvbox (dark, light; medium contrast) | github.com/ellisonleao/gruvbox.nvim | MIT |
-| `gruvbox-material` | Gruvbox Material | github.com/sainnhe/gruvbox-material | MIT |
+| `gruvbox-material` | Gruvbox Material (medium background, material foreground) | github.com/sainnhe/gruvbox-material | MIT |
 | `dracula` | Dracula / Alucard | github.com/dracula/vim | MIT |
 | `rose-pine*` | Rosé Pine (main, moon, dawn) | github.com/rose-pine/neovim | MIT |
 | `kanagawa*` | Kanagawa | github.com/rebelot/kanagawa.nvim | MIT |
-| `everforest` | Everforest | github.com/sainnhe/everforest | MIT |
+| `everforest` | Everforest (medium background) | github.com/sainnhe/everforest | MIT |
 | `one` | One Dark / One Light | github.com/atom/atom (one-dark-syntax) | MIT |
 | `solarized` | Solarized | github.com/altercation/solarized | MIT |
 | `github*` | GitHub Primer themes | github.com/primer/github-vscode-theme | MIT |
