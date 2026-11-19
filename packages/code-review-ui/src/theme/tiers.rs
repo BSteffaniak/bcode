@@ -20,9 +20,10 @@
 //!   the theme's accent role.
 //! * `accent_alt` is the first of the given alternates (syntax keyword and type colors, info,
 //!   link) that reads as a different hue: for an RGB accent, an RGB color at least 40° of
-//!   OKLCH hue from the accent and 20° from the success, error and info colors; for terminal
-//!   colors, a different color. Without one, an RGB accent is turned 70° in hue (readable on
-//!   the canvas), and a terminal-color accent gets magenta (blue when it is magenta itself).
+//!   OKLCH hue from the accent and 20° from the success, warning, error and info colors; for
+//!   terminal colors, a color other than the accent and those states. Without one, an RGB
+//!   accent is turned 70° in hue (readable on the canvas), and a terminal-color accent gets
+//!   magenta (blue when it is magenta itself).
 //! * `dim` is the muted color mixed toward the canvas while it keeps 2:1 contrast, else muted
 //!   text with the dim modifier.
 //! * `on_accent` is the canvas color on the accent when that reads (4.5:1), else black or
@@ -134,7 +135,12 @@ impl Tiers {
         );
         let accent_alt = second_accent(
             accent_fg,
-            [component.success.fg, component.error.fg, component.info.fg],
+            [
+                component.success.fg,
+                component.warning.fg,
+                component.error.fg,
+                component.info.fg,
+            ],
             alternates,
             base,
         )
@@ -188,7 +194,7 @@ pub fn readable_extreme(fill: Rgb) -> Rgb {
 /// `states`, else (for an RGB accent) the accent turned in hue, else `None`.
 fn second_accent(
     accent: Option<Color>,
-    states: [Option<Color>; 3],
+    states: [Option<Color>; 4],
     alternates: &[Color],
     canvas: Option<Rgb>,
 ) -> Option<Color> {
