@@ -618,7 +618,7 @@ default = true
   `explain` and one shared property flattening (`bcode_tui::inspector::property_rows`); the
   inspector also reports the target's manual override, its shown disclosure (group-adjusted for
   members), and grouping context, and explains groups from their synthesized group facts.
-* `bcode theme check [THEME] [--strict] [--json]` resolves a theme in both variants (once when
+* `bcode theme check [THEME | --all] [--strict] [--json] [--bless] [--accepted PATH]` resolves a theme in both variants (once when
   they resolve identically) and reports WCAG contrast for text, accent, status, diff, and
   selection role pairs (4.5:1 for text and states; 3:1 for secondary text, focus borders, diff
   signs, tool titles, and inactive selection); unknown style roles and container keys; roles
@@ -629,7 +629,9 @@ default = true
   unmeasured, not failed. Each contrast adjustment resolution made (role, pair background, fg or
   bg, before and after color, pair ratio before and after) is an informational `adjusted`
   finding and an `adjustments` entry in `--json`; adjustments never count as warnings. Warnings
-  exit 0 unless `--strict`; `--json` emits a versioned structure. The analysis is `bcode_tui_theme::check`; the command compiles rule layers.
+  are compared with the theme's accepted findings (`check-accepted.toml`); new or worse findings
+  fail, stale entries fail only under `--strict`, and `--bless` records the current findings;
+  `--json` emits a versioned structure. The analysis is `bcode_tui_theme::check`; the command compiles rule layers.
 * Global actions: expand all, collapse all, cycle detail, and "make this the default for this
   tool" (see Interaction).
 * `cargo run -p xtask -- theme-gallery [--check | --dry-run]` writes the generated gallery,
@@ -687,7 +689,8 @@ the design above, and what remains.
   `[presentation]`, and `kind`. Schema-v1 files resolve unchanged. Plugin component-theme
   contract v2.
 * Contrast-aware derivation against the shared pairing table; every bundled theme passes
-  `bcode theme check --strict` in both variants. Nord opts in with `contrast = "enforce"`, which
+  `bcode theme check --strict` in both variants, with upstream palettes' own low contrast recorded
+  as accepted findings (see `docs/tui-themes.md`, Accepting findings). Nord opts in with `contrast = "enforce"`, which
   lightens its authored error red (`#bf616a` to `#e17f87`) to reach 4.5:1 on its canvas.
 * Every `[chrome.tui]` key is honored by the terminal renderer:
   * `borders.panel` and `borders.dialog` select surface border glyphs, and `focus` (`gradient`,

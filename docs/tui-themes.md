@@ -576,8 +576,9 @@ configured one.
 
 ```console
 bcode theme check                 # the configured theme, profile, and overlays
-bcode theme check nord --strict   # fail on any warning
+bcode theme check nord --strict   # also fail on stale accepted findings
 bcode theme check ./my-theme.toml --json
+bcode theme check --all           # every theme, profile, and base
 ```
 
 `THEME` is a theme id, a profile id (checked over `terminal-native`), or a
@@ -601,11 +602,95 @@ theme file. The report lists, per variant:
   notes naming the role, whether its foreground or background moved, the
   color before and after, and the pair's contrast before and after.
 
-Adjustments are informational and never count as warnings. Warnings do not fail the command unless `--strict` is given. `--json` prints a
+Adjustments are informational and never count as warnings. `--json` prints a
 stable, versioned structure; a contrast row whose role color is a palette
-color kept exactly names that entry in `palette_slot`. Bundled themes pass
-`--strict` in both variants apart from contrast findings on palette colors,
-which reproduce their source scheme exactly.
+color kept exactly names that entry in `palette_slot`.
+
+### Accepting findings
+
+A theme can accept findings instead of changing colors — for example the low
+contrast of an upstream scheme the theme reproduces exactly. Every warning the
+check produces (contrast, unknown keys, coverage, resolver warnings, and
+presentation rules) is compared with the theme's accepted findings:
+
+* **accepted** — an entry matches; the finding does not fail the check;
+* **improved** — an accepted contrast finding now measures higher than its
+  recorded ratio; it passes and is reported, so the entry can be re-blessed;
+* **new** — no entry matches; the check fails;
+* **worse** — an accepted contrast finding now measures lower than its
+  recorded ratio (by more than 0.005); the check fails;
+* **stale** — an entry no longer occurs; reported as a warning, and an error
+  under `--strict`.
+
+The command exits with an error when any finding is new or worse (or, with
+`--strict`, any entry is stale); informational notes never fail it. Text
+output marks each warning `[accepted]`, `[improved]`, `[new]`, or `[worse]`
+and ends with a summary listing every new, worse, improved, and stale entry.
+`--json` adds an `acceptance` object with the `source` it read, the
+`accepted`, `improved`, `new`, `worse`, and `stale` lists (each item carries
+the entry fields below, plus `accepted_ratio` for contrast findings that have
+an entry), and a `summary` of their counts; each warning finding gains an
+`acceptance` status.
+
+Accepted findings live in `check-accepted.toml`:
+
+* for a theme file — discovered in `~/.config/bcode/themes`,
+  `.bcode/themes`, or a configured path, or given on the command line — the
+  file named `check-accepted.toml` in the same directory, which covers every
+  theme in that directory;
+* for bundled themes, the file shipped with Bcode
+  (`packages/tui-theme/themes/check-accepted.toml`);
+* `--accepted <PATH>` reads (and with `--bless` writes) another file instead.
+
+```toml
+schema_version = 1
+
+[[accepted]]
+theme = "solarized"
+variant = "light"            # dark or light; absent for selection-wide findings
+kind = "contrast"            # the finding category
+foreground = "state.warning" # contrast findings: the measured role pair
+background = "canvas"
+ratio = 2.97                 # contrast findings: the ratio when accepted
+slot = "warning"             # informational: the kept palette entry
+reason = "Solarized's yellow, kept exactly"
+
+[[accepted]]
+theme = "my-theme"
+variant = "dark"
+kind = "unknown_key"         # other findings: subject and exact message
+subject = "bordr.focussed"
+message = "unknown style role \"bordr.focussed\"; did you mean \"border.focused\"?"
+```
+
+Profiles and bases are checked over `terminal-native`, so their entries also
+carry `overlays = ["<profile>"]`. An entry is keyed by theme, overlays,
+variant, kind, and its role pair (or subject and message); `ratio`, `slot`,
+and `reason` are not part of the key.
+
+`--bless` accepts the current findings of the checked theme (or, with `--all`,
+every theme): it rewrites those themes' entries, keeps the `reason` of each
+entry that still occurs, records current ratios, removes stale entries, leaves
+other themes' entries alone, and writes the file sorted by key, so the result
+is deterministic and reviewable. Review the diff before committing it, and add
+a `reason` to say why each finding is acceptable.
+
+```console
+bcode theme check ./my-theme.toml --bless
+```
+
+Bundled themes may accept contrast findings only on palette colors kept
+exactly (rows with a `palette_slot`): colors Bcode derives must meet their
+threshold. A derived finding on a bundled theme is reported as new even when
+an entry lists it, and `--bless` refuses to record it. The bundled accepted
+findings are part of Bcode and change only with the source; the crate's
+tests fail when a bundled theme has a new, worse, or stale finding. After a
+deliberate palette change, re-bless them from a checkout with an empty user
+theme directory:
+
+```console
+bcode theme check --all --bless --accepted packages/tui-theme/themes/check-accepted.toml
+```
 
 ### Unknown roles
 

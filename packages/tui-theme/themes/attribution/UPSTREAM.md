@@ -200,8 +200,18 @@ the reference and keep `attribution/palettes.md` accurate (source and license).
 
 ```console
 cargo test -p bcode_tui_theme --test upstream_fidelity
-bcode theme check <id>      # contrast warnings on kept palette colors are expected
+bcode theme check <id>
 ```
+
+Contrast findings on kept palette colors reproduce the upstream scheme; review
+them and record them as accepted findings rather than changing a color:
+
+```console
+bcode theme check --all --bless --accepted packages/tui-theme/themes/check-accepted.toml
+```
+
+Findings on derived colors cannot be accepted for bundled themes (see
+`docs/tui-themes.md`, Accepting findings).
 
 The fidelity tests check that every palette is classified in `sources.toml`,
 that each reference resolves exactly (every slot and mapped role equals its
