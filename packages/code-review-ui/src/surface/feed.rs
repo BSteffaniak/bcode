@@ -367,7 +367,7 @@ impl ReviewSurface {
                 .map(|exchange| {
                     (
                         exchange.exchange_id.clone(),
-                        super::annotate::location_label(&exchange.anchor),
+                        super::annotate::location_label(self.notes.exchange_anchor(exchange)),
                     )
                 })
                 .collect();

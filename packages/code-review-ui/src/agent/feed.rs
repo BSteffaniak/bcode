@@ -42,6 +42,13 @@ pub const CONTEXT_MARKER: &str = "\n\n[Review context: ";
 /// Where the question starts in the prompts the review sends.
 const QUESTION_MARKER: &str = "\nQuestion:\n";
 
+/// What precedes the id of the thread a review prompt's question was asked from (on a line of
+/// its own).
+pub const THREAD_ID_LABEL: &str = "Thread id: ";
+
+/// What follows that thread id on its line.
+pub const THREAD_ID_END: &str = " (code_review.get_thread reads it in full)";
+
 /// State of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolState {
@@ -107,6 +114,9 @@ pub struct Turn {
     /// The question: the review prompt's question, or the whole user message otherwise.
     /// Empty for items before the first question inside the observed window.
     pub question: String,
+    /// The id the review tools give the thread the question was asked from, when the review
+    /// prompt names one.
+    pub thread: Option<String>,
     /// Items, oldest first (the newest [`MAX_TURN_ITEMS`]).
     pub items: Vec<FeedItem>,
     /// Items dropped before the first kept one.
@@ -179,6 +189,7 @@ impl Feed {
             if let TranscriptViewItemKind::UserMessage { message } = &item.kind {
                 turns.push(Turn {
                     question: question_of(&message.text),
+                    thread: thread_of(&message.text),
                     ..Turn::default()
                 });
                 if turns.len() > MAX_TURNS {
@@ -262,6 +273,18 @@ pub fn question_of(text: &str) -> String {
         .rfind(CONTEXT_MARKER)
         .map_or(question, |at| &question[..at]);
     bounded(question.trim(), MAX_QUESTION_BYTES)
+}
+
+/// The id of the thread a review prompt's question was asked from (as the review tools name
+/// it), read from the prompt's context before the question; `None` for other messages.
+#[must_use]
+pub fn thread_of(text: &str) -> Option<String> {
+    let context = &text[..text.rfind(QUESTION_MARKER)?];
+    let label = format!("\n{THREAD_ID_LABEL}");
+    let start = context.find(&label)? + label.len();
+    let line = context[start..].lines().next()?;
+    let id = line.strip_suffix(THREAD_ID_END)?.trim();
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 fn feed_item(item: &TranscriptViewItem) -> Option<FeedItem> {
@@ -611,6 +634,24 @@ mod tests {
         assert_eq!(
             question_of("Is it safe?\n\n[Review context: \"x\"; the reviewer is at a.rs:3.]"),
             "Is it safe?"
+        );
+    }
+
+    #[test]
+    fn the_thread_a_review_prompt_was_asked_from_is_read_before_its_question() {
+        let prompt = format!(
+            "You are helping.\n\nThe question is about a thread (open).\n{THREAD_ID_LABEL}fake/repo#102:PRRT_1{THREAD_ID_END}\nShown in this review: a.rs:3\n{QUESTION_MARKER}Thread id: not-this (code_review.get_thread reads it in full)\n"
+        );
+        assert_eq!(thread_of(&prompt).as_deref(), Some("fake/repo#102:PRRT_1"));
+        assert_eq!(
+            thread_of("You are helping.\n\nFile: a.rs\n\nQuestion:\nwhy?\n"),
+            None,
+            "a question asked from no thread"
+        );
+        assert_eq!(
+            thread_of("Thread id: t (code_review.get_thread reads it in full)"),
+            None,
+            "not a review prompt"
         );
     }
 }

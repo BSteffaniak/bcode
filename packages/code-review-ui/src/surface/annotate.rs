@@ -190,9 +190,22 @@ impl ReviewSurface {
                 .filter(|draft| draft.resolved_at_ms.is_none())
                 .map(|draft| draft.thread_id.clone())
                 .collect();
+            // Questions asked from a hidden thread hide with it.
+            let hidden: std::collections::BTreeSet<String> = annotations
+                .drafts
+                .iter()
+                .filter(|draft| !open.contains(&draft.thread_id))
+                .map(|draft| draft.thread_id.clone())
+                .collect();
             annotations
                 .drafts
                 .retain(|draft| open.contains(&draft.thread_id));
+            annotations.exchanges.retain(|exchange| {
+                exchange
+                    .thread_id
+                    .as_ref()
+                    .is_none_or(|thread_id| !hidden.contains(thread_id))
+            });
         }
         review.doc.set_annotations(&annotations);
         review.note_splices();
@@ -828,15 +841,36 @@ impl ReviewSurface {
         self.ask_about(anchor, question, now, None, false);
     }
 
-    /// The session a question about `anchor` goes to: the anchor's latest question's, else a
-    /// linked thread's; `None` when the question starts a new session.
-    fn anchor_session(&self, anchor: &DocAnchor) -> Option<String> {
+    /// The session a question about `anchor`, asked from the thread `thread` when it is, goes
+    /// to: the latest session of a question asked from that thread, else of the anchor's
+    /// latest question (not one shown with another thread), else a linked thread's; `None`
+    /// when the question starts a new session.
+    fn anchor_session(&self, anchor: &DocAnchor, thread: Option<&str>) -> Option<String> {
+        let thread = thread.map(|thread| self.notes.current_thread_id(thread));
+        if let Some(thread) = &thread
+            && let Some(session) = self
+                .notes
+                .exchanges()
+                .iter()
+                .rev()
+                .filter(|exchange| exchange.thread_id.as_ref() == Some(thread))
+                .find_map(|exchange| exchange.session_id.clone())
+        {
+            return Some(session);
+        }
         let identity = notes::anchor_identity(&anchor.to_draft_anchor());
         self.notes
             .exchanges()
             .iter()
             .rev()
             .filter(|exchange| notes::anchor_identity(&exchange.anchor) == identity)
+            .filter(|exchange| {
+                thread.is_none()
+                    || self
+                        .notes
+                        .exchange_thread(exchange)
+                        .is_none_or(|owner| Some(owner) == thread.as_deref())
+            })
             .find_map(|exchange| exchange.session_id.clone())
             .or_else(|| {
                 self.notes
@@ -847,13 +881,71 @@ impl ReviewSurface {
             })
     }
 
+    /// Recover the thread questions saved without one were asked from, and save it with them:
+    /// from the review prompt of each question's turn in what its card already observes of its
+    /// session (a bounded window; nothing more is read), mapped to the thread the review holds
+    /// under that id; and a question without a thread of its own, in the same session and on
+    /// the same anchor as one asked from a thread, goes with that thread (a follow-up asked from
+    /// its card). Returns whether any changed.
+    pub(super) fn recover_exchange_threads(&mut self) -> bool {
+        let at = (self.notes.revision(), self.agents.revision());
+        if self.exchange_threads_at == Some(at) {
+            return false;
+        }
+        self.exchange_threads_at = Some(at);
+        let unowned = |exchange: &&ReviewAiExchange| {
+            exchange.thread_id.is_none() && exchange.status != ReviewAiExchangeStatus::Pending
+        };
+        let mut found: Vec<(String, String)> = self
+            .notes
+            .exchanges()
+            .iter()
+            .filter(unowned)
+            .filter_map(|exchange| {
+                let state = self.agents.state(exchange.session_id.as_deref()?)?;
+                let (_, turn) = state.feed.turn_for(&exchange.question)?;
+                let thread = self.notes.thread_for_tool_id(turn.thread.as_deref()?)?;
+                Some((exchange.exchange_id.clone(), thread))
+            })
+            .collect();
+        let exchanges = self.notes.exchanges();
+        for exchange in exchanges.iter().filter(unowned) {
+            if found.iter().any(|(id, _)| *id == exchange.exchange_id) {
+                continue;
+            }
+            let Some(session) = exchange.session_id.as_deref() else {
+                continue;
+            };
+            let identity = notes::anchor_identity(&exchange.anchor);
+            let sibling = exchanges.iter().find_map(|other| {
+                let thread = other.thread_id.clone().or_else(|| {
+                    found
+                        .iter()
+                        .find(|(id, _)| *id == other.exchange_id)
+                        .map(|(_, thread)| thread.clone())
+                })?;
+                (other.session_id.as_deref() == Some(session)
+                    && notes::anchor_identity(&other.anchor) == identity)
+                    .then_some(thread)
+            });
+            if let Some(thread) = sibling {
+                found.push((exchange.exchange_id.clone(), thread));
+            }
+        }
+        let mut changed = false;
+        for (exchange_id, thread) in found {
+            changed |= self.notes.record_exchange_thread(&exchange_id, &thread);
+        }
+        changed
+    }
+
     /// The session the question being written goes to, when it is a follow-up.
     #[must_use]
     pub fn composer_session(&self) -> Option<String> {
         self.composer
             .as_ref()
             .filter(|composer| composer.mode == ComposerMode::Ask)
-            .and_then(|composer| self.anchor_session(&composer.anchor))
+            .and_then(|composer| self.anchor_session(&composer.anchor, composer.thread.as_deref()))
     }
 
     /// What the question composer's model and effort choices apply to: the follow-up's
@@ -877,13 +969,14 @@ impl ReviewSurface {
     ) {
         self.next_exchange += 1;
         let draft_anchor = anchor.to_draft_anchor();
-        let session = self.anchor_session(anchor);
+        let session = self.anchor_session(anchor, thread_id);
+        let owner = thread_id.map(|thread_id| self.notes.current_thread_id(thread_id));
         let exchange_id = format!("exchange-{now}-{}", self.next_exchange);
         let exchange = ReviewAiExchange {
             schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
             exchange_id,
             anchor: draft_anchor,
-            thread_id: None,
+            thread_id: owner,
             question: question.clone(),
             session_id: session,
             status: ReviewAiExchangeStatus::Pending,
@@ -1309,44 +1402,77 @@ impl ReviewSurface {
         }
         entries.extend(self.external_thread_entries());
         entries.extend(self.remote_thread_entries());
-        for exchange in self.notes.exchanges() {
-            if !self.threads_filter.matches_exchange(exchange) {
-                continue;
-            }
-            let line = exchange
-                .anchor
-                .new_line
-                .or(exchange.anchor.old_line)
-                .unwrap_or(0);
-            entries.push((
-                exchange.anchor.file_path.clone(),
-                line,
-                ItemKey::AgentThread {
-                    id: exchange.exchange_id.clone(),
-                },
-                Line::from_spans(vec![
-                    Span::styled(theme.icons.ai, theme.badge_ai),
-                    Span::raw(" "),
-                    Span::styled(location_label(&exchange.anchor), theme.path),
-                    Span::raw(" "),
-                    Span::styled(
-                        exchange
-                            .question
-                            .lines()
-                            .next()
-                            .unwrap_or_default()
-                            .to_owned(),
-                        theme.text,
-                    ),
-                ]),
-            ));
-        }
+        let listed: std::collections::BTreeSet<String> = entries
+            .iter()
+            .filter_map(|(_, _, key, _)| match key {
+                ItemKey::Thread { thread_id } => Some(thread_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut following = self.exchange_entries(&listed, &mut entries);
         entries.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-        for (index, (_, _, key, line)) in entries.into_iter().take(1_024).enumerate() {
+        let entries = entries.into_iter().flat_map(|(_, _, key, row)| {
+            let after = match &key {
+                ItemKey::Thread { thread_id } => following.remove(thread_id).unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            std::iter::once((key, row)).chain(after)
+        });
+        for (index, (key, line)) in entries.take(1_024).enumerate() {
             rows.items
                 .push(TreeViewItem::rich(format!("t{index}"), line, 0));
             rows.keys.push(key);
         }
+    }
+
+    /// Threads panel entries of AI questions: `(path, line, key, row)` pushed onto `entries`,
+    /// except those asked from a thread in `listed`, returned by that thread to list right
+    /// after it.
+    fn exchange_entries(
+        &self,
+        listed: &std::collections::BTreeSet<String>,
+        entries: &mut Vec<(String, u32, ItemKey, Line)>,
+    ) -> std::collections::BTreeMap<String, Vec<(ItemKey, Line)>> {
+        let theme = &self.theme;
+        let mut following: std::collections::BTreeMap<String, Vec<(ItemKey, Line)>> =
+            std::collections::BTreeMap::new();
+        for exchange in self.notes.exchanges() {
+            let anchor = self.notes.exchange_anchor(exchange);
+            if !self.threads_filter.matches_exchange(exchange, anchor) {
+                continue;
+            }
+            let line = anchor.new_line.or(anchor.old_line).unwrap_or(0);
+            let key = ItemKey::AgentThread {
+                id: exchange.exchange_id.clone(),
+            };
+            let row = Line::from_spans(vec![
+                Span::styled(theme.icons.ai, theme.badge_ai),
+                Span::raw(" "),
+                Span::styled(location_label(anchor), theme.path),
+                Span::raw(" "),
+                Span::styled(
+                    exchange
+                        .question
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    theme.text,
+                ),
+            ]);
+            match self
+                .notes
+                .exchange_thread(exchange)
+                .filter(|thread_id| listed.contains(*thread_id))
+            {
+                Some(thread_id) => following
+                    .entry(thread_id.to_owned())
+                    .or_default()
+                    .push((key, row)),
+                None => entries.push((anchor.file_path.clone(), line, key, row)),
+            }
+        }
+        following
     }
 
     /// Whether the threads filter lists `thread_id` by its viewed state.

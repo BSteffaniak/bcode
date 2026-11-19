@@ -271,34 +271,7 @@ pub fn collect(annotations: &Annotations) -> Vec<Annotation> {
             session_id: draft.session_id.clone(),
         });
     }
-    // Exchange id → the thread it is shown with.
-    let mut owned: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
-    for exchange in &annotations.exchanges {
-        let owner = exchange
-            .thread_id
-            .as_deref()
-            .and_then(|thread_id| threads.get_key_value(thread_id));
-        let (anchor, target) = match owner {
-            Some((thread_id, &index)) => {
-                owned.insert(&exchange.exchange_id, thread_id);
-                (out[index].anchor.clone(), out[index].target.clone())
-            }
-            None => (exchange.anchor.clone(), target_of(&exchange.anchor)),
-        };
-        out.push(Annotation {
-            key: ItemKey::AgentThread {
-                id: exchange.exchange_id.clone(),
-            },
-            anchor,
-            target,
-            created_at_ms: exchange.created_at_ms,
-            body: AnnotationBody::Agent {
-                exchange_id: Some(exchange.exchange_id.clone()),
-            },
-            suggestion_ids: Vec::new(),
-            session_id: exchange.session_id.clone(),
-        });
-    }
+    let owned = push_exchanges(&annotations.exchanges, &threads, &mut out);
     let mut suggestions: Vec<&ReviewSuggestion> = annotations.suggestions.iter().collect();
     suggestions.sort_by(|a, b| {
         (a.created_at_ms, &a.suggestion_id).cmp(&(b.created_at_ms, &b.suggestion_id))
@@ -337,6 +310,44 @@ pub fn collect(annotations: &Annotations) -> Vec<Annotation> {
         return out;
     }
     follow_threads(out, &owned)
+}
+
+/// Push an annotation per exchange onto `out` (which holds the threads, by thread id at
+/// `threads`): an exchange asked from one of those threads at that thread's anchor, others at
+/// their own. Returns the thread each exchange shown with a thread goes with, by exchange id.
+fn push_exchanges<'a>(
+    exchanges: &'a [ReviewAiExchange],
+    threads: &std::collections::BTreeMap<&'a str, usize>,
+    out: &mut Vec<Annotation>,
+) -> std::collections::BTreeMap<&'a str, &'a str> {
+    let mut owned = std::collections::BTreeMap::new();
+    for exchange in exchanges {
+        let thread = exchange
+            .thread_id
+            .as_deref()
+            .and_then(|thread_id| threads.get_key_value(thread_id));
+        let (anchor, target) = match thread {
+            Some((thread_id, &index)) => {
+                owned.insert(exchange.exchange_id.as_str(), *thread_id);
+                (out[index].anchor.clone(), out[index].target.clone())
+            }
+            None => (exchange.anchor.clone(), target_of(&exchange.anchor)),
+        };
+        out.push(Annotation {
+            key: ItemKey::AgentThread {
+                id: exchange.exchange_id.clone(),
+            },
+            anchor,
+            target,
+            created_at_ms: exchange.created_at_ms,
+            body: AnnotationBody::Agent {
+                exchange_id: Some(exchange.exchange_id.clone()),
+            },
+            suggestion_ids: Vec::new(),
+            session_id: exchange.session_id.clone(),
+        });
+    }
+    owned
 }
 
 /// `sorted` with every exchange of `owned` moved directly after its thread, keeping the

@@ -768,6 +768,9 @@ pub struct ReviewSurface {
     /// Questions on their way that create their own session, by exchange id.
     fresh_asks: std::collections::BTreeSet<String>,
     next_exchange: u64,
+    /// The annotations' and sessions' revisions the threads of earlier questions were last
+    /// recovered at.
+    exchange_threads_at: Option<(u64, u64)>,
     /// Whether the open document's annotations were requested.
     notes_requested: bool,
     /// Whether a transient review is being saved as a durable one.
@@ -925,6 +928,7 @@ impl ReviewSurface {
             asks: VecDeque::new(),
             fresh_asks: std::collections::BTreeSet::new(),
             next_exchange: 0,
+            exchange_threads_at: None,
             notes_requested: false,
             saving_as: false,
             viewed_sync: viewed_sync::Tracking::default(),
@@ -6066,6 +6070,7 @@ impl View for ReviewSurface {
         self.pump_notes(host);
         self.pump_feed(host);
         changed |= self.agents.drain();
+        changed |= self.recover_exchange_threads();
         self.reflect_review_tools(host);
         self.follow_layer_guide();
         self.pump_fan_out(host);

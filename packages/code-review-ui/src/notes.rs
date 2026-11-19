@@ -18,9 +18,9 @@ use bcode_code_review_models::{
     ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
     ListPublishRecordsResponse, ListReviewAiExchangesRequest, ListReviewAiExchangesResponse,
     ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, ResolveThreadRequest,
-    ReviewAiExchange, ReviewPublishRecord, ReviewScope, ReviewSuggestion, ReviewTarget,
-    ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, SaveDraftRequest, SaveDraftResponse,
-    SaveReviewSuggestionRequest, UpdateDraftRequest,
+    ReviewAiExchange, ReviewAiExchangeStatus, ReviewPublishRecord, ReviewScope, ReviewSuggestion,
+    ReviewTarget, ReviewThreadKind, ReviewThreadSeverity, ReviewWorkspace, SaveDraftRequest,
+    SaveDraftResponse, SaveReviewSuggestionRequest, UpdateDraftRequest,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -249,6 +249,11 @@ pub enum Mutation {
         /// The deleted exchange, restored on failure.
         exchange: ReviewAiExchange,
     },
+    /// Save an AI exchange again (the thread it was asked from, once known).
+    SaveExchange {
+        /// The exchange as saved.
+        exchange: Box<ReviewAiExchange>,
+    },
     /// Create or update a suggestion.
     SaveSuggestion {
         /// The suggestion as saved.
@@ -290,6 +295,8 @@ pub struct ReviewNotes {
     revision: u64,
     /// Threads of the drafts saved lately, by the local id they were added under.
     saved_threads: std::collections::BTreeMap<String, String>,
+    /// Persisted ids of threads saved lately, by their local thread id.
+    renamed_threads: std::collections::BTreeMap<String, String>,
 }
 
 /// Saved drafts whose threads are remembered by local id.
@@ -663,6 +670,98 @@ impl ReviewNotes {
         &self.exchanges
     }
 
+    /// The id the thread `thread_id` goes by now: its persisted id when it was named by the
+    /// local id it had before its save completed (lately), else `thread_id`.
+    #[must_use]
+    pub fn current_thread_id(&self, thread_id: &str) -> String {
+        self.renamed_threads
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_else(|| thread_id.to_owned())
+    }
+
+    /// Whether the review holds the thread `thread_id` (a draft thread, an imported thread, or
+    /// a pull request thread).
+    #[must_use]
+    pub fn has_thread(&self, thread_id: &str) -> bool {
+        if thread_id.starts_with(REMOTE_PREFIX) {
+            return self.remote.contains_key(thread_id);
+        }
+        if thread_id.starts_with(EXTERNAL_PREFIX) {
+            return self.external.contains_key(thread_id);
+        }
+        self.drafts
+            .iter()
+            .any(|draft| draft.thread_id == thread_id && draft.anchor.reply_to.is_none())
+    }
+
+    /// The thread `exchange` is shown with: the thread it was asked from, while the review
+    /// holds it.
+    #[must_use]
+    pub fn exchange_thread<'a>(&self, exchange: &'a ReviewAiExchange) -> Option<&'a str> {
+        exchange
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| self.has_thread(thread_id))
+    }
+
+    /// Where `exchange` is shown: its thread's anchor while it is shown with a thread
+    /// ([`Self::exchange_thread`]), else its own.
+    #[must_use]
+    pub fn exchange_anchor<'a>(&'a self, exchange: &'a ReviewAiExchange) -> &'a DraftAnchor {
+        self.exchange_thread(exchange)
+            .and_then(|thread_id| {
+                self.drafts
+                    .iter()
+                    .chain(&self.external_drafts)
+                    .chain(&self.remote_drafts)
+                    .filter(|draft| draft.thread_id == thread_id)
+                    .min_by_key(|draft| (draft.created_at_ms, draft.comment_id.as_str()))
+            })
+            .map_or(&exchange.anchor, |first| &first.anchor)
+    }
+
+    /// Record that the exchange `exchange_id`, which named no thread, was asked from
+    /// `thread_id`, and save it so. Returns whether it changed.
+    pub fn record_exchange_thread(&mut self, exchange_id: &str, thread_id: &str) -> bool {
+        let Some(exchange) = self
+            .exchanges
+            .iter_mut()
+            .find(|exchange| exchange.exchange_id == exchange_id && exchange.thread_id.is_none())
+        else {
+            return false;
+        };
+        exchange.thread_id = Some(thread_id.to_owned());
+        if exchange.status != ReviewAiExchangeStatus::Pending {
+            self.queue.push_back(Mutation::SaveExchange {
+                exchange: Box::new(exchange.clone()),
+            });
+        }
+        self.touch();
+        true
+    }
+
+    /// The thread first saved under the local id `local` is `saved` from now on: exchanges
+    /// naming it by its local id name it by `saved` and are saved again (a pending one is saved
+    /// when its question is sent, and renamed then by [`Self::put_exchange`]).
+    fn rename_exchange_threads(&mut self, local: &str, saved: &str) {
+        if self.renamed_threads.len() >= MAX_SAVED_THREADS {
+            self.renamed_threads.pop_first();
+        }
+        self.renamed_threads
+            .insert(local.to_owned(), saved.to_owned());
+        for exchange in &mut self.exchanges {
+            if exchange.thread_id.as_deref() == Some(local) {
+                exchange.thread_id = Some(saved.to_owned());
+                if exchange.status != ReviewAiExchangeStatus::Pending {
+                    self.queue.push_back(Mutation::SaveExchange {
+                        exchange: Box::new(exchange.clone()),
+                    });
+                }
+            }
+        }
+    }
+
     /// A suggestion by id.
     #[must_use]
     pub fn suggestion(&self, suggestion_id: &str) -> Option<&ReviewSuggestion> {
@@ -708,8 +807,22 @@ impl ReviewNotes {
         self.queue.len() + usize::from(self.running.is_some())
     }
 
-    /// Insert or replace an exchange (its id is its identity).
-    pub fn put_exchange(&mut self, exchange: ReviewAiExchange) {
+    /// Insert or replace an exchange (its id is its identity). An exchange naming a thread by
+    /// the local id it had before its save completed names it by its persisted id instead, and
+    /// is saved again that way.
+    pub fn put_exchange(&mut self, mut exchange: ReviewAiExchange) {
+        if let Some(saved) = exchange
+            .thread_id
+            .as_ref()
+            .and_then(|thread| self.renamed_threads.get(thread))
+        {
+            exchange.thread_id = Some(saved.clone());
+            if exchange.status != ReviewAiExchangeStatus::Pending {
+                self.queue.push_back(Mutation::SaveExchange {
+                    exchange: Box::new(exchange.clone()),
+                });
+            }
+        }
         match self
             .exchanges
             .iter_mut()
@@ -967,6 +1080,7 @@ impl ReviewNotes {
                             draft.thread_id.clone_from(&saved.thread_id);
                         }
                     }
+                    self.rename_exchange_threads(&local_thread, &saved.thread_id);
                 }
                 None
             }
@@ -1031,6 +1145,8 @@ impl ReviewNotes {
                 self.exchanges.push(exchange);
                 format!("could not delete the AI exchange: {error}")
             }
+            // The exchange keeps its thread here; the next change saves it again.
+            Mutation::SaveExchange { .. } => format!("could not save the AI exchange: {error}"),
             Mutation::SaveSuggestion {
                 suggestion,
                 previous,
@@ -1225,6 +1341,33 @@ pub async fn run(services: ReviewServices, scope: NoteScope, mutation: Mutation)
             })
             .await
             .map(drop),
+        mutation @ (Mutation::DeleteExchange { .. } | Mutation::SaveExchange { .. }) => {
+            let scope = NoteScope {
+                repo_path,
+                target,
+                scope,
+            };
+            run_exchange(&services, scope, mutation).await
+        }
+    };
+    done.map_or_else(
+        |error| MutationResult::Failed(error.message),
+        |()| MutationResult::Done,
+    )
+}
+
+/// Run a mutation of an AI exchange.
+async fn run_exchange(
+    services: &ReviewServices,
+    scope: NoteScope,
+    mutation: Mutation,
+) -> crate::services::ServiceResult<()> {
+    let NoteScope {
+        repo_path,
+        target,
+        scope,
+    } = scope;
+    match mutation {
         Mutation::DeleteExchange { exchange } => services
             .call(DeleteReviewAiExchangeRequest {
                 repo_path,
@@ -1234,17 +1377,25 @@ pub async fn run(services: ReviewServices, scope: NoteScope, mutation: Mutation)
             })
             .await
             .map(drop),
-    };
-    done.map_or_else(
-        |error| MutationResult::Failed(error.message),
-        |()| MutationResult::Done,
-    )
+        Mutation::SaveExchange { exchange } => services
+            .call(bcode_code_review_models::SaveReviewAiExchangeRequest {
+                repo_path,
+                target,
+                scope,
+                exchange: *exchange,
+            })
+            .await
+            .map(|_: bcode_code_review_models::SaveReviewAiExchangeResponse| ()),
+        _ => Ok(()),
+    }
 }
 
 /// Move persisted drafts from `from` to `to` (saving a transient review).
 ///
 /// Each draft is saved in `to`, each thread gets its kind, severity, and resolution there, and
 /// the draft is then deleted from `from`. Drafts with local ids (not saved yet) are skipped.
+/// Returns the id each moved thread has in `to`, by its id in `from` (a thread's id depends on
+/// its review).
 ///
 /// # Errors
 ///
@@ -1254,12 +1405,13 @@ pub async fn move_drafts(
     from: NoteScope,
     to: NoteScope,
     mut drafts: Vec<DraftComment>,
-) -> Result<(), String> {
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     drafts.retain(|draft| !is_local(&draft.comment_id));
     drafts.sort_by_key(|draft| draft.created_at_ms);
     let mut threads = std::collections::BTreeSet::new();
+    let mut moved = std::collections::BTreeMap::new();
     for draft in drafts {
-        let _: SaveDraftResponse = services
+        let saved: SaveDraftResponse = services
             .call(SaveDraftRequest {
                 repo_path: to.repo_path.clone(),
                 target: to.target.clone(),
@@ -1269,6 +1421,7 @@ pub async fn move_drafts(
             })
             .await
             .map_err(|error| error.message)?;
+        moved.insert(draft.thread_id.clone(), saved.draft.thread_id);
         if threads.insert(draft.thread_id.clone()) {
             let _: ClassifyThreadResponse = services
                 .call(ClassifyThreadRequest {
@@ -1304,7 +1457,7 @@ pub async fn move_drafts(
             .await
             .map_err(|error| error.message)?;
     }
-    Ok(())
+    Ok(moved)
 }
 
 /// Move AI exchanges and suggestions from `from` to `to` (saving a transient review).
@@ -1521,6 +1674,114 @@ mod tests {
             notes.comment("c1").map(|draft| draft.body.as_str()),
             Some("edited")
         );
+    }
+
+    fn exchange(
+        id: &str,
+        thread: Option<&str>,
+        status: ReviewAiExchangeStatus,
+    ) -> ReviewAiExchange {
+        ReviewAiExchange {
+            schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+            exchange_id: id.to_owned(),
+            anchor: anchor(),
+            thread_id: thread.map(str::to_owned),
+            question: "why?".to_owned(),
+            session_id: Some("s".to_owned()),
+            status,
+            error: None,
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        }
+    }
+
+    fn saved_exchanges(notes: &mut ReviewNotes) -> Vec<ReviewAiExchange> {
+        let mut saved = Vec::new();
+        while let Some(job) = notes.start_next() {
+            if let Mutation::SaveExchange { exchange } = &job {
+                saved.push((**exchange).clone());
+            }
+            notes.finish(MutationResult::Done);
+        }
+        saved
+    }
+
+    #[test]
+    fn a_question_asked_from_a_thread_before_its_save_names_its_saved_id() {
+        let mut notes = ReviewNotes::default();
+        let local = notes.add_draft(anchor(), "first".to_owned(), None, None, 1);
+        let local_thread = notes.comment(&local).expect("local").thread_id.clone();
+        // One question answered already, one still on its way.
+        notes.put_exchange(exchange(
+            "linked",
+            Some(&local_thread),
+            ReviewAiExchangeStatus::Linked,
+        ));
+        notes.put_exchange(exchange(
+            "pending",
+            Some(&local_thread),
+            ReviewAiExchangeStatus::Pending,
+        ));
+        assert!(notes.has_thread(&local_thread));
+        let draft = notes.comment(&local).cloned().expect("local draft");
+        notes.start_next();
+        notes.finish(MutationResult::Saved(Box::new(persisted(&draft, "c1"))));
+        let named = |notes: &ReviewNotes, id: &str| {
+            notes
+                .exchange(id)
+                .and_then(|exchange| exchange.thread_id.clone())
+        };
+        assert_eq!(named(&notes, "linked").as_deref(), Some("thread-1"));
+        assert_eq!(named(&notes, "pending").as_deref(), Some("thread-1"));
+        let saved = saved_exchanges(&mut notes);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|exchange| exchange.exchange_id.as_str())
+                .collect::<Vec<_>>(),
+            ["linked"],
+            "a pending question is saved when it is sent"
+        );
+        // The pending question comes back from its send naming the local id.
+        notes.put_exchange(exchange(
+            "pending",
+            Some(&local_thread),
+            ReviewAiExchangeStatus::Linked,
+        ));
+        assert_eq!(named(&notes, "pending").as_deref(), Some("thread-1"));
+        assert_eq!(saved_exchanges(&mut notes).len(), 1);
+        assert_eq!(notes.current_thread_id(&local_thread), "thread-1");
+        let shown = notes.exchange("pending").expect("pending").clone();
+        assert_eq!(notes.exchange_thread(&shown), Some("thread-1"));
+    }
+
+    #[test]
+    fn a_recorded_thread_is_saved_once_and_shows_its_thread_anchor() {
+        let mut notes = ReviewNotes::default();
+        let mut on_line = anchor();
+        on_line.kind = ReviewAnchorKind::Range;
+        on_line.new_line = Some(4);
+        let local = notes.add_draft(on_line.clone(), "first".to_owned(), None, None, 1);
+        let draft = notes.comment(&local).cloned().expect("local draft");
+        notes.start_next();
+        notes.finish(MutationResult::Saved(Box::new(persisted(&draft, "c1"))));
+        notes.put_exchange(exchange("old", None, ReviewAiExchangeStatus::Linked));
+        let old = notes.exchange("old").expect("old").clone();
+        assert_eq!(notes.exchange_anchor(&old), &anchor());
+        assert!(notes.record_exchange_thread("old", "thread-1"));
+        assert!(
+            !notes.record_exchange_thread("old", "thread-2"),
+            "a recorded thread stays"
+        );
+        let saved = saved_exchanges(&mut notes);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].thread_id.as_deref(), Some("thread-1"));
+        let old = notes.exchange("old").expect("old").clone();
+        assert_eq!(notes.exchange_anchor(&old), &on_line);
+        // Without its thread it is shown at its own anchor again.
+        notes.delete_draft("c1").expect("delete");
+        assert_eq!(notes.exchange_thread(&old), None);
+        assert_eq!(notes.exchange_anchor(&old), &anchor());
     }
 
     #[test]

@@ -338,7 +338,8 @@ impl ReviewSurface {
         (!answer.is_empty()).then(|| answer.to_owned())
     }
 
-    /// The cursor's exchange and its answer, or a status message saying what is missing.
+    /// The cursor's exchange, anchored where it is shown (with the thread it was asked from,
+    /// while the review holds it), and its answer; or a status message saying what is missing.
     fn answer_at_cursor(&mut self) -> Option<(bcode_code_review_models::ReviewAiExchange, String)> {
         let Some(Target::Agent {
             exchange_id: Some(exchange_id),
@@ -348,7 +349,8 @@ impl ReviewSurface {
             self.set_status("move to an AI answer first", StatusSeverity::Warning);
             return None;
         };
-        let exchange = self.notes.exchange(&exchange_id)?.clone();
+        let mut exchange = self.notes.exchange(&exchange_id)?.clone();
+        exchange.anchor = self.notes.exchange_anchor(&exchange).clone();
         let Some(answer) = self.answer_text(&exchange_id) else {
             self.set_status("this question has no answer yet", StatusSeverity::Warning);
             return None;
@@ -551,12 +553,15 @@ impl ReviewSurface {
                     .map(|first| first.anchor.clone())?;
                 Some((self.doc_anchor(&first), Some(thread_id)))
             }
+            // An answer to a question asked from a thread: about that thread, where it is now.
             Some(Target::Agent {
                 exchange_id: Some(exchange_id),
                 ..
             }) => {
-                let anchor = self.notes.exchange(&exchange_id)?.anchor.clone();
-                Some((self.doc_anchor(&anchor), None))
+                let exchange = self.notes.exchange(&exchange_id)?;
+                let anchor = self.notes.exchange_anchor(exchange).clone();
+                let thread = self.notes.exchange_thread(exchange).map(str::to_owned);
+                Some((self.doc_anchor(&anchor), thread))
             }
             _ => self.cursor_anchor().map(|anchor| (anchor, None)),
         }
@@ -976,7 +981,7 @@ impl ReviewSurface {
                 let _ = writeln!(
                     out,
                     "* {}: {}{}",
-                    super::annotate::location_label(&exchange.anchor),
+                    super::annotate::location_label(self.notes.exchange_anchor(exchange)),
                     exchange.question.lines().next().unwrap_or_default(),
                     exchange
                         .session_id

@@ -361,10 +361,12 @@ fn thread_section(thread: &AskThread) -> String {
     }
     state.push(if thread.resolved { "resolved" } else { "open" });
     let mut text = format!(
-        "The question is about {} ({}).\nThread id: {} (code_review.get_thread reads it in full)\n",
+        "The question is about {} ({}).\n{}{}{}\n",
         thread.origin,
         state.join(", "),
+        feed::THREAD_ID_LABEL,
         thread.id,
+        feed::THREAD_ID_END,
     );
     if let Some(written) = &thread.written_on {
         let lines = written.lines.map_or_else(

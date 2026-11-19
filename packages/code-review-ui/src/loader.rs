@@ -910,7 +910,19 @@ pub async fn save_as(
         super::notes::NoteScope::for_workspace(&transient),
         super::notes::NoteScope::for_workspace(&workspace),
     );
-    super::notes::move_drafts(services.clone(), from.clone(), to.clone(), notes.drafts).await?;
+    let moved =
+        super::notes::move_drafts(services.clone(), from.clone(), to.clone(), notes.drafts).await?;
+    // Questions asked from a moved thread name it by its id in the saved review.
+    let mut exchanges = notes.exchanges;
+    for exchange in &mut exchanges {
+        if let Some(thread) = exchange
+            .thread_id
+            .as_ref()
+            .and_then(|thread| moved.get(thread))
+        {
+            exchange.thread_id = Some(thread.clone());
+        }
+    }
     if let (Some(from_scope), Some(to_scope)) = (from.scope.clone(), to.scope.clone()) {
         let _: bcode_code_review_models::RekeyReviewGuidesResponse = services
             .call(bcode_code_review_models::RekeyReviewGuidesRequest {
@@ -921,7 +933,7 @@ pub async fn save_as(
             .await
             .map_err(|error| error.message)?;
     }
-    super::notes::move_agent_notes(services, from, to, notes.exchanges, notes.suggestions).await?;
+    super::notes::move_agent_notes(services, from, to, exchanges, notes.suggestions).await?;
     Ok(workspace)
 }
 

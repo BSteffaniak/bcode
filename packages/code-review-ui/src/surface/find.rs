@@ -21,8 +21,9 @@ use bcode_code_review::document::{
     Direction, FileFold, ItemKey, LayoutMode, NavKind, ReviewItem, SearchQuery, SearchResults,
 };
 use bcode_code_review_models::{
-    DraftComment, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind, ReviewLayoutMode,
-    ReviewPresentationState, ReviewScrollAnchor, ReviewThreadKind, ReviewThreadSeverity,
+    DraftAnchor, DraftComment, ReviewAiExchange, ReviewAiExchangeStatus, ReviewAnchorKind,
+    ReviewLayoutMode, ReviewPresentationState, ReviewScrollAnchor, ReviewThreadKind,
+    ReviewThreadSeverity,
 };
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui_components::status_bar::StatusSeverity;
@@ -145,13 +146,13 @@ impl ThreadsFilter {
         }
     }
 
-    /// Whether an AI exchange is listed.
+    /// Whether an AI exchange shown at `anchor` (with its thread, or its own) is listed.
     #[must_use]
-    pub fn matches_exchange(self, exchange: &ReviewAiExchange) -> bool {
+    pub fn matches_exchange(self, exchange: &ReviewAiExchange, anchor: &DraftAnchor) -> bool {
         match self {
             Self::All | Self::Open => true,
             Self::Attention => exchange.status == ReviewAiExchangeStatus::Failed,
-            Self::General => exchange.anchor.kind == ReviewAnchorKind::Review,
+            Self::General => anchor.kind == ReviewAnchorKind::Review,
             Self::Resolved | Self::PullRequest | Self::WaitingOnYou | Self::Unviewed => false,
         }
     }

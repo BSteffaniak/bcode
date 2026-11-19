@@ -27,6 +27,7 @@ mod parity;
 mod permission_bypass;
 mod publish;
 mod screen;
+mod thread_questions;
 mod uncommitted;
 mod wizard;
 
