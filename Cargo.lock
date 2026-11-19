@@ -4529,7 +4529,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -4539,15 +4539,15 @@ dependencies = [
 [[package]]
 name = "bmux_cell_geometry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
- "unicode-segmentation",
+ "bmux_unicode_segmentation",
 ]
 
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "lz4_flex 0.14.2",
  "serde",
@@ -4557,7 +4557,7 @@ dependencies = [
 [[package]]
 name = "bmux_color"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "serde",
 ]
@@ -4565,7 +4565,7 @@ dependencies = [
 [[package]]
 name = "bmux_config_composition"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "libc",
  "serde",
@@ -4575,7 +4575,7 @@ dependencies = [
 [[package]]
 name = "bmux_fonts"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -4584,7 +4584,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -4600,7 +4600,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -4615,7 +4615,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "serde",
 ]
@@ -4623,25 +4623,25 @@ dependencies = [
 [[package]]
 name = "bmux_markdown"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
  "bmux_tui",
+ "bmux_unicode_segmentation",
  "hyperchad_color",
  "hyperchad_markdown",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
  "pulldown-cmark",
  "smallvec",
- "unicode-segmentation",
  "url 2.5.8",
 ]
 
 [[package]]
 name = "bmux_mermaid_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_fonts",
  "cranelift-codegen",
@@ -4653,7 +4653,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "serde",
  "serde_json",
@@ -4662,7 +4662,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
@@ -4690,7 +4690,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "serde",
  "serde_json",
@@ -4703,7 +4703,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "serde",
  "sha2 0.11.1",
@@ -4714,7 +4714,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4734,7 +4734,7 @@ dependencies = [
 [[package]]
 name = "bmux_pty"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -4743,7 +4743,7 @@ dependencies = [
 [[package]]
 name = "bmux_syntax_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_tui",
  "syntect",
@@ -4753,7 +4753,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_keyboard",
  "futures-core",
@@ -4764,19 +4764,19 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_terminal_protocol",
+ "bmux_unicode_segmentation",
  "serde",
  "thiserror 2.0.21",
- "unicode-segmentation",
 ]
 
 [[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "serde",
 ]
@@ -4784,12 +4784,12 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_keyboard",
+ "bmux_unicode_segmentation",
  "serde",
- "unicode-segmentation",
  "web-time",
  "zeroize",
 ]
@@ -4797,7 +4797,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
@@ -4805,12 +4805,12 @@ dependencies = [
  "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_text_edit",
+ "bmux_unicode_segmentation",
  "futures-util",
  "image",
  "libc",
  "serde",
  "serde_json",
- "unicode-segmentation",
  "web-time",
  "zeroize",
 ]
@@ -4818,7 +4818,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
@@ -4826,16 +4826,16 @@ dependencies = [
  "bmux_terminal_grid",
  "bmux_text_edit",
  "bmux_tui",
+ "bmux_unicode_segmentation",
  "serde",
  "serde_json",
- "unicode-segmentation",
  "web-time",
 ]
 
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_image",
  "bmux_keyboard",
@@ -4847,9 +4847,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_unicode_segmentation"
+version = "0.0.1-alpha.4"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
+
+[[package]]
 name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#9fcb18f5c8eb789a90992008f301d88f02732f6f"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b29c044c31c931ce3abbadb72e3627c285da3394"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
