@@ -1122,7 +1122,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `tokyonight-storm` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
 | `vesper` | `#101010` | `#cccccc` | `#65737e` | `#65737e` | `#505050` | `#282828` | `#656565` | `#99ffe4` | `#82d9c2` | `#ffc799` | `#ff8080` |
 | `zen-paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
-| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#efef8f` | `#2e3330` | `#2c2e2e` | `#2f2f2f` | `#8cb0d3` | `#5f7f5f` | `#ffd7a7` | `#cc9393` |
+| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#2e3330` | `#2c2e2e` | `#2f2f2f` | `#8cb0d3` | `#5f7f5f` | `#ffd7a7` | `#cc9393` |
 
 ## Light variant swatches
 
@@ -1188,4 +1188,4 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `tokyonight-storm` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
 | `vesper` | `#101010` | `#cccccc` | `#65737e` | `#65737e` | `#505050` | `#282828` | `#656565` | `#99ffe4` | `#82d9c2` | `#ffc799` | `#ff8080` |
 | `zen-paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
-| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#efef8f` | `#2e3330` | `#2c2e2e` | `#2f2f2f` | `#8cb0d3` | `#5f7f5f` | `#ffd7a7` | `#cc9393` |
+| `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#2e3330` | `#2c2e2e` | `#2f2f2f` | `#8cb0d3` | `#5f7f5f` | `#ffd7a7` | `#cc9393` |
