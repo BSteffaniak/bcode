@@ -4932,7 +4932,7 @@ impl SessionActor {
                 store
                     .metrics()
                     .increment_counter("session.manifest.write_error_total");
-                eprintln!("failed to write session manifest: {error}");
+                tracing::warn!(target: "bcode_session::manifest", %error, "failed to write session manifest");
             } else {
                 store
                     .metrics()

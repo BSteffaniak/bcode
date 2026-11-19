@@ -17,6 +17,11 @@ pub use installed::{
     installed_bcode_executable_from, start_installed_daemon,
 };
 
+mod in_process;
+pub use in_process::{
+    InProcessDaemonStart, hosts_daemon_in_process, register_in_process_daemon_host,
+};
+
 mod execution_lifetime;
 pub use execution_lifetime::{
     ExecutionLifetime, ExecutionLifetimeStatus, ExecutionMaintenance, execution_lifetime_status,
@@ -3117,11 +3122,28 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
 /// Expiration or cancellation abandons observation, not a detached child or its
 /// durable startup ownership. A later caller reconciles that same attempt.
 /// Synchronous executable preparation cannot be preempted, but is charged to the budget.
+/// A process that registered an in-process host ([`register_in_process_daemon_host`])
+/// starts the daemon through it instead of launching a process.
 ///
 /// # Errors
 ///
 /// Returns startup errors or a timeout when the acquisition budget is exhausted.
 pub async fn ensure_daemon_running_with_budget(
+    options: &EnsureDaemonOptions,
+    budget: Duration,
+) -> Result<(), DaemonStartError> {
+    if let Some(host) = in_process::registered_host() {
+        let endpoint = options.endpoint.clone();
+        return ensure_daemon_running_in_process_with_budget(options, budget, move || {
+            host(&endpoint)
+        })
+        .await;
+    }
+    ensure_daemon_process_running_with_budget(options, budget).await
+}
+
+/// [`ensure_daemon_running_with_budget`] by launching `<executable> server run`.
+async fn ensure_daemon_process_running_with_budget(
     options: &EnsureDaemonOptions,
     budget: Duration,
 ) -> Result<(), DaemonStartError> {

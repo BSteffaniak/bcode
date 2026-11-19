@@ -1407,7 +1407,7 @@ impl SessionManager {
                 Ok(sessions) => sessions,
                 Err(error) => {
                     let _ = status.send(CatalogLoadStatus::Failed(error.to_string()));
-                    eprintln!("failed to load session catalog: {error}");
+                    tracing::warn!(target: "bcode_session::catalog", %error, "failed to load session catalog");
                     return;
                 }
             };

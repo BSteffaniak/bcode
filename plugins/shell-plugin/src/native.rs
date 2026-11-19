@@ -795,6 +795,7 @@ fn execute_workflow_command(
         remove_environment: DAEMON_PRIVATE_ENV_VARS
             .iter()
             .map(|name| (*name).to_owned())
+            .chain(bcode_config::host_environment::host_private_env())
             .collect(),
     };
     let cancellation = context.cancellation.clone();
@@ -1763,11 +1764,14 @@ fn encode_terminal_output(
 
 /// Inherited environment variables a shell command must not see: the daemon's own, and
 /// those configured.
-fn private_shell_environment(configured: &[String]) -> Vec<&str> {
+/// Variables shell commands never inherit: Bcode's own, the hosting process's
+/// ([`bcode_config::host_environment`]), and the configured `remove_env`.
+fn private_shell_environment(configured: &[String]) -> Vec<String> {
     DAEMON_PRIVATE_ENV_VARS
         .iter()
-        .copied()
-        .chain(configured.iter().map(String::as_str))
+        .map(|name| (*name).to_owned())
+        .chain(bcode_config::host_environment::host_private_env())
+        .chain(configured.iter().cloned())
         .collect()
 }
 
@@ -1818,12 +1822,13 @@ fn run_terminal_shell_command_inner(
         deadline: budget.deadline + Duration::from_millis(500),
         cancellation: capture_cancellation,
     };
+    let private_env = private_shell_environment(&shell_config.remove_env);
     let (mut child, mut reader) = terminal_process::spawn(
         &terminal_process::TerminalSpawn {
             program: &program,
             args: &args,
             cwd: cwd.as_deref(),
-            remove_env: private_shell_environment(&shell_config.remove_env),
+            remove_env: private_env.iter().map(String::as_str).collect(),
             columns,
             rows,
         },
@@ -3298,7 +3303,10 @@ mod tests {
         let script = "test -z \"${GITHUB_TOKEN+x}\" && test -z \"${GH_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_URL+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained";
         let parent = [
             ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "test-only-minting-token"),
-            ("ACTIONS_ID_TOKEN_REQUEST_URL", "https://example.invalid/oidc"),
+            (
+                "ACTIONS_ID_TOKEN_REQUEST_URL",
+                "https://example.invalid/oidc",
+            ),
             ("GITHUB_TOKEN", "synthetic-publication-token"),
             ("GH_TOKEN", "synthetic-cli-token"),
             ("BCODE_TEST_PUBLIC", "retained"),
@@ -3319,6 +3327,21 @@ mod tests {
             &parent,
             &["BCODE_TEST_SECRET".to_string()]
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_child_does_not_receive_the_hosting_processs_private_environment() {
+        bcode_config::host_environment::register_host_private_env([
+            "BCODE_TEST_HOST_CREDENTIAL".to_owned()
+        ]);
+        let script =
+            "test -z \"${BCODE_TEST_HOST_CREDENTIAL+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained";
+        let parent = [
+            ("BCODE_TEST_HOST_CREDENTIAL", "database-password"),
+            ("BCODE_TEST_PUBLIC", "retained"),
+        ];
+        assert!(terminal_child_succeeds(script, &parent, &[]));
     }
 
     /// Run `script` on a terminal as shell commands run, with `parent` standing in for
@@ -5936,7 +5959,11 @@ mod tests {
         );
         // Running anywhere else (the home directory, say) could act on the wrong files.
         assert!(response.is_error, "{}", response.output);
-        assert!(response.output.contains("does not exist"), "{}", response.output);
+        assert!(
+            response.output.contains("does not exist"),
+            "{}",
+            response.output
+        );
         assert!(!marker.exists(), "the command must not run");
     }
 

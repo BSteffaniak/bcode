@@ -23,6 +23,10 @@ Paths are complete JSON strings rather than truncated display values; paths that
 represented faithfully and failed image verification produce an explicit unavailable state,
 never a PATH-resolved substitute.
 
+A daemon hosted inside another application's process (see
+[In-process hosts](#in-process-hosts)) never pins or describes the application's executable;
+its context names the hosting application and the installed Bcode CLI, if any.
+
 Default coding guidance directs agents to use this executable for Bcode CLI operations,
 including sub-session control, while preserving state/configuration selection. This is
 execution identity plumbing, not a collaboration strategy or a permission grant. Snapshot
@@ -244,6 +248,17 @@ multi-client readiness protocol.
 A successful verified `Hello` is full application readiness. Lifecycle readiness performs that exact handshake and validates artifact identity, protocol, build fingerprint, storage writer epoch, and session event schema without hashing executable bytes. The server initializes configuration, plugins, session services, application state, workflow recovery, and ownership behavior before accepting that handshake. No partial-ready protocol is currently justified by measurements.
 
 Lifecycle must preserve a responsive foreign endpoint and report incompatibility rather than deleting it. Endpoint and record cleanup is permitted only with positive stale evidence.
+
+### In-process hosts
+
+A process may register one in-process daemon host
+(`register_in_process_daemon_host`). Every daemon start in that process, including a client's
+automatic start, then runs the host's start callback under the same startup lock, stale
+endpoint cleanup and verified readiness instead of materializing an image and spawning a child.
+The callback serves the endpoint (`bcode_server::run_in_process`) and returns without waiting.
+Such a daemon publishes no lifecycle record and advertises no process id, so record-driven stop
+paths never signal the host process; it leaves termination signals to the host and stops on
+host cancellation, an IPC stop request, or (when the host enables it) idleness.
 
 ## Timeouts and errors
 

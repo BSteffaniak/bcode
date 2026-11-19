@@ -662,6 +662,9 @@ pub struct ServerState {
     metrics: MetricsRegistry,
     shutdown_admission: server_operations::shutdown_admission::ShutdownAdmissionGate,
     shutdown_requested: std::sync::atomic::AtomicBool,
+    /// Whether termination and hangup signals stop this server. A server hosted inside an
+    /// application's process leaves those signals to the application.
+    handles_termination_signals: std::sync::atomic::AtomicBool,
     /// Set when the idle watcher commits its shutdown: clients are told the daemon stopped
     /// for idleness, not because it was asked to.
     idle_shutdown_committed: std::sync::atomic::AtomicBool,
@@ -2899,6 +2902,7 @@ impl ServerState {
             shutdown_admission:
                 server_operations::shutdown_admission::ShutdownAdmissionGate::default(),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            handles_termination_signals: std::sync::atomic::AtomicBool::new(true),
             idle_shutdown_committed: std::sync::atomic::AtomicBool::new(false),
             shutdown,
         }
@@ -4186,6 +4190,9 @@ impl ServerState {
 /// Treat a termination or hangup signal (for example system shutdown or logout) like an explicit
 /// stop, so managed native sessions are released and can resume after the next start.
 fn start_termination_signal_watcher(state: &Arc<ServerState>) {
+    if !state.handles_termination_signals.load(Ordering::SeqCst) {
+        return;
+    }
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -5022,6 +5029,83 @@ pub async fn run_embedded_with_config(
         config,
         None,
         Instant::now(),
+        ServerHost::native(),
+        bcode_agent_runtime::CancellationToken::new(),
+    ))
+    .await
+}
+
+/// How an application hosts the Bcode daemon inside its own process
+/// ([`run_in_process`]).
+#[derive(Debug, Clone)]
+pub struct InProcessServerOptions {
+    /// Static bundled plugins the application links.
+    pub static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
+    /// The hosting application's name, as agents are told it.
+    pub host_name: String,
+    /// The installed Bcode command-line executable agents should run for Bcode commands,
+    /// if any. The hosting application's executable is never offered as Bcode.
+    pub bcode_cli: Option<PathBuf>,
+    /// Whether the daemon stops itself after the configured idle period. A host whose
+    /// lifetime bounds the daemon usually turns this off.
+    pub idle_shutdown: bool,
+    /// Environment variables the host holds that commands Bcode runs must not inherit, such
+    /// as credentials (see `bcode_config::host_environment`).
+    pub private_env: Vec<String>,
+}
+
+/// Serve the daemon of the current artifact inside the calling application's process,
+/// until `shutdown` is cancelled, an IPC stop request arrives, or (when enabled) it idles.
+///
+/// Configuration, plugins, storage, recovery and IPC are exactly those of `bcode server run`,
+/// with three differences for a host that owns its process:
+///
+/// * Termination and hangup signals are left to the host.
+/// * No daemon lifecycle record is published, so tools that stop daemons by process never
+///   signal the host; clients still find the daemon through its endpoint.
+/// * The host's executable is not pinned or described as the canonical Bcode; agents are
+///   told the daemon is hosted and which installed Bcode CLI to use, if any.
+/// * The host's private environment variables are kept from the commands Bcode runs, which
+///   would otherwise inherit the host's whole environment.
+///
+/// Spawn it on a runtime with large enough thread stacks (Bcode's own uses 8 MiB). Keep
+/// polling it after cancelling `shutdown` until it returns, so cleanup finishes: dropping it
+/// is not graceful shutdown. Pair it with
+/// `bcode_daemon_lifecycle::register_in_process_daemon_host` so clients in the process start
+/// it instead of launching a daemon process.
+///
+/// # Errors
+///
+/// Returns configuration, plugin loading, initialization, binding, client handling, or
+/// shutdown failures.
+pub async fn run_in_process(
+    endpoint: IpcEndpoint,
+    options: InProcessServerOptions,
+    shutdown: bcode_agent_runtime::CancellationToken,
+) -> Result<(), ServerError> {
+    bcode_config::host_environment::register_host_private_env(options.private_env.iter().cloned());
+    let startup_started_at = Instant::now();
+    let (mut config, authority) = load_startup_config(startup_started_at)?;
+    if !options.idle_shutdown {
+        config.daemon.idle_shutdown = false;
+    }
+    let host = ServerHost {
+        termination_signals: false,
+        runtime_context: Some(format_in_process_runtime_context(
+            &options.host_name,
+            options.bcode_cli.as_deref(),
+            &bcode_config::default_state_dir(),
+        )),
+    };
+    Box::pin(run_with_config(
+        endpoint,
+        &options.static_plugins,
+        false,
+        config,
+        authority,
+        startup_started_at,
+        host,
+        shutdown,
     ))
     .await
 }
@@ -5033,6 +5117,30 @@ async fn run_with_static_bundled_inner(
     publish_daemon_record: bool,
 ) -> Result<(), ServerError> {
     let startup_started_at = Instant::now();
+    let (config, authority) = load_startup_config(startup_started_at)?;
+    Box::pin(run_with_config(
+        endpoint,
+        static_plugins,
+        publish_daemon_record,
+        config,
+        authority,
+        startup_started_at,
+        ServerHost::native(),
+        bcode_agent_runtime::CancellationToken::new(),
+    ))
+    .await
+}
+
+/// The daemon's configuration, and the authority to reread the explicit files it came from.
+fn load_startup_config(
+    startup_started_at: Instant,
+) -> Result<
+    (
+        bcode_config::BcodeConfig,
+        Option<bcode_config::recovery::ConfigSourceAuthority>,
+    ),
+    ServerError,
+> {
     let config_phase = bcode_metrics::startup::phase("server.config");
     let stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
@@ -5053,18 +5161,11 @@ async fn run_with_static_bundled_inner(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "config loaded"
     );
-    Box::pin(run_with_config(
-        endpoint,
-        static_plugins,
-        publish_daemon_record,
-        config,
-        authority,
-        startup_started_at,
-    ))
-    .await
+    Ok((config, authority))
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_with_config(
     endpoint: IpcEndpoint,
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
@@ -5072,6 +5173,8 @@ async fn run_with_config(
     config: bcode_config::BcodeConfig,
     startup_config_authority: Option<bcode_config::recovery::ConfigSourceAuthority>,
     startup_started_at: Instant,
+    host: ServerHost,
+    shutdown: bcode_agent_runtime::CancellationToken,
 ) -> Result<(), ServerError> {
     let stage_started_at = Instant::now();
     let plugin_phase = bcode_metrics::startup::phase("server.plugins_and_model_catalog");
@@ -5108,12 +5211,13 @@ async fn run_with_config(
         config,
         startup_started_at,
         ServerStartupServices {
+            host,
             config_authority: startup_config_authority,
             plugins,
             model_catalog,
             plugin_selection,
             default_plugin_ids,
-            shutdown: bcode_agent_runtime::CancellationToken::new(),
+            shutdown,
             locations: None,
             workflow_ready: None,
         },
@@ -5211,6 +5315,7 @@ pub async fn run_embedded_with_locations_and_shutdown(
         config,
         Instant::now(),
         ServerStartupServices {
+            host: ServerHost::native(),
             config_authority: None,
             locations,
             plugins,
@@ -5297,6 +5402,7 @@ pub async fn run_embedded_with_workflow_application(
         config,
         Instant::now(),
         ServerStartupServices {
+            host: ServerHost::native(),
             config_authority: None,
             plugins,
             model_catalog,
@@ -5310,11 +5416,31 @@ pub async fn run_embedded_with_workflow_application(
     .await
 }
 
+/// How the process running a server treats it.
+struct ServerHost {
+    /// Whether termination and hangup signals stop the server.
+    termination_signals: bool,
+    /// What agents are told about the Bcode runtime; `None` pins and describes the
+    /// current executable as the canonical Bcode.
+    runtime_context: Option<String>,
+}
+
+impl ServerHost {
+    /// A server that owns its process (`bcode server run`, embedded test hosts).
+    const fn native() -> Self {
+        Self {
+            termination_signals: true,
+            runtime_context: None,
+        }
+    }
+}
+
 /// Acquired services shared by native bootstrap and server execution.
 ///
 /// Keep acquisition outside execution so construction failures use the same
 /// plugin cleanup path regardless of how these services were acquired.
 struct ServerStartupServices {
+    host: ServerHost,
     config_authority: Option<bcode_config::recovery::ConfigSourceAuthority>,
     locations: Option<bcode_config::StateLocationSet>,
     plugins: bcode_plugin::PluginRuntimeHost,
@@ -5334,6 +5460,7 @@ async fn run_with_services(
     services: ServerStartupServices,
 ) -> Result<(), ServerError> {
     let ServerStartupServices {
+        host,
         config_authority,
         plugins,
         model_catalog,
@@ -5530,10 +5657,12 @@ async fn run_with_services(
         sessions,
         plugins,
         ServerStateInit {
-            bcode_runtime_context: bcode_daemon_lifecycle::pinned_bcode_executable().map_or_else(
-                |_| "Bcode runtime:\n* Canonical executable: unavailable (verification failed; no replacement selected)".to_owned(),
-                |executable| format_bcode_runtime_context(executable.path(), executable.digest(), &executable.artifact_id().to_string(), &state_root),
-            ),
+            bcode_runtime_context: host.runtime_context.clone().unwrap_or_else(|| {
+                bcode_daemon_lifecycle::pinned_bcode_executable().map_or_else(
+                    |_| "Bcode runtime:\n* Canonical executable: unavailable (verification failed; no replacement selected)".to_owned(),
+                    |executable| format_bcode_runtime_context(executable.path(), executable.digest(), &executable.artifact_id().to_string(), &state_root),
+                )
+            }),
             model_catalog: Some(model_catalog),
             startup_plugin_selection: plugin_selection,
             default_plugin_ids,
@@ -5586,6 +5715,9 @@ async fn run_with_services(
             .set(lifetime)
             .expect("new server lifetime slot is empty");
     }
+    state
+        .handles_termination_signals
+        .store(host.termination_signals, Ordering::SeqCst);
     construction_phase.finish();
     Box::pin(run_constructed_server(
         state,
@@ -32922,6 +33054,27 @@ fn append_bcode_runtime_context(mut context: String, enabled: bool, runtime: &st
         context.push_str(runtime);
     }
     context
+}
+
+/// What agents are told about the Bcode runtime when `host_name` hosts the daemon in its own
+/// process: never the host's executable as Bcode, and the installed Bcode CLI if there is one.
+fn format_in_process_runtime_context(
+    host_name: &str,
+    bcode_cli: Option<&Path>,
+    state_root: &Path,
+) -> String {
+    let host = serde_json::json!(host_name);
+    let cli = bcode_cli.and_then(Path::to_str).map_or_else(
+        || "unavailable (no installed Bcode CLI was found)".to_owned(),
+        |path| format!("(JSON string): {}", serde_json::json!(path)),
+    );
+    let state_root = state_root.to_str().map_or_else(
+        || "unavailable (path is not Unicode)".to_owned(),
+        |root| format!("(JSON string): {}", serde_json::json!(root)),
+    );
+    format!(
+        "Bcode runtime:\n* Hosted in-process by (JSON string): {host}; that application's executable is not Bcode\n* Installed Bcode CLI {cli}\n* State root {state_root}"
+    )
 }
 
 fn format_bcode_runtime_context(

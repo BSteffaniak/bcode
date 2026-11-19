@@ -117,7 +117,7 @@ impl SessionStore {
                     .filter(|summary| db::session_dir_path(&self.root, summary.id).exists())
                     .collect(),
                 Err(error) => {
-                    eprintln!("ignoring unreadable derived session catalog: {error}");
+                    tracing::warn!(target: "bcode_session::catalog", %error, "ignoring unreadable derived session catalog");
                     Vec::new()
                 }
             }
@@ -227,7 +227,7 @@ impl SessionStore {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    eprintln!("skipping unreadable session manifest {session_id}: {error}");
+                    tracing::warn!(target: "bcode_session::catalog", %session_id, %error, "skipping unreadable session manifest");
                 }
             }
             if db::session_db_path(&self.root, session_id).exists() {

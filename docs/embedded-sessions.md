@@ -8,9 +8,9 @@ that works.
 
 **Status.** Session origin, app-provided tools, the SDK JSON importer, the session bridge for apps
 built outside the Bcode workspace, app-contributed agent profiles and turn context blocks are
-built; [What is built](#what-is-built) lists the contracts and where they differ from the
-specification below. The app-hosted runtime stays deferred (decision D2). The decisions at the end
-were written before the build and have not been signed off.
+built, and so is the app-hosted runtime (decision D2) as an in-process daemon host;
+[What is built](#what-is-built) lists the contracts and where they differ from the specification
+below. The decisions at the end were written before the build and have not been signed off.
 
 Related contracts: [session persistence](session-persistence-architecture.md),
 [state locations](state-locations.md), [daemon lifecycle](daemon-lifecycle-architecture.md),
@@ -179,6 +179,44 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   running.
 * The bridge does not hold its own permission engine or session state; it is plumbing.
 
+### App-hosted runtime (in-process daemon host)
+
+* An application that links Bcode serves its own artifact's daemon inside its process:
+  `bcode_server::run_in_process(endpoint, InProcessServerOptions, shutdown)`. Configuration,
+  plugins (the static plugins the application links), storage, recovery and IPC are those of
+  `bcode server run`.
+* The application registers the host once, before creating clients:
+  `bcode_daemon_lifecycle::register_in_process_daemon_host(start)`. From then on every daemon
+  start in that process, including a client's automatic start, calls `start` with the endpoint
+  instead of launching `<executable> server run`. The startup lock, stale endpoint cleanup and
+  verified readiness still apply, so one daemon serves each artifact identity and state location
+  whichever process hosts it; another process of the same application connects to it, and starts
+  its own in-process daemon after it goes away.
+* The daemon's artifact identity and executable digest are those of the application's binary, so
+  it is a daemon of a different artifact from the installed Bcode's and coexists with it on the
+  same state location through the existing lease and writer-epoch rules. Like any daemon it runs
+  the session store's automatic known-legacy migrations.
+* What differs from a daemon process:
+  * Termination and hangup signals stay with the application.
+  * No daemon lifecycle record is published and no process id is advertised, so tools that stop
+    daemons by signalling their process never signal the application. Clients find the daemon
+    through its endpoint; an IPC stop request ends the daemon, not the application.
+  * The application's executable is not pinned as the canonical Bcode. Agents are told the daemon
+    is hosted and which installed Bcode CLI to use (`InProcessServerOptions::bcode_cli`), if any.
+  * Idle shutdown follows `InProcessServerOptions::idle_shutdown`; a host whose lifetime bounds
+    the daemon usually turns it off. A daemon that stops anyway is started again in-process by
+    the next client that needs it.
+* The application runs the daemon on a runtime with Bcode's thread stack size (8 MiB), cancels
+  `shutdown` when it exits, and keeps polling `run_in_process` until it returns so cleanup
+  finishes. Session leases are kernel file locks, so an abrupt exit releases them.
+* Commands Bcode runs would otherwise inherit the application's whole environment, so the host
+  names the variables it holds privately (`InProcessServerOptions::private_env`, for example
+  database credentials); shell commands remove them alongside Bcode's own private variables
+  and the configured `tools.shell.remove_env` (`bcode_config::host_environment`).
+* Diagnostics are `tracing` events; the daemon never writes to the application's terminal.
+* bdata hosts its daemon this way when its assistant runs embedded, and speaks to it through the
+  session bridge over an in-memory transport (`bcode_session_bridge_server::serve`).
+
 ### App-contributed agent profiles
 
 * `bcode_agent_profile::client_profile::ClientAgentProfile`: id `<provider_id>.<name>`, display
@@ -243,7 +281,6 @@ Related contracts: [session persistence](session-persistence-architecture.md),
 
 ### Not built
 
-* The app-hosted runtime (deferred by design).
 * Loosening a contributed profile in user configuration, and model or effort preferences on
   profiles.
 * The `producer_client_id` tool-event field and `ToolSource::Client` presentation hint.
@@ -332,11 +369,12 @@ Gaps this design closes:
 | Mode | Runtime | Store | Visible in Bcode | Use |
 | --- | --- | --- | --- | --- |
 | **Attached** (default) | The installed Bcode's daemon | The user's canonical store | Yes: list, resume, observe live | Any app on a machine with Bcode installed |
-| **App-hosted** (deferred, decision D2) | The app's linked Bcode, run as a daemon of the app's artifact | The user's canonical store | List and resume when idle; no cross-artifact live observation | Apps that ship without an installed Bcode |
+| **App-hosted** (decision D2) | The app's linked Bcode, run as an in-process daemon of the app's artifact | The user's canonical store | List and resume when idle; no cross-artifact live observation | Apps without an installed Bcode, or that choose their own runtime |
 | **SDK-local** (unchanged) | In-process `AgentSession` | App-owned adapter | No | Stateless generation, app-owned persistence, short scratch work such as bdata's inline edits |
 
 Attached mode is the model this document specifies. An app never silently switches between modes:
-if the installed Bcode is unavailable, the app reports it and may offer SDK-local mode explicitly.
+it shows which runtime serves its sessions, and if the installed Bcode is unavailable it reports it
+and may use the app-hosted runtime or offer SDK-local mode.
 It never falls back to a different state location (see `A session has one canonical storage path`).
 
 ## Session origin
@@ -401,12 +439,11 @@ SessionOrigin {
   today for several TUI windows.
 * SDK-local sessions never touch the canonical store. The only way from an SDK store to the
   canonical store is the explicit import below.
-* An app-hosted runtime (decision D2) would be a daemon of a different artifact on the same state
-  location. It would rely on the existing artifact coexistence rules: leases fence conflicting
-  owners, and writer-epoch checks fence incompatible writers. It must also never run automatic
-  session migration in the shared location. An app-hosted runtime built from a newer Bcode would
-  otherwise migrate sessions and fence the user's installed, older Bcode. A session that needs
-  migration is reported as maintenance-required, with a pointer to `bcode`.
+* An app-hosted runtime (decision D2) is a daemon of a different artifact on the same state
+  location. It relies on the existing artifact coexistence rules: leases fence conflicting
+  owners, and writer-epoch checks fence incompatible writers. Like every daemon it runs automatic
+  known-legacy session migration; a session it upgrades is then fenced from an older installed
+  Bcode until that Bcode is updated, exactly as between any two Bcode builds.
 
 ## Connecting: the session bridge
 
@@ -725,8 +762,8 @@ Each step is independently useful, keeps the worktree green and lands with behav
    * bdata's migration to attached mode (bridge client, tool registration, import, removal of its
      own permission engine) is follow-up work in the bdata repository.
 
-The app-hosted runtime (D2) is not scheduled. Revisit it if an app needs Bcode sessions on
-machines without Bcode installed.
+The app-hosted runtime (D2) is built as an in-process daemon host; see
+[App-hosted runtime](#app-hosted-runtime-in-process-daemon-host).
 
 ## Adopting this in bdata
 
@@ -803,8 +840,9 @@ publishing) go through the `build` agent's permission rules like any mutating to
   subprocess of the installed Bcode. The alternatives were a multi-version daemon protocol, which
   would weaken exact-match recovery, and requiring apps to pin the installed Bcode's exact
   revision, which is impractical. In-tree apps keep `BcodeClient`.
-* **D2, app-hosted runtime.** Deferred. If it is built, it must be non-migrating in the shared
-  location.
+* **D2, app-hosted runtime.** Built as an in-process daemon host of the app's artifact. It
+  migrates like any daemon, publishes no lifecycle record, and leaves the host's signals and
+  executable alone.
 * **D3, origin.** A new canonical event in the creation prefix, immutable, secret-free, with no
   authority and no backfill.
 * **D4, tool scope.** App tools are offered only in sessions a live connection of the provider
