@@ -387,7 +387,7 @@ fn a_card_goes_with_its_thread_near_its_code_on_its_file_and_on_its_layer() {
         text.lines()
             .enumerate()
             .filter(|(index, _)| !(1..=3).contains(index))
-            .map(|(_, line)| format!("{line}\n"))
+            .flat_map(|(_, line)| [line, "\n"])
             .collect()
     });
     let scenario = pull.open();
@@ -578,7 +578,7 @@ fn hiding_resolved_threads_hides_the_cards_asked_from_them() {
     let mut setup = interaction::setup(&fixture, 170, 50);
     let (_, asked) = asked_from_local_thread(&mut setup);
     let card = ItemKey::AgentThread {
-        id: asked.exchange_id.clone(),
+        id: asked.exchange_id,
     };
     let at = index_of(&setup.scenario, &first_thread(&setup.scenario));
     move_to(&mut setup.scenario, at);
