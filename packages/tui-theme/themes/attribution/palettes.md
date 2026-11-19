@@ -31,7 +31,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `poimandres` | Poimandres | github.com/drcmda/poimandres-theme | MIT |
 | `vesper` | Vesper | github.com/raunofreiberg/vesper | MIT |
 | `melange` | Melange | github.com/savq/melange-nvim | MIT |
-| `zenburn` | Zenburn | github.com/jnurmine/Zenburn | GPL-2.0 (review required) |
+| `zenburn` | Zenburn | github.com/jnurmine/Zenburn | GNU GPL, version unstated (GPL-1.0-or-later; review required) |
 | `monokai-classic` | Monokai | monokai.pro (classic palette) | Review required |
 | `night-owl` | Night Owl | github.com/sdras/night-owl-vscode-theme | MIT |
 
