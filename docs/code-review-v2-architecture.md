@@ -617,6 +617,16 @@ range endpoint no longer exists, or when a single-line anchor's line exists but 
 same kind (for example a removed line that is now context); outdated anchors are shown at the
 file level, and anchors to files no longer in the review at the review level.
 
+**Implementation (questions asked from threads).** `ReviewAiExchange::thread_id` (serde-defaulted,
+omitted when absent; column `review_ai_exchanges.thread_id`, migration
+`036_ai_exchange_thread_column`) names the thread a question was asked from by the review's own
+thread id. `anchors::collect` gives such an exchange the anchor and target of that thread's
+annotation while the thread is among the annotations, and orders it directly after the thread
+(and its earlier exchanges); otherwise the exchange is placed by its own anchor. Placement stays
+a function of anchors: a pull request thread's anchor is already mapped onto the current code,
+so its exchanges follow it. Saving an exchange whose only change is `thread_id` keeps its
+`updated_at_ms`.
+
 **Implementation (phase 3c).** `DraftAnchor::head_oid` (serde-defaulted, omitted when absent)
 records the commit the file's source head resolved to when the anchor was made, when the head is
 a commit (working-tree and index heads record none). Every V2 anchor carries it

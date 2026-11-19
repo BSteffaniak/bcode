@@ -133,8 +133,34 @@ What a question sends:
 
 A question's new session is titled after its file (for a pull request thread, the file it was
 written on) and, asked from a thread, its first comment's author (`Review: src/retry.rs ·
-kevin`); a question about the whole review is titled after the review. A later question on the
-same anchor is a follow-up in that session and carries the thread again.
+kevin`); a question about the whole review is titled after the review. A later question asked
+from the same thread (from the thread or from one of its cards) is a follow-up in the session of
+that thread's latest question, wherever the thread is now; any other later question on the same
+anchor is a follow-up in that anchor's latest session, as long as that session's card is not
+shown with another thread. Either way it carries the thread again.
+
+A question asked from a thread stays with that thread. The exchange records the thread
+(`ReviewAiExchange::thread_id`: a local thread's id, a pull request thread as `remote:`, its pull
+request's `provider/repository#number`, a `\u{1}`, and the provider's thread id, or an imported
+thread's `external:` id; ids that survive pushes and reloads, and a saved transient review's
+threads are renamed with it). While the review holds that thread, its cards are shown where the
+thread is shown, directly after it and after its earlier cards, in the document, the threads
+panel and thread motions: a pull request thread's cards move with its code across pushes, go
+near it when its lines were rewritten, onto its file or its layer with it. Only when the thread is
+no longer in the review (deleted, the pull request left the review, or its threads not shown at
+all, such as `outdated_on_file = false` hiding it) is a card placed at the anchor it was asked
+about, outdated as any anchor whose content changed. A thread hidden by a view filter (resolved
+threads hidden) hides its cards too. A card's **Draft**/**Suggest** actions and its listed
+location use where it is shown.
+
+Cards saved before they recorded their thread recover it as their sessions are followed: the
+review prompt of a question's turn names its thread (`Thread id: …`), so once the card's live
+feed holds that turn (the bounded window it already reads; nothing more is read, and no session
+is replayed) the thread is matched to one the review holds and saved with the exchange, once
+(without changing its update time, so the card does not turn unviewed). A card without a thread
+section of its own (a follow-up asked from its card) goes with the thread of a card in the same
+session on the same anchor. A question whose turn has left its feed's window, or whose thread
+the review no longer holds, stays at its own anchor.
 
 The card:
 
