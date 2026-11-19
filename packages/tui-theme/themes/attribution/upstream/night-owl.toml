@@ -1,0 +1,143 @@
+# Upstream reference for the `night-owl` palette. Palette values were extracted
+# by script from `file` at `revision`; highlight groups come from
+# lua/night-owl/theme.lua with the default options. Every value is a literal
+# palette entry (no computed colors). Captures night-owl leaves undefined resolve
+# through Neovim's default links (src/nvim/highlight_group.c and
+# runtime/syntax/diff.vim at neovim v0.12.6, 779c36969e31080503be2dfccbcc3f999e289606):
+# @keyword -> Keyword, @function -> Function, @string -> String, @number -> Number,
+# @operator -> Operator, @punctuation.delimiter -> @punctuation -> Delimiter,
+# @markup.heading -> Title, and @markup.raw, @markup.raw.markdown_inline and
+# @markup.list -> @markup -> Special. The theme's @text.* groups are legacy
+# captures current queries no longer emit, so they are not used. Omitted, because
+# the scheme defines no color for them: info, warning and success
+# (DiagnosticWarn/Info/Ok keep Neovim's defaults), muted (StatusLine uses the
+# primary fg; there is no secondary fg), markup_link (@markup.link resolves to
+# Underlined, which has no color) and markup_code_bg. diffAdded/diffRemoved also
+# keep Neovim's defaults, so diff_add/diff_remove use the scheme's git colors
+# (GitSignsAdd/GitSignsDelete). DiffAdd/DiffDelete paint dark text on a full
+# sign_add/sign_delete fill (fg = bg); Bcode's diff row fill sits under the
+# diff text color, and the same color for both would hide the text, so
+# diff_add_bg/diff_remove_bg are omitted. NormalFloat uses the editor
+# background, so surface equals background. purple is distinct from magenta and
+# maps to violet. Hue names follow the palette (cyan, green, red, yellow), not the
+# terminal colors.
+palette  = "night-owl"
+scheme   = "Night Owl"
+source   = "https://github.com/oxfist/night-owl.nvim"
+revision = "86ed124c2f7e118670649701288e024444bf91e5"
+license  = "BSD-3-Clause"
+
+[variants.dark]
+file = "lua/night-owl/palette.lua"
+
+[variants.dark.colors]
+"@function.fg"              = "#82aaff"
+"@keyword.fg"               = "#c792ea"
+"@markup.heading.fg"        = "#82b1ff"
+"@markup.list.fg"           = "#ffcb8b"
+"@markup.raw.fg"            = "#ffcb8b"
+"@number.fg"                = "#f78c6c"
+"@operator.fg"              = "#c792ea"
+"@punctuation.delimiter.fg" = "#d6deeb"
+"@string.fg"                = "#ecc48d"
+"@type.fg"                  = "#ffcb8b"
+"@variable.fg"              = "#d7dbe0"
+"Comment.fg"                = "#637777"
+"CursorLine.bg"             = "#021320"
+"DiagnosticError.fg"        = "#ef5350"
+"FloatBorder.fg"            = "#5f7e97"
+"Function.fg"               = "#82aaff"
+"GitSignsAdd.fg"            = "#9ccc65"
+"GitSignsDelete.fg"         = "#ef5350"
+"LineNr.fg"                 = "#4b6479"
+"Normal.bg"                 = "#021727"
+"Normal.fg"                 = "#d6deeb"
+"NormalFloat.bg"            = "#021727"
+"Visual.bg"                 = "#1d3b53"
+"WinSeparator.fg"           = "#262a39"
+bg                          = "#021727"
+blue                        = "#82aaff"
+cyan                        = "#6ae9f0"
+dark2                       = "#021320"
+dark_cyan                   = "#637777"
+error_red                   = "#ef5350"
+fg                          = "#d6deeb"
+gray                        = "#262a39"
+green                       = "#c5e478"
+line_number_fg              = "#4b6479"
+magenta                     = "#c792ea"
+orange                      = "#f78c6c"
+purple                      = "#7e57c2"
+red                         = "#ff5874"
+sign_add                    = "#9ccc65"
+sign_delete                 = "#ef5350"
+ui_border                   = "#5f7e97"
+visual                      = "#1d3b53"
+yellow                      = "#ffd602"
+
+[variants.dark.slots]
+background         = "bg"
+text               = "fg"
+accent             = "blue"
+blue               = "blue"
+cyan               = "cyan"
+green              = "green"
+magenta            = "magenta"
+orange             = "orange"
+red                = "red"
+violet             = "purple"
+yellow             = "yellow"
+error              = "error_red"
+comment            = "dark_cyan"
+border             = "gray"
+border_focused     = "ui_border"
+surface            = "bg"
+selection          = "visual"
+line_highlight     = "dark2"
+gutter             = "line_number_fg"
+diff_add           = "sign_add"
+diff_remove        = "sign_delete"
+syntax_keyword     = "@keyword.fg"
+syntax_function    = "@function.fg"
+syntax_variable    = "@variable.fg"
+syntax_string      = "@string.fg"
+syntax_number      = "@number.fg"
+syntax_type        = "@type.fg"
+syntax_operator    = "@operator.fg"
+syntax_punctuation = "@punctuation.delimiter.fg"
+markup_heading     = "@markup.heading.fg"
+markup_raw         = "@markup.raw.fg"
+markup_code        = "@markup.raw.fg"
+markup_list        = "@markup.list.fg"
+
+[variants.dark.roles]
+"canvas.bg"               = "Normal.bg"
+"canvas.fg"               = "Normal.fg"
+"text.primary.fg"         = "Normal.fg"
+"border.default.fg"       = "WinSeparator.fg"
+"border.focused.fg"       = "FloatBorder.fg"
+"surface.raised.bg"       = "NormalFloat.bg"
+"surface.overlay.bg"      = "NormalFloat.bg"
+"selection.active.bg"     = "Visual.bg"
+"selection.inactive.bg"   = "CursorLine.bg"
+"source.gutter.fg"        = "LineNr.fg"
+"state.error.fg"          = "DiagnosticError.fg"
+"diff.added.fg"           = "GitSignsAdd.fg"
+"diff.removed.fg"         = "GitSignsDelete.fg"
+"title.fg"                = "Function.fg"
+"markdown.text.fg"        = "Normal.fg"
+"markdown.heading.fg"     = "@markup.heading.fg"
+"markdown.inline_code.fg" = "@markup.raw.fg"
+"markdown.list_marker.fg" = "@markup.list.fg"
+"syntax.text.fg"          = "Normal.fg"
+"syntax.comment.fg"       = "Comment.fg"
+"syntax.keyword.fg"       = "@keyword.fg"
+"syntax.function.fg"      = "@function.fg"
+"syntax.variable.fg"      = "@variable.fg"
+"syntax.string.fg"        = "@string.fg"
+"syntax.number.fg"        = "@number.fg"
+"syntax.type.fg"          = "@type.fg"
+"syntax.operator.fg"      = "@operator.fg"
+"syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"syntax.heading.fg"       = "@markup.heading.fg"
+"syntax.raw.fg"           = "@markup.raw.fg"
