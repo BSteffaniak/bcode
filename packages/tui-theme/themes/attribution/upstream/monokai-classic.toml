@@ -1,0 +1,157 @@
+# Upstream reference for the `monokai-classic` palette. Values are copied exactly
+# from `file` at `revision`; see attribution/UPSTREAM.md.
+#
+# Monokai has no official Neovim port. The source is loctvl842/monokai-pro.nvim
+# with filter "classic", the Monokai Classic filter of Monokai Pro (by Monokai's
+# author): palette/classic.lua keeps Monokai's background #272822 and accents,
+# with Monokai Pro Classic's text #fdfff1. The port derives editor colors in
+# theme/scheme.lua with colors.blend(fg, alpha, bg) (per channel
+# (1-alpha)*bg + alpha*fg, rounded half up and clamped, colors/convert.lua);
+# the values here reproduce that exactly: CursorLine.bg =
+# blend(text, 0.05, background), Visual.bg = blend(dimmed1, 0.15, background),
+# DiffAdd.bg = blend(accent4, 0.1, dark1), DiffDelete.bg = blend(accent1, 0.1,
+# dark1). Highlight specs are merged in the port's load order (groups editor,
+# extra, semantic, syntax; eager plugins blink, lsp, treesitter) with default
+# options.
+#
+# Hue names follow palette/init.lua's field docs: accent1 red/pink, accent2
+# orange, accent3 yellow, accent4 green, accent5 cyan/blue (used for both blue
+# and cyan), accent6 purple (magenta). Monokai has no separate violet. accent is
+# the function color (accent4). muted is StatusLine's foreground (dimmed1).
+# markup_heading follows @markup.heading (green); the port colors Markdown's
+# per-level captures (@markup.heading.N.markdown) yellow. markup_link is the
+# port's base.blue, which Monokai Pro assigns to accent2 (orange).
+# Omitted: markup_code_bg (no background), success (no DiagnosticOk).
+palette  = "monokai-classic"
+scheme   = "Monokai Pro (classic filter)"
+source   = "https://github.com/loctvl842/monokai-pro.nvim"
+revision = "a68e38b8e55d69a215d0f02598900a79c356da9d"
+license  = "MIT"
+
+[variants.dark]
+file = "lua/monokai-pro/palette/classic.lua + theme/scheme.lua + theme/groups/*.lua + theme/plugins/{lsp,treesitter}.lua"
+
+[variants.dark.colors]
+"@function.fg"                   = "#a6e22e"
+"@keyword.fg"                    = "#f92672"
+"@markup.heading.fg"             = "#a6e22e"
+"@markup.link.fg"                = "#fd971f"
+"@markup.list.fg"                = "#fdfff1"
+"@markup.raw.fg"                 = "#e6db74"
+"@markup.raw.markdown_inline.fg" = "#e6db74"
+"@number.fg"                     = "#ae81ff"
+"@operator.fg"                   = "#f92672"
+"@punctuation.delimiter.fg"      = "#919288"
+"@string.fg"                     = "#e6db74"
+"@type.fg"                       = "#66d9ef"
+"@variable.fg"                   = "#fdfff1"
+"Comment.fg"                     = "#6e7066"
+"CursorLine.bg"                  = "#32332c"
+"DiagnosticError.fg"             = "#f92672"
+"DiagnosticInfo.fg"              = "#66d9ef"
+"DiagnosticWarn.fg"              = "#fd971f"
+"DiffAdd.bg"                     = "#2b321b"
+"DiffDelete.bg"                  = "#331f22"
+"FloatBorder.fg"                 = "#919288"
+"LineNr.fg"                      = "#57584f"
+"Normal.bg"                      = "#272822"
+"Normal.fg"                      = "#fdfff1"
+"NormalFloat.bg"                 = "#3b3c35"
+"StatusLine.fg"                  = "#c0c1b5"
+"Visual.bg"                      = "#3e3f38"
+"WinSeparator.fg"                = "#1d1e19"
+accent1                          = "#f92672"
+accent2                          = "#fd971f"
+accent3                          = "#e6db74"
+accent4                          = "#a6e22e"
+accent5                          = "#66d9ef"
+accent6                          = "#ae81ff"
+background                       = "#272822"
+dark1                            = "#1d1e19"
+"diffAdded.fg"                   = "#a6e22e"
+"diffRemoved.fg"                 = "#f92672"
+dimmed1                          = "#c0c1b5"
+dimmed2                          = "#919288"
+dimmed3                          = "#6e7066"
+dimmed4                          = "#57584f"
+dimmed5                          = "#3b3c35"
+text                             = "#fdfff1"
+
+[variants.dark.slots]
+background         = "background"
+text               = "text"
+accent             = "accent4"
+blue               = "accent5"
+cyan               = "accent5"
+green              = "accent4"
+magenta            = "accent6"
+orange             = "accent2"
+red                = "accent1"
+yellow             = "accent3"
+info               = "accent5"
+warning            = "accent2"
+error              = "accent1"
+muted              = "dimmed1"
+comment            = "dimmed3"
+border             = "dark1"
+border_focused     = "dimmed2"
+surface            = "dimmed5"
+selection          = "Visual.bg"
+line_highlight     = "CursorLine.bg"
+gutter             = "dimmed4"
+diff_add           = "accent4"
+diff_remove        = "accent1"
+diff_add_bg        = "DiffAdd.bg"
+diff_remove_bg     = "DiffDelete.bg"
+syntax_keyword     = "@keyword.fg"
+syntax_function    = "@function.fg"
+syntax_variable    = "@variable.fg"
+syntax_string      = "@string.fg"
+syntax_number      = "@number.fg"
+syntax_type        = "@type.fg"
+syntax_operator    = "@operator.fg"
+syntax_punctuation = "@punctuation.delimiter.fg"
+markup_heading     = "@markup.heading.fg"
+markup_link        = "@markup.link.fg"
+markup_raw         = "@markup.raw.fg"
+markup_code        = "@markup.raw.markdown_inline.fg"
+markup_list        = "@markup.list.fg"
+
+[variants.dark.roles]
+"canvas.bg"               = "Normal.bg"
+"canvas.fg"               = "Normal.fg"
+"text.primary.fg"         = "Normal.fg"
+"markdown.text.fg"        = "Normal.fg"
+"syntax.text.fg"          = "Normal.fg"
+"state.info.fg"           = "DiagnosticInfo.fg"
+"state.warning.fg"        = "DiagnosticWarn.fg"
+"state.error.fg"          = "DiagnosticError.fg"
+"text.muted.fg"           = "StatusLine.fg"
+"syntax.comment.fg"       = "Comment.fg"
+"border.default.fg"       = "WinSeparator.fg"
+"border.focused.fg"       = "FloatBorder.fg"
+"surface.raised.bg"       = "NormalFloat.bg"
+"surface.overlay.bg"      = "NormalFloat.bg"
+"selection.active.bg"     = "Visual.bg"
+"selection.inactive.bg"   = "CursorLine.bg"
+"source.gutter.fg"        = "LineNr.fg"
+"diff.added.fg"           = "diffAdded.fg"
+"diff.removed.fg"         = "diffRemoved.fg"
+"diff.added_row.bg"       = "DiffAdd.bg"
+"diff.removed_row.bg"     = "DiffDelete.bg"
+"syntax.keyword.fg"       = "@keyword.fg"
+"syntax.function.fg"      = "@function.fg"
+"syntax.variable.fg"      = "@variable.fg"
+"syntax.string.fg"        = "@string.fg"
+"syntax.number.fg"        = "@number.fg"
+"syntax.type.fg"          = "@type.fg"
+"syntax.operator.fg"      = "@operator.fg"
+"syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"markdown.heading.fg"     = "@markup.heading.fg"
+"syntax.heading.fg"       = "@markup.heading.fg"
+"markdown.link.fg"        = "@markup.link.fg"
+"link.fg"                 = "@markup.link.fg"
+"syntax.link.fg"          = "@markup.link.fg"
+"syntax.raw.fg"           = "@markup.raw.fg"
+"markdown.inline_code.fg" = "@markup.raw.markdown_inline.fg"
+"markdown.list_marker.fg" = "@markup.list.fg"

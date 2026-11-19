@@ -32,7 +32,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `vesper` | Vesper | github.com/raunofreiberg/vesper | MIT |
 | `melange` | Melange | github.com/savq/melange-nvim | MIT |
 | `zenburn` | Zenburn | github.com/jnurmine/Zenburn | GNU GPL, version unstated (GPL-1.0-or-later; review required) |
-| `monokai-classic` | Monokai | monokai.pro (classic palette) | Review required |
+| `monokai-classic` | Monokai Pro (classic filter) | github.com/loctvl842/monokai-pro.nvim (scheme: monokai.pro) | MIT port (review required) |
 | `night-owl` | Night Owl | github.com/oxfist/night-owl.nvim | BSD-3-Clause |
 
 Entries marked "review required" must be confirmed (or replaced with original
