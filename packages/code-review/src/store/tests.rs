@@ -619,21 +619,11 @@ fn stack_snapshots_round_trip(
     assert_eq!(get(repo).stack_snapshots, Vec::new());
 }
 
-/// An exchange saved before exchanges recorded the thread they were asked from reads back with
-/// none once the database is migrated, and can record one afterwards.
-#[test]
-fn exchanges_saved_before_the_thread_column_migrate_without_one() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let repo = temp.path().join("repo");
-    std::fs::create_dir_all(&repo).expect("repo");
-    git_test(&repo, &["init", "--quiet"]);
-    let config = CodeReviewConfig {
-        state_location: CodeReviewStateLocation::User,
-        state_dir: Some(temp.path().join("state")),
-    };
-    let exchange = ReviewAiExchange {
+/// A linked exchange about the whole review, naming no thread.
+fn review_level_exchange(id: &str, question: &str) -> ReviewAiExchange {
+    ReviewAiExchange {
         schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
-        exchange_id: "exchange-old".to_string(),
+        exchange_id: id.to_string(),
         anchor: DraftAnchor {
             kind: ReviewAnchorKind::Review,
             file_path: "<review>".to_string(),
@@ -655,13 +645,28 @@ fn exchanges_saved_before_the_thread_column_migrate_without_one() {
             reply_to: None,
         },
         thread_id: None,
-        question: "asked long ago".to_string(),
+        question: question.to_string(),
         session_id: Some("session-old".to_string()),
         status: ReviewAiExchangeStatus::Linked,
         error: None,
         created_at_ms: 0,
         updated_at_ms: 0,
+    }
+}
+
+/// An exchange saved before exchanges recorded the thread they were asked from reads back with
+/// none once the database is migrated, and can record one afterwards.
+#[test]
+fn exchanges_saved_before_the_thread_column_migrate_without_one() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git_test(&repo, &["init", "--quiet"]);
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
     };
+    let exchange = review_level_exchange("exchange-old", "asked long ago");
     let save = |exchange: ReviewAiExchange| {
         save_ai_exchange_for_request(
             SaveReviewAiExchangeRequest {
@@ -712,11 +717,24 @@ fn exchanges_saved_before_the_thread_column_migrate_without_one() {
     .expect("migrate");
     assert_eq!(list(), vec![saved.clone()]);
     let owned = ReviewAiExchange {
-        thread_id: Some("thread-abc".to_string()),
-        ..saved
+        thread_id: Some("remote:fake/repo#102\u{1}thread-1".to_string()),
+        ..saved.clone()
     };
     save(owned);
-    assert_eq!(list()[0].thread_id.as_deref(), Some("thread-abc"));
+    let listed = list();
+    assert_eq!(
+        listed[0].thread_id.as_deref(),
+        Some("remote:fake/repo#102\u{1}thread-1")
+    );
+    assert_eq!(listed[0].created_at_ms, saved.created_at_ms);
+    assert_eq!(
+        listed[0].updated_at_ms, saved.updated_at_ms,
+        "recording the thread alone is not an update of the question"
+    );
+    let mut unowned = listed[0].clone();
+    unowned.thread_id = None;
+    save(unowned);
+    assert_eq!(list()[0].thread_id, None);
 }
 
 #[test]
@@ -791,59 +809,7 @@ fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
         &config,
     )
     .expect("list exchanges");
-    assert_eq!(listed.exchanges, vec![saved.clone()]);
-
-    // The thread it was asked from is kept, and can be recorded later on the same exchange.
-    let list = || {
-        list_ai_exchanges_for_request(
-            &ListReviewAiExchangesRequest {
-                repo_path: repo.clone(),
-                target: ReviewTarget::Repository,
-                scope: None,
-            },
-            &config,
-        )
-        .expect("list exchanges")
-        .exchanges
-    };
-    let owned = ReviewAiExchange {
-        thread_id: Some("remote:fake/repo#102\u{1}thread-1".to_string()),
-        ..saved.clone()
-    };
-    save_ai_exchange_for_request(
-        SaveReviewAiExchangeRequest {
-            repo_path: repo.clone(),
-            target: ReviewTarget::Repository,
-            scope: None,
-            exchange: owned,
-        },
-        &config,
-    )
-    .expect("save owned exchange");
-    let listed = list();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed[0].thread_id.as_deref(),
-        Some("remote:fake/repo#102\u{1}thread-1")
-    );
-    assert_eq!(listed[0].created_at_ms, saved.created_at_ms);
-    assert_eq!(
-        listed[0].updated_at_ms, saved.updated_at_ms,
-        "recording the thread alone is not an update of the question"
-    );
-    let mut unowned = listed[0].clone();
-    unowned.thread_id = None;
-    save_ai_exchange_for_request(
-        SaveReviewAiExchangeRequest {
-            repo_path: repo.clone(),
-            target: ReviewTarget::Repository,
-            scope: None,
-            exchange: unowned,
-        },
-        &config,
-    )
-    .expect("save unowned exchange");
-    assert_eq!(list()[0].thread_id, None);
+    assert_eq!(listed.exchanges, vec![saved]);
 
     let bundle = review_bundle_for_request(
         PublishReviewRequest {
