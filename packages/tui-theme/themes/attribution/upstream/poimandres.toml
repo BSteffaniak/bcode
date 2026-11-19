@@ -1,0 +1,149 @@
+# Upstream reference for the `poimandres` palette. Palette values were extracted by
+# script from `file` at `revision` (the `main` variant); highlight groups come from
+# lua/poimandres/theme.lua with the default config in lua/poimandres/init.lua
+# (groups: background = background2, panel/border = background3, punctuation =
+# blue3, error = pink3, info = blue3, warn = yellow, git_add = teal1, git_delete =
+# pink3). DiffAdd/DiffDelete are computed with utils.blend(git color,
+# background2, 0.5), which the script reproduces exactly: each 0-255 channel is
+# 0.5 * fg + 0.5 * bg rounded with floor(x + 0.5). Groups the theme leaves
+# undefined resolve through Neovim's default links (src/nvim/highlight_group.c at
+# neovim v0.12.6): WinSeparator -> VertSplit, @number -> Number, @markup.heading
+# -> Title, @markup.raw, @markup.raw.markdown_inline and @markup.list -> @markup
+# -> Special. diffAdded/diffRemoved link to DiffAdd/DiffDelete, which set only a
+# background, so diff_add/diff_remove use the git colors (GitSignsAdd/
+# GitSignsDelete). Omitted, because upstream defines no color: orange, violet,
+# success (no DiagnosticOk), markup_link (@markup.link -> Underlined, no color)
+# and markup_code_bg. Poimandres names its colors by family (teal1, blue1-4,
+# pink1-3); hues map by family and diagnostic use: blue2 blue (the Function
+# color, also accent), blue1 cyan, teal1 green, pink2 magenta, pink3 red
+# (DiagnosticError), yellow. muted is blueGray1, the secondary foreground used
+# by Pmenu, Comment, Identifier, Type and Delimiter. The repository ships no
+# license file, so `license` is NOASSERTION; the original theme,
+# github.com/drcmda/poimandres-theme, is MIT.
+palette  = "poimandres"
+scheme   = "Poimandres"
+source   = "https://github.com/olivercederborg/poimandres.nvim"
+revision = "a488957d803943a4201ac3b774913fcafa9e6b3a"
+license  = "NOASSERTION"
+
+[variants.dark]
+file = "lua/poimandres/palette.lua"
+
+[variants.dark.colors]
+"@function.fg"              = "#add7ff"
+"@keyword.fg"               = "#91b4d5"
+"@markup.heading.fg"        = "#e4f0fb"
+"@markup.list.fg"           = "#767c9d"
+"@markup.raw.fg"            = "#767c9d"
+"@number.fg"                = "#5de4c7"
+"@operator.fg"              = "#add7ff"
+"@punctuation.delimiter.fg" = "#91b4d5"
+"@string.fg"                = "#5de4c7"
+"@type.fg"                  = "#a6accd"
+"@variable.fg"              = "#e4f0fb"
+"Comment.fg"                = "#a6accd"
+"CursorLine.bg"             = "#303340"
+"DiagnosticError.fg"        = "#d0679d"
+"DiagnosticInfo.fg"         = "#91b4d5"
+"DiagnosticWarn.fg"         = "#fffac2"
+"DiffAdd.bg"                = "#3c8178"
+"DiffDelete.bg"             = "#764363"
+"FloatBorder.fg"            = "#171922"
+"Function.fg"               = "#add7ff"
+"GitSignsAdd.fg"            = "#5de4c7"
+"GitSignsDelete.fg"         = "#d0679d"
+"LineNr.fg"                 = "#506477"
+"Normal.bg"                 = "#1b1e28"
+"Normal.fg"                 = "#e4f0fb"
+"NormalFloat.bg"            = "#171922"
+"Pmenu.fg"                  = "#a6accd"
+"Visual.bg"                 = "#506477"
+"WinSeparator.fg"           = "#171922"
+background1                 = "#303340"
+background2                 = "#1b1e28"
+background3                 = "#171922"
+blue1                       = "#89ddff"
+blue2                       = "#add7ff"
+blue3                       = "#91b4d5"
+blueGray1                   = "#a6accd"
+blueGray3                   = "#506477"
+pink2                       = "#fcc5e9"
+pink3                       = "#d0679d"
+teal1                       = "#5de4c7"
+text                        = "#e4f0fb"
+yellow                      = "#fffac2"
+
+[variants.dark.slots]
+background         = "background2"
+text               = "text"
+accent             = "blue2"
+blue               = "blue2"
+cyan               = "blue1"
+green              = "teal1"
+magenta            = "pink2"
+red                = "pink3"
+yellow             = "yellow"
+info               = "blue3"
+warning            = "yellow"
+error              = "pink3"
+muted              = "blueGray1"
+comment            = "blueGray1"
+border             = "background3"
+border_focused     = "background3"
+surface            = "background3"
+selection          = "blueGray3"
+line_highlight     = "background1"
+gutter             = "blueGray3"
+diff_add           = "teal1"
+diff_remove        = "pink3"
+diff_add_bg        = "DiffAdd.bg"
+diff_remove_bg     = "DiffDelete.bg"
+syntax_keyword     = "@keyword.fg"
+syntax_function    = "@function.fg"
+syntax_variable    = "@variable.fg"
+syntax_string      = "@string.fg"
+syntax_number      = "@number.fg"
+syntax_type        = "@type.fg"
+syntax_operator    = "@operator.fg"
+syntax_punctuation = "@punctuation.delimiter.fg"
+markup_heading     = "@markup.heading.fg"
+markup_raw         = "@markup.raw.fg"
+markup_code        = "@markup.raw.fg"
+markup_list        = "@markup.list.fg"
+
+[variants.dark.roles]
+"canvas.bg"               = "Normal.bg"
+"canvas.fg"               = "Normal.fg"
+"text.primary.fg"         = "Normal.fg"
+"text.muted.fg"           = "Pmenu.fg"
+"border.default.fg"       = "WinSeparator.fg"
+"border.focused.fg"       = "FloatBorder.fg"
+"surface.raised.bg"       = "NormalFloat.bg"
+"surface.overlay.bg"      = "NormalFloat.bg"
+"selection.active.bg"     = "Visual.bg"
+"selection.inactive.bg"   = "CursorLine.bg"
+"source.gutter.fg"        = "LineNr.fg"
+"state.info.fg"           = "DiagnosticInfo.fg"
+"state.warning.fg"        = "DiagnosticWarn.fg"
+"state.error.fg"          = "DiagnosticError.fg"
+"diff.added.fg"           = "GitSignsAdd.fg"
+"diff.removed.fg"         = "GitSignsDelete.fg"
+"diff.added_row.bg"       = "DiffAdd.bg"
+"diff.removed_row.bg"     = "DiffDelete.bg"
+"title.fg"                = "Function.fg"
+"markdown.text.fg"        = "Normal.fg"
+"markdown.heading.fg"     = "@markup.heading.fg"
+"markdown.inline_code.fg" = "@markup.raw.fg"
+"markdown.list_marker.fg" = "@markup.list.fg"
+"syntax.text.fg"          = "Normal.fg"
+"syntax.comment.fg"       = "Comment.fg"
+"syntax.keyword.fg"       = "@keyword.fg"
+"syntax.function.fg"      = "@function.fg"
+"syntax.variable.fg"      = "@variable.fg"
+"syntax.string.fg"        = "@string.fg"
+"syntax.number.fg"        = "@number.fg"
+"syntax.type.fg"          = "@type.fg"
+"syntax.operator.fg"      = "@operator.fg"
+"syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"syntax.heading.fg"       = "@markup.heading.fg"
+"syntax.raw.fg"           = "@markup.raw.fg"
