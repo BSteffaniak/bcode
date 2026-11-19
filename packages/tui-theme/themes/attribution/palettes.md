@@ -26,7 +26,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `ayu*` | Ayu (dark, mirage, light) | github.com/Shatur/neovim-ayu (palette: github.com/ayu-theme/ayu-colors, MIT) | GPL-3.0 (review required) |
 | `nightfox` | Nightfox / Dawnfox | github.com/EdenEast/nightfox.nvim | MIT |
 | `oxocarbon` | Oxocarbon | github.com/nyoom-engineering/oxocarbon.nvim | MIT |
-| `modus` | Modus Vivendi / Operandi | github.com/protesilaos/modus-themes | GPL-3.0 (review required) |
+| `modus` | Modus Vivendi / Operandi | github.com/miikanissi/modus-themes.nvim (scheme: github.com/protesilaos/modus-themes) | GPL-3.0 (review required) |
 | `flexoki` | Flexoki (dark, light) | github.com/kepano/flexoki-neovim (palette: github.com/kepano/flexoki) | MIT |
 | `poimandres` | Poimandres | github.com/olivercederborg/poimandres.nvim (port of github.com/drcmda/poimandres-theme, MIT) | None declared (review required) |
 | `vesper` | Vesper | github.com/raunofreiberg/vesper | MIT |
