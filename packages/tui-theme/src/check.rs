@@ -18,7 +18,14 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub mod accepted;
+
+pub use accepted::{
+    Acceptance, AcceptanceItem, AcceptancePolicy, AcceptanceStatus, AcceptanceSummary,
+    AcceptedFinding, AcceptedFindings, AcceptedFindingsError, BlessSummary,
+};
 
 use crate::contrast::{
     AdjustedChannel, CanvasColors, ContrastAdjustment, PAIRS, PairBackground, PairSpec,
@@ -59,7 +66,7 @@ impl Severity {
 }
 
 /// What a finding is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingCategory {
     /// A contrast pair below its threshold.
@@ -108,6 +115,10 @@ pub struct CheckFinding {
     pub subject: String,
     /// Human-readable description.
     pub message: String,
+    /// How the finding compares with the accepted findings, when the check
+    /// was compared with them (see [`ThemeCheck::apply_acceptance`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<AcceptanceStatus>,
 }
 
 impl CheckFinding {
@@ -123,6 +134,7 @@ impl CheckFinding {
             category,
             subject: subject.into(),
             message: message.into(),
+            acceptance: None,
         }
     }
 
@@ -138,6 +150,7 @@ impl CheckFinding {
             category,
             subject: subject.into(),
             message: message.into(),
+            acceptance: None,
         }
     }
 }
@@ -293,7 +306,7 @@ impl From<&ContrastAdjustment> for AdjustmentRow {
 }
 
 /// Light/dark branch a variant check covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckVariant {
     /// Dark variant.
@@ -390,6 +403,9 @@ pub struct ThemeCheck {
     pub findings: Vec<CheckFinding>,
     /// Finding totals, kept in sync by [`ThemeCheck::finish`].
     pub summary: CheckSummary,
+    /// Comparison with the accepted findings, when one was made.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<Acceptance>,
 }
 
 impl ThemeCheck {
@@ -463,6 +479,7 @@ pub fn check_theme(
         variants: variants.into_iter().map(|(_, check)| check).collect(),
         findings: Vec::new(),
         summary: CheckSummary::default(),
+        acceptance: None,
     };
     report.finish();
     Ok(report)
@@ -1107,13 +1124,17 @@ yellow = "#8c6c3e"
         assert!(matches!(result, Err(ThemeError::MissingTheme { .. })));
     }
 
-    /// Every bundled definition passes a strict check in both variants;
-    /// selectable themes are checked alone and profiles and bases over the
-    /// terminal-native theme.
+    /// Every bundled definition passes its check in both variants once the
+    /// bundled accepted findings are applied: selectable themes are checked
+    /// alone and profiles and bases over the terminal-native theme. Only
+    /// palette colors kept exactly may be accepted, every accepted entry must
+    /// still occur, and every entry must name a bundled selection.
     #[test]
-    fn every_bundled_theme_resolves_and_reports() {
+    fn every_bundled_theme_passes_with_its_accepted_findings() {
         let catalog = ThemeCatalog::bundled().expect("bundled");
-        let mut strict_failures = Vec::new();
+        let accepted = AcceptedFindings::bundled().expect("bundled accepted findings");
+        let mut failures = Vec::new();
+        let mut selections = BTreeSet::new();
         for definition in catalog.definitions() {
             let (base, overlays) = match definition.kind() {
                 crate::definition::ThemeKind::Theme => (definition.id().to_owned(), Vec::new()),
@@ -1122,7 +1143,7 @@ yellow = "#8c6c3e"
                     vec![definition.id().to_owned()],
                 ),
             };
-            let report = check_theme(&catalog, &base, &overlays, &[], |_| Vec::new())
+            let mut report = check_theme(&catalog, &base, &overlays, &[], |_| Vec::new())
                 .unwrap_or_else(|error| panic!("{}: {error}", definition.id()));
             assert_ne!(report.variants, Vec::new());
             for variant in &report.variants {
@@ -1139,31 +1160,49 @@ yellow = "#8c6c3e"
                     );
                 }
             }
-            // Colors a palette declares are kept exactly, so their contrast
-            // findings report the source scheme rather than resolution.
-            let failures: Vec<_> = report
-                .all_findings()
-                .filter(|finding| finding.severity == Severity::Warning)
-                .filter(|finding| finding.category != FindingCategory::Contrast)
-                .map(|finding| format!("{}: {}", finding.subject, finding.message))
-                .chain(report.variants.iter().flat_map(|variant| {
-                    variant
-                        .contrast
-                        .iter()
-                        .filter(|row| {
-                            row.outcome == ContrastOutcome::Fail && row.palette_slot.is_none()
-                        })
-                        .map(|row| format!("{}: {:?}", pair_subject(row), row.ratio))
-                }))
-                .collect();
-            if !failures.is_empty() {
-                strict_failures.push((definition.id().to_owned(), failures));
-            }
+            report.apply_acceptance(&accepted, AcceptancePolicy::BUNDLED, "bundled");
+            let acceptance = report.acceptance.as_ref().expect("acceptance");
+            failures.extend(
+                acceptance
+                    .new
+                    .iter()
+                    .map(|item| format!("new: {}", item.finding.describe()))
+                    .chain(acceptance.worse.iter().map(|item| {
+                        format!(
+                            "worse: {} (accepted {:?})",
+                            item.finding.describe(),
+                            item.accepted_ratio
+                        )
+                    }))
+                    .chain(
+                        acceptance
+                            .stale
+                            .iter()
+                            .map(|entry| format!("stale: {}", entry.describe())),
+                    )
+                    .map(|line| format!("{base} {overlays:?}: {line}")),
+            );
+            selections.insert((base, overlays));
         }
+        failures.extend(
+            accepted
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !selections.contains(&(entry.theme.clone(), entry.overlays.clone()))
+                })
+                .map(|entry| {
+                    format!(
+                        "not a bundled selection: {} {:?}",
+                        entry.theme, entry.overlays
+                    )
+                }),
+        );
         assert_eq!(
-            strict_failures,
-            Vec::<(String, Vec<String>)>::new(),
-            "every bundled theme passes --strict in both variants, apart from palette colors"
+            failures,
+            Vec::<String>::new(),
+            "bundled themes must match themes/check-accepted.toml; re-bless with \
+             `bcode theme check --all --bless --accepted packages/tui-theme/themes/check-accepted.toml`"
         );
     }
 }

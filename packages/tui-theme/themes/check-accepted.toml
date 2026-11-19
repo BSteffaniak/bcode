@@ -1,0 +1,3633 @@
+# Accepted `bcode theme check` findings, keyed by theme, variant, kind, and
+# role pair or subject. Add a `reason` to explain an entry; regenerate the
+# entries with `bcode theme check --bless`, which keeps reasons. See the
+# "Accepting findings" section of docs/tui-themes.md.
+
+schema_version = 1
+
+[[accepted]]
+theme = "ayu"
+variant = "dark"
+kind = "contrast"
+foreground = "text.muted"
+background = "canvas"
+ratio = 2.83
+slot = "muted"
+
+[[accepted]]
+theme = "ayu"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.meta"
+background = "canvas"
+ratio = 2.83
+slot = "muted"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 1.8
+slot = "accent"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.13
+slot = "border_focused"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "control.focused"
+background = "canvas"
+ratio = 1.8
+slot = "accent"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.17
+slot = "diff_add"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "diff.hunk"
+background = "canvas"
+ratio = 2.24
+slot = "info"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.48
+slot = "diff_remove"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.24
+slot = "info"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 2.22
+slot = "markup_heading"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 1.63
+slot = "markup_code"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.24
+slot = "info"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.53
+slot = "error"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.98
+slot = "error"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 2.24
+slot = "info"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 1.99
+slot = "info"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.35
+slot = "green"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.07
+slot = "green"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.22
+slot = "warning"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 1.99
+slot = "warning"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.13
+slot = "comment"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 1.8
+slot = "accent"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "tool.running.title"
+background = "canvas"
+ratio = 2.24
+slot = "info"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.35
+slot = "green"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.2
+slot = "magenta"
+
+[[accepted]]
+theme = "ayu"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 1.8
+slot = "accent"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.95
+slot = "diff_add"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.hunk"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 4.34
+slot = "markup_heading"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.65
+slot = "markup_code"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 4.39
+slot = "text"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.16
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.54
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.31
+slot = "warning"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.05
+slot = "warning"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "tool.running.title"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "dark"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.95
+slot = "diff_add"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "diff.hunk"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 4.34
+slot = "markup_heading"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.65
+slot = "markup_code"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 4.39
+slot = "text"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.16
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.54
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.31
+slot = "warning"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.05
+slot = "warning"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "tool.running.title"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-latte"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.95
+slot = "diff_add"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "diff.hunk"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 4.34
+slot = "markup_heading"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.65
+slot = "markup_code"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 4.39
+slot = "text"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.16
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.54
+slot = "success"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.31
+slot = "warning"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.05
+slot = "warning"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "tool.running.title"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "catppuccin-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "dracula"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 4.11
+slot = "markup_code"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.55
+slot = "border_focused"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "control.focused"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.69
+slot = "diff_add"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.79
+slot = "markup_link"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 2.48
+slot = "markup_heading"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.45
+slot = "markup_code"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.79
+slot = "markup_link"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.03
+slot = "error"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.6
+slot = "error"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 3.12
+slot = "info"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.67
+slot = "info"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.69
+slot = "success"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.34
+slot = "success"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.12
+slot = "warning"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 1.91
+slot = "warning"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.55
+slot = "comment"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.69
+slot = "success"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 2.83
+slot = "magenta"
+
+[[accepted]]
+theme = "everforest"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "flexoki"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.6
+slot = "border_focused"
+
+[[accepted]]
+theme = "flexoki"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 1.95
+slot = "text"
+
+[[accepted]]
+theme = "flexoki"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.71
+slot = "text"
+
+[[accepted]]
+theme = "flexoki"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.41
+slot = "error"
+
+[[accepted]]
+theme = "flexoki"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.6
+slot = "comment"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.99
+slot = "border_focused"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 4.24
+slot = "text"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.98
+slot = "text"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 4.43
+slot = "info"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 4.2
+slot = "markup_code"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 4.43
+slot = "info"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 4.43
+slot = "info"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 3.62
+slot = "info"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 4.38
+slot = "success"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 3.59
+slot = "success"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 3.39
+slot = "warning"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.86
+slot = "warning"
+
+[[accepted]]
+theme = "flexoki"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 1.99
+slot = "comment"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.55
+slot = "border_focused"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "control.focused"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.69
+slot = "diff_add"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.79
+slot = "markup_link"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 2.48
+slot = "markup_heading"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.45
+slot = "markup_code"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.79
+slot = "markup_link"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.03
+slot = "error"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.6
+slot = "error"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 3.12
+slot = "info"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.67
+slot = "info"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.69
+slot = "success"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.34
+slot = "success"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.12
+slot = "warning"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 1.91
+slot = "warning"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.55
+slot = "comment"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.69
+slot = "success"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 2.83
+slot = "magenta"
+
+[[accepted]]
+theme = "forest-floor"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 2.69
+slot = "accent"
+
+[[accepted]]
+theme = "github"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.09
+slot = "border_focused"
+
+[[accepted]]
+theme = "github"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.45
+slot = "border_focused"
+
+[[accepted]]
+theme = "github-dimmed"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.72
+slot = "border_focused"
+
+[[accepted]]
+theme = "github-dimmed"
+variant = "dark"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 3.85
+slot = "text"
+
+[[accepted]]
+theme = "github-dimmed"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.05
+slot = "error"
+
+[[accepted]]
+theme = "github-dimmed"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.72
+slot = "border_focused"
+
+[[accepted]]
+theme = "github-dimmed"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 3.85
+slot = "text"
+
+[[accepted]]
+theme = "github-dimmed"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.05
+slot = "error"
+
+[[accepted]]
+theme = "glacier"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 4.19
+slot = "orange"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 4.24
+slot = "text"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.28
+slot = "error"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.32
+slot = "accent"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 4.28
+slot = "markup_heading"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.77
+slot = "markup_code"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 4.28
+slot = "success"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 3.32
+slot = "warning"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.81
+slot = "warning"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.32
+slot = "accent"
+
+[[accepted]]
+theme = "gruvbox"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.32
+slot = "accent"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.48
+slot = "accent"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 4.35
+slot = "markup_link"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 3.75
+slot = "markup_heading"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.78
+slot = "markup_code"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 4.35
+slot = "markup_link"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.25
+slot = "error"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 4.24
+slot = "success"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 3.48
+slot = "warning"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.92
+slot = "warning"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.48
+slot = "accent"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.43
+slot = "magenta"
+
+[[accepted]]
+theme = "gruvbox-material"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.48
+slot = "accent"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.23
+slot = "border_focused"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.66
+slot = "error"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "dark"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 4.15
+slot = "info"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.97
+slot = "diff_add"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 4.47
+slot = "text"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 3.44
+slot = "text"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.69
+slot = "markup_link"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.94
+slot = "markup_code"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.69
+slot = "markup_link"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.71
+slot = "error"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 3.09
+slot = "error"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 3.96
+slot = "info"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 3.26
+slot = "success"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.77
+slot = "success"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.16
+slot = "warning"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 1.93
+slot = "warning"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.93
+slot = "comment"
+
+[[accepted]]
+theme = "kanagawa-dragon"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.45
+slot = "border_focused"
+
+[[accepted]]
+theme = "kanagawa-dragon"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.04
+slot = "error"
+
+[[accepted]]
+theme = "kanagawa-dragon"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.45
+slot = "border_focused"
+
+[[accepted]]
+theme = "kanagawa-dragon"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.04
+slot = "error"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.97
+slot = "accent"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.81
+slot = "diff_add"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "diff.hunk"
+background = "canvas"
+ratio = 2.79
+slot = "info"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.8
+slot = "diff_remove"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.79
+slot = "markup_link"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 3.98
+slot = "markup_heading"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.79
+slot = "markup_link"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 2.8
+slot = "error"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.42
+slot = "error"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 2.79
+slot = "info"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.41
+slot = "info"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.81
+slot = "success"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.43
+slot = "success"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 3.97
+slot = "warning"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 3.29
+slot = "warning"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.97
+slot = "accent"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "tool.failed.title"
+background = "canvas"
+ratio = 2.8
+slot = "error"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "tool.running.title"
+background = "canvas"
+ratio = 2.79
+slot = "info"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.81
+slot = "success"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.97
+slot = "accent"
+
+[[accepted]]
+theme = "monokai-classic"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.92
+slot = "error"
+
+[[accepted]]
+theme = "monokai-classic"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.95
+slot = "comment"
+
+[[accepted]]
+theme = "monokai-classic"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.92
+slot = "error"
+
+[[accepted]]
+theme = "monokai-classic"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.95
+slot = "comment"
+
+[[accepted]]
+theme = "newsroom"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.93
+slot = "orange"
+
+[[accepted]]
+theme = "night-owl"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.49
+slot = "violet"
+
+[[accepted]]
+theme = "night-owl"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.49
+slot = "violet"
+
+[[accepted]]
+theme = "night-shift"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.33
+slot = "diff_remove"
+
+[[accepted]]
+theme = "night-shift"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.54
+slot = "markup_code"
+
+[[accepted]]
+theme = "night-shift"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.55
+slot = "error"
+
+[[accepted]]
+theme = "night-shift"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.35
+slot = "comment"
+
+[[accepted]]
+theme = "night-shift"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.37
+slot = "violet"
+
+[[accepted]]
+theme = "night-shift"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.33
+slot = "diff_remove"
+
+[[accepted]]
+theme = "night-shift"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.54
+slot = "markup_code"
+
+[[accepted]]
+theme = "night-shift"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.55
+slot = "error"
+
+[[accepted]]
+theme = "night-shift"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.35
+slot = "comment"
+
+[[accepted]]
+theme = "night-shift"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.37
+slot = "violet"
+
+[[accepted]]
+theme = "nightfox"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.64
+slot = "error"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.24
+slot = "border_focused"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 3.46
+slot = "markup_link"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.82
+slot = "markup_code"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 3.46
+slot = "markup_link"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.84
+slot = "error"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 3.18
+slot = "error"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 3.67
+slot = "success"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 3.07
+slot = "success"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.05
+slot = "warning"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 1.85
+slot = "warning"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.72
+slot = "comment"
+
+[[accepted]]
+theme = "nightfox"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.46
+slot = "magenta"
+
+[[accepted]]
+theme = "one"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.31
+slot = "border_focused"
+
+[[accepted]]
+theme = "one"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.37
+slot = "error"
+
+[[accepted]]
+theme = "one"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.31
+slot = "comment"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.87
+slot = "accent"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.46
+slot = "border_focused"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 3.87
+slot = "markup_link"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 3.06
+slot = "markup_heading"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.69
+slot = "markup_code"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 3.87
+slot = "markup_link"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.51
+slot = "error"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.95
+slot = "error"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 4.0
+slot = "info"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 3.31
+slot = "info"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 3.07
+slot = "success"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.62
+slot = "success"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.46
+slot = "comment"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.87
+slot = "accent"
+
+[[accepted]]
+theme = "one"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.87
+slot = "accent"
+
+[[accepted]]
+theme = "oxocarbon"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.02
+slot = "border_focused"
+
+[[accepted]]
+theme = "oxocarbon"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.31
+slot = "comment"
+
+[[accepted]]
+theme = "oxocarbon"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.02
+slot = "border_focused"
+
+[[accepted]]
+theme = "oxocarbon"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.31
+slot = "comment"
+
+[[accepted]]
+theme = "paper"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.93
+slot = "orange"
+
+[[accepted]]
+theme = "poimandres"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.05
+slot = "border_focused"
+
+[[accepted]]
+theme = "poimandres"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.94
+slot = "text"
+
+[[accepted]]
+theme = "poimandres"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.5
+slot = "markup_code"
+
+[[accepted]]
+theme = "poimandres"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.05
+slot = "border_focused"
+
+[[accepted]]
+theme = "poimandres"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.94
+slot = "text"
+
+[[accepted]]
+theme = "poimandres"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.5
+slot = "markup_code"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.95
+slot = "diff_add"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "diff.hunk"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 4.34
+slot = "markup_heading"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.65
+slot = "markup_code"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 2.81
+slot = "markup_link"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 4.39
+slot = "text"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.16
+slot = "info"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.54
+slot = "success"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.31
+slot = "warning"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.05
+slot = "warning"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "tool.running.title"
+background = "canvas"
+ratio = 2.46
+slot = "info"
+
+[[accepted]]
+theme = "rice-mocha"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.95
+slot = "success"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.46
+slot = "accent"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.72
+slot = "border_focused"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 3.46
+slot = "markup_link"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 3.13
+slot = "markup_heading"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.3
+slot = "orange"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 3.46
+slot = "markup_link"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.84
+slot = "error"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 3.18
+slot = "error"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 3.13
+slot = "info"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.66
+slot = "info"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 3.23
+slot = "success"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.74
+slot = "success"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.05
+slot = "warning"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 1.85
+slot = "warning"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.46
+slot = "accent"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.46
+slot = "magenta"
+
+[[accepted]]
+theme = "rose-pine"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.46
+slot = "accent"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 4.07
+slot = "accent"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 4.11
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 4.11
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 3.42
+slot = "markup_link"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 3.25
+slot = "markup_heading"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 2.95
+slot = "markup_code"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 3.42
+slot = "markup_link"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.24
+slot = "red"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.74
+slot = "red"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 4.07
+slot = "blue"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.78
+slot = "comment"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "text.muted"
+background = "canvas"
+ratio = 2.78
+slot = "muted"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "text.primary"
+background = "surface.overlay"
+ratio = 4.2
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "text.primary"
+background = "surface.raised"
+ratio = 4.44
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 4.07
+slot = "accent"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.42
+slot = "violet"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.meta"
+background = "canvas"
+ratio = 2.78
+slot = "muted"
+
+[[accepted]]
+theme = "solarized"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 4.07
+slot = "accent"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.41
+slot = "accent"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.97
+slot = "diff_add"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_emphasis"
+background = "diff.added_emphasis"
+ratio = 3.01
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.63
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_emphasis"
+background = "diff.removed_emphasis"
+ratio = 2.73
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 3.63
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "diff.text"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 4.05
+slot = "markup_link"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.code_block_text"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 4.27
+slot = "markup_heading"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.94
+slot = "markup_code"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 4.05
+slot = "markup_link"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.text"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 2.99
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "source.text"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.28
+slot = "red"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 3.41
+slot = "blue"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.87
+slot = "blue"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.97
+slot = "green"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.success.surface"
+background = "state.success.surface"
+ratio = 2.54
+slot = "green"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 2.97
+slot = "yellow"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning.surface"
+background = "state.warning.surface"
+ratio = 2.54
+slot = "yellow"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.47
+slot = "comment"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.text"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "text.muted"
+background = "canvas"
+ratio = 2.47
+slot = "muted"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "text.primary"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "text.primary"
+background = "surface.overlay"
+ratio = 3.7
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "text.primary"
+background = "surface.raised"
+ratio = 3.9
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.41
+slot = "accent"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "tool.output"
+background = "canvas"
+ratio = 4.12
+slot = "text"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.97
+slot = "green"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.05
+slot = "violet"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.meta"
+background = "canvas"
+ratio = 2.47
+slot = "muted"
+
+[[accepted]]
+theme = "solarized"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.41
+slot = "accent"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.73
+slot = "diff_remove"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.54
+slot = "markup_code"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.16
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.76
+slot = "comment"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "accent"
+background = "canvas"
+ratio = 3.1
+slot = "accent"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 2.71
+slot = "border_focused"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added"
+background = "canvas"
+ratio = 2.62
+slot = "diff_add"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.56
+slot = "text"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.53
+slot = "diff_remove"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 3.27
+slot = "text"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "link"
+background = "canvas"
+ratio = 3.22
+slot = "markup_link"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.heading"
+background = "canvas"
+ratio = 3.1
+slot = "markup_heading"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 1.67
+slot = "markup_code"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.link"
+background = "canvas"
+ratio = 3.22
+slot = "markup_link"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 3.27
+slot = "text"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.78
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "state.info"
+background = "canvas"
+ratio = 3.27
+slot = "info"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "state.info.surface"
+background = "state.info.surface"
+ratio = 2.76
+slot = "info"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 4.03
+slot = "green"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "state.warning"
+background = "canvas"
+ratio = 3.74
+slot = "warning"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.53
+slot = "comment"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "text.primary"
+background = "surface.overlay"
+ratio = 3.98
+slot = "text"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "text.primary"
+background = "surface.raised"
+ratio = 3.98
+slot = "text"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "title"
+background = "canvas"
+ratio = 3.1
+slot = "accent"
+
+[[accepted]]
+theme = "tokyonight"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.user.label"
+background = "canvas"
+ratio = 3.1
+slot = "accent"
+
+[[accepted]]
+theme = "tokyonight-moon"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.69
+slot = "markup_code"
+
+[[accepted]]
+theme = "tokyonight-moon"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.0
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight-moon"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.58
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight-moon"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.69
+slot = "markup_code"
+
+[[accepted]]
+theme = "tokyonight-moon"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.0
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight-moon"
+variant = "light"
+kind = "contrast"
+foreground = "state.error.surface"
+background = "state.error.surface"
+ratio = 2.58
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.33
+slot = "diff_remove"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.54
+slot = "markup_code"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.55
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.35
+slot = "comment"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.37
+slot = "violet"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.33
+slot = "diff_remove"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.54
+slot = "markup_code"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.55
+slot = "error"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.35
+slot = "comment"
+
+[[accepted]]
+theme = "tokyonight-storm"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.37
+slot = "violet"
+
+[[accepted]]
+theme = "vesper"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.77
+slot = "diff_remove"
+
+[[accepted]]
+theme = "vesper"
+variant = "dark"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.53
+slot = "markup_code"
+
+[[accepted]]
+theme = "vesper"
+variant = "dark"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 3.62
+slot = "text"
+
+[[accepted]]
+theme = "vesper"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed"
+background = "canvas"
+ratio = 2.77
+slot = "diff_remove"
+
+[[accepted]]
+theme = "vesper"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.53
+slot = "markup_code"
+
+[[accepted]]
+theme = "vesper"
+variant = "light"
+kind = "contrast"
+foreground = "selection.active"
+background = "selection.active"
+ratio = 3.62
+slot = "text"
+
+[[accepted]]
+theme = "zen-paper"
+variant = "light"
+kind = "contrast"
+foreground = "markdown.inline_code"
+background = "canvas"
+ratio = 3.93
+slot = "orange"
+
+[[accepted]]
+theme = "zenburn"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.09
+slot = "red"
+
+[[accepted]]
+theme = "zenburn"
+variant = "dark"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.35
+slot = "green"
+
+[[accepted]]
+theme = "zenburn"
+variant = "dark"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.35
+slot = "green"
+
+[[accepted]]
+theme = "zenburn"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.25
+slot = "magenta"
+
+[[accepted]]
+theme = "zenburn"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 4.09
+slot = "red"
+
+[[accepted]]
+theme = "zenburn"
+variant = "light"
+kind = "contrast"
+foreground = "state.success"
+background = "canvas"
+ratio = 2.35
+slot = "green"
+
+[[accepted]]
+theme = "zenburn"
+variant = "light"
+kind = "contrast"
+foreground = "tool.succeeded.title"
+background = "canvas"
+ratio = 2.35
+slot = "green"
+
+[[accepted]]
+theme = "zenburn"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 3.25
+slot = "magenta"
