@@ -27,7 +27,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `nightfox` | Nightfox / Dawnfox | github.com/EdenEast/nightfox.nvim | MIT |
 | `oxocarbon` | Oxocarbon | github.com/nyoom-engineering/oxocarbon.nvim | MIT |
 | `modus` | Modus Vivendi / Operandi | github.com/protesilaos/modus-themes | GPL-3.0 (review required) |
-| `flexoki` | Flexoki | github.com/kepano/flexoki | MIT |
+| `flexoki` | Flexoki (dark, light) | github.com/kepano/flexoki-neovim (palette: github.com/kepano/flexoki) | MIT |
 | `poimandres` | Poimandres | github.com/olivercederborg/poimandres.nvim (port of github.com/drcmda/poimandres-theme, MIT) | None declared (review required) |
 | `vesper` | Vesper | github.com/raunofreiberg/vesper | MIT |
 | `melange` | Melange | github.com/savq/melange-nvim | MIT |
