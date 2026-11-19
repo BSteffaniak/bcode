@@ -219,6 +219,9 @@ pub struct ContrastRow {
     pub outcome: ContrastOutcome,
     /// Why the pair is unmeasured, or which fallback supplied a color.
     pub note: Option<String>,
+    /// Palette entry the pair's text color is taken from unchanged. Resolution
+    /// keeps such a color exactly rather than raising it to the threshold.
+    pub palette_slot: Option<String>,
 }
 
 /// Which color of a role a contrast adjustment changed.
@@ -483,14 +486,18 @@ pub fn check_resolved(
             FindingCategory::Contrast,
             pair_subject(row),
             format!(
-                "contrast {:.2} is below {:.1}{}",
+                "contrast {:.2} is below {:.1}{}{}",
                 row.ratio.unwrap_or_default(),
                 row.minimum,
                 if row.foreground == row.background {
                     " (on its own background)"
                 } else {
                     ""
-                }
+                },
+                row.palette_slot
+                    .as_ref()
+                    .map(|slot| format!("; palette color ${slot} is kept exactly"))
+                    .unwrap_or_default()
             ),
         ));
     }
@@ -694,11 +701,13 @@ fn measure_pair(
         minimum: pair.minimum,
         outcome: ContrastOutcome::Unmeasured,
         note: None,
+        palette_slot: None,
     };
-    let Some((_, colors)) = pair_colors(&resolved.styles, pair, canvas) else {
+    let Some((style, colors)) = pair_colors(&resolved.styles, pair, canvas) else {
         row.note = Some(format!("{} is not set", pair.role));
         return row;
     };
+    row.palette_slot = kept_palette_slot(resolved, style, pair);
     let mut notes = colors.notes;
     let measured = (
         colors
@@ -733,6 +742,28 @@ fn measure_pair(
         row.note = Some(notes.join("; "));
     }
     row
+}
+
+/// The palette entry whose exact color a pair's text takes, which
+/// resolution keeps rather than raising: the role's own foreground, or for a
+/// role painting its own fill under another role's text, that text.
+fn kept_palette_slot(
+    resolved: &ResolvedThemeDefinition,
+    style: bmux_tui::style::Style,
+    pair: &PairSpec,
+) -> Option<String> {
+    let slot = |role: &str| {
+        resolved
+            .palette_roles
+            .iter()
+            .find(|color| color.role == role && color.channel == AdjustedChannel::Foreground)
+            .map(|color| color.slot.clone())
+    };
+    match pair.background {
+        _ if style.fg.is_some() => slot(pair.role),
+        PairBackground::OwnWithText(text) => slot(text),
+        PairBackground::Surface(_) => None,
+    }
 }
 
 /// A contrast ratio truncated to two decimals, as reported.
@@ -1108,10 +1139,22 @@ yellow = "#8c6c3e"
                     );
                 }
             }
+            // Colors a palette declares are kept exactly, so their contrast
+            // findings report the source scheme rather than resolution.
             let failures: Vec<_> = report
                 .all_findings()
                 .filter(|finding| finding.severity == Severity::Warning)
+                .filter(|finding| finding.category != FindingCategory::Contrast)
                 .map(|finding| format!("{}: {}", finding.subject, finding.message))
+                .chain(report.variants.iter().flat_map(|variant| {
+                    variant
+                        .contrast
+                        .iter()
+                        .filter(|row| {
+                            row.outcome == ContrastOutcome::Fail && row.palette_slot.is_none()
+                        })
+                        .map(|row| format!("{}: {:?}", pair_subject(row), row.ratio))
+                }))
                 .collect();
             if !failures.is_empty() {
                 strict_failures.push((definition.id().to_owned(), failures));
@@ -1120,7 +1163,7 @@ yellow = "#8c6c3e"
         assert_eq!(
             strict_failures,
             Vec::<(String, Vec<String>)>::new(),
-            "every bundled theme passes --strict in both variants"
+            "every bundled theme passes --strict in both variants, apart from palette colors"
         );
     }
 }

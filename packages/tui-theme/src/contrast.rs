@@ -323,19 +323,40 @@ impl ContrastAdjustment {
     }
 }
 
-/// Raise `adjustable` roles in `styles` to their [`PAIRS`] thresholds.
+/// The color of `style` that enforcing `pair` would move, if any.
 ///
-/// Pairs are visited in table order. A failing pair adjusts the role's own
-/// foreground when it sets one; a role that paints its own background but
-/// takes its text from another role adjusts that background instead, so the
-/// shared text color stays consistent. Pairs with an unmeasurable color, a
-/// `reversed` role, or a role that is not adjustable are left unchanged.
+/// The role's own foreground moves when it sets one and it is adjustable; a
+/// role that paints its own background moves that background instead when it
+/// takes its text from another role or its foreground is not adjustable, so
+/// shared or declared text colors stay as they are.
+fn adjustable_channel(
+    style: Style,
+    pair: &PairSpec,
+    adjustable: impl Fn(AdjustedChannel) -> bool,
+) -> Option<AdjustedChannel> {
+    if style.fg.is_some() && adjustable(AdjustedChannel::Foreground) {
+        Some(AdjustedChannel::Foreground)
+    } else if matches!(pair.background, PairBackground::OwnWithText(_))
+        && style.bg.is_some()
+        && adjustable(AdjustedChannel::Background)
+    {
+        Some(AdjustedChannel::Background)
+    } else {
+        None
+    }
+}
+
+/// Raise the `adjustable` role colors in `styles` to their [`PAIRS`] thresholds.
+///
+/// Pairs are visited in table order, and a failing pair moves the color
+/// [`adjustable_channel`] picks. Pairs with an unmeasurable color, a
+/// `reversed` role, or no adjustable color are left unchanged.
 pub(crate) fn enforce(
     styles: &mut BTreeMap<String, Style>,
-    adjustable: impl Fn(&str) -> bool,
+    adjustable: impl Fn(&str, AdjustedChannel) -> bool,
 ) -> Vec<ContrastAdjustment> {
     let mut adjustments = Vec::new();
-    for pair in PAIRS.iter().filter(|pair| adjustable(pair.role)) {
+    for pair in PAIRS {
         let canvas = CanvasColors::of(styles);
         let Some((style, colors)) = pair_colors(styles, pair, canvas) else {
             continue;
@@ -354,30 +375,30 @@ pub(crate) fn enforce(
             PairBackground::Surface(surface) => surface,
             PairBackground::OwnWithText(_) => pair.role,
         };
-        let adjustment = if style.fg.is_some() {
-            let after = bmux_color::ensure_contrast(fg, bg, pair.minimum);
-            ContrastAdjustment {
-                role: pair.role,
-                channel: AdjustedChannel::Foreground,
-                pair_background,
-                before: fg,
-                after,
-                against: bg,
-                minimum: pair.minimum,
-            }
-        } else if matches!(pair.background, PairBackground::OwnWithText(_)) && style.bg.is_some() {
-            let after = bmux_color::ensure_contrast(bg, fg, pair.minimum);
-            ContrastAdjustment {
-                role: pair.role,
-                channel: AdjustedChannel::Background,
-                pair_background,
-                before: bg,
-                after,
-                against: fg,
-                minimum: pair.minimum,
-            }
-        } else {
+        let Some(channel) =
+            adjustable_channel(style, pair, |channel| adjustable(pair.role, channel))
+        else {
             continue;
+        };
+        let (before, against) = match channel {
+            AdjustedChannel::Foreground => (fg, bg),
+            AdjustedChannel::Background => (bg, fg),
+        };
+        let after = bmux_color::ensure_contrast(before, against, pair.minimum);
+        // A fill that would have to cross its text's lightness to reach the
+        // threshold (a light theme's tint turning dark) is left as it is.
+        let lighter = |color: Rgb| color.relative_luminance() > against.relative_luminance();
+        if channel == AdjustedChannel::Background && lighter(before) != lighter(after) {
+            continue;
+        }
+        let adjustment = ContrastAdjustment {
+            role: pair.role,
+            channel,
+            pair_background,
+            before,
+            after,
+            against,
+            minimum: pair.minimum,
         };
         if let Some(style) = styles.get_mut(pair.role) {
             let color = Color::from(adjustment.after);
@@ -396,7 +417,7 @@ mod tests {
     use bmux_color::Oklch;
 
     use super::*;
-    use crate::check::{CheckVariant, ContrastOutcome, check_resolved};
+    use crate::check::{CheckVariant, ContrastOutcome, ContrastRow, check_resolved};
     use crate::definition::{
         ResolvedThemeDefinition, ThemeCatalog, ThemeKind, ThemeSelection, parse_theme_definition,
     };
@@ -424,6 +445,10 @@ mod tests {
     }
 
     fn row_outcome(resolved: &ResolvedThemeDefinition, subject: &str) -> ContrastOutcome {
+        contrast_row(resolved, subject).outcome
+    }
+
+    fn contrast_row(resolved: &ResolvedThemeDefinition, subject: &str) -> ContrastRow {
         check_resolved(resolved, &[])
             .contrast
             .iter()
@@ -436,11 +461,12 @@ mod tests {
                 name == subject
             })
             .unwrap_or_else(|| panic!("no pair {subject}"))
-            .outcome
+            .clone()
     }
 
     /// Seeds whose derived state surfaces, inline code, and selection fall
-    /// below their thresholds before contrast enforcement.
+    /// below their thresholds before contrast enforcement, and whose yellow
+    /// fails on the background as declared.
     const LOW_CONTRAST_SEEDS: &str = r##"
 schema_version = 2
 id = "low-contrast"
@@ -469,10 +495,11 @@ yellow = "#8c6c3e"
                 PairBackground::Surface(surface) => format!("{}/{surface}", pair.role),
                 PairBackground::OwnWithText(_) => pair.role.to_owned(),
             };
-            assert_ne!(
-                row_outcome(&resolved, &subject),
-                ContrastOutcome::Fail,
-                "{subject}"
+            let row = contrast_row(&resolved, &subject);
+            // Only colors kept exactly from the palette may stay below.
+            assert!(
+                row.outcome != ContrastOutcome::Fail || row.palette_slot.is_some(),
+                "{subject}: {row:?}"
             );
         }
         // Text keeps its color where it already passes; the tinted surface
@@ -485,6 +512,45 @@ yellow = "#8c6c3e"
             })
             .expect("a state surface is adjusted");
         assert_eq!(surface.channel, AdjustedChannel::Background);
+    }
+
+    #[test]
+    fn palette_colors_pass_through_unless_the_theme_opts_in() {
+        let kept = resolve(LOW_CONTRAST_SEEDS, CheckVariant::Light);
+        assert_eq!(
+            kept.style("state.warning").and_then(|style| style.fg),
+            Some(Color::Rgb(0x8c, 0x6c, 0x3e))
+        );
+        let row = contrast_row(&kept, "state.warning/canvas");
+        assert_eq!(row.outcome, ContrastOutcome::Fail);
+        assert_eq!(row.palette_slot.as_deref(), Some("yellow"));
+        assert!(kept.palette_roles.iter().any(|color| {
+            color.role == "state.warning"
+                && color.channel == AdjustedChannel::Foreground
+                && color.slot == "yellow"
+        }));
+        // A computed fill under declared text moves instead of the text.
+        let selection = kept.style("selection.active").expect("selection");
+        assert_eq!(selection.fg, Some(Color::Rgb(0x37, 0x60, 0xbf)));
+        assert_ne!(
+            row_outcome(&kept, "selection.active"),
+            ContrastOutcome::Fail
+        );
+
+        let enforced = resolve(
+            &LOW_CONTRAST_SEEDS.replace("extends", "contrast = \"enforce\"\nextends"),
+            CheckVariant::Light,
+        );
+        assert_eq!(
+            row_outcome(&enforced, "state.warning/canvas"),
+            ContrastOutcome::Pass
+        );
+        assert!(
+            !enforced
+                .palette_roles
+                .iter()
+                .any(|color| color.role == "state.warning")
+        );
     }
 
     #[test]

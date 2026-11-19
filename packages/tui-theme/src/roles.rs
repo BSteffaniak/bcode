@@ -130,21 +130,102 @@ pub const SEED_PALETTE: &[(&str, &str)] = &[
     ("violet", "optional hue slot"),
 ];
 
-// Derivation building blocks. Every expression resolves only from seeds, so a
-// v2 theme with RGB seeds derives a complete, contrast-checked presentation.
-const INFO: &str = "ensure_contrast(or($info, $blue, $cyan, $accent), $background, 4.5)";
-const SUCCESS: &str = "ensure_contrast(or($success, $green, $accent), $background, 4.5)";
-const WARNING: &str = "ensure_contrast(or($warning, $yellow, $orange, $accent), $background, 4.5)";
-const ERROR: &str = "ensure_contrast(or($error, $red, $accent), $background, 4.5)";
-const ACCENT: &str = "ensure_contrast($accent, $background, 4.5)";
-const TEXT: &str = "ensure_contrast($text, $background, 4.5)";
-const MUTED: &str = "ensure_contrast(mix($text, $background, 0.6), $background, 3.0)";
-const BORDER: &str = "mix($text, $background, 0.25)";
-const VIOLET: &str = "ensure_contrast(or($violet, $magenta, $accent), $background, 4.5)";
-const CYAN: &str = "ensure_contrast(or($cyan, $blue, $accent), $background, 4.5)";
-const ORANGE: &str = "ensure_contrast(or($orange, $yellow, $accent), $background, 4.5)";
-const BLUE: &str = "ensure_contrast(or($blue, $cyan, $accent), $background, 4.5)";
-const GREEN: &str = "ensure_contrast(or($green, $success, $accent), $background, 4.5)";
+/// Optional palette slots for colors a source scheme declares exactly.
+///
+/// Each slot feeds the roles listed beside it unchanged. A palette that omits
+/// a slot keeps the seed derivation for those roles, so slots only ever make
+/// a palette more exact.
+pub const EXACT_PALETTE: &[(&str, &str)] = &[
+    (
+        "muted",
+        "secondary text: text.muted, metadata, labels, diff context",
+    ),
+    ("comment", "code comments: syntax.comment"),
+    (
+        "border",
+        "window and panel borders: border.default, source.border",
+    ),
+    ("border_focused", "focused borders: border.focused"),
+    ("surface", "raised panels and popups: surface.raised"),
+    (
+        "surface_overlay",
+        "modal panels: surface.overlay (defaults to surface)",
+    ),
+    ("selection", "selection fill: selection.active background"),
+    (
+        "line_highlight",
+        "current-line fill: selection.inactive background",
+    ),
+    ("gutter", "line numbers: source.gutter"),
+    ("diff_add", "added diff lines: diff.added"),
+    ("diff_remove", "removed diff lines: diff.removed"),
+    ("diff_add_bg", "added row fill: diff.added_row"),
+    ("diff_remove_bg", "removed row fill: diff.removed_row"),
+    (
+        "diff_add_emphasis_bg",
+        "intraline added fill: diff.added_emphasis",
+    ),
+    (
+        "diff_remove_emphasis_bg",
+        "intraline removed fill: diff.removed_emphasis",
+    ),
+    ("syntax_keyword", "keywords: syntax.keyword"),
+    ("syntax_function", "functions: syntax.function"),
+    ("syntax_variable", "variables: syntax.variable"),
+    ("syntax_string", "strings: syntax.string"),
+    ("syntax_number", "numbers and constants: syntax.number"),
+    ("syntax_type", "types: syntax.type"),
+    ("syntax_operator", "operators: syntax.operator"),
+    ("syntax_punctuation", "punctuation: syntax.punctuation"),
+    (
+        "markup_heading",
+        "headings: markdown.heading, syntax.heading",
+    ),
+    ("markup_link", "links: link, markdown.link, syntax.link"),
+    ("markup_raw", "markup literals: syntax.raw"),
+    ("markup_code", "inline code text: markdown.inline_code"),
+    ("markup_code_bg", "inline code fill: markdown.inline_code"),
+    ("markup_list", "list markers: markdown.list_marker"),
+];
+
+// Derivation building blocks. Every expression resolves only from the
+// palette, so a v2 theme with RGB seeds derives a complete presentation.
+// `readable(…)` keeps a color taken directly from the palette exactly and
+// raises only computed colors to the ratio.
+const INFO: &str = "readable(or($info, $blue, $cyan, $accent), $background, 4.5)";
+const SUCCESS: &str = "readable(or($success, $green, $accent), $background, 4.5)";
+const WARNING: &str = "readable(or($warning, $yellow, $orange, $accent), $background, 4.5)";
+const ERROR: &str = "readable(or($error, $red, $accent), $background, 4.5)";
+const ACCENT: &str = "readable($accent, $background, 4.5)";
+const TEXT: &str = "readable($text, $background, 4.5)";
+const MUTED: &str = "readable(or($muted, mix($text, $background, 0.6)), $background, 3.0)";
+const BORDER: &str = "or($border, mix($text, $background, 0.25))";
+/// Markdown rules and frames: lines inside content rather than window borders.
+const RULE: &str = "mix($text, $background, 0.25)";
+const VIOLET: &str = "readable(or($violet, $magenta, $accent), $background, 4.5)";
+const CYAN: &str = "readable(or($cyan, $blue, $accent), $background, 4.5)";
+const BLUE: &str = "readable(or($blue, $cyan, $accent), $background, 4.5)";
+const FOCUSED: &str = "readable(or($border_focused, $accent), $background, 4.5)";
+const HEADING: &str = "readable(or($markup_heading, $accent), $background, 4.5)";
+const LINK: &str = "readable(or($markup_link, $info, $blue, $cyan, $accent), $background, 4.5)";
+const COMMENT: &str =
+    "readable(or($comment, $muted, mix($text, $background, 0.6)), $background, 3.0)";
+const GUTTER: &str =
+    "readable(or($gutter, $muted, mix($text, $background, 0.6)), $background, 3.0)";
+const PUNCTUATION: &str = "readable(or($syntax_punctuation, $muted, \
+     mix($text, $background, 0.6)), $background, 3.0)";
+const KEYWORD: &str = "readable(or($syntax_keyword, $violet, $magenta, $accent), $background, 4.5)";
+const FUNCTION: &str = "readable(or($syntax_function, $blue, $cyan, $accent), $background, 4.5)";
+const VARIABLE: &str = "readable(or($syntax_variable, $text), $background, 4.5)";
+const STRING: &str = "readable(or($syntax_string, $green, $success, $accent), $background, 4.5)";
+const NUMBER: &str = "readable(or($syntax_number, $orange, $yellow, $accent), $background, 4.5)";
+const TYPE: &str = "readable(or($syntax_type, $cyan, $blue, $accent), $background, 4.5)";
+const OPERATOR: &str = "readable(or($syntax_operator, $cyan, $blue, $accent), $background, 4.5)";
+const RAW: &str = "readable(or($markup_raw, $green, $success, $accent), $background, 4.5)";
+const INLINE_CODE: &str = "readable(or($markup_code, $orange, $yellow, $accent), $background, 4.5)";
+const LIST_MARKER: &str = "readable(or($markup_list, $accent), $background, 4.5)";
+const DIFF_ADDED: &str = "readable(or($diff_add, $success, $green, $accent), $background, 4.5)";
+const DIFF_REMOVED: &str = "readable(or($diff_remove, $error, $red, $accent), $background, 4.5)";
 
 /// Every registered role, in category order.
 pub const ROLES: &[RoleSpec] = &[
@@ -177,7 +258,7 @@ pub const ROLES: &[RoleSpec] = &[
         "border.focused",
         RoleCategory::Base,
         "focused borders and accent chrome",
-        Some(DerivedStyle::fg(ACCENT).with(&["bold"])),
+        Some(DerivedStyle::fg(FOCUSED).with(&["bold"])),
     ),
     role(
         "border.focused.panel",
@@ -189,7 +270,9 @@ pub const ROLES: &[RoleSpec] = &[
         "surface.raised",
         RoleCategory::Base,
         "pickers, palettes, the composer",
-        Some(DerivedStyle::bg("mix($text, $background, 0.05)")),
+        Some(DerivedStyle::bg(
+            "or($surface, mix($text, $background, 0.05))",
+        )),
     ),
     role(
         "activity.spinner",
@@ -225,7 +308,9 @@ pub const ROLES: &[RoleSpec] = &[
         "surface.overlay",
         RoleCategory::Base,
         "opaque modal and dialog panels",
-        Some(DerivedStyle::bg("mix($text, $background, 0.09)")),
+        Some(DerivedStyle::bg(
+            "or($surface_overlay, $surface, mix($text, $background, 0.09))",
+        )),
     ),
     role(
         "surface.scrim",
@@ -249,7 +334,7 @@ pub const ROLES: &[RoleSpec] = &[
         "link",
         RoleCategory::Base,
         "hyperlinks",
-        Some(DerivedStyle::fg(INFO).with(&["underline"])),
+        Some(DerivedStyle::fg(LINK).with(&["underline"])),
     ),
     // Interaction
     role(
@@ -270,7 +355,7 @@ pub const ROLES: &[RoleSpec] = &[
         "selection in the focused control",
         Some(
             DerivedStyle::fg(TEXT)
-                .and_bg("mix($accent, $background, 0.3)")
+                .and_bg("or($selection, mix($accent, $background, 0.3))")
                 .with(&["bold"]),
         ),
     ),
@@ -278,7 +363,9 @@ pub const ROLES: &[RoleSpec] = &[
         "selection.inactive",
         RoleCategory::Interaction,
         "selection in an unfocused control",
-        Some(DerivedStyle::bg("mix($text, $background, 0.12)")),
+        Some(DerivedStyle::bg(
+            "or($line_highlight, mix($text, $background, 0.12))",
+        )),
     ),
     // State
     role(
@@ -548,13 +635,13 @@ pub const ROLES: &[RoleSpec] = &[
         "markdown.heading",
         RoleCategory::Markdown,
         "headings",
-        Some(DerivedStyle::fg(ACCENT).with(&["bold"])),
+        Some(DerivedStyle::fg(HEADING).with(&["bold"])),
     ),
     role(
         "markdown.link",
         RoleCategory::Markdown,
         "links",
-        Some(DerivedStyle::fg(INFO).with(&["underline"])),
+        Some(DerivedStyle::fg(LINK).with(&["underline"])),
     ),
     role(
         "markdown.strong",
@@ -578,7 +665,10 @@ pub const ROLES: &[RoleSpec] = &[
         "markdown.inline_code",
         RoleCategory::Markdown,
         "inline code",
-        Some(DerivedStyle::fg(ORANGE).and_bg("mix($text, $background, 0.07)")),
+        Some(
+            DerivedStyle::fg(INLINE_CODE)
+                .and_bg("or($markup_code_bg, mix($text, $background, 0.07))"),
+        ),
     ),
     role(
         "markdown.code_block_text",
@@ -590,13 +680,13 @@ pub const ROLES: &[RoleSpec] = &[
         "markdown.code_block_border",
         RoleCategory::Markdown,
         "fenced code border",
-        Some(DerivedStyle::fg(BORDER)),
+        Some(DerivedStyle::fg(RULE)),
     ),
     role(
         "markdown.blockquote_bar",
         RoleCategory::Markdown,
         "blockquote bar",
-        Some(DerivedStyle::fg(BORDER)),
+        Some(DerivedStyle::fg(RULE)),
     ),
     role(
         "markdown.alert_note",
@@ -632,7 +722,7 @@ pub const ROLES: &[RoleSpec] = &[
         "markdown.list_marker",
         RoleCategory::Markdown,
         "list markers",
-        Some(DerivedStyle::fg(ACCENT)),
+        Some(DerivedStyle::fg(LIST_MARKER)),
     ),
     role(
         "markdown.task_checked",
@@ -650,13 +740,13 @@ pub const ROLES: &[RoleSpec] = &[
         "markdown.table_border",
         RoleCategory::Markdown,
         "table borders",
-        Some(DerivedStyle::fg(BORDER)),
+        Some(DerivedStyle::fg(RULE)),
     ),
     role(
         "markdown.horizontal_rule",
         RoleCategory::Markdown,
         "horizontal rules",
-        Some(DerivedStyle::fg(BORDER)),
+        Some(DerivedStyle::fg(RULE)),
     ),
     role(
         "markdown.keyboard",
@@ -664,7 +754,7 @@ pub const ROLES: &[RoleSpec] = &[
         "keyboard keys (HTML <kbd>)",
         Some(DerivedStyle {
             fg: Some(TEXT),
-            bg: Some(BORDER),
+            bg: Some(RULE),
             modifiers: &[],
         }),
     ),
@@ -767,73 +857,73 @@ pub const ROLES: &[RoleSpec] = &[
         "syntax.comment",
         RoleCategory::Syntax,
         "comments",
-        Some(DerivedStyle::fg(MUTED).with(&["italic"])),
+        Some(DerivedStyle::fg(COMMENT).with(&["italic"])),
     ),
     role(
         "syntax.keyword",
         RoleCategory::Syntax,
         "keywords",
-        Some(DerivedStyle::fg(VIOLET)),
+        Some(DerivedStyle::fg(KEYWORD)),
     ),
     role(
         "syntax.function",
         RoleCategory::Syntax,
         "functions",
-        Some(DerivedStyle::fg(BLUE)),
+        Some(DerivedStyle::fg(FUNCTION)),
     ),
     role(
         "syntax.variable",
         RoleCategory::Syntax,
         "variables",
-        Some(DerivedStyle::fg(TEXT)),
+        Some(DerivedStyle::fg(VARIABLE)),
     ),
     role(
         "syntax.string",
         RoleCategory::Syntax,
         "strings",
-        Some(DerivedStyle::fg(GREEN)),
+        Some(DerivedStyle::fg(STRING)),
     ),
     role(
         "syntax.number",
         RoleCategory::Syntax,
         "numbers",
-        Some(DerivedStyle::fg(ORANGE)),
+        Some(DerivedStyle::fg(NUMBER)),
     ),
     role(
         "syntax.type",
         RoleCategory::Syntax,
         "types",
-        Some(DerivedStyle::fg(CYAN)),
+        Some(DerivedStyle::fg(TYPE)),
     ),
     role(
         "syntax.operator",
         RoleCategory::Syntax,
         "operators",
-        Some(DerivedStyle::fg(CYAN)),
+        Some(DerivedStyle::fg(OPERATOR)),
     ),
     role(
         "syntax.punctuation",
         RoleCategory::Syntax,
         "punctuation",
-        Some(DerivedStyle::fg(MUTED)),
+        Some(DerivedStyle::fg(PUNCTUATION)),
     ),
     role(
         "syntax.heading",
         RoleCategory::Syntax,
         "markup headings",
-        Some(DerivedStyle::fg(ACCENT).with(&["bold"])),
+        Some(DerivedStyle::fg(HEADING).with(&["bold"])),
     ),
     role(
         "syntax.link",
         RoleCategory::Syntax,
         "markup links",
-        Some(DerivedStyle::fg(INFO)),
+        Some(DerivedStyle::fg(LINK)),
     ),
     role(
         "syntax.raw",
         RoleCategory::Syntax,
         "markup literals",
-        Some(DerivedStyle::fg(GREEN)),
+        Some(DerivedStyle::fg(RAW)),
     ),
     // Source and diff
     role(
@@ -852,7 +942,7 @@ pub const ROLES: &[RoleSpec] = &[
         "source.gutter",
         RoleCategory::Source,
         "line-number gutter",
-        Some(DerivedStyle::fg(MUTED)),
+        Some(DerivedStyle::fg(GUTTER)),
     ),
     role(
         "source.truncated",
@@ -942,13 +1032,13 @@ pub const ROLES: &[RoleSpec] = &[
         "diff.added",
         RoleCategory::Source,
         "added lines",
-        Some(DerivedStyle::fg(SUCCESS)),
+        Some(DerivedStyle::fg(DIFF_ADDED)),
     ),
     role(
         "diff.removed",
         RoleCategory::Source,
         "removed lines",
-        Some(DerivedStyle::fg(ERROR)),
+        Some(DerivedStyle::fg(DIFF_REMOVED)),
     ),
     role(
         "diff.hunk",
@@ -961,26 +1051,38 @@ pub const ROLES: &[RoleSpec] = &[
         RoleCategory::Source,
         "added row background",
         Some(DerivedStyle::bg(
-            "mix(or($success, $green), $background, 0.14)",
+            "or($diff_add_bg, mix(or($success, $green), $background, 0.14))",
         )),
     ),
     role(
         "diff.removed_row",
         RoleCategory::Source,
         "removed row background",
-        Some(DerivedStyle::bg("mix(or($error, $red), $background, 0.14)")),
+        Some(DerivedStyle::bg(
+            "or($diff_remove_bg, mix(or($error, $red), $background, 0.14))",
+        )),
     ),
     role(
         "diff.added_emphasis",
         RoleCategory::Source,
         "intraline added emphasis",
-        Some(DerivedStyle::bg("mix(or($success, $green), $background, 0.32)").with(&["bold"])),
+        Some(
+            DerivedStyle::bg(
+                "or($diff_add_emphasis_bg, mix(or($success, $green), $background, 0.32))",
+            )
+            .with(&["bold"]),
+        ),
     ),
     role(
         "diff.removed_emphasis",
         RoleCategory::Source,
         "intraline removed emphasis",
-        Some(DerivedStyle::bg("mix(or($error, $red), $background, 0.32)").with(&["bold"])),
+        Some(
+            DerivedStyle::bg(
+                "or($diff_remove_emphasis_bg, mix(or($error, $red), $background, 0.32))",
+            )
+            .with(&["bold"]),
+        ),
     ),
 ];
 

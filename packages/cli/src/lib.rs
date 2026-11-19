@@ -1151,6 +1151,31 @@ fn write_theme_validation(
     Ok(())
 }
 
+/// Write `bcode theme roles`: registered roles, seeds, and exact palette slots.
+fn write_theme_roles(writer: &mut impl std::io::Write) -> Result<(), CliError> {
+    for spec in bcode_tui::theme::roles::ROLES {
+        writeln!(
+            writer,
+            "{}\t{}\t{}{}",
+            spec.key,
+            spec.category.name(),
+            spec.description,
+            if spec.derive.is_some() {
+                ""
+            } else {
+                "\t(no seed derivation)"
+            }
+        )?;
+    }
+    for (seed, description) in bcode_tui::theme::roles::SEED_PALETTE {
+        writeln!(writer, "${seed}\tseed\t{description}")?;
+    }
+    for (slot, description) in bcode_tui::theme::roles::EXACT_PALETTE {
+        writeln!(writer, "${slot}\tslot\t{description}")?;
+    }
+    Ok(())
+}
+
 fn write_theme_command(
     command: ThemeCommand,
     writer: &mut impl std::io::Write,
@@ -1178,25 +1203,7 @@ fn write_theme_command(
                 )?;
             }
         }
-        ThemeCommand::Roles => {
-            for spec in bcode_tui::theme::roles::ROLES {
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}{}",
-                    spec.key,
-                    spec.category.name(),
-                    spec.description,
-                    if spec.derive.is_some() {
-                        ""
-                    } else {
-                        "\t(no seed derivation)"
-                    }
-                )?;
-            }
-            for (seed, description) in bcode_tui::theme::roles::SEED_PALETTE {
-                writeln!(writer, "${seed}\tseed\t{description}")?;
-            }
-        }
+        ThemeCommand::Roles => write_theme_roles(writer)?,
         ThemeCommand::Validate { path, json, strict } => {
             write_theme_validation(&path, json, strict, writer)?;
         }

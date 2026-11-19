@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::chrome::{RawChrome, TuiBorders, TuiChrome};
-use crate::contrast::ContrastAdjustment;
+use crate::contrast::{AdjustedChannel, ContrastAdjustment};
 use crate::expr::{self, ColorContext, Evaluated};
 
 /// Semantic style roles every version-1 theme must resolve through definition or inheritance.
@@ -495,6 +495,17 @@ impl ThemeCatalog {
     }
 }
 
+/// A derived role color taken unchanged from a palette entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PaletteRoleColor {
+    /// Role key.
+    pub role: String,
+    /// Which color of the role.
+    pub channel: AdjustedChannel,
+    /// Palette entry the color comes from, without the leading `$`.
+    pub slot: String,
+}
+
 /// Fully resolved declarative theme data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedThemeDefinition {
@@ -518,6 +529,10 @@ pub struct ResolvedThemeDefinition {
     pub presentation: Vec<RuleLayer>,
     /// Roles filled by seed derivation rather than authored values.
     pub derived_roles: Vec<String>,
+    /// Derived role colors taken unchanged from a palette entry. Resolution
+    /// never adjusts these unless the theme opts in with `contrast = "enforce"`.
+    #[serde(default)]
+    pub palette_roles: Vec<PaletteRoleColor>,
     /// Colors raised to meet their contrast pair, in pair-table order.
     pub contrast_adjustments: Vec<ContrastAdjustment>,
     /// Non-fatal problems such as unknown roles or approximate color math.
@@ -545,6 +560,7 @@ impl ResolvedThemeDefinition {
             renderer_chrome: BTreeMap::new(),
             presentation: Vec::new(),
             derived_roles: Vec::new(),
+            palette_roles: Vec::new(),
             contrast_adjustments: Vec::new(),
             warnings: Vec::new(),
             applied_layers: Vec::new(),
@@ -903,6 +919,7 @@ fn resolve_merged(
     role_namespaces: &[String],
 ) -> Result<ResolvedThemeDefinition, ThemeError> {
     let mut resolver = PaletteResolver::new(id, &merged.palette);
+    resolver.adjust_palette_colors = merged.contrast == ContrastPolicy::Enforce;
     for name in merged.palette.keys() {
         resolver.get(name)?;
     }
@@ -911,21 +928,32 @@ fn resolve_merged(
         styles.insert(role.clone(), resolver.style(raw)?);
     }
     let mut derived_roles = Vec::new();
+    let mut palette_roles = Vec::new();
     if merged.derive {
         for spec in crate::roles::ROLES {
             if styles.contains_key(spec.key) {
                 continue;
             }
-            if let Some(derived) = spec.derive.and_then(|derive| resolver.derived(derive)) {
+            if let Some((derived, sources)) =
+                spec.derive.and_then(|derive| resolver.derived(derive))
+            {
                 styles.insert(spec.key.to_owned(), derived);
                 derived_roles.push(spec.key.to_owned());
+                palette_roles.extend(sources.into_iter().map(|(channel, slot)| PaletteRoleColor {
+                    role: spec.key.to_owned(),
+                    channel,
+                    slot,
+                }));
             }
         }
     }
     let contrast_adjustments = match merged.contrast {
-        ContrastPolicy::Enforce => crate::contrast::enforce(&mut styles, |_| true),
-        ContrastPolicy::Derived => crate::contrast::enforce(&mut styles, |role| {
+        ContrastPolicy::Enforce => crate::contrast::enforce(&mut styles, |_, _| true),
+        ContrastPolicy::Derived => crate::contrast::enforce(&mut styles, |role, channel| {
             derived_roles.iter().any(|derived| derived == role)
+                && !palette_roles
+                    .iter()
+                    .any(|color| color.role == role && color.channel == channel)
         }),
     };
     let mut warnings = std::mem::take(&mut resolver.warnings);
@@ -982,6 +1010,7 @@ fn resolve_merged(
         renderer_chrome: merged.chrome.other,
         presentation: merged.presentation,
         derived_roles,
+        palette_roles,
         contrast_adjustments,
         warnings,
         applied_layers,
@@ -1057,6 +1086,8 @@ struct PaletteResolver<'a> {
     warnings: Vec<ThemeWarning>,
     /// First structured error raised inside expression evaluation.
     failure: Option<ThemeError>,
+    /// Whether `readable(…)` also raises colors taken from the palette.
+    adjust_palette_colors: bool,
 }
 
 impl<'a> PaletteResolver<'a> {
@@ -1068,6 +1099,7 @@ impl<'a> PaletteResolver<'a> {
             stack: Vec::new(),
             warnings: Vec::new(),
             failure: None,
+            adjust_palette_colors: false,
         }
     }
 
@@ -1159,24 +1191,42 @@ impl<'a> PaletteResolver<'a> {
     }
 
     /// Derive a role from seeds; `None` unless every input resolves exactly.
-    fn derived(&mut self, derive: crate::roles::DerivedStyle) -> Option<Style> {
-        let mut exact = |value: &str| match self.expression_or_reference(value) {
-            Ok(Evaluated::Exact(color)) => Some(color),
-            _ => None,
-        };
+    ///
+    /// Also returns the channels whose color is a palette entry taken
+    /// unchanged, with the entry's name.
+    fn derived(
+        &mut self,
+        derive: crate::roles::DerivedStyle,
+    ) -> Option<(Style, Vec<(AdjustedChannel, String)>)> {
         let mut style = Style::new();
+        let mut sources = Vec::new();
         if let Some(fg) = derive.fg {
-            style = style.fg(exact(fg)?);
+            let (color, source) = self.derived_color(fg)?;
+            style = style.fg(color);
+            sources.extend(source.map(|slot| (AdjustedChannel::Foreground, slot)));
         }
         if let Some(bg) = derive.bg {
-            style = style.bg(exact(bg)?);
+            let (color, source) = self.derived_color(bg)?;
+            style = style.bg(color);
+            sources.extend(source.map(|slot| (AdjustedChannel::Background, slot)));
         }
         let modifiers = derive
             .modifiers
             .iter()
             .filter_map(|name| modifier_by_name(name))
             .collect::<Vec<_>>();
-        Some(apply_modifiers(style, &modifiers))
+        Some((apply_modifiers(style, &modifiers), sources))
+    }
+
+    /// One exact derived color and the palette entry it is taken from unchanged.
+    fn derived_color(&mut self, value: &str) -> Option<(Color, Option<String>)> {
+        let Ok(Evaluated::Exact(color)) = self.expression_or_reference(value) else {
+            return None;
+        };
+        let parsed = expr::parse(value).ok()?;
+        let source = expr::palette_source(&parsed, self).ok()?;
+        self.failure = None;
+        Some((color, source))
     }
 
     fn expression_or_reference(&mut self, value: &str) -> Result<Evaluated, ThemeError> {
@@ -1202,6 +1252,10 @@ impl ColorContext for PaletteResolver<'_> {
     fn literal(&mut self, value: &str) -> Result<Color, String> {
         parse_direct_color(self.theme, &RawColor::Text(value.to_owned()))
             .map_err(|error| error.to_string())
+    }
+
+    fn adjusts_palette_colors(&self) -> bool {
+        self.adjust_palette_colors
     }
 }
 

@@ -8,6 +8,9 @@
 //!   remaining distance to white or black;
 //! * `saturate(c, t)`, `desaturate(c, t)` — scale chroma by `1 ± t`;
 //! * `ensure_contrast(fg, bg, ratio)` — minimal lightness change to reach `ratio`;
+//! * `readable(fg, bg, ratio)` — `ensure_contrast` for computed colors, while a
+//!   color taken directly from the palette passes through unchanged (see
+//!   [`palette_source`]) unless the context adjusts authored colors;
 //! * `or(a, b, …)` — the first argument whose references all exist.
 //!
 //! Arguments are palette references (`$name`), direct colors, numbers, or
@@ -49,6 +52,8 @@ pub enum Function {
     Desaturate,
     /// `ensure_contrast(fg, bg, ratio)`.
     EnsureContrast,
+    /// `readable(fg, bg, ratio)`.
+    Readable,
     /// `or(a, b, …)`.
     Or,
 }
@@ -62,6 +67,7 @@ impl Function {
             "saturate" => Self::Saturate,
             "desaturate" => Self::Desaturate,
             "ensure_contrast" => Self::EnsureContrast,
+            "readable" => Self::Readable,
             "or" => Self::Or,
             _ => return None,
         })
@@ -75,6 +81,7 @@ impl Function {
             Self::Saturate => "saturate",
             Self::Desaturate => "desaturate",
             Self::EnsureContrast => "ensure_contrast",
+            Self::Readable => "readable",
             Self::Or => "or",
         }
     }
@@ -198,7 +205,7 @@ impl Parser<'_> {
 
 fn check_arity(function: Function, arguments: &[Expr]) -> Result<(), String> {
     let expected = match function {
-        Function::Mix | Function::EnsureContrast => 3,
+        Function::Mix | Function::EnsureContrast | Function::Readable => 3,
         Function::Lighten | Function::Darken | Function::Saturate | Function::Desaturate => 2,
         Function::Or => {
             return if arguments.len() >= 2 {
@@ -246,6 +253,43 @@ pub trait ColorContext {
     ///
     /// Returns a message for malformed literals.
     fn literal(&mut self, value: &str) -> Result<Color, String>;
+
+    /// Whether `readable(…)` also raises colors taken directly from the
+    /// palette. By default palette colors pass through unchanged.
+    fn adjusts_palette_colors(&self) -> bool {
+        false
+    }
+}
+
+/// The palette entry `expr` takes its value from unchanged, if any.
+///
+/// A bare reference names its entry; `or(…)` follows its first available
+/// argument; `readable(…)` follows its color argument unless `context`
+/// adjusts palette colors. Every other function computes a new color, so its
+/// result has no palette source. A missing reference has none either.
+///
+/// # Errors
+///
+/// Returns a message when evaluating an `or(…)` argument fails.
+pub fn palette_source(
+    expr: &Expr,
+    context: &mut impl ColorContext,
+) -> Result<Option<String>, String> {
+    match expr {
+        Expr::Reference(name) => Ok(context.reference(name)?.map(|_| name.clone())),
+        Expr::Call(Function::Or, arguments) => {
+            for argument in arguments {
+                if !matches!(evaluate(argument, context)?, Evaluated::Missing(_)) {
+                    return palette_source(argument, context);
+                }
+            }
+            Ok(None)
+        }
+        Expr::Call(Function::Readable, arguments) if !context.adjusts_palette_colors() => {
+            palette_source(&arguments[0], context)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Evaluate `expr`.
@@ -271,28 +315,42 @@ pub fn evaluate(expr: &Expr, context: &mut impl ColorContext) -> Result<Evaluate
             }
             Ok(Evaluated::Missing(missing.join(", ")))
         }
-        Expr::Call(function, arguments) => {
-            let mut colors = Vec::new();
-            let mut amount = None;
-            let mut note = None;
-            for argument in arguments {
-                if let Expr::Number(number) = argument {
-                    amount = Some(*number);
-                    continue;
-                }
-                match evaluate(argument, context)? {
-                    Evaluated::Exact(color) => colors.push(color),
-                    Evaluated::Approximate(color, reason) => {
-                        note.get_or_insert(reason);
-                        colors.push(color);
-                    }
-                    missing @ Evaluated::Missing(_) => return Ok(missing),
-                }
+        Expr::Call(Function::Readable, arguments) if palette_source(expr, context)?.is_some() => {
+            // A palette color passes through exactly; terminal-owned colors
+            // fall through so the math reports them as approximate.
+            match evaluate(&arguments[0], context)? {
+                Evaluated::Exact(color @ Color::Rgb(..)) => Ok(Evaluated::Exact(color)),
+                _ => evaluate_math(Function::Readable, arguments, context),
             }
-            let amount = amount.ok_or_else(|| format!("{}(…) needs a number", function.name()))?;
-            apply(*function, &colors, amount, note)
+        }
+        Expr::Call(function, arguments) => evaluate_math(*function, arguments, context),
+    }
+}
+
+fn evaluate_math(
+    function: Function,
+    arguments: &[Expr],
+    context: &mut impl ColorContext,
+) -> Result<Evaluated, String> {
+    let mut colors = Vec::new();
+    let mut amount = None;
+    let mut note = None;
+    for argument in arguments {
+        if let Expr::Number(number) = argument {
+            amount = Some(*number);
+            continue;
+        }
+        match evaluate(argument, context)? {
+            Evaluated::Exact(color) => colors.push(color),
+            Evaluated::Approximate(color, reason) => {
+                note.get_or_insert(reason);
+                colors.push(color);
+            }
+            missing @ Evaluated::Missing(_) => return Ok(missing),
         }
     }
+    let amount = amount.ok_or_else(|| format!("{}(…) needs a number", function.name()))?;
+    apply(function, &colors, amount, note)
 }
 
 fn apply(
@@ -301,7 +359,10 @@ fn apply(
     amount: f64,
     note: Option<String>,
 ) -> Result<Evaluated, String> {
-    let expected = if matches!(function, Function::Mix | Function::EnsureContrast) {
+    let expected = if matches!(
+        function,
+        Function::Mix | Function::EnsureContrast | Function::Readable
+    ) {
         2
     } else {
         1
@@ -326,7 +387,9 @@ fn apply(
         Function::Darken => bmux_color::darken(rgb[0], amount),
         Function::Saturate => bmux_color::saturate(rgb[0], amount),
         Function::Desaturate => bmux_color::desaturate(rgb[0], amount),
-        Function::EnsureContrast => bmux_color::ensure_contrast(rgb[0], rgb[1], amount),
+        Function::EnsureContrast | Function::Readable => {
+            bmux_color::ensure_contrast(rgb[0], rgb[1], amount)
+        }
         Function::Or => unreachable!("or is evaluated before apply"),
     };
     let color = Color::from(result);
@@ -341,11 +404,15 @@ mod tests {
 
     use super::*;
 
-    struct Palette(BTreeMap<&'static str, Color>);
+    struct Palette(BTreeMap<&'static str, Color>, bool);
 
     impl ColorContext for Palette {
         fn reference(&mut self, name: &str) -> Result<Option<Color>, String> {
             Ok(self.0.get(name).copied())
+        }
+
+        fn adjusts_palette_colors(&self) -> bool {
+            self.1
         }
 
         fn literal(&mut self, value: &str) -> Result<Color, String> {
@@ -360,12 +427,16 @@ mod tests {
     }
 
     fn palette() -> Palette {
-        Palette(BTreeMap::from([
-            ("bg", Color::Rgb(0, 0, 0)),
-            ("fg", Color::Rgb(255, 255, 255)),
-            ("green", Color::Rgb(0x40, 0xa0, 0x2b)),
-            ("ansi", Color::Green),
-        ]))
+        Palette(
+            BTreeMap::from([
+                ("bg", Color::Rgb(0, 0, 0)),
+                ("fg", Color::Rgb(255, 255, 255)),
+                ("green", Color::Rgb(0x40, 0xa0, 0x2b)),
+                ("ansi", Color::Green),
+                ("dim", Color::Rgb(0x20, 0x20, 0x20)),
+            ]),
+            false,
+        )
     }
 
     fn eval(source: &str) -> Result<Evaluated, String> {
@@ -391,6 +462,52 @@ mod tests {
         assert!(matches!(
             eval("darken(#ffffff, 0.5)"),
             Ok(Evaluated::Exact(Color::Rgb(..)))
+        ));
+    }
+
+    #[test]
+    fn readable_keeps_palette_colors_and_raises_computed_ones() {
+        let dim = Evaluated::Exact(Color::Rgb(0x20, 0x20, 0x20));
+        assert_eq!(eval("readable($dim, $bg, 4.5)"), Ok(dim.clone()));
+        assert_eq!(eval("readable(or($missing, $dim), $bg, 4.5)"), Ok(dim));
+        let source = |source: &str, palette: &mut Palette| {
+            palette_source(&parse(source).expect("parses"), palette)
+        };
+        assert_eq!(
+            source("readable(or($missing, $dim), $bg, 4.5)", &mut palette()),
+            Ok(Some("dim".to_owned()))
+        );
+        assert_eq!(
+            source("or($missing, mix($dim, $bg, 0.5))", &mut palette()),
+            Ok(None)
+        );
+        for computed in [
+            "readable(mix($dim, $bg, 0.9), $bg, 4.5)",
+            "readable(or($missing, mix($dim, $bg, 0.9)), $bg, 4.5)",
+        ] {
+            let Ok(Evaluated::Exact(Color::Rgb(r, g, b))) = eval(computed) else {
+                panic!("{computed}");
+            };
+            let raised = bmux_color::Rgb::new(r, g, b);
+            assert!(
+                raised.contrast_ratio(bmux_color::Rgb::BLACK) >= 4.5,
+                "{computed}"
+            );
+        }
+        let mut adjusting = palette();
+        adjusting.1 = true;
+        assert_eq!(source("readable($dim, $bg, 4.5)", &mut adjusting), Ok(None));
+        let Ok(Evaluated::Exact(Color::Rgb(r, g, b))) = evaluate(
+            &parse("readable($dim, $bg, 4.5)").expect("parses"),
+            &mut adjusting,
+        ) else {
+            panic!("exact rgb");
+        };
+        assert!(bmux_color::Rgb::new(r, g, b).contrast_ratio(bmux_color::Rgb::BLACK) >= 4.5);
+        // Terminal-owned colors are never passed off as exact.
+        assert!(matches!(
+            eval("readable($ansi, $bg, 4.5)"),
+            Ok(Evaluated::Approximate(Color::Green, _))
         ));
     }
 

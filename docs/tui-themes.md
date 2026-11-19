@@ -104,29 +104,62 @@ Profile files may set a one-line `description`, shown in the picker.
 ### Seed palettes
 
 `schema_version = 2` files may define seed colors and leave roles unset; Bcode
-derives every registered role from the seeds and keeps text, accents, and
-states readable (4.5:1, muted text 3:1) against the background. Seeds are
+derives every registered role from the palette. Seeds are
 `background`, `text`, `accent`, and the hue slots `red`, `green`, `yellow`,
 `blue`, `magenta`, `cyan`, `orange`, `violet` (`info`, `success`, `warning`,
 `error` may override the state hues). Derivation only fills roles that resolve
 exactly from RGB seeds; terminal-owned seeds keep their inherited roles.
 
-Derived roles are contrast-aware. After derivation, each derived role is
+A palette may also declare exact slots for colors its source scheme defines,
+so those roles use the scheme's own color instead of one Bcode computes. Every
+slot is optional; an omitted slot keeps the derivation for its roles.
+`bcode theme roles` lists them as `slot` rows.
+
+| Slot | Roles it feeds |
+|---|---|
+| `muted` | `text.muted` and every secondary-text role (metadata, muted labels, `diff.muted`) |
+| `comment` | `syntax.comment` (defaults to `muted`) |
+| `border` | `border.default`, `source.border` |
+| `border_focused` | `border.focused` (defaults to `accent`) |
+| `surface` | `surface.raised` |
+| `surface_overlay` | `surface.overlay` (defaults to `surface`) |
+| `selection` | `selection.active` background |
+| `line_highlight` | `selection.inactive` background |
+| `gutter` | `source.gutter` (defaults to `muted`) |
+| `diff_add`, `diff_remove` | `diff.added`, `diff.removed` |
+| `diff_add_bg`, `diff_remove_bg` | `diff.added_row`, `diff.removed_row` |
+| `diff_add_emphasis_bg`, `diff_remove_emphasis_bg` | `diff.added_emphasis`, `diff.removed_emphasis` |
+| `syntax_keyword`, `syntax_function`, `syntax_variable`, `syntax_string`, `syntax_number`, `syntax_type`, `syntax_operator`, `syntax_punctuation` | the `syntax.*` role of the same name |
+| `markup_heading` | `markdown.heading`, `syntax.heading` |
+| `markup_link` | `link`, `markdown.link`, `syntax.link` |
+| `markup_raw` | `syntax.raw` |
+| `markup_code`, `markup_code_bg` | `markdown.inline_code` text and fill |
+| `markup_list` | `markdown.list_marker` |
+
+The `syntax_*` slots cover every token kind the syntax highlighter
+distinguishes; the `markdown.code.*` roles follow the matching `syntax.*` role.
+
+A color a palette declares is used exactly as written: a role that takes a
+palette color unchanged — a slot, or a seed such as `$blue` for
+`syntax.function` — keeps it. Colors Bcode computes, such as mixes, are
+contrast-aware and stay readable (4.5:1, muted text 3:1) against the
+background. After derivation, each computed role color is
 measured against the background it is painted on, using the same pairs
 `bcode theme check` measures (text on the raised and overlay surfaces, inline
 code on its tinted fill, state text on its state surface, diff text on diff
 rows, selection text on the selection). A role that falls short has its own
 foreground raised, or, when it paints a tint under another role's text (state
-surfaces, diff rows and emphasis), its background moved instead so the shared
-text color stays consistent. Only OKLCH lightness changes, by the minimum
-needed, so hue is preserved.
+surfaces, diff rows and emphasis) or under a declared text color, its
+background moved instead so the text color stays consistent. Only OKLCH
+lightness changes, by the minimum needed, so hue is preserved.
 
-Authored colors are kept exactly as written. A theme that wants failing
-authored roles raised the same way opts in at the top level, in any schema
-version:
+Authored colors — roles a theme sets and palette colors a role takes
+unchanged — are kept exactly as written; `bcode theme check` reports those
+below their threshold as warnings. A theme that wants them raised the same
+way opts in at the top level, in any schema version:
 
 ```toml
-contrast = "enforce"   # default "derived": adjust derived roles only
+contrast = "enforce"   # default "derived": adjust computed colors only
 ```
 
 ```toml
@@ -151,7 +184,10 @@ cyan       = "#7dcfff"
 
 Palette and style values in schema-v2 files may derive colors:
 `mix(a, b, t)` (`t` is the share of `a`), `lighten(c, t)`, `darken(c, t)`,
-`saturate(c, t)`, `desaturate(c, t)`, `ensure_contrast(fg, bg, ratio)`, and
+`saturate(c, t)`, `desaturate(c, t)`, `ensure_contrast(fg, bg, ratio)`,
+`readable(fg, bg, ratio)` (`ensure_contrast` for computed colors; a palette
+color it receives directly, possibly through `or`, passes through unchanged
+unless the theme sets `contrast = "enforce"`), and
 `or(a, b, …)` (first argument whose references exist). Math runs in OKLab/OKLCH.
 Applying math to a terminal-owned color warns and keeps the first color.
 
@@ -566,8 +602,10 @@ theme file. The report lists, per variant:
   color before and after, and the pair's contrast before and after.
 
 Adjustments are informational and never count as warnings. Warnings do not fail the command unless `--strict` is given. `--json` prints a
-stable, versioned structure. Every bundled theme passes `--strict` in both
-variants.
+stable, versioned structure; a contrast row whose role color is a palette
+color kept exactly names that entry in `palette_slot`. Bundled themes pass
+`--strict` in both variants apart from contrast findings on palette colors,
+which reproduce their source scheme exactly.
 
 ### Unknown roles
 
@@ -903,7 +941,7 @@ bcode theme validate ~/.config/bcode/themes/my-theme.toml
 
 Then define `my-theme` as the default in `[tui.theme]`, or select it globally with `/theme apply my-theme` or the appearance picker. Interactive selection writes user state, never `bcode.toml`; `/theme reset` restores the configured default. Saving a valid edit hot-reloads the full presentation without recompiling Rust. A parse error leaves the last valid presentation active and emits a bounded source-specific diagnostic; fixing the file permits the next poll to apply it atomically.
 
-Syntax grammars classify source tokens into semantic roles; the resolved Bcode theme exclusively selects their final colors. The semantic roles are `syntax.text`, `syntax.comment`, `syntax.keyword`, `syntax.function`, `syntax.variable`, `syntax.string`, `syntax.number`, `syntax.type`, `syntax.operator`, and `syntax.punctuation`. Omitted roles derive from the resolved text, muted, info/accent, success, and warning presentation rather than from a bundled syntax theme.
+Syntax grammars classify source tokens into semantic roles; the resolved Bcode theme exclusively selects their final colors. The semantic roles are `syntax.text`, `syntax.comment`, `syntax.keyword`, `syntax.function`, `syntax.variable`, `syntax.string`, `syntax.number`, `syntax.type`, `syntax.operator`, and `syntax.punctuation`, plus `syntax.heading`, `syntax.link`, and `syntax.raw` for markup grammars. Omitted roles derive from the palette's `syntax_*` slots when declared, else from the seed hues, rather than from a bundled syntax theme.
 
 ## Color and terminal behavior
 
@@ -915,7 +953,8 @@ for terminal defaults. Opaque `bg` values should therefore be intentional.
 
 For deterministic RGB themes, bundled-theme tests enforce WCAG-style contrast ratios of at least
 `4.5:1` for primary text and `3:1` for muted/secondary text across canvas, raised, and overlay
-surfaces. These thresholds do not apply to non-text decoration or to terminal-default, ANSI, and
+surfaces for every color Bcode computes; colors a palette declares reproduce their source scheme
+and are reported, not changed. These thresholds do not apply to non-text decoration or to terminal-default, ANSI, and
 indexed values whose displayed RGB colors remain terminal-owned and therefore unknown to Bcode.
 Selection text is checked at the primary-text threshold when both foreground and background are
 explicit RGB values. Theme authors should use redundant glyphs or modifiers for semantic state even
