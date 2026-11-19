@@ -17,7 +17,7 @@
 # Hue names follow palette/init.lua's field docs: accent1 red/pink, accent2
 # orange, accent3 yellow, accent4 green, accent5 cyan/blue (used for both blue
 # and cyan), accent6 purple (magenta). Monokai has no separate violet. accent is
-# the function color (accent4). muted is StatusLine's foreground (dimmed1).
+# accent4, the green Monokai uses for functions and titles. muted is StatusLine's foreground (dimmed1).
 # markup_heading follows @markup.heading (green); the port colors Markdown's
 # per-level captures (@markup.heading.N.markdown) yellow. markup_link is the
 # port's base.blue, which Monokai Pro assigns to accent2 (orange).

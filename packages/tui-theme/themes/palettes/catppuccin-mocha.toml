@@ -8,7 +8,7 @@ schema_version = 2
 [palette]
 background         = "#1e1e2e"
 text               = "#cdd6f4"
-accent             = "#89b4fa"
+accent             = "#cba6f7"
 blue               = "#89b4fa"
 cyan               = "#94e2d5"
 green              = "#a6e3a1"
@@ -52,7 +52,7 @@ markup_list        = "#94e2d5"
 [variants.light.palette]
 background         = "#eff1f5"
 text               = "#4c4f69"
-accent             = "#1e66f5"
+accent             = "#8839ef"
 blue               = "#1e66f5"
 cyan               = "#179299"
 green              = "#40a02b"

@@ -6,7 +6,8 @@
 # backgrounds are computed upstream by utils/colors.lua `blend` (per channel
 # floor(clamp(a*fg + (1-a)*bg) + 0.5)); the values here reproduce that
 # algorithm exactly and are written lowercase (upstream formats them with %02X).
-# `muted` is subtext0 (the style guide's sub-headline/label text).
+# `accent` is mauve, Catppuccin's default accent (the Function color, blue,
+# stays in syntax). `muted` is subtext0 (the style guide's sub-headline/label text).
 # @markup.raw.markdown_inline is undefined upstream, so Markdown inline code
 # falls back to @markup.raw (no background).
 palette  = "catppuccin-frappe"
@@ -79,7 +80,7 @@ yellow                      = "#e5c890"
 [variants.dark.slots]
 background         = "base"
 text               = "text"
-accent             = "blue"
+accent             = "mauve"
 blue               = "blue"
 cyan               = "teal"
 green              = "green"
@@ -138,7 +139,6 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "diffRemoved.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
-"title.fg"                = "Title.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.link.fg"        = "@markup.link.fg"

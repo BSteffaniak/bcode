@@ -20,6 +20,8 @@
 # * No Diagnostic* groups, FloatBorder, or secondary-text color exist, so
 #   `info`, `warning`, `error`, `success`, `border_focused`, and `muted` are
 #   omitted.
+# * `accent` is the Keyword/Statement yellow, Zenburn's signature warm accent
+#   (the brighter Function yellow stays in syntax).
 # * `border` is the VertSplit foreground (Vim draws the split as `|` in
 #   VertSplit; its background is #688060).
 # * `diff_add` is the DiffAdd foreground. `diffAdded`/`diffRemoved` link to
@@ -69,7 +71,7 @@ file = "colors/zenburn.vim"
 [variants.dark.slots]
 background         = "Normal.bg"
 text               = "Normal.fg"
-accent             = "Function.fg"
+accent             = "@keyword.fg"
 blue               = "terminal_ansi_colors[4]"
 cyan               = "terminal_ansi_colors[6]"
 green              = "terminal_ansi_colors[2]"
@@ -111,7 +113,6 @@ markup_list        = "@markup.list.fg"
 "diff.added.fg"           = "DiffAdd.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
-"title.fg"                = "Function.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.link.fg"        = "@markup.link.fg"

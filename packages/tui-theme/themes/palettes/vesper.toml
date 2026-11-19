@@ -8,7 +8,7 @@ schema_version = 2
 [palette]
 background         = "#101010"
 text               = "#cccccc"
-accent             = "#ffcfa8"
+accent             = "#ffc799"
 blue               = "#82d9c2"
 cyan               = "#a0a0a0"
 green              = "#82d9c2"

@@ -8,8 +8,8 @@
 #
 # * `@markup.raw.markdown_inline` is not defined, so the capture falls back to
 #   `@markup.raw`; it sets no background, so `markup_code_bg` is omitted.
-# * `accent` is the Function color (green); the scheme has one purple, so
-#   `violet` is omitted.
+# * `accent` is green, Everforest's signature color; the scheme has one purple,
+#   so `violet` is omitted.
 # * `muted` is grey2, the PmenuExtra foreground (secondary menu text);
 #   `comment` and `border_focused` are grey1.
 palette  = "everforest"

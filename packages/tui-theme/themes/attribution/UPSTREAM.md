@@ -103,7 +103,7 @@ color. When a group is undefined, Neovim's default link applies: `Number`,
 | Slot | Neovim source | Other sources |
 |---|---|---|
 | `background`, `text` | `Normal` bg/fg | editor background/foreground |
-| `accent` | the scheme's primary blue/accent (`Function` color in most schemes) | primary accent |
+| `accent` | the scheme's recognisable accent (see below) | primary accent |
 | hues | the named palette colors | ANSI-equivalent palette names |
 | `violet` | the scheme's purple when distinct from magenta | |
 | `info`, `warning`, `error` | `DiagnosticInfo`, `DiagnosticWarn`, `DiagnosticError` fg | |
@@ -131,6 +131,24 @@ color. When a group is undefined, Neovim's default link applies: `Number`,
 | `markup_raw` | `@markup.raw` | markup inline raw |
 | `markup_code`, `markup_code_bg` | `@markup.raw.markdown_inline` fg/bg | Markdown inline code |
 | `markup_list` | `@markup.list` | list marker |
+
+### The accent
+
+`accent` is the color a scheme is recognised by, because Bcode paints its
+chrome with it (`accent`, `title`, focus, the active tab). Choose, in order:
+
+1. a color upstream itself names as the accent (`accent`, `accent.fg`);
+2. otherwise the scheme's signature color: the hue its own UI, statusline, or
+   documentation leads with (Gruvbox yellow, Catppuccin mauve, Rosé Pine iris,
+   Dracula purple, Oxocarbon purple, Poimandres teal, Vesper peach).
+
+The accent must be a value from the upstream palette or highlight groups,
+mapped in the reference file like any other slot. Do not pick the `Function`
+color only because it is the function color: it belongs in `syntax_function`,
+and is the accent only when it is also the scheme's signature color. Say in the
+reference file's header comment which color the accent is and why.
+Bcode's `title` role follows the accent; map it to upstream `Title` only
+when the two are the same color.
 
 When upstream lacks a slot, omit it: the role keeps its derivation. Declare a
 slot even when it equals a seed, so the mapping stays explicit and audited.

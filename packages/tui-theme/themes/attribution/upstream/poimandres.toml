@@ -15,7 +15,7 @@
 # success (no DiagnosticOk), markup_link (@markup.link -> Underlined, no color)
 # and markup_code_bg. Poimandres names its colors by family (teal1, blue1-4,
 # pink1-3); hues map by family and diagnostic use: blue2 blue (the Function
-# color, also accent), blue1 cyan, teal1 green, pink2 magenta, pink3 red
+# color), blue1 cyan, teal1 green (also accent, Poimandres's signature teal), pink2 magenta, pink3 red
 # (DiagnosticError), yellow. muted is blueGray1, the secondary foreground used
 # by Pmenu, Comment, Identifier, Type and Delimiter. The repository ships no
 # license file, so `license` is NOASSERTION; the original theme,
@@ -76,7 +76,7 @@ yellow                      = "#fffac2"
 [variants.dark.slots]
 background         = "background2"
 text               = "text"
-accent             = "blue2"
+accent             = "teal1"
 blue               = "blue2"
 cyan               = "blue1"
 green              = "teal1"
@@ -130,7 +130,6 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "GitSignsDelete.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
-"title.fg"                = "Function.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.inline_code.fg" = "@markup.raw.fg"

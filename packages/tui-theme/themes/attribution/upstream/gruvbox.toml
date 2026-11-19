@@ -11,8 +11,8 @@
 #   `@markup.raw` (String); it sets no background, so `markup_code_bg` is omitted.
 # * `diffAdded`/`diffRemoved` link to DiffAdd/DiffDelete, which set only a
 #   background; the git text colors are taken from GitSignsAdd/GitSignsDelete.
-# * `accent` is the Function/Title color (green); gruvbox has one purple, so
-#   `violet` is omitted.
+# * `accent` is yellow, Gruvbox's signature accent (the Function color, green,
+#   stays in syntax); gruvbox has one purple, so `violet` is omitted.
 # * `muted` is fg4, the StatusLineNC foreground.
 palette  = "gruvbox"
 scheme   = "Gruvbox (dark; light: light), contrast medium"
@@ -76,7 +76,7 @@ yellow                           = "#fabd2f"
 [variants.dark.slots]
 background         = "bg0"
 text               = "fg1"
-accent             = "green"
+accent             = "yellow"
 blue               = "blue"
 cyan               = "aqua"
 green              = "green"
@@ -134,7 +134,6 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "GitSignsDelete.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
-"title.fg"                = "Title.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.link.fg"        = "@markup.link.fg"
@@ -211,7 +210,7 @@ yellow                           = "#b57614"
 [variants.light.slots]
 background         = "bg0"
 text               = "fg1"
-accent             = "green"
+accent             = "yellow"
 blue               = "blue"
 cyan               = "aqua"
 green              = "green"
@@ -269,7 +268,6 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "GitSignsDelete.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
-"title.fg"                = "Title.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.link.fg"        = "@markup.link.fg"

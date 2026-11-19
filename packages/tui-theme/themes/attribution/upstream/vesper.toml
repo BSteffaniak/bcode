@@ -17,8 +17,8 @@
 #
 # Vesper names no blue, cyan, or yellow; those hues use the port's own terminal
 # colors (terminal_color_4 greenLight, terminal_color_6 primary,
-# terminal_color_3 yellowDark). magenta is the port's `purple`, which is also
-# the function color used as accent. muted is fgInactive (StatusLineNC),
+# terminal_color_3 yellowDark). magenta is the port's `purple` (also the function
+# color). accent is yellowDark, Vesper's signature peach (also `warn`). muted is fgInactive (StatusLineNC),
 # border_focused the palette's borderFocus. The port draws diff rows on the
 # normal background (DiffAdd/DiffDelete bg = bg). Omitted: markup_link
 # (@markup.link -> Underlined has no color), markup_code_bg (no background),
@@ -85,7 +85,7 @@ yellowDark                       = "#ffc799"
 [variants.dark.slots]
 background         = "bg"
 text               = "fg"
-accent             = "purple"
+accent             = "yellowDark"
 blue               = "greenLight"
 cyan               = "primary"
 green              = "green"

@@ -12,9 +12,9 @@
 # @markup.heading -> Title, @markup.link -> markdownUrl -> String,
 # @markup.raw(.markdown_inline) -> String, @markup.list -> markdownListMarker.
 # Oxocarbon has numbered colors, not hue names; hues follow each color's hue and
-# its diagnostic use: base09 blue (primary blue, also accent and DiagnosticInfo),
-# base08 cyan, base13 green, base12 magenta, base10 red (DiagnosticError), base14
-# violet (also DiagnosticWarn). The scheme has no yellow or orange, no
+# its diagnostic use: base09 blue (primary blue, also DiagnosticInfo), base08
+# cyan, base13 green, base12 magenta, base10 red (DiagnosticError), base14
+# violet (also DiagnosticWarn). accent is base14, Oxocarbon's signature purple. The scheme has no yellow or orange, no
 # DiagnosticOk and no secondary foreground (StatusLine uses Normal's fg), so
 # yellow, orange, success and muted are omitted, as is markup_code_bg (String
 # sets no background). FloatBorder paints `blend` on `blend`, so the focused
@@ -75,7 +75,7 @@ blend                            = "#131313"
 [variants.dark.slots]
 background         = "base00"
 text               = "base04"
-accent             = "base09"
+accent             = "base14"
 blue               = "base09"
 cyan               = "base08"
 green              = "base13"
@@ -128,7 +128,6 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "diffRemoved.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
-"title.fg"                = "base09"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.link.fg"        = "@markup.link.fg"

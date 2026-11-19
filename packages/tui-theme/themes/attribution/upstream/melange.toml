@@ -15,7 +15,7 @@
 # * `diffAdded`/`diffRemoved` are undefined and `DiffAdded`/`@diff.plus` link to
 #   DiffAdd, which sets only a background; the git text colors are taken from
 #   GitSignsAdd/GitSignsDelete (MiniDiffSignAdd/MiniDiffSignDelete).
-# * `accent` is the Function color (b.yellow); `orange` is c.yellow, the
+# * `accent` is b.yellow, Melange's signature warm yellow; `orange` is c.yellow, the
 #   scheme's orange; melange has no separate violet, so `violet` is omitted.
 # * `muted` is a.com, the StatusLineNC foreground (also the comment color).
 palette  = "melange"
