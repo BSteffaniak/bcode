@@ -12,12 +12,12 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 
 | Palette ids | Source scheme | Upstream | License |
 |---|---|---|---|
-| `catppuccin-*` | Catppuccin | github.com/catppuccin/catppuccin | MIT |
+| `catppuccin-*` | Catppuccin (frappe, latte, macchiato, mocha) | github.com/catppuccin/nvim | MIT |
 | `tokyonight*` | Tokyo Night (night, day, moon, storm) | github.com/folke/tokyonight.nvim | Apache-2.0 |
 | `gruvbox` | Gruvbox | github.com/morhetz/gruvbox | MIT |
 | `gruvbox-material` | Gruvbox Material | github.com/sainnhe/gruvbox-material | MIT |
-| `dracula` | Dracula / Alucard | github.com/dracula/dracula-theme | MIT |
-| `rose-pine*` | Rosé Pine | github.com/rose-pine/rose-pine-theme | MIT |
+| `dracula` | Dracula / Alucard | github.com/dracula/vim | MIT |
+| `rose-pine*` | Rosé Pine (main, moon, dawn) | github.com/rose-pine/neovim | MIT |
 | `kanagawa*` | Kanagawa | github.com/rebelot/kanagawa.nvim | MIT |
 | `everforest` | Everforest | github.com/sainnhe/everforest | MIT |
 | `one` | One Dark / One Light | github.com/atom/atom (one-dark-syntax) | MIT |
