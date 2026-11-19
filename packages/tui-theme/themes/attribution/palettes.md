@@ -21,7 +21,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `kanagawa*` | Kanagawa (wave, lotus, dragon) | github.com/rebelot/kanagawa.nvim | MIT |
 | `everforest` | Everforest (medium background) | github.com/sainnhe/everforest | MIT |
 | `one` | One Dark (dark, light) | github.com/navarasu/onedark.nvim | MIT |
-| `solarized` | Solarized | github.com/altercation/solarized | MIT |
+| `solarized` | Solarized (dark, light) | github.com/altercation/solarized (group mapping: github.com/altercation/vim-colors-solarized) | MIT |
 | `github*` | GitHub (dark default, light default, dark dimmed) | github.com/projekt0n/github-nvim-theme | MIT |
 | `ayu*` | Ayu (dark, mirage, light) | github.com/Shatur/neovim-ayu (palette: github.com/ayu-theme/ayu-colors, MIT) | GPL-3.0 (review required) |
 | `nightfox` | Nightfox / Dawnfox | github.com/EdenEast/nightfox.nvim | MIT |
