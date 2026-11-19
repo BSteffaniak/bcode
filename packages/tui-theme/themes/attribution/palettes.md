@@ -14,7 +14,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 |---|---|---|---|
 | `catppuccin-*` | Catppuccin (frappe, latte, macchiato, mocha) | github.com/catppuccin/nvim | MIT |
 | `tokyonight*` | Tokyo Night (night, day, moon, storm) | github.com/folke/tokyonight.nvim | Apache-2.0 |
-| `gruvbox` | Gruvbox | github.com/morhetz/gruvbox | MIT |
+| `gruvbox` | Gruvbox (dark, light; medium contrast) | github.com/ellisonleao/gruvbox.nvim | MIT |
 | `gruvbox-material` | Gruvbox Material | github.com/sainnhe/gruvbox-material | MIT |
 | `dracula` | Dracula / Alucard | github.com/dracula/vim | MIT |
 | `rose-pine*` | Rosé Pine (main, moon, dawn) | github.com/rose-pine/neovim | MIT |
