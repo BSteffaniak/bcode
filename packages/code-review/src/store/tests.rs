@@ -422,6 +422,7 @@ fn ai_exchange_delete_is_explicit_and_idempotent() {
             blob_oid: None,
             reply_to: None,
         },
+        thread_id: None,
         question: "delete me".to_string(),
         session_id: None,
         status: ReviewAiExchangeStatus::Pending,
@@ -618,6 +619,106 @@ fn stack_snapshots_round_trip(
     assert_eq!(get(repo).stack_snapshots, Vec::new());
 }
 
+/// An exchange saved before exchanges recorded the thread they were asked from reads back with
+/// none once the database is migrated, and can record one afterwards.
+#[test]
+fn exchanges_saved_before_the_thread_column_migrate_without_one() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git_test(&repo, &["init", "--quiet"]);
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let exchange = ReviewAiExchange {
+        schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+        exchange_id: "exchange-old".to_string(),
+        anchor: DraftAnchor {
+            kind: ReviewAnchorKind::Review,
+            file_path: "<review>".to_string(),
+            diff_row: 0,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            old_line: None,
+            new_line: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+            head_oid: None,
+            blob_oid: None,
+            reply_to: None,
+        },
+        thread_id: None,
+        question: "asked long ago".to_string(),
+        session_id: Some("session-old".to_string()),
+        status: ReviewAiExchangeStatus::Linked,
+        error: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let save = |exchange: ReviewAiExchange| {
+        save_ai_exchange_for_request(
+            SaveReviewAiExchangeRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+                exchange,
+            },
+            &config,
+        )
+        .expect("save exchange")
+        .exchange
+    };
+    let list = || {
+        list_ai_exchanges_for_request(
+            &ListReviewAiExchangesRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+            },
+            &config,
+        )
+        .expect("list exchanges")
+        .exchanges
+    };
+    let saved = save(exchange);
+    // Take the database back to before the column, with the row in it.
+    let root = resolve_repo_root(&repo).expect("root");
+    with_database(&root, &config, move |database| {
+        Box::pin(async move {
+            alter_table("review_ai_exchanges")
+                .drop_column("thread_id".to_string())
+                .execute(database)
+                .await?;
+            database
+                .delete(MIGRATIONS_TABLE)
+                .filter(Box::new(where_eq("id", "036_ai_exchange_thread_column")))
+                .execute(database)
+                .await?;
+            assert!(
+                !database
+                    .column_exists("review_ai_exchanges", "thread_id")
+                    .await?
+            );
+            run_migrations(database).await
+        })
+    })
+    .expect("migrate");
+    assert_eq!(list(), vec![saved.clone()]);
+    let owned = ReviewAiExchange {
+        thread_id: Some("thread-abc".to_string()),
+        ..saved
+    };
+    save(owned);
+    assert_eq!(list()[0].thread_id.as_deref(), Some("thread-abc"));
+}
+
 #[test]
 fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -659,6 +760,7 @@ fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
         schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
         exchange_id: "exchange-1".to_string(),
         anchor,
+        thread_id: None,
         question: "Is this safe?".to_string(),
         session_id: Some("session-1".to_string()),
         status: ReviewAiExchangeStatus::Linked,
@@ -689,7 +791,59 @@ fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
         &config,
     )
     .expect("list exchanges");
-    assert_eq!(listed.exchanges, vec![saved]);
+    assert_eq!(listed.exchanges, vec![saved.clone()]);
+
+    // The thread it was asked from is kept, and can be recorded later on the same exchange.
+    let list = || {
+        list_ai_exchanges_for_request(
+            &ListReviewAiExchangesRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+            },
+            &config,
+        )
+        .expect("list exchanges")
+        .exchanges
+    };
+    let owned = ReviewAiExchange {
+        thread_id: Some("remote:fake/repo#102\u{1}thread-1".to_string()),
+        ..saved.clone()
+    };
+    save_ai_exchange_for_request(
+        SaveReviewAiExchangeRequest {
+            repo_path: repo.clone(),
+            target: ReviewTarget::Repository,
+            scope: None,
+            exchange: owned,
+        },
+        &config,
+    )
+    .expect("save owned exchange");
+    let listed = list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].thread_id.as_deref(),
+        Some("remote:fake/repo#102\u{1}thread-1")
+    );
+    assert_eq!(listed[0].created_at_ms, saved.created_at_ms);
+    assert_eq!(
+        listed[0].updated_at_ms, saved.updated_at_ms,
+        "recording the thread alone is not an update of the question"
+    );
+    let mut unowned = listed[0].clone();
+    unowned.thread_id = None;
+    save_ai_exchange_for_request(
+        SaveReviewAiExchangeRequest {
+            repo_path: repo.clone(),
+            target: ReviewTarget::Repository,
+            scope: None,
+            exchange: unowned,
+        },
+        &config,
+    )
+    .expect("save unowned exchange");
+    assert_eq!(list()[0].thread_id, None);
 
     let bundle = review_bundle_for_request(
         PublishReviewRequest {

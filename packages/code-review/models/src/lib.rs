@@ -1349,8 +1349,22 @@ pub struct ReviewAiExchange {
     pub schema_version: u16,
     /// Stable exchange identity.
     pub exchange_id: String,
-    /// Review anchor that owns the exchange.
+    /// Review anchor the question was asked about, as it was at ask time.
     pub anchor: DraftAnchor,
+    /// The review thread the question was asked from, when it was: the id the review knows
+    /// the thread by, which survives pushes and reloads.
+    ///
+    /// * A local draft thread: its thread id (`thread-…`).
+    /// * A pull request thread: `remote:`, its pull request key
+    ///   (`provider/repository#number`), a `\u{1}`, and the provider's thread id (the
+    ///   `remote:` prefix and `DraftAnchor::reply_to`'s form).
+    /// * An imported thread: `external:<importer>:<external id>`.
+    ///
+    /// While that thread is in the review the exchange is shown with it, wherever the thread
+    /// is placed; otherwise at `anchor`. Omitted when absent, so other exchanges serialize as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     /// Reviewer-authored question shown in the review conversation.
     pub question: String,
     /// Linked Bcode session id, when established.
@@ -3369,6 +3383,7 @@ mod tests {
                 blob_oid: None,
                 reply_to: None,
             },
+            thread_id: None,
             question: "Why is this safe?".to_string(),
             session_id: Some("session-1".to_string()),
             status: ReviewAiExchangeStatus::Linked,
@@ -3378,10 +3393,22 @@ mod tests {
         };
 
         let json = serde_json::to_string(&exchange).expect("serialize exchange");
+        assert!(
+            !json.contains("thread_id"),
+            "an absent owner is omitted: {json}"
+        );
         let round_trip: ReviewAiExchange =
             serde_json::from_str(&json).expect("deserialize exchange");
-
         assert_eq!(round_trip, exchange);
+
+        let owned = ReviewAiExchange {
+            thread_id: Some("remote:fake/repo#102\u{1}thread-1".to_string()),
+            ..exchange
+        };
+        let json = serde_json::to_string(&owned).expect("serialize owned exchange");
+        let round_trip: ReviewAiExchange =
+            serde_json::from_str(&json).expect("deserialize owned exchange");
+        assert_eq!(round_trip, owned);
         assert_eq!(
             serde_json::to_value(ReviewAiExchangeStatus::Failed).expect("status json"),
             serde_json::json!("failed")

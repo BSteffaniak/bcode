@@ -453,6 +453,7 @@ impl<'a> CodeReviewDb<'a> {
                 "schema_version",
                 "exchange_id",
                 "anchor_json",
+                "thread_id",
                 "question",
                 "session_id",
                 "status",
@@ -541,7 +542,18 @@ impl<'a> CodeReviewDb<'a> {
         let existing = self
             .db
             .select("review_ai_exchanges")
-            .columns(&["exchange_id", "created_at_ms"])
+            .columns(&[
+                "schema_version",
+                "exchange_id",
+                "anchor_json",
+                "thread_id",
+                "question",
+                "session_id",
+                "status",
+                "error",
+                "created_at_ms",
+                "updated_at_ms",
+            ])
             .filter(Box::new(where_eq(
                 "exchange_id",
                 exchange.exchange_id.clone(),
@@ -551,15 +563,28 @@ impl<'a> CodeReviewDb<'a> {
         exchange.updated_at_ms = now;
         if let Some(row) = existing {
             exchange.created_at_ms = i64_to_u64(required_i64(&row, "created_at_ms")?);
+            // Recording only the thread it was asked from is not an update of the question:
+            // its time (what a card's viewed state follows) stays.
+            if let Ok(stored) = ai_exchange_from_row(&row) {
+                let same_question = ReviewAiExchange {
+                    thread_id: exchange.thread_id.clone(),
+                    updated_at_ms: now,
+                    ..stored.clone()
+                } == exchange;
+                if same_question {
+                    exchange.updated_at_ms = stored.updated_at_ms;
+                }
+            }
             self.db
                 .update("review_ai_exchanges")
                 .value("schema_version", i64::from(exchange.schema_version))
                 .value("anchor_json", serde_json::to_string(&exchange.anchor)?)
+                .value("thread_id", exchange.thread_id.clone())
                 .value("question", exchange.question.clone())
                 .value("session_id", exchange.session_id.clone())
                 .value("status", ai_exchange_status_to_str(exchange.status))
                 .value("error", exchange.error.clone())
-                .value("updated_at_ms", u64_to_i64(now))
+                .value("updated_at_ms", u64_to_i64(exchange.updated_at_ms))
                 .filter(Box::new(where_eq(
                     "exchange_id",
                     exchange.exchange_id.clone(),
@@ -574,6 +599,7 @@ impl<'a> CodeReviewDb<'a> {
                 .value("exchange_id", exchange.exchange_id.clone())
                 .value("review_key", review_key.to_string())
                 .value("anchor_json", serde_json::to_string(&exchange.anchor)?)
+                .value("thread_id", exchange.thread_id.clone())
                 .value("question", exchange.question.clone())
                 .value("session_id", exchange.session_id.clone())
                 .value("status", ai_exchange_status_to_str(exchange.status))
@@ -1678,6 +1704,22 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(super::guides::review_guide_areas_table_migration());
     source.add_migration(super::guides::review_guide_threads_table_migration());
     source.add_migration(super::guides::review_guide_marks_table_migration());
+    source.add_migration(ai_exchange_thread_column_migration());
+}
+
+/// The thread an AI exchange was asked from (see `ReviewAiExchange::thread_id`); older rows
+/// read as none.
+pub fn ai_exchange_thread_column_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "036_ai_exchange_thread_column".to_string(),
+        Box::new(alter_table("review_ai_exchanges").add_column(
+            "thread_id".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    )
 }
 
 /// The revision of a saved review's row, changed by every write, so concurrent writers replace
@@ -1991,6 +2033,7 @@ pub fn ai_exchange_from_row(row: &Row) -> Result<ReviewAiExchange, StoreError> {
         schema_version,
         exchange_id: required_text(row, "exchange_id")?,
         anchor: serde_json::from_str(&required_text(row, "anchor_json")?)?,
+        thread_id: optional_text(row, "thread_id"),
         question: required_text(row, "question")?,
         session_id: optional_text(row, "session_id"),
         status: ai_exchange_status_from_str(&required_text(row, "status")?)?,

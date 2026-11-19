@@ -883,6 +883,7 @@ impl ReviewSurface {
             schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
             exchange_id,
             anchor: draft_anchor,
+            thread_id: None,
             question: question.clone(),
             session_id: session,
             status: ReviewAiExchangeStatus::Pending,
