@@ -1,15 +1,19 @@
 # Bundled palette attribution
 
-Bcode's seed palettes record a small set of seed colors (background, text,
-accent, and hue slots) adapted from the color schemes below. Every other role is
-derived by Bcode. Original Bcode palettes (`neon-noir`, `phosphor`, `amber`,
+Bcode's bundled palettes take their colors from the color schemes below.
+Palettes converted to their upstream scheme (`status = "upstream"` in
+`sources.toml`) declare that scheme's exact colors, and `upstream/<id>.toml`
+records the source repository, pinned revision, license, and values; roles the
+scheme does not define are derived by Bcode. Palettes still `pending` record a
+small set of adapted seed colors. See `UPSTREAM.md` for the conversion
+procedure. Original Bcode palettes (`neon-noir`, `phosphor`, `amber`,
 `paper`, `blueprint`, `aurora`, `ember`, `glacier`, `moss`, `dusk`) are authored
-for Bcode.
+for Bcode; `claude-code` is measured from Claude Code's renderer.
 
 | Palette ids | Source scheme | Upstream | License |
 |---|---|---|---|
 | `catppuccin-*` | Catppuccin | github.com/catppuccin/catppuccin | MIT |
-| `tokyonight*` | Tokyo Night | github.com/folke/tokyonight.nvim | Apache-2.0 |
+| `tokyonight*` | Tokyo Night (night, day, moon, storm) | github.com/folke/tokyonight.nvim | Apache-2.0 |
 | `gruvbox` | Gruvbox | github.com/morhetz/gruvbox | MIT |
 | `gruvbox-material` | Gruvbox Material | github.com/sainnhe/gruvbox-material | MIT |
 | `dracula` | Dracula / Alucard | github.com/dracula/dracula-theme | MIT |
