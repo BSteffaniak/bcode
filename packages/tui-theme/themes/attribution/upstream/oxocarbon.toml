@@ -1,0 +1,150 @@
+# Upstream reference for the `oxocarbon` palette. Values were extracted by script
+# from `file` at `revision` (the compiled Lua of fnl/oxocarbon/init.fnl), using the
+# dark table (vim.o.background == "dark"). base01-base05 are computed at load
+# with blend-hex (an HSLuv blend of base00 and base06); the script ports
+# lua/oxocarbon/colorutils.lua line by line (HSLuv conversion, radial hue and
+# linear saturation/lightness tween, rgb->hex with floor(x * 255 + 0.5)) and
+# reproduces IBM Carbon's grays (#262626, #393939, #525252) for base01-base03.
+# Groups are resolved from the last nvim_set_hl call for each name, following
+# links (names are case-insensitive, so DiffAdded/DiffRemoved define
+# diffAdded/diffRemoved): @string -> String, @number -> Number (the later of
+# the two @number definitions), @type -> Type, @operator -> Operator,
+# @markup.heading -> Title, @markup.link -> markdownUrl -> String,
+# @markup.raw(.markdown_inline) -> String, @markup.list -> markdownListMarker.
+# Oxocarbon has numbered colors, not hue names; hues follow each color's hue and
+# its diagnostic use: base09 blue (primary blue, also accent and DiagnosticInfo),
+# base08 cyan, base13 green, base12 magenta, base10 red (DiagnosticError), base14
+# violet (also DiagnosticWarn). The scheme has no yellow or orange, no
+# DiagnosticOk and no secondary foreground (StatusLine uses Normal's fg), so
+# yellow, orange, success and muted are omitted, as is markup_code_bg (String
+# sets no background). FloatBorder paints `blend` on `blend`, so the focused
+# border equals the float surface.
+palette  = "oxocarbon"
+scheme   = "Oxocarbon (dark)"
+source   = "https://github.com/nyoom-engineering/oxocarbon.nvim"
+revision = "cd6523a0836d6e8ee823d343149fd06c7b71fdde"
+license  = "MIT"
+
+[variants.dark]
+file = "lua/oxocarbon/init.lua"
+
+[variants.dark.colors]
+"@function.fg"                   = "#ff7eb6"
+"@keyword.fg"                    = "#78a9ff"
+"@markup.heading.fg"             = "#d0d0d0"
+"@markup.link.fg"                = "#be95ff"
+"@markup.list.fg"                = "#3ddbd9"
+"@markup.raw.fg"                 = "#be95ff"
+"@markup.raw.markdown_inline.fg" = "#be95ff"
+"@number.fg"                     = "#82cfff"
+"@operator.fg"                   = "#78a9ff"
+"@punctuation.delimiter.fg"      = "#3ddbd9"
+"@string.fg"                     = "#be95ff"
+"@type.fg"                       = "#78a9ff"
+"@variable.fg"                   = "#d0d0d0"
+"Comment.fg"                     = "#525252"
+"CursorLine.bg"                  = "#262626"
+"DiagnosticError.fg"             = "#ee5396"
+"DiagnosticInfo.fg"              = "#78a9ff"
+"DiagnosticWarn.fg"              = "#be95ff"
+"DiffAdd.bg"                     = "#122f2f"
+"DiffDelete.bg"                  = "#361c28"
+"FloatBorder.fg"                 = "#131313"
+"LineNr.fg"                      = "#525252"
+"Normal.bg"                      = "#161616"
+"Normal.fg"                      = "#d0d0d0"
+"NormalFloat.bg"                 = "#131313"
+"Visual.bg"                      = "#393939"
+"WinSeparator.fg"                = "#262626"
+base00                           = "#161616"
+base01                           = "#262626"
+base02                           = "#393939"
+base03                           = "#525252"
+base04                           = "#d0d0d0"
+base07                           = "#08bdba"
+base08                           = "#3ddbd9"
+base09                           = "#78a9ff"
+base10                           = "#ee5396"
+base12                           = "#ff7eb6"
+base13                           = "#42be65"
+base14                           = "#be95ff"
+blend                            = "#131313"
+"diffAdded.fg"                   = "#08bdba"
+"diffRemoved.fg"                 = "#ee5396"
+
+[variants.dark.slots]
+background         = "base00"
+text               = "base04"
+accent             = "base09"
+blue               = "base09"
+cyan               = "base08"
+green              = "base13"
+magenta            = "base12"
+red                = "base10"
+violet             = "base14"
+info               = "base09"
+warning            = "base14"
+error              = "base10"
+comment            = "base03"
+border             = "base01"
+border_focused     = "blend"
+surface            = "blend"
+selection          = "base02"
+line_highlight     = "base01"
+gutter             = "base03"
+diff_add           = "base07"
+diff_remove        = "base10"
+diff_add_bg        = "DiffAdd.bg"
+diff_remove_bg     = "DiffDelete.bg"
+syntax_keyword     = "@keyword.fg"
+syntax_function    = "@function.fg"
+syntax_variable    = "@variable.fg"
+syntax_string      = "@string.fg"
+syntax_number      = "@number.fg"
+syntax_type        = "@type.fg"
+syntax_operator    = "@operator.fg"
+syntax_punctuation = "@punctuation.delimiter.fg"
+markup_heading     = "@markup.heading.fg"
+markup_link        = "@markup.link.fg"
+markup_raw         = "@markup.raw.fg"
+markup_code        = "@markup.raw.markdown_inline.fg"
+markup_list        = "@markup.list.fg"
+
+[variants.dark.roles]
+"canvas.bg"               = "Normal.bg"
+"canvas.fg"               = "Normal.fg"
+"text.primary.fg"         = "Normal.fg"
+"border.default.fg"       = "WinSeparator.fg"
+"border.focused.fg"       = "FloatBorder.fg"
+"surface.raised.bg"       = "NormalFloat.bg"
+"surface.overlay.bg"      = "NormalFloat.bg"
+"selection.active.bg"     = "Visual.bg"
+"selection.inactive.bg"   = "CursorLine.bg"
+"source.gutter.fg"        = "LineNr.fg"
+"state.info.fg"           = "DiagnosticInfo.fg"
+"state.warning.fg"        = "DiagnosticWarn.fg"
+"state.error.fg"          = "DiagnosticError.fg"
+"diff.added.fg"           = "diffAdded.fg"
+"diff.removed.fg"         = "diffRemoved.fg"
+"diff.added_row.bg"       = "DiffAdd.bg"
+"diff.removed_row.bg"     = "DiffDelete.bg"
+"title.fg"                = "base09"
+"markdown.text.fg"        = "Normal.fg"
+"markdown.heading.fg"     = "@markup.heading.fg"
+"markdown.link.fg"        = "@markup.link.fg"
+"link.fg"                 = "@markup.link.fg"
+"markdown.inline_code.fg" = "@markup.raw.markdown_inline.fg"
+"markdown.list_marker.fg" = "@markup.list.fg"
+"syntax.text.fg"          = "Normal.fg"
+"syntax.comment.fg"       = "Comment.fg"
+"syntax.keyword.fg"       = "@keyword.fg"
+"syntax.function.fg"      = "@function.fg"
+"syntax.variable.fg"      = "@variable.fg"
+"syntax.string.fg"        = "@string.fg"
+"syntax.number.fg"        = "@number.fg"
+"syntax.type.fg"          = "@type.fg"
+"syntax.operator.fg"      = "@operator.fg"
+"syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"syntax.heading.fg"       = "@markup.heading.fg"
+"syntax.link.fg"          = "@markup.link.fg"
+"syntax.raw.fg"           = "@markup.raw.fg"
