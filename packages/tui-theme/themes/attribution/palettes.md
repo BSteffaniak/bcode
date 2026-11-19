@@ -29,7 +29,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `modus` | Modus Vivendi / Operandi | github.com/miikanissi/modus-themes.nvim (scheme: github.com/protesilaos/modus-themes) | GPL-3.0 (review required) |
 | `flexoki` | Flexoki (dark, light) | github.com/kepano/flexoki-neovim (palette: github.com/kepano/flexoki) | MIT |
 | `poimandres` | Poimandres | github.com/olivercederborg/poimandres.nvim (port of github.com/drcmda/poimandres-theme, MIT) | None declared (review required) |
-| `vesper` | Vesper | github.com/raunofreiberg/vesper | MIT |
+| `vesper` | Vesper | github.com/datsfilipe/vesper.nvim (scheme: github.com/raunofreiberg/vesper) | MIT |
 | `melange` | Melange | github.com/savq/melange-nvim | MIT |
 | `zenburn` | Zenburn | github.com/jnurmine/Zenburn | GNU GPL, version unstated (GPL-1.0-or-later; review required) |
 | `monokai-classic` | Monokai Pro (classic filter) | github.com/loctvl842/monokai-pro.nvim (scheme: monokai.pro) | MIT port (review required) |

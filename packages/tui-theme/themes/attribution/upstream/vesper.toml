@@ -1,0 +1,158 @@
+# Upstream reference for the `vesper` palette. Values are copied exactly from
+# `file` at `revision`; see attribution/UPSTREAM.md.
+#
+# Read from datsfilipe/vesper.nvim: the colors table in lua/vesper/colors.lua
+# and the groups in set_groups() of lua/vesper/init.lua, with default options
+# (not transparent). Several colors are computed by the port's utils.mix
+# (per channel alpha*fg + (1-alpha)*bg, rounded half up) or utils.shade
+# (mix toward #ffffff unless a base is given); the values here reproduce those
+# formulas exactly: fg = mix(#FFFFFF, #000000, 0.80), green and greenLight =
+# mix(#99FFE4, #000000, 0.85), comment = mix(#8b8b8b, #000000, 0.90),
+# Visual.bg = shade(bgDarker, 0.70), DiffAdd.fg = shade(green, 0.5, bg),
+# DiffDelete.fg = shade(red, 0.5, bg). Group names are case-insensitive
+# (the port's `Winseparator` links WinSeparator to VertSplit). Captures the port
+# leaves undefined follow Neovim's default links (neovim/neovim v0.12.6
+# src/nvim/highlight_group.c): @markup.heading -> Title, @markup.raw and
+# @markup.list -> @markup -> Special.
+#
+# Vesper names no blue, cyan, or yellow; those hues use the port's own terminal
+# colors (terminal_color_4 greenLight, terminal_color_6 primary,
+# terminal_color_3 yellowDark). magenta is the port's `purple`, which is also
+# the function color used as accent. muted is fgInactive (StatusLineNC),
+# border_focused the palette's borderFocus. The port draws diff rows on the
+# normal background (DiffAdd/DiffDelete bg = bg). Omitted: markup_link
+# (@markup.link -> Underlined has no color), markup_code_bg (no background),
+# success (no DiagnosticOk).
+palette  = "vesper"
+scheme   = "Vesper"
+source   = "https://github.com/datsfilipe/vesper.nvim"
+revision = "1717b1ad657c94bec3fc2bdebb0c55452d9fe46d"
+license  = "MIT"
+
+[variants.dark]
+file = "lua/vesper/colors.lua + lua/vesper/init.lua"
+
+[variants.dark.colors]
+"@function.fg"                   = "#ffcfa8"
+"@keyword.fg"                    = "#a0a0a0"
+"@markup.heading.fg"             = "#82d9c2"
+"@markup.list.fg"                = "#65737e"
+"@markup.raw.fg"                 = "#65737e"
+"@markup.raw.markdown_inline.fg" = "#65737e"
+"@number.fg"                     = "#ffffff"
+"@operator.fg"                   = "#a0a0a0"
+"@punctuation.delimiter.fg"      = "#65737e"
+"@string.fg"                     = "#82d9c2"
+"@type.fg"                       = "#ffcfa8"
+"@variable.fg"                   = "#ffffff"
+"Comment.fg"                     = "#7d7d7d"
+"CursorLine.bg"                  = "#343434"
+"DiagnosticError.fg"             = "#ff8080"
+"DiagnosticInfo.fg"              = "#99ffe4"
+"DiagnosticWarn.fg"              = "#ffc799"
+"DiffAdd.bg"                     = "#101010"
+"DiffAdd.fg"                     = "#497569"
+"DiffDelete.bg"                  = "#101010"
+"DiffDelete.fg"                  = "#884848"
+"Function.fg"                    = "#ffcfa8"
+"LineNr.fg"                      = "#505050"
+"Normal.bg"                      = "#101010"
+"Normal.fg"                      = "#cccccc"
+"NormalFloat.bg"                 = "#282828"
+"StatusLineNC.fg"                = "#65737e"
+"Visual.bg"                      = "#656565"
+"WinSeparator.fg"                = "#505050"
+bg                               = "#101010"
+bgFloat                          = "#282828"
+bgOption                         = "#343434"
+border                           = "#505050"
+borderFocus                      = "#65737e"
+comment                          = "#7d7d7d"
+error                            = "#ff8080"
+fg                               = "#cccccc"
+fgInactive                       = "#65737e"
+fgLineNr                         = "#505050"
+green                            = "#82d9c2"
+greenLight                       = "#82d9c2"
+info                             = "#99ffe4"
+orange                           = "#ffcfa8"
+primary                          = "#a0a0a0"
+purple                           = "#ffcfa8"
+red                              = "#ff8080"
+warn                             = "#ffc799"
+yellowDark                       = "#ffc799"
+
+[variants.dark.slots]
+background         = "bg"
+text               = "fg"
+accent             = "purple"
+blue               = "greenLight"
+cyan               = "primary"
+green              = "green"
+magenta            = "purple"
+orange             = "orange"
+red                = "red"
+yellow             = "yellowDark"
+info               = "info"
+warning            = "warn"
+error              = "error"
+muted              = "fgInactive"
+comment            = "comment"
+border             = "border"
+border_focused     = "borderFocus"
+surface            = "bgFloat"
+selection          = "Visual.bg"
+line_highlight     = "bgOption"
+gutter             = "fgLineNr"
+diff_add           = "DiffAdd.fg"
+diff_remove        = "DiffDelete.fg"
+diff_add_bg        = "bg"
+diff_remove_bg     = "bg"
+syntax_keyword     = "@keyword.fg"
+syntax_function    = "@function.fg"
+syntax_variable    = "@variable.fg"
+syntax_string      = "@string.fg"
+syntax_number      = "@number.fg"
+syntax_type        = "@type.fg"
+syntax_operator    = "@operator.fg"
+syntax_punctuation = "@punctuation.delimiter.fg"
+markup_heading     = "@markup.heading.fg"
+markup_raw         = "@markup.raw.fg"
+markup_code        = "@markup.raw.markdown_inline.fg"
+markup_list        = "@markup.list.fg"
+
+[variants.dark.roles]
+"canvas.bg"               = "Normal.bg"
+"canvas.fg"               = "Normal.fg"
+"text.primary.fg"         = "Normal.fg"
+"markdown.text.fg"        = "Normal.fg"
+"syntax.text.fg"          = "Normal.fg"
+"state.info.fg"           = "DiagnosticInfo.fg"
+"state.warning.fg"        = "DiagnosticWarn.fg"
+"state.error.fg"          = "DiagnosticError.fg"
+"text.muted.fg"           = "StatusLineNC.fg"
+"syntax.comment.fg"       = "Comment.fg"
+"border.default.fg"       = "WinSeparator.fg"
+"border.focused.fg"       = "borderFocus"
+"surface.raised.bg"       = "NormalFloat.bg"
+"surface.overlay.bg"      = "NormalFloat.bg"
+"selection.active.bg"     = "Visual.bg"
+"selection.inactive.bg"   = "CursorLine.bg"
+"source.gutter.fg"        = "LineNr.fg"
+"diff.added.fg"           = "DiffAdd.fg"
+"diff.removed.fg"         = "DiffDelete.fg"
+"diff.added_row.bg"       = "DiffAdd.bg"
+"diff.removed_row.bg"     = "DiffDelete.bg"
+"syntax.keyword.fg"       = "@keyword.fg"
+"syntax.function.fg"      = "@function.fg"
+"syntax.variable.fg"      = "@variable.fg"
+"syntax.string.fg"        = "@string.fg"
+"syntax.number.fg"        = "@number.fg"
+"syntax.type.fg"          = "@type.fg"
+"syntax.operator.fg"      = "@operator.fg"
+"syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"markdown.heading.fg"     = "@markup.heading.fg"
+"syntax.heading.fg"       = "@markup.heading.fg"
+"syntax.raw.fg"           = "@markup.raw.fg"
+"markdown.inline_code.fg" = "@markup.raw.markdown_inline.fg"
+"markdown.list_marker.fg" = "@markup.list.fg"
