@@ -1210,9 +1210,21 @@ fn write_theme_command(
         ThemeCommand::Profiles { json } => theme_explain::run_profiles(json, writer)?,
         ThemeCommand::Check {
             theme,
+            all,
             strict,
             json,
-        } => theme_check::run_check(theme.as_deref(), strict, json, writer)?,
+            bless,
+            accepted,
+        } => theme_check::run_check(
+            &theme_check::CheckOptions {
+                selection: theme_check::CheckSelection::new(theme.as_deref(), all),
+                strict,
+                json,
+                bless,
+                accepted: accepted.as_deref(),
+            },
+            writer,
+        )?,
         ThemeCommand::Explain {
             theme,
             profile,
@@ -5757,20 +5769,38 @@ enum ThemeCommand {
     /// pairs; unknown style roles and container keys; roles that resolve only
     /// through seed derivation or host fallbacks; role registry coverage; and
     /// structural presentation rule diagnostics, including rules that cross
-    /// the visibility floor. Warnings do not fail the command unless
-    /// `--strict` is given.
+    /// the visibility floor.
+    ///
+    /// Warnings are compared with the theme's accepted findings
+    /// (`check-accepted.toml` next to the theme, or the accepted findings
+    /// shipped for bundled themes). The command fails on findings that are not
+    /// accepted and on accepted contrast findings that got worse; accepted
+    /// entries that no longer occur are reported as stale. `--bless` accepts
+    /// the current findings.
     Check {
         /// Theme id, profile id, or theme file path; defaults to the
         /// configured theme with its profile and overlays. Profiles are
         /// checked over the default theme.
-        #[arg(value_name = "THEME")]
+        #[arg(value_name = "THEME", conflicts_with = "all")]
         theme: Option<String>,
-        /// Exit with an error when the report has any warning.
+        /// Check every theme, profile, and base in the catalog.
+        #[arg(long)]
+        all: bool,
+        /// Also fail when accepted findings no longer occur (stale entries).
         #[arg(long)]
         strict: bool,
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Accept the current findings: rewrite the checked themes' entries
+        /// in the accepted-findings file, keeping reasons and removing stale
+        /// entries.
+        #[arg(long)]
+        bless: bool,
+        /// Accepted-findings file to read (and, with `--bless`, write)
+        /// instead of the one next to each theme.
+        #[arg(long, value_name = "PATH")]
+        accepted: Option<PathBuf>,
     },
     /// List theme profiles (bundled and discovered) with descriptions.
     Profiles {
