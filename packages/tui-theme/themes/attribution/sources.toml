@@ -20,56 +20,32 @@ status = "original"
 status = "original"
 
 [palettes.ayu]
-candidates = [
-    "https://github.com/ayu-theme/ayu-colors",
-    "https://github.com/Shatur/neovim-ayu",
-]
-family = "Ayu (dark; light: light)"
-status = "pending"
+status = "upstream"
 
 [palettes.ayu-mirage]
-candidates = [
-    "https://github.com/ayu-theme/ayu-colors",
-    "https://github.com/Shatur/neovim-ayu",
-]
-family = "Ayu (mirage)"
-status = "pending"
+status = "upstream"
 
 [palettes.blueprint]
 status = "original"
 
 [palettes.catppuccin-frappe]
-candidates = ["https://github.com/catppuccin/nvim", "https://github.com/catppuccin/palette"]
-family     = "Catppuccin (frappe)"
-status     = "pending"
+status = "upstream"
 
 [palettes.catppuccin-latte]
-candidates = ["https://github.com/catppuccin/nvim", "https://github.com/catppuccin/palette"]
-family     = "Catppuccin (latte)"
-status     = "pending"
+status = "upstream"
 
 [palettes.catppuccin-macchiato]
-candidates = ["https://github.com/catppuccin/nvim", "https://github.com/catppuccin/palette"]
-family     = "Catppuccin (macchiato)"
-status     = "pending"
+status = "upstream"
 
 [palettes.catppuccin-mocha]
-candidates = ["https://github.com/catppuccin/nvim", "https://github.com/catppuccin/palette"]
-family     = "Catppuccin (mocha; light: latte)"
-status     = "pending"
+status = "upstream"
 
 [palettes.claude-code]
 note   = "Measured from Claude Code's renderer with scripts/appearance-reference; see docs/appearance-reference.md."
 status = "measured"
 
 [palettes.dracula]
-candidates = [
-    "https://github.com/dracula/vim",
-    "https://github.com/dracula/dracula-theme",
-    "https://github.com/Mofiqul/dracula.nvim",
-]
-family = "Dracula (dark; light: Alucard)"
-status = "pending"
+status = "upstream"
 
 [palettes.dusk]
 status = "original"
@@ -78,76 +54,40 @@ status = "original"
 status = "original"
 
 [palettes.everforest]
-candidates = ["https://github.com/sainnhe/everforest", "https://github.com/neanias/everforest-nvim"]
-family     = "Everforest (dark medium; light: light medium)"
-status     = "pending"
+status = "upstream"
 
 [palettes.flexoki]
-candidates = ["https://github.com/kepano/flexoki", "https://github.com/kepano/flexoki-neovim"]
-family     = "Flexoki (dark; light: light)"
-status     = "pending"
+status = "upstream"
 
 [palettes.github]
-candidates = [
-    "https://github.com/projekt0n/github-nvim-theme",
-    "https://github.com/primer/github-vscode-theme",
-    "https://github.com/primer/primitives",
-]
-family = "GitHub (dark default; light: light default)"
-status = "pending"
+status = "upstream"
 
 [palettes.github-dimmed]
-candidates = [
-    "https://github.com/projekt0n/github-nvim-theme",
-    "https://github.com/primer/github-vscode-theme",
-    "https://github.com/primer/primitives",
-]
-family = "GitHub (dark dimmed)"
-status = "pending"
+status = "upstream"
 
 [palettes.glacier]
 status = "original"
 
 [palettes.gruvbox]
-candidates = ["https://github.com/ellisonleao/gruvbox.nvim", "https://github.com/morhetz/gruvbox"]
-family     = "Gruvbox (dark medium; light: light medium)"
-status     = "pending"
+status = "upstream"
 
 [palettes.gruvbox-material]
-candidates = ["https://github.com/sainnhe/gruvbox-material"]
-family     = "Gruvbox Material (dark medium; light: light medium)"
-status     = "pending"
+status = "upstream"
 
 [palettes.kanagawa]
-candidates = ["https://github.com/rebelot/kanagawa.nvim"]
-family     = "Kanagawa (wave; light: lotus)"
-status     = "pending"
+status = "upstream"
 
 [palettes.kanagawa-dragon]
-candidates = ["https://github.com/rebelot/kanagawa.nvim"]
-family     = "Kanagawa (dragon)"
-status     = "pending"
+status = "upstream"
 
 [palettes.melange]
-candidates = ["https://github.com/savq/melange-nvim"]
-family     = "Melange (dark; light: light)"
-status     = "pending"
+status = "upstream"
 
 [palettes.modus]
-candidates = [
-    "https://github.com/miikanissi/modus-themes.nvim",
-    "https://github.com/protesilaos/modus-themes",
-]
-family = "Modus (vivendi; light: operandi)"
-status = "pending"
+status = "upstream"
 
 [palettes.monokai-classic]
-candidates = [
-    "https://github.com/loctvl842/monokai-pro.nvim",
-    "https://github.com/tanvirtin/monokai.nvim",
-]
-family = "Monokai (classic)"
-status = "pending"
+status = "upstream"
 
 [palettes.moss]
 status = "original"
@@ -156,27 +96,16 @@ status = "original"
 status = "original"
 
 [palettes.night-owl]
-candidates = ["https://github.com/oxfist/night-owl.nvim", "https://github.com/sdras/night-owl-vscode-theme"]
-family     = "Night Owl"
-status     = "pending"
+status = "upstream"
 
 [palettes.nightfox]
-candidates = ["https://github.com/EdenEast/nightfox.nvim"]
-family     = "Nightfox (nightfox; light: dawnfox)"
-status     = "pending"
+status = "upstream"
 
 [palettes.one]
-candidates = [
-    "https://github.com/navarasu/onedark.nvim",
-    "https://github.com/atom/atom/tree/master/packages/one-dark-syntax",
-]
-family = "One (dark; light: light)"
-status = "pending"
+status = "upstream"
 
 [palettes.oxocarbon]
-candidates = ["https://github.com/nyoom-engineering/oxocarbon.nvim"]
-family     = "Oxocarbon (dark)"
-status     = "pending"
+status = "upstream"
 
 [palettes.paper]
 status = "original"
@@ -185,24 +114,16 @@ status = "original"
 status = "original"
 
 [palettes.poimandres]
-candidates = ["https://github.com/olivercederborg/poimandres.nvim", "https://github.com/drcmda/poimandres-theme"]
-family     = "Poimandres"
-status     = "pending"
+status = "upstream"
 
 [palettes.rose-pine]
-candidates = ["https://github.com/rose-pine/neovim", "https://github.com/rose-pine/rose-pine-palette"]
-family     = "Rose Pine (main; light: dawn)"
-status     = "pending"
+status = "upstream"
 
 [palettes.rose-pine-moon]
-candidates = ["https://github.com/rose-pine/neovim", "https://github.com/rose-pine/rose-pine-palette"]
-family     = "Rose Pine (moon)"
-status     = "pending"
+status = "upstream"
 
 [palettes.solarized]
-candidates = ["https://github.com/altercation/solarized", "https://github.com/maxmx03/solarized.nvim"]
-family     = "Solarized (dark; light: light)"
-status     = "pending"
+status = "upstream"
 
 [palettes.tokyonight]
 status = "upstream"
@@ -214,11 +135,7 @@ status = "upstream"
 status = "upstream"
 
 [palettes.vesper]
-candidates = ["https://github.com/datsfilipe/vesper.nvim", "https://github.com/raunofreiberg/vesper"]
-family     = "Vesper"
-status     = "pending"
+status = "upstream"
 
 [palettes.zenburn]
-candidates = ["https://github.com/phha/zenburn.nvim", "https://github.com/jnurmine/Zenburn"]
-family     = "Zenburn"
-status     = "pending"
+status = "upstream"

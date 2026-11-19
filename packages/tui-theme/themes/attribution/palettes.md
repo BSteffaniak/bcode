@@ -4,9 +4,8 @@ Bcode's bundled palettes take their colors from the color schemes below.
 Palettes converted to their upstream scheme (`status = "upstream"` in
 `sources.toml`) declare that scheme's exact colors, and `upstream/<id>.toml`
 records the source repository, pinned revision, license, and values; roles the
-scheme does not define are derived by Bcode. Palettes still `pending` record a
-small set of adapted seed colors. See `UPSTREAM.md` for the conversion
-procedure. Original Bcode palettes (`neon-noir`, `phosphor`, `amber`,
+scheme does not define are derived by Bcode. See `UPSTREAM.md` for the
+conversion procedure. Original Bcode palettes (`neon-noir`, `phosphor`, `amber`,
 `paper`, `blueprint`, `aurora`, `ember`, `glacier`, `moss`, `dusk`) are authored
 for Bcode; `claude-code` is measured from Claude Code's renderer.
 
