@@ -325,3 +325,115 @@ fn unknown_schema_versions_are_refused_and_left_untouched() {
         Err(FeedbackStoreError::UnsupportedSchema(99))
     ));
 }
+
+fn attach_request(
+    id: FeedbackId,
+    source: &std::path::Path,
+    name: &str,
+) -> bcode_feedback_models::AttachFeedbackRequest {
+    bcode_feedback_models::AttachFeedbackRequest {
+        id,
+        source: source.to_string_lossy().into_owned(),
+        name: name.into(),
+        media_type: "application/x-bmux-recording".into(),
+        description: Some("the pane around the feedback".into()),
+        sensitive: false,
+    }
+}
+
+#[test]
+fn files_and_directory_trees_are_copied_into_the_store_and_read_back() {
+    use bcode_feedback_models::AttachmentKind;
+    let (dir, store) = store();
+    let id = record(&store, "bmux", "flicker", Vec::new());
+    let sources = tempfile::tempdir().unwrap();
+    let file = sources.path().join("clip.txt");
+    std::fs::write(&file, b"MARKER-B\n").unwrap();
+    let tree = sources.path().join("cut");
+    std::fs::create_dir_all(tree.join("nested")).unwrap();
+    std::fs::write(tree.join("manifest.json"), b"{}").unwrap();
+    std::fs::write(tree.join("nested").join("events_0.bin"), b"12345").unwrap();
+
+    store
+        .attach(&attach_request(id, &file, "clip.txt"), 10)
+        .unwrap();
+    let item = store.attach(&attach_request(id, &tree, "cut"), 11).unwrap();
+
+    assert_eq!(item.attachments.len(), 2);
+    let (text, cut) = (&item.attachments[0], &item.attachments[1]);
+    assert_eq!(
+        (text.ordinal, text.kind, text.bytes),
+        (1, AttachmentKind::File, 9)
+    );
+    assert_eq!(
+        (cut.ordinal, cut.kind, cut.bytes),
+        (2, AttachmentKind::Directory, 7)
+    );
+    assert!(
+        cut.path
+            .starts_with(&dir.path().to_string_lossy().into_owned())
+    );
+    assert_eq!(std::fs::read(&text.path).unwrap(), b"MARKER-B\n");
+    assert_eq!(
+        std::fs::read(std::path::Path::new(&cut.path).join("nested/events_0.bin")).unwrap(),
+        b"12345"
+    );
+    drop(sources);
+    assert!(
+        std::path::Path::new(&cut.path)
+            .join("manifest.json")
+            .exists(),
+        "the store keeps its own copy after the source is gone"
+    );
+    assert_eq!(store.get(id).unwrap().attachments, item.attachments);
+}
+
+#[cfg(unix)]
+#[test]
+fn symbolic_links_and_missing_sources_are_refused_without_leaving_copies() {
+    let (dir, store) = store();
+    let id = record(&store, "bmux", "flicker", Vec::new());
+    let sources = tempfile::tempdir().unwrap();
+    let secret = sources.path().join("secret");
+    std::fs::write(&secret, b"key").unwrap();
+    let tree = sources.path().join("cut");
+    std::fs::create_dir(&tree).unwrap();
+    std::os::unix::fs::symlink(&secret, tree.join("link")).unwrap();
+    let link = sources.path().join("direct-link");
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+    for (source, name) in [
+        (tree.as_path(), "cut"),
+        (link.as_path(), "link"),
+        (sources.path().join("missing").as_path(), "missing"),
+    ] {
+        assert!(matches!(
+            store.attach(&attach_request(id, source, name), 1),
+            Err(FeedbackStoreError::AttachmentRejected(_))
+        ));
+    }
+    assert_eq!(store.get(id).unwrap().attachments, Vec::new());
+    let stored = dir.path().join("feedback/attachments").join(id.to_string());
+    assert!(
+        !stored.exists() || std::fs::read_dir(&stored).unwrap().next().is_none(),
+        "nothing is left behind"
+    );
+}
+
+#[test]
+fn items_hold_a_bounded_number_of_attachments() {
+    let (_dir, store) = store();
+    let id = record(&store, "bmux", "flicker", Vec::new());
+    let sources = tempfile::tempdir().unwrap();
+    let file = sources.path().join("clip.txt");
+    std::fs::write(&file, b"x").unwrap();
+    for n in 0..bcode_feedback_models::MAX_ATTACHMENTS {
+        store
+            .attach(&attach_request(id, &file, &format!("clip-{n}.txt")), 1)
+            .unwrap();
+    }
+    assert!(matches!(
+        store.attach(&attach_request(id, &file, "one-more.txt"), 1),
+        Err(FeedbackStoreError::AttachmentRejected(_))
+    ));
+}

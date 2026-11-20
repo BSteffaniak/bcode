@@ -122,6 +122,23 @@ async fn create_schema(db: &dyn Database) -> Result<(), FeedbackStoreError> {
         .foreign_key_column("to_id", "feedback_items", "id")
         .execute(db)
         .await?;
+    create_table("feedback_attachments")
+        .columns(vec![
+            column("item_id", DataType::BigInt, false),
+            column("ordinal", DataType::BigInt, false),
+            column("name", DataType::Text, false),
+            column("kind", DataType::Text, false),
+            column("media_type", DataType::Text, false),
+            column("bytes", DataType::BigInt, false),
+            column("description", DataType::Text, true),
+            column("sensitive", DataType::BigInt, false),
+            column("stored_path", DataType::Text, false),
+            column("created_at_ms", DataType::BigInt, false),
+        ])
+        .primary_key_columns(["item_id", "ordinal"])
+        .foreign_key_column("item_id", "feedback_items", "id")
+        .execute(db)
+        .await?;
     for (name, table, columns) in [
         ("feedback_items_app", "feedback_items", vec!["app", "id"]),
         (

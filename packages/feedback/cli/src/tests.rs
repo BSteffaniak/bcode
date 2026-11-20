@@ -16,6 +16,7 @@ fn item(facets: Vec<Facet>) -> FeedbackItem {
         status: FeedbackStatus::Open,
         status_change: None,
         links: Vec::new(),
+        attachments: Vec::new(),
     }
 }
 

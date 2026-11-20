@@ -41,6 +41,8 @@ pub const OP_LINK: &str = "link";
 pub const OP_INTAKE_SESSION: &str = "intake_session";
 /// Set the intake session if it still matches: [`ClaimIntakeSessionRequest`] → [`IntakeSession`].
 pub const OP_CLAIM_INTAKE_SESSION: &str = "claim_intake_session";
+/// Copy a file or directory into an item: [`AttachFeedbackRequest`] → [`FeedbackItem`].
+pub const OP_ATTACH: &str = "attach";
 
 /// Maximum UTF-8 bytes of feedback text.
 pub const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -72,6 +74,14 @@ pub const MAX_REFERENCE_BYTES: usize = 128;
 pub const MAX_PAGE_LIMIT: usize = 100;
 /// Value shown to models in place of a sensitive facet value.
 pub const REDACTED_VALUE: &str = "[sensitive]";
+/// Maximum attachments on one item.
+pub const MAX_ATTACHMENTS: usize = 16;
+/// Maximum total bytes of one attachment, counting every file of a directory.
+pub const MAX_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum files in one directory attachment.
+pub const MAX_ATTACHMENT_FILES: usize = 1024;
+/// Maximum UTF-8 bytes of an attachment name or media type.
+pub const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 
 /// Reason a feedback value or request is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -120,6 +130,19 @@ pub enum FeedbackValidationError {
     /// A page limit is zero or larger than [`MAX_PAGE_LIMIT`].
     #[error("page limit must be 1-{MAX_PAGE_LIMIT}")]
     InvalidLimit,
+    /// An attachment name is empty, too long, or not a plain file name.
+    #[error(
+        "attachment names must be 1-{MAX_ATTACHMENT_NAME_BYTES} bytes of [A-Za-z0-9._-], not starting with a dot"
+    )]
+    InvalidAttachmentName,
+    /// An attachment media type is empty, too long, or malformed.
+    #[error(
+        "attachment media types look like text/plain and are at most {MAX_ATTACHMENT_NAME_BYTES} bytes"
+    )]
+    InvalidMediaType,
+    /// An attachment source is not an absolute path.
+    #[error("attachment sources must be absolute paths")]
+    RelativeAttachmentSource,
     /// A feedback id does not parse.
     #[error("feedback ids look like fb-12")]
     InvalidId,
@@ -329,16 +352,25 @@ pub struct FeedbackItem {
     /// Outgoing links.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<FeedbackLink>,
+    /// Files and directories attached to the item, such as a recording clip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<FeedbackAttachment>,
 }
 
 impl FeedbackItem {
-    /// Return a copy safe for model context: sensitive facet values are redacted.
+    /// Return a copy safe for model context: sensitive facet values and the locations of
+    /// sensitive attachments are redacted.
     #[must_use]
     pub fn redacted(&self) -> Self {
         let mut item = self.clone();
         for facet in &mut item.facets {
             if facet.sensitive {
                 REDACTED_VALUE.clone_into(&mut facet.value);
+            }
+        }
+        for attachment in &mut item.attachments {
+            if attachment.sensitive {
+                REDACTED_VALUE.clone_into(&mut attachment.path);
             }
         }
         item
@@ -351,6 +383,102 @@ impl FeedbackItem {
             || self.text.lines().next().unwrap_or_default().trim(),
             |triage| triage.title.as_str(),
         )
+    }
+}
+
+/// Whether an attachment is one file or a directory tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    /// A regular file.
+    File,
+    /// A directory of regular files, such as a recording in its native format.
+    Directory,
+}
+
+/// A file or directory copied into the feedback store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackAttachment {
+    /// Position on the item, from 1.
+    pub ordinal: u32,
+    /// Plain name, such as `recording.gif`.
+    pub name: String,
+    /// File or directory.
+    pub kind: AttachmentKind,
+    /// Media type, such as `image/gif` or `application/x-bmux-recording`.
+    pub media_type: String,
+    /// Total bytes.
+    pub bytes: u64,
+    /// What it shows and why it was attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Withhold its location from models.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
+    /// Absolute path of the stored copy, or [`REDACTED_VALUE`] for models.
+    pub path: String,
+    /// When it was attached, in Unix milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Copy a file or directory into an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachFeedbackRequest {
+    /// Item to attach to.
+    pub id: FeedbackId,
+    /// Absolute path of the file or directory to copy. Symbolic links are refused.
+    pub source: String,
+    /// Plain name for the stored copy.
+    pub name: String,
+    /// Media type, such as `text/plain`.
+    pub media_type: String,
+    /// What it shows and why it was attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Withhold its location from models.
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+impl AttachFeedbackRequest {
+    /// Check the name, media type, description and that the source is absolute.
+    ///
+    /// # Errors
+    /// [`FeedbackValidationError::InvalidAttachmentName`], `InvalidMediaType`, `InvalidNote` or
+    /// `RelativeAttachmentSource`.
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        let name_ok = !self.name.is_empty()
+            && self.name.len() <= MAX_ATTACHMENT_NAME_BYTES
+            && !self.name.starts_with('.')
+            && self
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        if !name_ok {
+            return Err(FeedbackValidationError::InvalidAttachmentName);
+        }
+        let media_ok = self.media_type.len() <= MAX_ATTACHMENT_NAME_BYTES
+            && self
+                .media_type
+                .split_once('/')
+                .is_some_and(|(kind, subtype)| {
+                    !kind.is_empty()
+                        && !subtype.is_empty()
+                        && self.media_type.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'/' | b'.' | b'+' | b'-')
+                        })
+                });
+        if !media_ok {
+            return Err(FeedbackValidationError::InvalidMediaType);
+        }
+        if let Some(description) = &self.description {
+            validate_note(description)?;
+        }
+        if !std::path::Path::new(&self.source).is_absolute() {
+            return Err(FeedbackValidationError::RelativeAttachmentSource);
+        }
+        Ok(())
     }
 }
 
@@ -747,11 +875,63 @@ mod tests {
             status: FeedbackStatus::Open,
             status_change: None,
             links: Vec::new(),
+            attachments: vec![FeedbackAttachment {
+                ordinal: 1,
+                name: "clip".into(),
+                kind: AttachmentKind::Directory,
+                media_type: "application/x-bmux-recording".into(),
+                bytes: 10,
+                description: None,
+                sensitive: true,
+                path: "/state/feedback/attachments/fb-1/1-clip".into(),
+                created_at_ms: 1,
+            }],
         };
         let redacted = item.redacted();
+        assert_eq!(redacted.attachments[0].path, REDACTED_VALUE);
         assert_eq!(redacted.facets[0].value, "postgres");
         assert_eq!(redacted.facets[1].value, REDACTED_VALUE);
         assert!(!serde_json::to_string(&redacted).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn attachments_need_plain_names_typed_media_and_absolute_sources() {
+        let valid = AttachFeedbackRequest {
+            id: FeedbackId(1),
+            source: "/tmp/clip.gif".into(),
+            name: "clip.gif".into(),
+            media_type: "image/gif".into(),
+            description: None,
+            sensitive: false,
+        };
+        assert_eq!(valid.validate(), Ok(()));
+        for name in ["", "../escape", ".hidden", "a/b", "spaced name"] {
+            let request = AttachFeedbackRequest {
+                name: name.into(),
+                ..valid.clone()
+            };
+            assert_eq!(
+                request.validate(),
+                Err(FeedbackValidationError::InvalidAttachmentName),
+                "{name:?}"
+            );
+        }
+        let relative = AttachFeedbackRequest {
+            source: "clip.gif".into(),
+            ..valid.clone()
+        };
+        assert_eq!(
+            relative.validate(),
+            Err(FeedbackValidationError::RelativeAttachmentSource)
+        );
+        let untyped = AttachFeedbackRequest {
+            media_type: "gif".into(),
+            ..valid
+        };
+        assert_eq!(
+            untyped.validate(),
+            Err(FeedbackValidationError::InvalidMediaType)
+        );
     }
 
     #[test]

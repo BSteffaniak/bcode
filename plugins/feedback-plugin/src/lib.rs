@@ -18,10 +18,10 @@ use std::path::PathBuf;
 
 use bcode_feedback::{FeedbackStore, FeedbackStoreError};
 use bcode_feedback_models::{
-    Actor, ClaimIntakeSessionRequest, FEEDBACK_SERVICE_INTERFACE_ID, FeedbackQuery,
-    GetFeedbackRequest, LinkFeedbackRequest, OP_CLAIM_INTAKE_SESSION, OP_GET, OP_INTAKE_SESSION,
-    OP_LINK, OP_LIST, OP_RECORD, OP_SET_STATUS, OP_TRIAGE, RecordFeedbackRequest,
-    SetFeedbackStatusRequest, TriageFeedbackRequest,
+    Actor, AttachFeedbackRequest, ClaimIntakeSessionRequest, FEEDBACK_SERVICE_INTERFACE_ID,
+    FeedbackQuery, GetFeedbackRequest, LinkFeedbackRequest, OP_ATTACH, OP_CLAIM_INTAKE_SESSION,
+    OP_GET, OP_INTAKE_SESSION, OP_LINK, OP_LIST, OP_RECORD, OP_SET_STATUS, OP_TRIAGE,
+    RecordFeedbackRequest, SetFeedbackStatusRequest, TriageFeedbackRequest,
 };
 use bcode_plugin_sdk::prelude::*;
 
@@ -81,6 +81,8 @@ impl FeedbackPlugin {
             }),
             OP_LINK => decode::<LinkFeedbackRequest>(request)
                 .and_then(|payload| encode(store.link(&payload, now))),
+            OP_ATTACH => decode::<AttachFeedbackRequest>(request)
+                .and_then(|payload| encode(store.attach(&payload, now))),
             OP_INTAKE_SESSION => encode(store.intake_session()),
             OP_CLAIM_INTAKE_SESSION => decode::<ClaimIntakeSessionRequest>(request)
                 .and_then(|payload| encode(store.claim_intake_session(&payload))),
@@ -128,6 +130,7 @@ fn store_error(error: &FeedbackStoreError) -> ServiceResponse {
         FeedbackStoreError::NotFound(_) => "not_found",
         FeedbackStoreError::Forbidden(_) => "forbidden",
         FeedbackStoreError::Conflict(_) => "conflict",
+        FeedbackStoreError::AttachmentRejected(_) => "attachment_rejected",
         FeedbackStoreError::UnsupportedSchema(_) => "maintenance_required",
         FeedbackStoreError::Path(..)
         | FeedbackStoreError::Corrupt(_)

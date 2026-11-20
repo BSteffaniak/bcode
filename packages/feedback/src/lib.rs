@@ -13,6 +13,7 @@
 //! [`FeedbackStatus::Open`] and [`FeedbackStatus::AgentResolved`], and never touches an item
 //! a person has verified or dismissed. Only an [`Actor::User`] verifies or dismisses.
 
+mod attachments;
 mod database;
 
 use std::path::{Path, PathBuf};
@@ -48,6 +49,9 @@ pub enum FeedbackStoreError {
     /// The actor may not make this status change.
     #[error("{0}")]
     Forbidden(&'static str),
+    /// An attachment source is missing, a symbolic link, too large, or the item is full.
+    #[error("attachment rejected: {0}")]
+    AttachmentRejected(String),
     /// The item changed concurrently; read it again and retry.
     #[error("{0} changed concurrently; read it again")]
     Conflict(FeedbackId),
@@ -86,6 +90,8 @@ pub fn database_path(state_dir: &Path) -> PathBuf {
 /// Open handle to the feedback store.
 pub struct FeedbackStore {
     database: Box<dyn Database>,
+    /// Directory holding the database and the `attachments` tree.
+    root: PathBuf,
 }
 
 impl std::fmt::Debug for FeedbackStore {
@@ -132,6 +138,7 @@ impl FeedbackStore {
         let database = database::open(path, Duration::from_secs(5))?;
         database::block_on(database::initialize(&database))?;
         Ok(Self {
+            root: parent.to_owned(),
             database: Box::new(database),
         })
     }
@@ -442,8 +449,15 @@ impl FeedbackStore {
         let links = self
             .database
             .select("feedback_links")
-            .filter(Box::new(where_in("from_id", ids)))
+            .filter(Box::new(where_in("from_id", ids.clone())))
             .sort("to_id", SortDirection::Asc)
+            .execute(&*self.database)
+            .await?;
+        let attachments = self
+            .database
+            .select("feedback_attachments")
+            .filter(Box::new(where_in("item_id", ids)))
+            .sort("ordinal", SortDirection::Asc)
             .execute(&*self.database)
             .await?;
         for item in &mut items {
@@ -463,6 +477,11 @@ impl FeedbackStore {
                         kind: parse_link_kind(&text(row, "kind")?)?,
                         target: FeedbackId(unsigned(row, "to_id")?),
                     });
+                }
+            }
+            for row in &attachments {
+                if unsigned(row, "item_id")? == id {
+                    item.attachments.push(attachments::from_row(row)?);
                 }
             }
         }
@@ -541,6 +560,7 @@ fn item_from_row(row: &Row) -> Result<FeedbackItem, FeedbackStoreError> {
         status: parse_status(&text(row, "status")?)?,
         status_change,
         links: Vec::new(),
+        attachments: Vec::new(),
     })
 }
 
