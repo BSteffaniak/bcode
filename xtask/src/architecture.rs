@@ -440,6 +440,23 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
         ],
     ),
     (
+        // Applications shell out to the feedback command line; it reaches the store only
+        // through the daemon's feedback service, never by opening it or hosting plugins.
+        "bcode_feedback_cli",
+        "packages/feedback/cli",
+        "",
+        &["bcode_client", "bcode_feedback_models"],
+        &[
+            "bcode_feedback",
+            "bcode_feedback_plugin",
+            "bcode_plugin",
+            "bcode_bundled_plugins",
+            "bcode_server",
+            "bcode_session",
+            "bcode_tui",
+        ],
+    ),
+    (
         // The review data layer and its document stay renderer-neutral and reach plugin
         // services only through the transport its caller provides.
         "bcode_code_review",
@@ -625,7 +642,7 @@ fn profile_graph(target: &str, package: &str, directory: &str, features: &str) -
         .map_err(|error| format_error(format!("invalid probe manifest: {error}")))?;
     if matches!(
         package,
-        "bcode_recap_cli" | "bcode_git_ui_cli" | "bcode_code_review_ui_cli"
+        "bcode_recap_cli" | "bcode_git_ui_cli" | "bcode_code_review_ui_cli" | "bcode_feedback_cli"
     ) {
         configure_binary_probe(&mut probe_manifest, &workspace_manifest, &path)?;
     }

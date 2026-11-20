@@ -26,6 +26,7 @@ bcode_default_agents_plugin             = { workspace = true, optional = true }
 bcode_document_plugin                   = { workspace = true, optional = true }
 bcode_eval_plugin                       = { workspace = true, optional = true }
 bcode_fake_provider_plugin              = { workspace = true, optional = true }
+bcode_feedback_plugin                   = { workspace = true, optional = true }
 bcode_file_references_plugin            = { workspace = true, optional = true }
 bcode_filesystem_plugin                 = { workspace = true, optional = true }
 bcode_git_plugin                        = { workspace = true, optional = true }
@@ -123,6 +124,7 @@ static-bundled-fake-provider-plugin = [
     "dep:bcode_fake_provider_plugin",
     "bcode_fake_provider_plugin/script-controls",
 ]
+static-bundled-feedback-plugin = ["dep:bcode_feedback_plugin"]
 static-bundled-file-references-plugin = [
     "dep:bcode_file_references_plugin",
     "bcode_file_references_plugin/tui",
@@ -167,6 +169,7 @@ static-bundled-plugins = [
     "static-bundled-vox-plugin",
     "static-bundled-ocr-plugin",
     "static-bundled-fake-provider-plugin",
+    "static-bundled-feedback-plugin",
     "static-bundled-file-references-plugin",
     "static-bundled-filesystem-plugin",
     "static-bundled-git-plugin",

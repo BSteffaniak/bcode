@@ -1,0 +1,409 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+
+//! Feedback command line shared by `bcode feedback` and the standalone `bcode-feedback`.
+//!
+//! Every command goes through the daemon's `bcode.feedback/v1` service, acting for the
+//! person. `submit` records the item first, so nothing is lost when triage cannot run, then
+//! sends it to the single intake session as a follow-up turn whose context blocks carry the
+//! item id, application and facets.
+//!
+//! Applications that do not link Bcode shell out to `bcode-feedback submit`, passing a
+//! [`RecordFeedbackRequest`] as JSON on stdin with `--request-json`.
+
+mod intake;
+mod render;
+
+use std::collections::BTreeSet;
+use std::io::Read as _;
+use std::time::Duration;
+
+use bcode_client::BcodeClient;
+use bcode_feedback_models::{
+    Actor, FEEDBACK_PLUGIN_ID, FEEDBACK_SERVICE_INTERFACE_ID, Facet, FeedbackId, FeedbackItem,
+    FeedbackPage, FeedbackQuery, FeedbackStatus, GetFeedbackRequest, IntakeSession,
+    LinkFeedbackRequest, LinkKind, OP_GET, OP_INTAKE_SESSION, OP_LINK, OP_LIST, OP_RECORD,
+    OP_SET_STATUS, RecordFeedbackRequest, SetFeedbackStatusRequest, TriageState,
+};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+/// Collect, search and resolve feedback about any application.
+#[derive(Debug, Parser)]
+#[command(name = "feedback")]
+pub struct FeedbackCli {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: FeedbackCommand,
+}
+
+/// Feedback subcommands.
+#[derive(Debug, Subcommand)]
+pub enum FeedbackCommand {
+    /// Record feedback and hand it to the intake agent for triage.
+    Submit(SubmitArgs),
+    /// List feedback, newest first.
+    List(ListArgs),
+    /// Show one item.
+    Show {
+        /// Item id, such as fb-12.
+        id: FeedbackId,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Items an agent resolved that await your verification, and items with open questions.
+    Inbox {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm an item is fixed.
+    Verify(StatusArgs),
+    /// Decide not to act on an item.
+    Dismiss(StatusArgs),
+    /// Reopen an item.
+    Reopen(StatusArgs),
+    /// Link one item to another.
+    Link {
+        /// Source item.
+        from: FeedbackId,
+        /// Target item.
+        to: FeedbackId,
+        /// Relationship from source to target.
+        #[arg(long, value_enum, default_value = "related")]
+        kind: LinkKindArg,
+    },
+    /// Print the intake session id, creating the session if needed.
+    Session,
+}
+
+/// Arguments of `feedback submit`.
+#[derive(Debug, Args)]
+pub struct SubmitArgs {
+    /// Application the feedback is about, such as bdata or bmux.
+    #[arg(long, required_unless_present = "request_json")]
+    pub app: Option<String>,
+    /// Context as KEY=VALUE, such as bdata.connection=prod (repeatable).
+    #[arg(long = "facet", value_name = "KEY=VALUE", value_parser = parse_facet)]
+    pub facets: Vec<(String, String)>,
+    /// Context the model must not read, as KEY=VALUE (repeatable).
+    #[arg(long = "sensitive-facet", value_name = "KEY=VALUE", value_parser = parse_facet)]
+    pub sensitive_facets: Vec<(String, String)>,
+    /// Read the whole request as JSON from stdin: {"app", "text", "facets": [{"key", "value", "sensitive"}]}.
+    #[arg(long, conflicts_with_all = ["app", "facets", "sensitive_facets", "text"])]
+    pub request_json: bool,
+    /// Record only; do not send the item to the intake agent.
+    #[arg(long, conflicts_with = "wait")]
+    pub no_triage: bool,
+    /// Wait for the intake agent and print its reply, for up to SECS seconds (default 600).
+    #[arg(
+        long,
+        value_name = "SECS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "600"
+    )]
+    pub wait: Option<u64>,
+    /// Print JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// The feedback; read from stdin when absent.
+    #[arg(trailing_var_arg = true)]
+    pub text: Vec<String>,
+}
+
+/// Arguments of `feedback list`.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Only this application.
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Only these statuses (repeatable).
+    #[arg(long = "status", value_enum)]
+    pub statuses: Vec<StatusArg>,
+    /// Only items not yet triaged.
+    #[arg(long)]
+    pub pending: bool,
+    /// Only this category.
+    #[arg(long)]
+    pub category: Option<String>,
+    /// Only items with every one of these tags (repeatable).
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
+    /// Only items with these exact facets, as KEY=VALUE (repeatable).
+    #[arg(long = "facet", value_name = "KEY=VALUE", value_parser = parse_facet)]
+    pub facets: Vec<(String, String)>,
+    /// Case-insensitive text in the feedback, title or summary.
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Continue after this id, from a previous page.
+    #[arg(long)]
+    pub before: Option<FeedbackId>,
+    /// Maximum items.
+    #[arg(long, default_value_t = 25)]
+    pub limit: usize,
+    /// Print JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments of status changes.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Item id, such as fb-12.
+    pub id: FeedbackId,
+    /// Why.
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
+/// Status filter values.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum StatusArg {
+    /// Not yet resolved.
+    Open,
+    /// Resolved by an agent, awaiting verification.
+    AgentResolved,
+    /// Verified by a person.
+    Verified,
+    /// Dismissed by a person.
+    Dismissed,
+}
+
+impl From<StatusArg> for FeedbackStatus {
+    fn from(value: StatusArg) -> Self {
+        match value {
+            StatusArg::Open => Self::Open,
+            StatusArg::AgentResolved => Self::AgentResolved,
+            StatusArg::Verified => Self::Verified,
+            StatusArg::Dismissed => Self::Dismissed,
+        }
+    }
+}
+
+/// Link kinds.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LinkKindArg {
+    /// Same problem.
+    Duplicate,
+    /// Shared area or likely fix.
+    Related,
+    /// Consequence of the target.
+    CausedBy,
+}
+
+impl From<LinkKindArg> for LinkKind {
+    fn from(value: LinkKindArg) -> Self {
+        match value {
+            LinkKindArg::Duplicate => Self::Duplicate,
+            LinkKindArg::Related => Self::Related,
+            LinkKindArg::CausedBy => Self::CausedBy,
+        }
+    }
+}
+
+fn parse_facet(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value.split_once('=').ok_or("facets are KEY=VALUE")?;
+    Ok((key.trim().to_owned(), value.to_owned()))
+}
+
+/// Run one command through `client`.
+///
+/// `bcode feedback` passes the client of its own daemon; `bcode-feedback` passes the
+/// installed Bcode's ([`BcodeClient::for_installed_bcode`]).
+///
+/// # Errors
+/// Returns a printable message when the daemon, the feedback service, or the intake session
+/// cannot complete the command.
+pub async fn run(cli: FeedbackCli, client: &BcodeClient) -> Result<(), String> {
+    match cli.command {
+        FeedbackCommand::Submit(args) => submit(client, args).await,
+        FeedbackCommand::List(args) => {
+            let json = args.json;
+            let page: FeedbackPage = call(client, OP_LIST, &list_query(args)).await?;
+            render::page(&page, json)
+        }
+        FeedbackCommand::Show { id, json } => {
+            let item: FeedbackItem = call(client, OP_GET, &GetFeedbackRequest { id }).await?;
+            render::item(&item, json)
+        }
+        FeedbackCommand::Inbox { json } => inbox(client, json).await,
+        FeedbackCommand::Verify(args) => set_status(client, args, FeedbackStatus::Verified).await,
+        FeedbackCommand::Dismiss(args) => set_status(client, args, FeedbackStatus::Dismissed).await,
+        FeedbackCommand::Reopen(args) => set_status(client, args, FeedbackStatus::Open).await,
+        FeedbackCommand::Link { from, to, kind } => {
+            let item: FeedbackItem = call(
+                client,
+                OP_LINK,
+                &LinkFeedbackRequest {
+                    from,
+                    to,
+                    kind: kind.into(),
+                },
+            )
+            .await?;
+            render::item(&item, false)
+        }
+        FeedbackCommand::Session => {
+            let session = intake::ensure_session(client).await?;
+            println!("{session}");
+            Ok(())
+        }
+    }
+}
+
+async fn submit(client: &BcodeClient, args: SubmitArgs) -> Result<(), String> {
+    let request = if args.request_json {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|error| format!("reading stdin: {error}"))?;
+        serde_json::from_str::<RecordFeedbackRequest>(&input)
+            .map_err(|error| format!("invalid request JSON: {error}"))?
+    } else {
+        let text = if args.text.is_empty() {
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .map_err(|error| format!("reading stdin: {error}"))?;
+            input
+        } else {
+            args.text.join(" ")
+        };
+        RecordFeedbackRequest {
+            app: args.app.unwrap_or_default(),
+            text: text.trim().to_owned(),
+            facets: args
+                .facets
+                .into_iter()
+                .map(|(key, value)| Facet::new(key, value))
+                .chain(args.sensitive_facets.into_iter().map(|(key, value)| Facet {
+                    key,
+                    value,
+                    sensitive: true,
+                }))
+                .collect(),
+        }
+    };
+    request.validate().map_err(|error| error.to_string())?;
+    let item: FeedbackItem = call(client, OP_RECORD, &request).await?;
+    if args.no_triage {
+        return render::submitted(&item, None, None, args.json);
+    }
+    // The item is recorded; a triage failure is reported but the item stays.
+    match intake::send(client, &item, args.wait.map(Duration::from_secs)).await {
+        Ok(outcome) => render::submitted(
+            &item,
+            Some(&outcome.session_id.to_string()),
+            outcome.reply.as_deref(),
+            args.json,
+        ),
+        Err(error) => {
+            render::submitted(&item, None, None, args.json)?;
+            Err(format!(
+                "{} was recorded, but triage could not start: {error}",
+                item.id
+            ))
+        }
+    }
+}
+
+fn list_query(args: ListArgs) -> FeedbackQuery {
+    FeedbackQuery {
+        app: args.app,
+        statuses: args.statuses.into_iter().map(Into::into).collect(),
+        triage_state: args.pending.then_some(TriageState::Pending),
+        category: args.category,
+        tags: args.tags.into_iter().collect(),
+        facets: args.facets,
+        text: args.search,
+        before: args.before,
+        limit: args.limit,
+    }
+}
+
+async fn inbox(client: &BcodeClient, json: bool) -> Result<(), String> {
+    let resolved: FeedbackPage = call(
+        client,
+        OP_LIST,
+        &FeedbackQuery {
+            statuses: BTreeSet::from([FeedbackStatus::AgentResolved]),
+            limit: bcode_feedback_models::MAX_PAGE_LIMIT,
+            ..FeedbackQuery::default()
+        },
+    )
+    .await?;
+    let open: FeedbackPage = call(
+        client,
+        OP_LIST,
+        &FeedbackQuery {
+            statuses: BTreeSet::from([FeedbackStatus::Open]),
+            triage_state: Some(TriageState::Triaged),
+            limit: bcode_feedback_models::MAX_PAGE_LIMIT,
+            ..FeedbackQuery::default()
+        },
+    )
+    .await?;
+    let questions: Vec<FeedbackItem> = open
+        .items
+        .into_iter()
+        .filter(|item| {
+            item.triage
+                .as_ref()
+                .is_some_and(|triage| !triage.open_questions.is_empty())
+        })
+        .collect();
+    render::inbox(&resolved.items, &questions, json)
+}
+
+async fn set_status(
+    client: &BcodeClient,
+    args: StatusArgs,
+    status: FeedbackStatus,
+) -> Result<(), String> {
+    let item: FeedbackItem = call(
+        client,
+        OP_SET_STATUS,
+        &SetFeedbackStatusRequest {
+            id: args.id,
+            status,
+            actor: Actor::User,
+            note: args.note,
+            session_id: None,
+            commits: Vec::new(),
+        },
+    )
+    .await?;
+    render::item(&item, false)
+}
+
+/// Call one `bcode.feedback/v1` operation.
+async fn call<R: serde::de::DeserializeOwned>(
+    client: &BcodeClient,
+    operation: &str,
+    payload: &(impl serde::Serialize + Sync),
+) -> Result<R, String> {
+    let payload = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
+    let response = client
+        .invoke_plugin_service(
+            FEEDBACK_PLUGIN_ID.into(),
+            FEEDBACK_SERVICE_INTERFACE_ID.into(),
+            operation.into(),
+            payload,
+        )
+        .await
+        .map_err(|error| format!("feedback service unavailable: {error}"))?;
+    if let Some(error) = response.error {
+        return Err(format!("{} ({})", error.message, error.code));
+    }
+    serde_json::from_slice(&response.payload)
+        .map_err(|error| format!("unexpected feedback service response: {error}"))
+}
+
+async fn intake_session(client: &BcodeClient) -> Result<IntakeSession, String> {
+    call(client, OP_INTAKE_SESSION, &()).await
+}
+
+#[cfg(test)]
+mod tests;

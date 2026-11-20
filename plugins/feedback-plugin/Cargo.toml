@@ -1,0 +1,37 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Feedback store service, model tools and CLI for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "feedback", "plugin"]
+license     = { workspace = true }
+name        = "bcode_feedback_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+bcode_client          = { workspace = true }
+bcode_config          = { workspace = true }
+bcode_feedback        = { workspace = true }
+bcode_feedback_cli    = { workspace = true }
+bcode_feedback_models = { workspace = true }
+bcode_plugin_sdk      = { workspace = true }
+bcode_tool            = { workspace = true }
+clap                  = { workspace = true, features = ["std"] }
+serde                 = { workspace = true, features = ["derive", "std"] }
+serde_json            = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
+default          = []
+dynamic-backend  = []
+dynamic-frontend = []
+fail-on-warnings = []

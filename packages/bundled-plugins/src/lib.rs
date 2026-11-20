@@ -153,6 +153,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(eval_plugin());
     #[cfg(feature = "static-bundled-usage-plugin")]
     plugins.push(usage_plugin());
+    #[cfg(feature = "static-bundled-feedback-plugin")]
+    plugins.push(feedback_plugin());
     #[cfg(feature = "static-bundled-metrics-plugin")]
     plugins.push(metrics_plugin());
     #[cfg(feature = "static-bundled-recap-plugin")]
@@ -285,6 +287,15 @@ fn harness_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/harness-plugin/bcode-plugin.toml"),
         bcode_harness_plugin::plugin_definition,
     )
+}
+
+#[cfg(feature = "static-bundled-feedback-plugin")]
+fn feedback_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::from_definition(
+        include_str!("../../../plugins/feedback-plugin/bcode-plugin.toml"),
+        bcode_feedback_plugin::plugin_definition,
+    )
+    .with_cli_registration(bcode_feedback_plugin::cli_registration)
 }
 
 #[cfg(feature = "static-bundled-usage-plugin")]

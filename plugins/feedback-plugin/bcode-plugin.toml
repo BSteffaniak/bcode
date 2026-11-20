@@ -1,0 +1,25 @@
+categories = ["feedback"]
+id         = "bcode.feedback"
+name       = "Bcode Feedback"
+version    = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Durable feedback store shared by every application"
+interface_id = "bcode.feedback/v1"
+name         = "Feedback Store"
+
+[[services]]
+class        = "tool_execution"
+description  = "Record, search, triage, link and resolve feedback"
+interface_id = "bcode.tool/v1"
+name         = "Feedback Tools"
+
+[concurrency]
+max  = 1
+type = "limited"
+
+[runtime]
+abi_version = 5
+library     = "libbcode_feedback_plugin.dylib"
+type        = "native"

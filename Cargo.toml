@@ -19,6 +19,7 @@ members = [
     "plugins/git-plugin",
     "plugins/code-review-plugin",
     "plugins/eval-plugin",
+    "plugins/feedback-plugin",
     "plugins/usage-plugin",
     "plugins/metrics-plugin",
     "plugins/read-plugin",
@@ -104,6 +105,9 @@ members = [
     "packages/models-site",
     "packages/models-site/ui",
     "packages/markdown-render",
+    "packages/feedback",
+    "packages/feedback/cli",
+    "packages/feedback/models",
     "packages/usage",
     "packages/usage/models",
     "packages/metrics",
@@ -275,6 +279,10 @@ bcode_eval                              = { version = "0.0.1-alpha.0", default-f
 bcode_eval_models                       = { version = "0.0.1-alpha.0", default-features = false, path = "packages/eval/models" }
 bcode_eval_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/eval-plugin" }
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
+bcode_feedback                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback" }
+bcode_feedback_cli                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback/cli" }
+bcode_feedback_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback/models" }
+bcode_feedback_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/feedback-plugin" }
 bcode_file_references_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/file-references-plugin" }
 bcode_filesystem_models                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin/models" }
 bcode_filesystem_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/filesystem-plugin" }

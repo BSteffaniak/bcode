@@ -1,0 +1,41 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "development-tools"]
+description = "Feedback command line: `bcode feedback` and the standalone `bcode-feedback`"
+edition     = { workspace = true }
+keywords    = ["bcode", "feedback", "cli"]
+license     = { workspace = true }
+name        = "bcode_feedback_cli"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bcode-feedback"
+path = "src/main.rs"
+
+[dependencies]
+bcode_client = { workspace = true }
+bcode_config = { workspace = true }
+bcode_feedback_models = { workspace = true }
+bcode_session_models = { workspace = true }
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+    "time",
+] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Durable feedback store for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "feedback"]
+license     = { workspace = true }
+name        = "bcode_feedback"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_feedback_models       = { workspace = true }
+futures                     = { workspace = true, features = ["executor"] }
+serde_json                  = { workspace = true, features = ["std"] }
+switchy_database            = { workspace = true }
+switchy_database_connection = { workspace = true }
+thiserror                   = { workspace = true }
+tokio                       = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

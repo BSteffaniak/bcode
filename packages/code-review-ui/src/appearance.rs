@@ -362,8 +362,7 @@ impl AppearanceOverlay {
         let frame = modal::frame(
             theme,
             " Review appearance ",
-            "↑/↓ preview · tab contrast · ←/→ adjust · 0 reset · enter apply · f follow Bcode · \
-             esc cancel",
+            "↑/↓ move · tab contrast · ←/→ adjust · 0 reset · enter apply · f follow Bcode · esc cancel",
             area.size(),
         );
         let notes = TextBlock::new(Text::from_lines(self.notes(theme))).wrap(TextWrap::Word);

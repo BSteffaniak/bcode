@@ -1750,6 +1750,7 @@ dependencies = [
  "bcode_document_plugin",
  "bcode_eval_plugin",
  "bcode_fake_provider_plugin",
+ "bcode_feedback_plugin",
  "bcode_file_references_plugin",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
@@ -2342,6 +2343,60 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "bcode_feedback"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_feedback_models",
+ "futures 0.3.34",
+ "serde_json",
+ "switchy_database",
+ "switchy_database_connection",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_feedback_cli"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_client",
+ "bcode_config",
+ "bcode_feedback_models",
+ "bcode_session_models",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_feedback_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "bcode_feedback_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_client",
+ "bcode_config",
+ "bcode_feedback",
+ "bcode_feedback_cli",
+ "bcode_feedback_models",
+ "bcode_plugin_sdk",
+ "bcode_tool",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

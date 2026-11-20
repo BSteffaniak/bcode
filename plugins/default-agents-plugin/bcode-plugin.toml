@@ -82,6 +82,13 @@ build_tools = [
     "code_review.guide.check",
     "code_review.guide.plan",
     "code_review.guide.export",
+    # Offered by the feedback plugin: the shared feedback store.
+    "feedback.search",
+    "feedback.get",
+    "feedback.record",
+    "feedback.triage",
+    "feedback.set_status",
+    "feedback.link",
 ]
 # These tools mutate only the authenticated active run. Application policy, ownership,
 # exact-candidate publication, execution ceilings and downstream tool permissions still apply.
@@ -93,6 +100,11 @@ build_preauthorizations = [
     "workflow.stage_run_graph_edit",
     "workflow.publish_run_graph_edit",
     "workflow.accept_run_graph_publication",
+    # Feedback tools change only feedback records; agents cannot verify or dismiss items.
+    "feedback.record",
+    "feedback.triage",
+    "feedback.set_status",
+    "feedback.link",
 ]
 plan_disabled_tools = [
     "workflow.stage_delegation",
@@ -122,6 +134,10 @@ plan_disabled_tools = [
     "code_review.delete_review",
     "code_review.guide.start",
     "code_review.guide.write",
+    "feedback.record",
+    "feedback.triage",
+    "feedback.set_status",
+    "feedback.link",
 ]
 
 [runtime]

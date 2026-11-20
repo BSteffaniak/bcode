@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable feedback records and service contracts for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "feedback"]
+license     = { workspace = true }
+name        = "bcode_feedback_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde     = { workspace = true, features = ["derive", "std"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[features]
+default          = []
+fail-on-warnings = []
