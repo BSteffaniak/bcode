@@ -415,7 +415,7 @@ fn contrast_previews_live_resets_and_enter_saves_only_the_edited_value_for_the_t
         "1.00×",
         "Minimum",
         "off   3.0   4.5   7.0",
-        "tab contrast",
+        "tab contrast & color",
     ] {
         assert!(screen.contains(text), "{text}:\n{}", screen.text());
     }
@@ -478,19 +478,38 @@ fn contrast_previews_live_resets_and_enter_saves_only_the_edited_value_for_the_t
     appearance.control.offer(watched);
     assert_eq!(appearance.fingerprint(), raised);
 
-    // The minimum cycles off, 3.0, 4.5, 7.0; saving it keeps the saved factor.
+    // The minimum cycles off, 3.0, 4.5, 7.0; shift+tab reaches the last row (background
+    // tint) and up moves back to it. Saving keeps the saved factor.
     scenario.key("ctrl+t");
     let screen = render(&mut scenario, &appearance);
     assert!(screen.contains("1.40×"), "{}", screen.text());
     scenario.key("shift+tab");
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.contains("› Background tint"), "{}", screen.text());
+    for _ in 0..3 {
+        scenario.key("up");
+    }
     scenario.key("right");
     scenario.key("right");
     let screen = render(&mut scenario, &appearance);
     assert!(screen.contains("› Minimum"), "{}", screen.text());
+    // Vibrance is the row below; its edit previews and saves like the others.
+    scenario.key("down");
+    let before = appearance.fingerprint();
+    scenario.key("right");
+    assert_ne!(appearance.fingerprint(), before, "vibrance previews live");
+    let screen = render(&mut scenario, &appearance);
+    assert!(
+        screen.contains("› Vibrance") && screen.contains("+0.05"),
+        "{}",
+        screen.text()
+    );
     scenario.key("enter");
     let overrides = appearance.saved_overrides().expect("overrides saved");
     assert_eq!(overrides["nord"]["contrast"].as_float(), Some(1.4));
     assert_eq!(overrides["nord"]["minimum_contrast"].as_float(), Some(4.5));
+    assert_eq!(overrides["nord"]["vibrance"].as_float(), Some(0.05));
+    assert!(overrides["nord"].get("richness").is_none());
 }
 
 #[test]

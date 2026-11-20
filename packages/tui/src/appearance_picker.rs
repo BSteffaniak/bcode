@@ -9,10 +9,11 @@
 //! picker opened with. The column lists ([`PaletteAxisState`],
 //! [`ProfileAxisState`]) follow the selection for scrolling and hit testing.
 //!
-//! Below the columns, a contrast slider and a minimum-contrast row adjust the
-//! selected palette's contrast ([`ContrastControls`]). The focus keys cycle
-//! palettes, profiles, contrast and minimum; on a contrast row the horizontal
-//! keys change its value and `0` resets it.
+//! Below the columns, a contrast slider, a minimum-contrast row and the
+//! vibrance, richness and background-tint sliders adjust the selected
+//! palette's contrast and color ([`ContrastControls`]). The focus keys cycle
+//! palettes, profiles and each of those rows; on a row the horizontal keys
+//! change its value and `0` resets it.
 
 use bcode_tui_theme::picker::AppearanceSelection;
 use bmux_keyboard::KeyStroke;
@@ -334,10 +335,10 @@ impl AppearancePickerState {
             }
             (None, Some("tui.control.focus_next")) => match self.axis() {
                 AppearanceAxis::Palette => self.selection.switch_to(AppearanceAxis::Profile).into(),
-                AppearanceAxis::Profile => self.focus_contrast(ContrastRow::Factor),
+                AppearanceAxis::Profile => self.focus_contrast(ContrastRow::FIRST),
             },
             (None, Some("tui.control.focus_previous")) => match self.axis() {
-                AppearanceAxis::Palette => self.focus_contrast(ContrastRow::Minimum),
+                AppearanceAxis::Palette => self.focus_contrast(ContrastRow::LAST),
                 AppearanceAxis::Profile => self.selection.switch_to(AppearanceAxis::Palette).into(),
             },
             (None, _) => AppearancePickerOutcome::Ignored,
@@ -518,10 +519,17 @@ pub mod tests {
             tab(&mut picker),
             AppearancePickerOutcome::ContrastFocused(ContrastRow::Factor)
         );
-        assert_eq!(
-            tab(&mut picker),
-            AppearancePickerOutcome::ContrastFocused(ContrastRow::Minimum)
-        );
+        for row in [
+            ContrastRow::Minimum,
+            ContrastRow::Vibrance,
+            ContrastRow::Richness,
+            ContrastRow::BackgroundTint,
+        ] {
+            assert_eq!(
+                tab(&mut picker),
+                AppearancePickerOutcome::ContrastFocused(row)
+            );
+        }
         assert_eq!(
             tab(&mut picker),
             AppearancePickerOutcome::AxisChanged(AppearanceAxis::Palette)
@@ -529,8 +537,13 @@ pub mod tests {
         assert_eq!(picker.contrast().focus(), None);
         assert_eq!(
             picker.handle_key(parse_key_stroke("shift+tab").unwrap()),
-            AppearancePickerOutcome::ContrastFocused(ContrastRow::Minimum)
+            AppearancePickerOutcome::ContrastFocused(ContrastRow::BackgroundTint)
         );
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Right)),
+            AppearancePickerOutcome::ContrastChanged("dusk".to_owned())
+        );
+        assert_eq!(picker.contrast().shown().background_tint.get(), 1.05);
     }
 
     #[test]

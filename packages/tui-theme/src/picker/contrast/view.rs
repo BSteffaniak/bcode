@@ -1,8 +1,9 @@
 //! The contrast rows as a BMUX component below a picker's body.
 //!
-//! [`ContrastRowsComponent`] lays its body out above the two rows and paints the rows from
-//! [`ContrastControls`]: the contrast factor as a line gauge over the accepted range labelled
-//! with its value, and the minimum-contrast choices with the current one marked. The rows
+//! [`ContrastRowsComponent`] lays its body out above the rows and paints the rows from
+//! [`ContrastControls`]: the contrast factor, vibrance, richness and background tint as line
+//! gauges over their accepted ranges labelled with their values, and the minimum-contrast
+//! choices with the current one marked. The rows
 //! degrade explicitly: they drop their labels when the width cannot hold a label beside a
 //! usable control, and they are omitted when the body would keep fewer than its minimum
 //! height. Each painted row registers a hit region (its id from [`row_hit_id`]), and pointer
@@ -27,7 +28,7 @@ use bmux_tui_components::progress_bar::{
     ProgressBarComponent, ProgressBarPolicy, ProgressBarStyles, ProgressBarValue,
 };
 
-use super::{ContrastControls, ContrastRow, factor_position, minimum_choices};
+use super::{ContrastControls, ContrastRow, minimum_choices};
 
 /// Narrowest control that keeps its row label beside it.
 const CONTROL_MIN_WIDTH: u64 = 12;
@@ -37,7 +38,7 @@ const LABEL_GAP: u64 = 1;
 const FOCUS_MARKER: &str = "› ";
 const BLUR_MARKER: &str = "  ";
 /// Rows the contrast rows take.
-const ROWS: u64 = 2;
+const ROWS: u64 = ContrastRow::ALL.len() as u64;
 
 /// Styles of the contrast rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,6 +72,9 @@ pub fn row_hit_id(id: &str, row: ContrastRow) -> String {
     match row {
         ContrastRow::Factor => format!("{id}.contrast"),
         ContrastRow::Minimum => format!("{id}.minimum"),
+        ContrastRow::Vibrance => format!("{id}.vibrance"),
+        ContrastRow::Richness => format!("{id}.richness"),
+        ContrastRow::BackgroundTint => format!("{id}.background_tint"),
     }
 }
 
@@ -93,6 +97,13 @@ pub const fn pointer_action(kind: MouseEventKind, row: ContrastRow) -> Option<Co
     }
 }
 
+fn row_index(row: ContrastRow) -> usize {
+    ContrastRow::ALL
+        .iter()
+        .position(|candidate| *candidate == row)
+        .unwrap_or_default()
+}
+
 /// A picker body with the contrast rows below it.
 pub struct ContrastRowsComponent<'a> {
     id: String,
@@ -101,7 +112,7 @@ pub struct ContrastRowsComponent<'a> {
     styles: ContrastRowsStyles,
     min_body_height: u64,
     pointer: Option<&'a Cell<Option<ContrastPointer>>>,
-    factor_label: String,
+    slider_labels: Vec<Option<String>>,
     choices: Vec<String>,
 }
 
@@ -128,7 +139,10 @@ impl<'a> ContrastRowsComponent<'a> {
             styles,
             min_body_height: 1,
             pointer: None,
-            factor_label: format!("{}×", shown.factor),
+            slider_labels: ContrastRow::ALL
+                .iter()
+                .map(|row| row.slider_label(&shown))
+                .collect(),
             choices,
         }
     }
@@ -162,57 +176,65 @@ impl<'a> ContrastRowsComponent<'a> {
         width >= Self::label_width() + LABEL_GAP + CONTROL_MIN_WIDTH
     }
 
+    fn slider(&self, row: ContrastRow, position: u64, focused: bool) -> Element<'_> {
+        let styles = self.styles;
+        let filled = if focused {
+            styles.focused
+        } else {
+            styles.value
+        };
+        let label = self
+            .slider_labels
+            .get(row_index(row))
+            .and_then(Option::as_deref)
+            .unwrap_or_default();
+        Element::new(
+            ProgressBarComponent::new(
+                format!("{}.gauge.{}", self.id, row_index(row)),
+                ProgressBarValue::determinate(position, 100),
+            )
+            .label(label)
+            .policy(ProgressBarPolicy::compact().line_gauge())
+            .styles(ProgressBarStyles {
+                filled,
+                empty: styles.muted,
+                label: filled,
+                complete: filled,
+                indeterminate: filled,
+                background: styles.background,
+            }),
+        )
+    }
+
+    fn minimum_choices(&self, focused: bool) -> Element<'_> {
+        let styles = self.styles;
+        let current = self.controls.shown().minimum.to_string();
+        let mut spans = Vec::new();
+        for (index, choice) in self.choices.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" ", styles.background));
+            }
+            let style = match (*choice == current, focused) {
+                (true, true) => styles.selected,
+                (true, false) => styles
+                    .value
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
+                (false, _) => styles.muted,
+            };
+            spans.push(Span::styled(format!(" {choice} "), style));
+        }
+        Element::new(TextBlock::new(Text::from_lines(vec![Line::from_spans(
+            spans,
+        )])))
+    }
+
     fn row_element(&self, row: ContrastRow, labelled: bool) -> Element<'_> {
         let focused = self.controls.focus() == Some(row);
         let styles = self.styles;
-        let control: Element<'_> = match row {
-            ContrastRow::Factor => {
-                let filled = if focused {
-                    styles.focused
-                } else {
-                    styles.value
-                };
-                Element::new(
-                    ProgressBarComponent::new(
-                        format!("{}.gauge", self.id),
-                        ProgressBarValue::determinate(
-                            factor_position(self.controls.shown().factor),
-                            100,
-                        ),
-                    )
-                    .label(&self.factor_label)
-                    .policy(ProgressBarPolicy::compact().line_gauge())
-                    .styles(ProgressBarStyles {
-                        filled,
-                        empty: styles.muted,
-                        label: filled,
-                        complete: filled,
-                        indeterminate: filled,
-                        background: styles.background,
-                    }),
-                )
-            }
-            ContrastRow::Minimum => {
-                let current = self.controls.shown().minimum.to_string();
-                let mut spans = Vec::new();
-                for (index, choice) in self.choices.iter().enumerate() {
-                    if index > 0 {
-                        spans.push(Span::styled(" ", styles.background));
-                    }
-                    let style = match (*choice == current, focused) {
-                        (true, true) => styles.selected,
-                        (true, false) => styles
-                            .value
-                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
-                        (false, _) => styles.muted,
-                    };
-                    spans.push(Span::styled(format!(" {choice} "), style));
-                }
-                Element::new(TextBlock::new(Text::from_lines(vec![Line::from_spans(
-                    spans,
-                )])))
-            }
-        };
+        let control = row.slider_position(&self.controls.shown()).map_or_else(
+            || self.minimum_choices(focused),
+            |position| self.slider(row, position, focused),
+        );
         let content: Element<'_> = if labelled {
             let (marker, style) = if focused {
                 (FOCUS_MARKER, styles.focused.add_modifier(Modifier::BOLD))
@@ -249,7 +271,7 @@ impl Component for ContrastRowsComponent<'_> {
         self.min_body_height.hash(&mut layout);
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         self.controls.focus().hash(&mut paint);
-        self.factor_label.hash(&mut paint);
+        self.slider_labels.hash(&mut paint);
         self.controls.shown().minimum.to_string().hash(&mut paint);
         self.choices.hash(&mut paint);
         self.styles.hash(&mut paint);
@@ -395,14 +417,23 @@ mod tests {
             ..crate::adjustment::ContrastSettings::EXACT
         });
         controls.set_focus(Some(ContrastRow::Minimum));
-        let (rows, hits, _) = paint(&controls, Rect::new(0, 0, 50, 6));
+        let (rows, hits, _) = paint(&controls, Rect::new(0, 0, 50, 8));
         assert!(
-            rows[4].contains("Contrast") && rows[4].contains("1.40×"),
+            rows[3].contains("Contrast") && rows[3].contains("1.40×"),
             "{rows:?}"
         );
-        assert!(rows[5].starts_with("› Minimum"), "{rows:?}");
-        assert!(rows[5].contains("off   3.0   4.5   7.0"), "{rows:?}");
-        for (y, row) in [(4, ContrastRow::Factor), (5, ContrastRow::Minimum)] {
+        assert!(rows[4].starts_with("› Minimum"), "{rows:?}");
+        assert!(rows[4].contains("off   3.0   4.5   7.0"), "{rows:?}");
+        assert!(
+            rows[5].contains("Vibrance") && rows[5].contains("0.00"),
+            "{rows:?}"
+        );
+        assert!(rows[6].contains("Richness"), "{rows:?}");
+        assert!(
+            rows[7].contains("Background tint") && rows[7].contains("1.00×"),
+            "{rows:?}"
+        );
+        for (y, row) in (3..).zip(ContrastRow::ALL) {
             for x in [0, 49] {
                 let hit = hits.hit_test(Point::new(x, y)).expect("hit");
                 assert_eq!(hit_row("picker", hit.region.id.as_str()), Some(row));
@@ -410,19 +441,20 @@ mod tests {
         }
 
         // Narrow: the labels go, the controls stay inside the area.
-        let (rows, hits, _) = paint(&controls, Rect::new(0, 0, 14, 6));
+        let (rows, hits, _) = paint(&controls, Rect::new(0, 0, 14, 8));
         assert!(
-            !rows[4].contains("Contrast") && rows[4].contains("1.40×"),
+            !rows[3].contains("Contrast") && rows[3].contains("1.40×"),
             "{rows:?}"
         );
-        assert!(rows[5].starts_with(" off "), "{rows:?}");
-        assert!(hits.hit_test(Point::new(13, 5)).is_some());
+        assert!(rows[4].starts_with(" off "), "{rows:?}");
+        assert!(!rows[7].contains("Background"), "{rows:?}");
+        assert!(hits.hit_test(Point::new(13, 7)).is_some());
 
         // Short: the body keeps its rows and the contrast rows are omitted, without hits.
-        let (rows, hits, layout) = paint(&controls, Rect::new(0, 0, 50, 4));
+        let (rows, hits, layout) = paint(&controls, Rect::new(0, 0, 50, 7));
         assert_eq!(layout.children.len(), 1);
         assert!(rows.iter().all(|row| !row.contains("Minimum")), "{rows:?}");
-        assert!((0..4).all(|y| hits.hit_test(Point::new(0, y)).is_none()));
+        assert!((0..7).all(|y| hits.hit_test(Point::new(0, y)).is_none()));
 
         // Nothing at all.
         let (_, hits, _) = paint(&controls, Rect::new(0, 0, 0, 0));

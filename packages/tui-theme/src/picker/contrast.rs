@@ -1,6 +1,7 @@
-//! The appearance pickers' contrast rows: a contrast slider and a minimum-contrast control.
+//! The appearance pickers' contrast rows: a contrast slider, a minimum-contrast control, and
+//! vibrance, richness and background-tint sliders.
 //!
-//! Contrast is kept per palette. The rows show the values the edited palette presents
+//! Contrast and color are kept per palette. The rows show the values the edited palette presents
 //! (configured, saved, or edited while the picker is open); an edit changes only the edited
 //! value of that palette. [`ContrastControls`] remembers each edited palette's values from
 //! before its first edit, so cancelling can restore them, and the edits alone are what applying
@@ -16,7 +17,10 @@ use std::collections::BTreeMap;
 #[cfg(feature = "components")]
 pub mod view;
 
-use crate::adjustment::{ContrastFactor, ContrastOverride, ContrastSettings, MinimumContrast};
+use crate::adjustment::{
+    BackgroundTint, ContrastFactor, ContrastOverride, ContrastSettings, MinimumContrast, Richness,
+    Vibrance,
+};
 
 /// One contrast row of a picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -25,11 +29,28 @@ pub enum ContrastRow {
     Factor,
     /// The minimum-contrast floor.
     Minimum,
+    /// The vibrance slider.
+    Vibrance,
+    /// The richness slider.
+    Richness,
+    /// The background-tint slider.
+    BackgroundTint,
 }
 
 impl ContrastRow {
     /// The rows, in painted order.
-    pub const ALL: [Self; 2] = [Self::Factor, Self::Minimum];
+    pub const ALL: [Self; 5] = [
+        Self::Factor,
+        Self::Minimum,
+        Self::Vibrance,
+        Self::Richness,
+        Self::BackgroundTint,
+    ];
+
+    /// The first row.
+    pub const FIRST: Self = Self::Factor;
+    /// The last row.
+    pub const LAST: Self = Self::BackgroundTint;
 
     /// Row label.
     #[must_use]
@@ -37,6 +58,61 @@ impl ContrastRow {
         match self {
             Self::Factor => "Contrast",
             Self::Minimum => "Minimum",
+            Self::Vibrance => "Vibrance",
+            Self::Richness => "Richness",
+            Self::BackgroundTint => "Background tint",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|row| *row == self)
+            .unwrap_or_default()
+    }
+
+    /// The row after this one, if any.
+    #[must_use]
+    pub fn next(self) -> Option<Self> {
+        Self::ALL.get(self.index() + 1).copied()
+    }
+
+    /// The row before this one, if any.
+    #[must_use]
+    pub fn previous(self) -> Option<Self> {
+        self.index()
+            .checked_sub(1)
+            .and_then(|index| Self::ALL.get(index).copied())
+    }
+
+    /// Where `settings`' value of this slider row sits in its accepted range, in hundredths;
+    /// `None` for the minimum-contrast row, which is not a slider.
+    #[must_use]
+    pub fn slider_position(self, settings: &ContrastSettings) -> Option<u64> {
+        let position = match self {
+            Self::Factor => return Some(factor_position(settings.factor)),
+            Self::Minimum => return None,
+            Self::Vibrance => settings.vibrance.position(),
+            Self::Richness => settings.richness.position(),
+            Self::BackgroundTint => settings.background_tint.position(),
+        };
+        // The position lies in 0..=1, so its hundredths fit.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let hundredths = (position * 100.0).round().clamp(0.0, 100.0) as u64;
+        Some(hundredths)
+    }
+
+    /// The label a slider row shows for `settings`' value; `None` for the minimum-contrast row.
+    #[must_use]
+    pub fn slider_label(self, settings: &ContrastSettings) -> Option<String> {
+        match self {
+            Self::Factor => Some(format!("{}×", settings.factor)),
+            Self::Minimum => None,
+            Self::Vibrance => {
+                Some(format!("{:+.2}", settings.vibrance.get()).replace("+0.00", "0.00"))
+            }
+            Self::Richness => Some(settings.richness.to_string()),
+            Self::BackgroundTint => Some(format!("{}×", settings.background_tint)),
         }
     }
 }
@@ -129,22 +205,24 @@ impl ContrastControls {
                 ContrastKeyOutcome::Ignored
             }
         };
-        match (key, row) {
-            (ContrastKey::Raise, _) => changed(self.step(palette, row, true)),
-            (ContrastKey::Lower, _) => changed(self.step(palette, row, false)),
-            (ContrastKey::Reset, _) => changed(self.reset(palette, row)),
-            (ContrastKey::Up, ContrastRow::Factor) => self.leave(ContrastExit::Above),
-            (ContrastKey::Previous, ContrastRow::Factor) => self.leave(ContrastExit::Before),
-            (ContrastKey::Next, ContrastRow::Minimum) => self.leave(ContrastExit::After),
-            (ContrastKey::Down | ContrastKey::Next, ContrastRow::Factor) => {
-                self.focus = Some(ContrastRow::Minimum);
-                ContrastKeyOutcome::Focused(ContrastRow::Minimum)
-            }
-            (ContrastKey::Up | ContrastKey::Previous, ContrastRow::Minimum) => {
-                self.focus = Some(ContrastRow::Factor);
-                ContrastKeyOutcome::Focused(ContrastRow::Factor)
-            }
-            (ContrastKey::Down, ContrastRow::Minimum) => ContrastKeyOutcome::Ignored,
+        let moved = |controls: &mut Self, to: ContrastRow| {
+            controls.focus = Some(to);
+            ContrastKeyOutcome::Focused(to)
+        };
+        match key {
+            ContrastKey::Raise => changed(self.step(palette, row, true)),
+            ContrastKey::Lower => changed(self.step(palette, row, false)),
+            ContrastKey::Reset => changed(self.reset(palette, row)),
+            ContrastKey::Up | ContrastKey::Previous => match row.previous() {
+                Some(previous) => moved(self, previous),
+                None if key == ContrastKey::Up => self.leave(ContrastExit::Above),
+                None => self.leave(ContrastExit::Before),
+            },
+            ContrastKey::Down | ContrastKey::Next => match row.next() {
+                Some(next) => moved(self, next),
+                None if key == ContrastKey::Next => self.leave(ContrastExit::After),
+                None => ContrastKeyOutcome::Ignored,
+            },
         }
     }
 
@@ -153,10 +231,16 @@ impl ContrastControls {
         ContrastKeyOutcome::Left(exit)
     }
 
-    /// Change `row` of `palette` one step (`forward` raises the factor or moves the floor to
-    /// the next preset); returns whether the value changed.
+    /// Change `row` of `palette` one step (`forward` raises a slider or moves the floor to the
+    /// next preset); returns whether the value changed.
     pub fn step(&mut self, palette: &str, row: ContrastRow, forward: bool) -> bool {
+        let steps = if forward { 1 } else { -1 };
         match row {
+            ContrastRow::Vibrance => self.set_vibrance(palette, self.shown.vibrance.stepped(steps)),
+            ContrastRow::Richness => self.set_richness(palette, self.shown.richness.stepped(steps)),
+            ContrastRow::BackgroundTint => {
+                self.set_background_tint(palette, self.shown.background_tint.stepped(steps))
+            }
             ContrastRow::Factor => self.set_factor(
                 palette,
                 self.shown.factor.stepped(if forward { 1 } else { -1 }),
@@ -172,13 +256,47 @@ impl ContrastControls {
         }
     }
 
-    /// Reset `row` of `palette`: the factor to `1.0`, the floor to off; returns whether the
-    /// value changed.
+    /// Reset `row` of `palette` to the value that keeps the theme's colors (the factor and the
+    /// background tint to `1.0`, the floor to off, vibrance and richness to `0.0`); returns
+    /// whether the value changed.
     pub fn reset(&mut self, palette: &str, row: ContrastRow) -> bool {
         match row {
             ContrastRow::Factor => self.set_factor(palette, ContrastFactor::EXACT),
             ContrastRow::Minimum => self.set_minimum(palette, MinimumContrast::OFF),
+            ContrastRow::Vibrance => self.set_vibrance(palette, Vibrance::EXACT),
+            ContrastRow::Richness => self.set_richness(palette, Richness::EXACT),
+            ContrastRow::BackgroundTint => self.set_background_tint(palette, BackgroundTint::EXACT),
         }
+    }
+
+    fn set_vibrance(&mut self, palette: &str, vibrance: Vibrance) -> bool {
+        if vibrance == self.shown.vibrance {
+            return false;
+        }
+        self.shown.vibrance = vibrance;
+        self.edits.entry(palette.to_owned()).or_default().vibrance = Some(vibrance);
+        true
+    }
+
+    fn set_richness(&mut self, palette: &str, richness: Richness) -> bool {
+        if richness == self.shown.richness {
+            return false;
+        }
+        self.shown.richness = richness;
+        self.edits.entry(palette.to_owned()).or_default().richness = Some(richness);
+        true
+    }
+
+    fn set_background_tint(&mut self, palette: &str, tint: BackgroundTint) -> bool {
+        if tint == self.shown.background_tint {
+            return false;
+        }
+        self.shown.background_tint = tint;
+        self.edits
+            .entry(palette.to_owned())
+            .or_default()
+            .background_tint = Some(tint);
+        true
     }
 
     fn set_factor(&mut self, palette: &str, factor: ContrastFactor) -> bool {
@@ -320,6 +438,16 @@ mod tests {
             })
             .collect();
         assert_eq!(floors, ["3.0", "4.5", "7.0", "off"]);
+        for row in [
+            ContrastRow::Vibrance,
+            ContrastRow::Richness,
+            ContrastRow::BackgroundTint,
+        ] {
+            assert_eq!(
+                controls.handle_key("nord", ContrastKey::Next),
+                ContrastKeyOutcome::Focused(row)
+            );
+        }
         assert_eq!(
             controls.handle_key("nord", ContrastKey::Down),
             ContrastKeyOutcome::Ignored
@@ -374,5 +502,50 @@ mod tests {
         );
         assert_eq!(factor_position(ContrastFactor::EXACT), 33);
         assert_eq!(factor_position(factor), 60);
+    }
+
+    #[test]
+    fn color_rows_step_reset_and_edit_only_their_value() {
+        let mut controls = ContrastControls::default();
+        controls.remember_original("nord", None);
+        controls.set_focus(Some(ContrastRow::Vibrance));
+        for _ in 0..3 {
+            assert_eq!(
+                controls.handle_key("nord", ContrastKey::Raise),
+                ContrastKeyOutcome::Changed
+            );
+        }
+        assert_eq!(controls.shown().vibrance.get(), 0.15);
+        assert!(controls.step("nord", ContrastRow::Vibrance, false));
+        assert_eq!(controls.shown().vibrance.get(), 0.1);
+        assert!(!controls.step("nord", ContrastRow::Richness, false), "at 0");
+        assert!(controls.step("nord", ContrastRow::Richness, true));
+        assert!(controls.step("nord", ContrastRow::BackgroundTint, false));
+        assert_eq!(controls.shown().background_tint.get(), 0.95);
+        let values = controls.edited_values("nord").expect("edited");
+        assert_eq!(values.vibrance.map(Vibrance::get), Some(0.1));
+        assert_eq!(values.richness.map(Richness::get), Some(0.05));
+        assert_eq!(values.background_tint.map(BackgroundTint::get), Some(0.95));
+        assert_eq!(values.contrast, None);
+        controls.set_focus(Some(ContrastRow::BackgroundTint));
+        assert_eq!(
+            controls.handle_key("nord", ContrastKey::Reset),
+            ContrastKeyOutcome::Changed
+        );
+        assert_eq!(controls.shown().background_tint, BackgroundTint::EXACT);
+        assert_eq!(
+            ContrastRow::Vibrance
+                .slider_label(&controls.shown())
+                .as_deref(),
+            Some("+0.10")
+        );
+        assert_eq!(
+            ContrastRow::Vibrance.slider_position(&controls.shown()),
+            Some(55)
+        );
+        assert_eq!(
+            ContrastRow::Minimum.slider_position(&controls.shown()),
+            None
+        );
     }
 }

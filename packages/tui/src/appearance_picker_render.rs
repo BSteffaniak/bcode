@@ -48,7 +48,9 @@ const PREVIEW_MIN_HEIGHT: u16 = 7;
 /// Shortest body that stacks both columns (a header and one row each).
 const STACKED_MIN_HEIGHT: u16 = 4;
 /// The contrast rows, in painted order.
-const CONTRAST_ROWS: [ContrastRow; 2] = ContrastRow::ALL;
+const CONTRAST_ROWS: [ContrastRow; CONTRAST_ROW_COUNT] = ContrastRow::ALL;
+/// Number of contrast rows.
+const CONTRAST_ROW_COUNT: usize = ContrastRow::ALL.len();
 /// Rows the columns keep above the contrast rows (a header and two rows).
 pub const CONTRAST_MIN_COLUMNS_HEIGHT: u16 = 3;
 /// Narrowest contrast control that keeps its row label beside it.
@@ -128,7 +130,7 @@ pub struct AppearanceLayout {
     /// Diagnostic row for skipped catalog entries.
     pub diagnostic: Option<Rect>,
     /// Contrast rows, when the body has room for them.
-    pub contrast: Option<[ContrastRowLayout; 2]>,
+    pub contrast: Option<[ContrastRowLayout; CONTRAST_ROW_COUNT]>,
 }
 
 impl AppearanceLayout {
@@ -195,7 +197,7 @@ fn contrast_row_layout(row: ContrastRow, area: Rect) -> ContrastRowLayout {
 
 /// Split the contrast rows off the bottom of `body` when the columns keep
 /// [`CONTRAST_MIN_COLUMNS_HEIGHT`] rows above them.
-fn split_contrast(body: Rect) -> (Rect, Option<[ContrastRowLayout; 2]>) {
+fn split_contrast(body: Rect) -> (Rect, Option<[ContrastRowLayout; CONTRAST_ROW_COUNT]>) {
     let rows = u16::try_from(CONTRAST_ROWS.len()).unwrap_or(u16::MAX);
     if body.width == 0 || body.height < rows.saturating_add(CONTRAST_MIN_COLUMNS_HEIGHT) {
         return (body, None);
@@ -204,10 +206,12 @@ fn split_contrast(body: Rect) -> (Rect, Option<[ContrastRowLayout; 2]>) {
     let row = |index: u16| Rect::new(body.x, top + index, body.width, 1);
     (
         Rect::new(body.x, body.y, body.width, body.height - rows),
-        Some([
-            contrast_row_layout(ContrastRow::Factor, row(0)),
-            contrast_row_layout(ContrastRow::Minimum, row(1)),
-        ]),
+        Some(std::array::from_fn(|index| {
+            contrast_row_layout(
+                CONTRAST_ROWS[index],
+                row(u16::try_from(index).unwrap_or(u16::MAX)),
+            )
+        })),
     )
 }
 
@@ -402,68 +406,66 @@ fn render_contrast_row(
             theme.overlay,
         );
     }
-    match layout.row {
-        ContrastRow::Factor => {
-            let value = bcode_tui_theme::picker::contrast::factor_position(shown.factor);
-            let label = format!("{}×", shown.factor);
-            let gauge = ProgressBarComponent::new(
-                "appearance.contrast",
-                ProgressBarValue::determinate(value, 100),
-            )
-            .label(&label)
-            .policy(ProgressBarPolicy::compact().line_gauge())
-            .styles({
-                let filled = if focused { theme.focused } else { theme.text };
-                ProgressBarStyles {
-                    filled,
-                    empty: theme.muted,
-                    label: filled,
-                    complete: filled,
-                    indeterminate: filled,
-                    background: theme.overlay,
-                }
-            });
-            let gauge_layout = gauge.layout(
-                Constraints::tight(layout.control.size()),
-                &mut LayoutCx::new(),
-            );
-            frame.with_child(
-                i32::from(layout.control.x),
-                i64::from(layout.control.y),
-                LocalRect::new(0, 0, layout.control.width, layout.control.height),
-                |cx| gauge.paint(&gauge_layout, cx),
-            );
-        }
-        ContrastRow::Minimum => {
-            let current = shown.minimum;
-            let mut spans = Vec::new();
-            let choices = bcode_tui_theme::picker::contrast::minimum_choices();
-            let mut listed = false;
-            for (index, choice) in choices.enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled(" ", theme.overlay));
-                }
-                let chosen = choice == current;
-                listed |= chosen;
-                let style = match (chosen, focused) {
-                    (true, true) => theme.selection,
-                    (true, false) => theme
-                        .text
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
-                    (false, _) => theme.muted,
-                };
-                spans.push(Span::styled(format!(" {choice} "), style));
+    if let (Some(value), Some(label)) = (
+        layout.row.slider_position(&shown),
+        layout.row.slider_label(&shown),
+    ) {
+        let gauge = ProgressBarComponent::new(
+            format!("appearance.contrast.{:?}", layout.row),
+            ProgressBarValue::determinate(value, 100),
+        )
+        .label(&label)
+        .policy(ProgressBarPolicy::compact().line_gauge())
+        .styles({
+            let filled = if focused { theme.focused } else { theme.text };
+            ProgressBarStyles {
+                filled,
+                empty: theme.muted,
+                label: filled,
+                complete: filled,
+                indeterminate: filled,
+                background: theme.overlay,
             }
-            if !listed {
-                // A configured floor between the presets is shown as it is.
-                spans.push(Span::styled(format!("  {current}"), theme.text));
+        });
+        let gauge_layout = gauge.layout(
+            Constraints::tight(layout.control.size()),
+            &mut LayoutCx::new(),
+        );
+        frame.with_child(
+            i32::from(layout.control.x),
+            i64::from(layout.control.y),
+            LocalRect::new(0, 0, layout.control.width, layout.control.height),
+            |cx| gauge.paint(&gauge_layout, cx),
+        );
+    } else {
+        let current = shown.minimum;
+        let mut spans = Vec::new();
+        let choices = bcode_tui_theme::picker::contrast::minimum_choices();
+        let mut listed = false;
+        for (index, choice) in choices.enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" ", theme.overlay));
             }
-            frame.write_line_with_fallback_style(
-                LocalRect::terminal(layout.control),
-                &Line::from_spans(spans),
-                theme.overlay,
-            );
+            let chosen = choice == current;
+            listed |= chosen;
+            let style = match (chosen, focused) {
+                (true, true) => theme.selection,
+                (true, false) => theme
+                    .text
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
+                (false, _) => theme.muted,
+            };
+            spans.push(Span::styled(format!(" {choice} "), style));
         }
+        if !listed {
+            // A configured floor between the presets is shown as it is.
+            spans.push(Span::styled(format!("  {current}"), theme.text));
+        }
+        frame.write_line_with_fallback_style(
+            LocalRect::terminal(layout.control),
+            &Line::from_spans(spans),
+            theme.overlay,
+        );
     }
 }
 
@@ -1251,14 +1253,20 @@ mod tests {
                 }
             }
             // The focus marker sits on the focused row only.
-            if let Some([factor, minimum]) = layout.contrast
-                && factor.label.is_some()
+            if let Some(rows) = layout.contrast
+                && rows[0].label.is_some()
             {
                 let marker = |row: ContrastRowLayout| {
                     region_text(&buffer, row.label.expect("label"))[0]
                         .starts_with(CONTRAST_FOCUS_MARKER.trim_end())
                 };
-                assert!(marker(minimum) && !marker(factor), "{area:?}");
+                for row in rows {
+                    assert_eq!(
+                        marker(row),
+                        row.row == ContrastRow::Minimum,
+                        "{area:?}: {row:?}"
+                    );
+                }
             }
         }
     }
@@ -1272,7 +1280,8 @@ mod tests {
         }
         let (_, text) = render_into(&mut picker, Rect::new(0, 0, 130, 44));
         assert!(text.contains("1.20×"), "{text}");
-        assert!(!text.contains("1.00×"), "{text}");
+        // Only the background tint still shows its exact value.
+        assert_eq!(text.matches("1.00×").count(), 1, "{text}");
     }
 
     #[test]

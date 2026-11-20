@@ -8,7 +8,8 @@
 //! * [`AppearanceOverlay`] is the picker: a BMUX `picker_frame` over a BMUX `menu` of the rows of
 //!   [`AppPicker`] (Follow Bcode, the palettes, the profiles) with the shared contrast rows below
 //!   it ([`ContrastRowsComponent`]). Moving the cursor restyles the whole app at once; `tab`
-//!   reaches the contrast slider and the minimum contrast of the previewed palette, where
+//!   reaches the contrast slider, the minimum contrast and the vibrance, richness and
+//!   background-tint sliders of the previewed palette, where
 //!   `←`/`→` change the value (previewed at once) and `0` resets it. `enter` applies (the
 //!   contrast edits are saved per theme in `[theme.overrides.<theme-id>]`, shared with Bcode and
 //!   the git client), `esc` restores what was presented. Pointer events route through exactly
@@ -362,7 +363,7 @@ impl AppearanceOverlay {
         let frame = modal::frame(
             theme,
             " Review appearance ",
-            "↑/↓ move · tab contrast · ←/→ adjust · 0 reset · enter apply · f follow Bcode · esc cancel",
+            "↑/↓ move · tab contrast & color · ←/→ adjust · 0 reset · enter apply · f follow Bcode · esc cancel",
             area.size(),
         );
         let notes = TextBlock::new(Text::from_lines(self.notes(theme))).wrap(TextWrap::Word);

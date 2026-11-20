@@ -3,8 +3,8 @@
 //! The picker is a popup menu over the rows of [`AppPicker`] (Follow Bcode, the palettes, the
 //! profiles) with the shared contrast rows below them
 //! ([`bcode_tui_theme::picker::contrast::view::ContrastRowsComponent`]). Moving the cursor
-//! restyles the whole UI at once; `tab` reaches the contrast slider and the minimum contrast of
-//! the previewed palette, where `←`/`→` change the value (previewed at once) and `0` resets it;
+//! restyles the whole UI at once; `tab` reaches the contrast slider, the minimum contrast and
+//! the vibrance, richness and background-tint sliders of the previewed palette, where `←`/`→` change the value (previewed at once) and `0` resets it;
 //! a click focuses a contrast row and the wheel steps it. Confirming saves the git UI's own
 //! choice in user state (`[apps.git.theme]`), or removes it on the Follow Bcode row so the UI
 //! follows bcode's again, and saves the contrast edits per theme
@@ -18,10 +18,10 @@ use bcode_config_layers::user_state::{
 };
 use bcode_tui_theme::appearance::AppearanceResolution;
 use bcode_tui_theme::picker::app::{AppContrastOutcome, AppPicker, AppPickerRowKind};
-use bcode_tui_theme::picker::contrast::ContrastKey;
 use bcode_tui_theme::picker::contrast::view::{
     ContrastPointer, ContrastRowsComponent, ContrastRowsStyles, hit_row, pointer_action,
 };
+use bcode_tui_theme::picker::contrast::{ContrastKey, ContrastRow};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::Component;
 use bmux_tui::event::MouseEvent;
@@ -102,7 +102,9 @@ const CONTRAST_ID: &str = "appearance.contrast";
 /// Rows the picker's list keeps above the contrast rows.
 const CONTRAST_MIN_BODY_HEIGHT: u64 = 3;
 /// Rows the contrast rows add to the picker.
-pub const CONTRAST_ROWS: u16 = 2;
+// The shared rows are a handful, so the count fits.
+#[allow(clippy::cast_possible_truncation)]
+pub const CONTRAST_ROWS: u16 = ContrastRow::ALL.len() as u16;
 
 /// The picker body `body` with the contrast rows of `picker` below it.
 pub fn with_contrast<'a>(
@@ -147,7 +149,7 @@ fn fill(menu: &mut Menu, picker: AppPicker, error: Option<String>) {
         notes.push(Line::from(error));
     }
     notes.push(Line::from(
-        "enter apply · tab contrast · ←/→ adjust · 0 reset · f follow Bcode · esc cancel",
+        "enter apply · tab contrast & color · ←/→ adjust · 0 reset · f follow Bcode · esc cancel",
     ));
     menu.notes = notes;
     menu.appearance = Some(Box::new(picker));
@@ -625,7 +627,7 @@ mod tests {
             "1.00×",
             "Minimum",
             "off   3.0   4.5   7.0",
-            "tab contrast",
+            "tab contrast & color",
             "0 reset",
         ] {
             assert!(screen.contains(text), "{text}\n{screen}");
@@ -679,7 +681,16 @@ mod tests {
         harness.key("ctrl+w");
         harness.key("t");
         assert!(harness.screen(100, 40).contains("1.40×"));
+        // Shift+tab reaches the last row, the background tint.
         harness.key("shift+tab");
+        assert!(harness.screen(100, 40).contains("› Background tint"));
+        let before = harness.app.theme.clone();
+        harness.key("left");
+        assert_ne!(harness.app.theme, before, "the tint previews live");
+        assert!(harness.screen(100, 40).contains("0.95×"));
+        for _ in 0..3 {
+            harness.key("up");
+        }
         harness.key("right");
         harness.key("right");
         assert!(harness.screen(100, 40).contains("› Minimum"));
@@ -687,6 +698,7 @@ mod tests {
         let overrides = harness.saved_overrides().expect("overrides saved");
         assert_eq!(overrides["nord"]["contrast"].as_float(), Some(1.4));
         assert_eq!(overrides["nord"]["minimum_contrast"].as_float(), Some(4.5));
+        assert_eq!(overrides["nord"]["background_tint"].as_float(), Some(0.95));
     }
 
     #[test]

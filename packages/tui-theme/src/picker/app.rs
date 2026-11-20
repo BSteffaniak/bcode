@@ -269,14 +269,14 @@ impl AppPicker {
     }
 
     /// Handle a contrast key. With the rows focused, only [`ContrastKey::Next`] (to the
-    /// slider) and [`ContrastKey::Previous`] (to the minimum) are handled; with a contrast row
+    /// first row) and [`ContrastKey::Previous`] (to the last) are handled; with a contrast row
     /// focused, every key is ([`ContrastControls::handle_key`]), and leaving the contrast rows
     /// returns focus to the rows.
     pub fn contrast_key(&mut self, key: ContrastKey, live: &LiveAppearance) -> AppContrastOutcome {
         if self.contrast.focus().is_none() {
             let row = match key {
-                ContrastKey::Next => ContrastRow::Factor,
-                ContrastKey::Previous => ContrastRow::Minimum,
+                ContrastKey::Next => ContrastRow::FIRST,
+                ContrastKey::Previous => ContrastRow::LAST,
                 _ => return AppContrastOutcome::Ignored,
             };
             self.contrast.set_focus(Some(row));
@@ -790,13 +790,19 @@ mod tests {
         let mut picker = AppPicker::open("review", &live, |path| path.display().to_string());
         assert_eq!(picker.contrast_palette(), "dracula");
         picker.contrast_key(ContrastKey::Previous, &live);
-        assert_eq!(picker.contrast().focus(), Some(ContrastRow::Minimum));
+        assert_eq!(picker.contrast().focus(), Some(ContrastRow::LAST));
         assert!(
             picker
                 .step_contrast(ContrastRow::Minimum, true, &live)
                 .is_some()
         );
         assert_eq!(picker.contrast().shown().minimum.ratio(), Some(3.0));
+        assert!(
+            picker
+                .step_contrast(ContrastRow::Vibrance, true, &live)
+                .is_some()
+        );
+        assert_eq!(picker.contrast().shown().vibrance.get(), 0.05);
         let restored = picker.cancel(&live, |_| {});
         assert_eq!(
             restored.resolved.as_ref().expect("resolves").fingerprint,
