@@ -841,7 +841,14 @@ pickers drop the row labels first; pickers too short to keep three column rows
 above them do not show the rows (the keys still adjust them).
 
 The git client and the review app read the same `[tui.theme]` keys and the
-values saved by the picker, so their colors and terminal views match.
+values saved by the picker, so their colors and terminal views match. Their own
+appearance pickers (`ctrl+w t` in `bcode git`, `ctrl+t` in the review) have the
+same contrast and minimum rows below their lists, with the same keys, mouse
+behavior, and narrow-size degradation; Tab moves between the list and the two
+rows. The rows edit the palette the cursor previews (for **Follow Bcode**, the
+palette bcode presents), Enter saves the changed values to the same
+`[theme.overrides.<theme-id>]`, so a theme's contrast is the same in bcode, the
+git client, and the review, and Escape restores what the picker opened with.
 
 `bcode theme check` measures the authored theme. `--with-adjustments` measures
 the colors your contrast settings produce for the checked theme instead (the

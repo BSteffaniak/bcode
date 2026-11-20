@@ -6,17 +6,30 @@
 //!   (`[apps.review.theme]`) or removes it so the review follows Bcode's again; Bcode's own
 //!   choice is never written here.
 //! * [`AppearanceOverlay`] is the picker: a BMUX `picker_frame` over a BMUX `menu` of the rows of
-//!   [`AppPicker`] (Follow Bcode, the palettes, the profiles). Moving the cursor restyles the
-//!   whole app at once; `enter` applies, `esc` restores what was presented. Pointer events route
-//!   through exactly the layout it was painted with.
+//!   [`AppPicker`] (Follow Bcode, the palettes, the profiles) with the shared contrast rows below
+//!   it ([`ContrastRowsComponent`]). Moving the cursor restyles the whole app at once; `tab`
+//!   reaches the contrast slider and the minimum contrast of the previewed palette, where
+//!   `←`/`→` change the value (previewed at once) and `0` resets it. `enter` applies (the
+//!   contrast edits are saved per theme in `[theme.overrides.<theme-id>]`, shared with Bcode and
+//!   the git client), `esc` restores what was presented. Pointer events route through exactly
+//!   the layout it was painted with: a click focuses a contrast row and the wheel steps it.
 
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bcode_config_layers::user_state::{SavedTuiAppearance, save_app_tui_appearance};
+use bcode_config_layers::user_state::{
+    SavedTuiAppearance, save_app_tui_appearance, update_theme_override,
+};
+use bcode_tui_theme::adjustment::ContrastOverride;
 use bcode_tui_theme::appearance::{AppearanceResolution, SavedAppearance};
 use bcode_tui_theme::picker::LiveAppearance;
-use bcode_tui_theme::picker::app::{AppPicker, AppPickerRow, AppPickerRowKind};
+use bcode_tui_theme::picker::app::{AppContrastOutcome, AppPicker, AppPickerRow, AppPickerRowKind};
+use bcode_tui_theme::picker::contrast::ContrastKey;
+use bcode_tui_theme::picker::contrast::view::{
+    ContrastPointer, ContrastRowsComponent, ContrastRowsStyles,
+};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::LayoutNode;
 use bmux_tui::composition::{Column, Flex, TextBlock};
@@ -33,6 +46,10 @@ use crate::config::APPEARANCE_APP;
 
 const FRAME_ID: &str = "review.appearance";
 const MENU_ID: &str = "review.appearance.menu";
+/// Layout id of the body with the contrast rows (and prefix of the rows' hit regions).
+const CONTRAST_ID: &str = "review.appearance.contrast";
+/// Rows the notes and the menu keep above the contrast rows.
+const CONTRAST_MIN_BODY_HEIGHT: u64 = 4;
 /// Menu item id prefix of a picker row (followed by its index).
 const ROW_PREFIX: &str = "row.";
 
@@ -104,6 +121,14 @@ impl AppearanceControl {
         save_app_tui_appearance(&self.state_file, APPEARANCE_APP, own.as_ref())
             .map_err(|error| error.to_string())
     }
+
+    /// Save the contrast edited per theme beside Bcode's (`[theme.overrides.<theme-id>]`).
+    fn persist_contrast(&self, edits: &BTreeMap<String, ContrastOverride>) -> Result<(), String> {
+        edits.iter().try_for_each(|(theme, edits)| {
+            update_theme_override(&self.state_file, theme, |prior| edits.saved_over(prior))
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 /// What an input did to the picker.
@@ -123,6 +148,7 @@ pub struct AppearanceOverlay {
     menu: MenuPanel,
     error: Option<String>,
     painted: Option<(Rect, LayoutNode)>,
+    pointer: Cell<Option<ContrastPointer>>,
 }
 
 impl std::fmt::Debug for AppearanceOverlay {
@@ -145,6 +171,7 @@ impl AppearanceOverlay {
             menu: MenuPanel::new(MENU_ID),
             error: None,
             painted: None,
+            pointer: Cell::new(None),
         };
         overlay.refresh_items(theme);
         overlay
@@ -163,6 +190,15 @@ impl AppearanceOverlay {
         control: &AppearanceControl,
         theme: &ReviewTheme,
     ) -> AppearanceOutcome {
+        let back_tab = stroke.key == KeyCode::Tab
+            && stroke.modifiers
+                == bmux_keyboard::Modifiers {
+                    shift: true,
+                    ..bmux_keyboard::Modifiers::NONE
+                };
+        if back_tab {
+            return self.contrast(ContrastKey::Previous, control);
+        }
         if !stroke.modifiers.is_empty() {
             return AppearanceOutcome::Ignored;
         }
@@ -174,6 +210,18 @@ impl AppearanceOverlay {
                 AppearanceOutcome::Close
             }
             KeyCode::Enter => self.apply(control),
+            KeyCode::Tab => self.contrast(ContrastKey::Next, control),
+            key if self.picker.contrast().focus().is_some() => {
+                let key = match key {
+                    KeyCode::Left | KeyCode::Char('h') => ContrastKey::Lower,
+                    KeyCode::Right | KeyCode::Char('l') => ContrastKey::Raise,
+                    KeyCode::Up | KeyCode::Char('k') => ContrastKey::Up,
+                    KeyCode::Down | KeyCode::Char('j') => ContrastKey::Down,
+                    KeyCode::Char('0') => ContrastKey::Reset,
+                    _ => return AppearanceOutcome::Ignored,
+                };
+                self.contrast(key, control)
+            }
             KeyCode::Char('f') => self.select(0, control, theme),
             key => {
                 if !self.menu.navigate(key) {
@@ -185,6 +233,39 @@ impl AppearanceOverlay {
                 })
             }
         }
+    }
+
+    /// Hand `key` to the contrast rows, presenting the edited contrast.
+    fn contrast(&mut self, key: ContrastKey, control: &AppearanceControl) -> AppearanceOutcome {
+        match self.picker.contrast_key(key, &control.live) {
+            AppContrastOutcome::Preview(preview) => {
+                control.present(&preview);
+                self.error = None;
+                AppearanceOutcome::Redraw
+            }
+            AppContrastOutcome::Moved => AppearanceOutcome::Redraw,
+            AppContrastOutcome::Ignored => AppearanceOutcome::Ignored,
+        }
+    }
+
+    /// Act on a pointer event over a contrast row: a press focuses it, a wheel notch steps it.
+    fn contrast_pointer(
+        &mut self,
+        pointer: ContrastPointer,
+        control: &AppearanceControl,
+    ) -> AppearanceOutcome {
+        match pointer {
+            ContrastPointer::Focus(row) => {
+                self.picker.focus_contrast(Some(row));
+            }
+            ContrastPointer::Step(row, raise) => {
+                if let Some(preview) = self.picker.step_contrast(row, raise, &control.live) {
+                    control.present(&preview);
+                    self.error = None;
+                }
+            }
+        }
+        AppearanceOutcome::Redraw
     }
 
     /// Route a pointer event through the painted layout; a click previews the row it lands
@@ -202,6 +283,9 @@ impl AppearanceOverlay {
             let component = self.component(theme, area);
             modal::route(&component, area, &layout, event)
         };
+        if let Some(pointer) = self.pointer.take() {
+            return self.contrast_pointer(pointer, control);
+        }
         if let Some(row) = self.menu.take_activated().as_deref().and_then(row_index) {
             return self.select(row, control, theme);
         }
@@ -229,6 +313,7 @@ impl AppearanceOverlay {
     fn apply(&mut self, control: &AppearanceControl) -> AppearanceOutcome {
         match self.picker.apply(
             &control.live,
+            |edits| control.persist_contrast(edits),
             |own| control.persist(own),
             |resolution| control.present(resolution),
         ) {
@@ -277,7 +362,8 @@ impl AppearanceOverlay {
         let frame = modal::frame(
             theme,
             " Review appearance ",
-            "↑/↓ preview · enter apply · f follow Bcode · esc cancel",
+            "↑/↓ preview · tab contrast · ←/→ adjust · 0 reset · enter apply · f follow Bcode · \
+             esc cancel",
             area.size(),
         );
         let notes = TextBlock::new(Text::from_lines(self.notes(theme))).wrap(TextWrap::Word);
@@ -285,6 +371,21 @@ impl AppearanceOverlay {
             .id(format!("{FRAME_ID}.body"))
             .child(notes)
             .flex(Flex::new(1, self.menu.component(theme)));
+        let body = ContrastRowsComponent::new(
+            CONTRAST_ID,
+            body,
+            self.picker.contrast(),
+            ContrastRowsStyles {
+                label: theme.muted,
+                focused: theme.accent,
+                value: theme.text,
+                muted: theme.muted,
+                selected: theme.overlay_component.selected,
+                background: theme.tiers.overlay,
+            },
+        )
+        .min_body_height(CONTRAST_MIN_BODY_HEIGHT)
+        .pointer(&self.pointer);
         PickerFrameComponent::new(FRAME_ID, frame, body)
     }
 

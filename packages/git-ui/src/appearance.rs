@@ -1,16 +1,31 @@
 //! The git UI's appearance picker: its own palette and profile, or bcode's.
 //!
 //! The picker is a popup menu over the rows of [`AppPicker`] (Follow Bcode, the palettes, the
-//! profiles). Moving the cursor restyles the whole UI at once; confirming saves the git UI's
-//! own choice in user state (`[apps.git.theme]`), or removes it on the Follow Bcode row so the
-//! UI follows bcode's again; closing restores what was presented. bcode's own choice is never
-//! written here. The appearance watcher keeps running, but its results wait while the picker
-//! previews ([`bcode_tui_theme::picker::LiveAppearance`]).
+//! profiles) with the shared contrast rows below them
+//! ([`bcode_tui_theme::picker::contrast::view::ContrastRowsComponent`]). Moving the cursor
+//! restyles the whole UI at once; `tab` reaches the contrast slider and the minimum contrast of
+//! the previewed palette, where `←`/`→` change the value (previewed at once) and `0` resets it;
+//! a click focuses a contrast row and the wheel steps it. Confirming saves the git UI's own
+//! choice in user state (`[apps.git.theme]`), or removes it on the Follow Bcode row so the UI
+//! follows bcode's again, and saves the contrast edits per theme
+//! (`[theme.overrides.<theme-id>]`, shared with bcode and the review); closing restores what was
+//! presented. bcode's own choice is never written here. The appearance watcher keeps running,
+//! but its results wait while the picker previews
+//! ([`bcode_tui_theme::picker::LiveAppearance`]).
 
-use bcode_config_layers::user_state::{SavedTuiAppearance, save_app_tui_appearance};
+use bcode_config_layers::user_state::{
+    SavedTuiAppearance, save_app_tui_appearance, update_theme_override,
+};
 use bcode_tui_theme::appearance::AppearanceResolution;
-use bcode_tui_theme::picker::app::{AppPicker, AppPickerRowKind};
-use bmux_keyboard::KeyStroke;
+use bcode_tui_theme::picker::app::{AppContrastOutcome, AppPicker, AppPickerRowKind};
+use bcode_tui_theme::picker::contrast::ContrastKey;
+use bcode_tui_theme::picker::contrast::view::{
+    ContrastPointer, ContrastRowsComponent, ContrastRowsStyles, hit_row, pointer_action,
+};
+use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_tui::component::Component;
+use bmux_tui::event::MouseEvent;
+use bmux_tui::geometry::Point;
 use bmux_tui::text::{Line, Span};
 use bmux_tui_runtime::Update;
 
@@ -49,6 +64,66 @@ impl App {
         let (theme, _) = GitTheme::from_resolution(resolution);
         self.set_theme(theme)
     }
+
+    /// A pointer event over a painted contrast row of the open picker: a press focuses the
+    /// row, a wheel notch steps it. `None` when the event is not over one.
+    pub(crate) fn appearance_pointer(&mut self, mouse: MouseEvent) -> Option<Update<Msg>> {
+        if !matches!(self.popups.last(), Some(Popup::Menu(menu)) if menu.appearance.is_some()) {
+            return None;
+        }
+        let row = {
+            let hits = self.hits.borrow();
+            hits.hit_test(Point::new(mouse.position.x, mouse.position.y))
+                .and_then(|hit| hit_row(CONTRAST_ID, hit.region.id.as_str()))
+        }?;
+        let action = pointer_action(mouse.kind, row)?;
+        let live = std::sync::Arc::clone(&self.appearance.as_ref()?.live);
+        let Some(Popup::Menu(mut menu)) = self.popups.pop() else {
+            return None;
+        };
+        let mut picker = *menu.appearance.take()?;
+        let update = match action {
+            ContrastPointer::Focus(row) => {
+                picker.focus_contrast(Some(row));
+                Update::none()
+            }
+            ContrastPointer::Step(row, raise) => picker
+                .step_contrast(row, raise, &live)
+                .map_or_else(Update::none, |preview| self.present_appearance(&preview)),
+        };
+        fill(&mut menu, picker, None);
+        self.popups.push(Popup::Menu(menu));
+        Some(Update::redraw().merge(update))
+    }
+}
+
+/// Layout id of the picker body with the contrast rows (and prefix of the rows' hit regions).
+const CONTRAST_ID: &str = "appearance.contrast";
+/// Rows the picker's list keeps above the contrast rows.
+const CONTRAST_MIN_BODY_HEIGHT: u64 = 3;
+/// Rows the contrast rows add to the picker.
+pub const CONTRAST_ROWS: u16 = 2;
+
+/// The picker body `body` with the contrast rows of `picker` below it.
+pub fn with_contrast<'a>(
+    body: impl Component + 'a,
+    picker: &'a AppPicker,
+    theme: &GitTheme,
+) -> ContrastRowsComponent<'a> {
+    ContrastRowsComponent::new(
+        CONTRAST_ID,
+        body,
+        picker.contrast(),
+        ContrastRowsStyles {
+            label: theme.muted,
+            focused: theme.accent,
+            value: theme.text,
+            muted: theme.muted,
+            selected: theme.cursor,
+            background: theme.overlay,
+        },
+    )
+    .min_body_height(CONTRAST_MIN_BODY_HEIGHT)
 }
 
 /// Rebuild `menu` from `picker`: one item per row, the cursor on the picker's row, and the
@@ -71,7 +146,9 @@ fn fill(menu: &mut Menu, picker: AppPicker, error: Option<String>) {
     if let Some(error) = error {
         notes.push(Line::from(error));
     }
-    notes.push(Line::from("enter apply · f follow Bcode · esc cancel"));
+    notes.push(Line::from(
+        "enter apply · tab contrast · ←/→ adjust · 0 reset · f follow Bcode · esc cancel",
+    ));
     menu.notes = notes;
     menu.appearance = Some(Box::new(picker));
 }
@@ -117,6 +194,15 @@ pub fn key(
     else {
         return Update::redraw();
     };
+    if let Some(key) = contrast_key(&picker, action, stroke) {
+        let update = match picker.contrast_key(key, &live) {
+            AppContrastOutcome::Preview(preview) => app.present_appearance(&preview),
+            AppContrastOutcome::Moved | AppContrastOutcome::Ignored => Update::none(),
+        };
+        fill(&mut menu, picker, None);
+        app.popups.push(Popup::Menu(menu));
+        return Update::redraw().merge(update);
+    }
     let follow =
         bcode_keymap::controls::LiteralText::from_stroke(stroke).is_some_and(|text| text.0 == 'f');
     let preview = match action {
@@ -132,6 +218,11 @@ pub fn key(
                 .unwrap_or_default();
             let saved = picker.apply(
                 &live,
+                |edits| {
+                    edits.iter().try_for_each(|(theme, edits)| {
+                        update_theme_override(&state_file, theme, |prior| edits.saved_over(prior))
+                    })
+                },
                 |own| {
                     let own = own.map(|own| SavedTuiAppearance {
                         theme: own.theme.clone(),
@@ -166,6 +257,41 @@ pub fn key(
     fill(&mut menu, picker, None);
     app.popups.push(Popup::Menu(menu));
     Update::redraw().merge(update)
+}
+
+/// The contrast key `stroke` (resolved to `action`) stands for: `tab` and `shift+tab` move
+/// between the rows and the contrast rows; while a contrast row has focus, the horizontal keys
+/// change it, `0` resets it and the vertical keys move between the contrast rows.
+fn contrast_key(
+    picker: &AppPicker,
+    action: Option<Action>,
+    stroke: KeyStroke,
+) -> Option<ContrastKey> {
+    let shift_only = bmux_keyboard::Modifiers {
+        shift: true,
+        ..bmux_keyboard::Modifiers::NONE
+    };
+    match (stroke.key, stroke.modifiers) {
+        (KeyCode::Tab, modifiers) if modifiers.is_empty() => return Some(ContrastKey::Next),
+        (KeyCode::Tab, modifiers) if modifiers == shift_only => return Some(ContrastKey::Previous),
+        _ => {}
+    }
+    picker.contrast().focus()?;
+    match action {
+        Some(Action::MenuUp) => return Some(ContrastKey::Up),
+        Some(Action::MenuDown) => return Some(ContrastKey::Down),
+        Some(Action::MenuClose | Action::MenuConfirm) => return None,
+        _ => {}
+    }
+    if !stroke.modifiers.is_empty() {
+        return None;
+    }
+    match stroke.key {
+        KeyCode::Left | KeyCode::Char('h') => Some(ContrastKey::Lower),
+        KeyCode::Right | KeyCode::Char('l') => Some(ContrastKey::Raise),
+        KeyCode::Char('0') => Some(ContrastKey::Reset),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -278,13 +404,55 @@ mod tests {
 
         /// The watcher read the state file now and reported it.
         fn watch(&mut self) {
-            let loaded = LoadedConfig {
+            let loaded = self.loaded();
+            self.offer(&loaded);
+        }
+
+        /// The configuration the watcher loads from the state file now, saved contrast folded
+        /// in as configuration loading does.
+        fn loaded(&self) -> LoadedConfig {
+            let mut loaded = LoadedConfig {
                 saved_appearance: saved(&self.saved().bcode),
                 app_appearance: self.saved().app.as_ref().map(saved),
                 config_dir: self.dir.path().to_path_buf(),
                 ..LoadedConfig::default()
             };
-            self.offer(&loaded);
+            loaded.theme.contrast.apply_saved(
+                &bcode_config_layers::user_state::load_saved_theme_overrides(
+                    &self.dir.path().join("tui.toml"),
+                )
+                .expect("state"),
+            );
+            loaded
+        }
+
+        /// The `[theme.overrides]` table saved in the state file.
+        fn saved_overrides(&self) -> Option<toml::Value> {
+            let text = std::fs::read_to_string(self.dir.path().join("tui.toml")).expect("state");
+            let document: toml::Table = text.parse().expect("toml");
+            document.get("theme")?.get("overrides").cloned()
+        }
+
+        fn screen(&mut self, width: u16, height: u16) -> String {
+            crate::render_text(&mut self.app, width, height).join("\n")
+        }
+
+        /// The painted area of contrast row `suffix` (`contrast` or `minimum`).
+        fn contrast_row(&self, suffix: &str) -> Option<bmux_tui::geometry::Rect> {
+            self.app
+                .hit_regions()
+                .into_iter()
+                .find(|(id, _)| *id == format!("{CONTRAST_ID}.{suffix}"))
+                .map(|(_, area)| area)
+        }
+
+        fn mouse(&mut self, kind: bmux_tui::event::MouseEventKind, x: u16, y: u16) {
+            self.app
+                .update(RuntimeEvent::Terminal(Event::Mouse(MouseEvent::new(
+                    kind,
+                    Point::new(x, y),
+                ))))
+                .expect("update");
         }
 
         fn offer(&mut self, loaded: &LoadedConfig) {
@@ -442,5 +610,175 @@ mod tests {
             }
         }
         harness.key("escape");
+    }
+
+    #[test]
+    fn contrast_previews_live_resets_and_enter_saves_only_the_edited_value_for_the_theme() {
+        let mut harness = Harness::new();
+        let nord = harness.theme_of("nord");
+        let stale = harness.loaded();
+        harness.key("ctrl+w");
+        harness.key("t");
+        let screen = harness.screen(100, 40);
+        for text in [
+            "Contrast",
+            "1.00×",
+            "Minimum",
+            "off   3.0   4.5   7.0",
+            "tab contrast",
+            "0 reset",
+        ] {
+            assert!(screen.contains(text), "{text}\n{screen}");
+        }
+        // Tab reaches the slider of the palette the follow row presents (bcode's nord).
+        harness.key("tab");
+        for _ in 0..8 {
+            harness.key("right");
+        }
+        assert!(harness.screen(100, 40).contains("1.40×"));
+        let raised = harness.app.theme.clone();
+        assert_ne!(raised, nord, "the whole UI previews the contrast");
+        harness.key("0");
+        assert_eq!(harness.app.theme, nord);
+        for _ in 0..8 {
+            harness.key("right");
+        }
+        assert_eq!(harness.app.theme, raised);
+
+        harness.key("enter");
+        assert!(harness.picker().is_none());
+        let overrides = harness.saved_overrides().expect("overrides saved");
+        let themes = overrides.as_table().expect("table");
+        assert_eq!(
+            themes.keys().collect::<Vec<_>>(),
+            ["nord"],
+            "only the edited theme"
+        );
+        let saved_nord = themes["nord"].as_table().expect("nord");
+        assert_eq!(
+            saved_nord.keys().collect::<Vec<_>>(),
+            ["contrast"],
+            "only the edited value"
+        );
+        assert_eq!(saved_nord["contrast"].as_float(), Some(1.4));
+        assert_eq!(
+            harness.saved().app,
+            None,
+            "the git UI's own choice is untouched"
+        );
+        assert_eq!(harness.saved().bcode.theme.as_deref(), Some("nord"));
+        assert_eq!(harness.app.theme, raised);
+        // A watcher tick that read the file before the save does not bring the old contrast
+        // back; one after it presents the saved contrast.
+        harness.offer(&stale);
+        assert_eq!(harness.app.theme, raised);
+        harness.watch();
+        assert_eq!(harness.app.theme, raised);
+
+        // The minimum cycles from off; saving it keeps the saved factor.
+        harness.key("ctrl+w");
+        harness.key("t");
+        assert!(harness.screen(100, 40).contains("1.40×"));
+        harness.key("shift+tab");
+        harness.key("right");
+        harness.key("right");
+        assert!(harness.screen(100, 40).contains("› Minimum"));
+        harness.key("enter");
+        let overrides = harness.saved_overrides().expect("overrides saved");
+        assert_eq!(overrides["nord"]["contrast"].as_float(), Some(1.4));
+        assert_eq!(overrides["nord"]["minimum_contrast"].as_float(), Some(4.5));
+    }
+
+    #[test]
+    fn escape_restores_the_contrast_and_saves_nothing() {
+        let mut harness = Harness::new();
+        let nord = harness.theme_of("nord");
+        harness.key("ctrl+w");
+        harness.key("t");
+        preview(&mut harness, "dracula");
+        let dracula = harness.app.theme.clone();
+        harness.key("tab");
+        harness.key("left");
+        harness.key("down");
+        harness.key("right");
+        assert_ne!(harness.app.theme, dracula);
+        // Up leaves the contrast rows for the list; the cursor stayed on dracula meanwhile.
+        harness.key("up");
+        harness.key("up");
+        let picker = harness.picker().expect("open");
+        assert_eq!(picker.contrast().focus(), None);
+        assert_eq!(picker.contrast_palette(), "dracula");
+        harness.key("escape");
+        assert_eq!(harness.app.theme, nord);
+        assert_eq!(harness.saved_overrides(), None);
+        assert_eq!(harness.saved().app, None);
+    }
+
+    #[test]
+    fn a_click_focuses_a_contrast_row_and_the_wheel_steps_it() {
+        use bmux_tui::event::{MouseButton, MouseEventKind};
+        let mut harness = Harness::new();
+        harness.key("ctrl+w");
+        harness.key("t");
+        let screen = harness.screen(100, 40);
+        let factor = harness.contrast_row("contrast").expect("slider painted");
+        let minimum = harness.contrast_row("minimum").expect("minimum painted");
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(rows[usize::from(factor.y)].contains("Contrast"), "{screen}");
+        assert!(rows[usize::from(minimum.y)].contains("Minimum"), "{screen}");
+
+        harness.mouse(MouseEventKind::ScrollUp, factor.right() - 1, factor.y);
+        assert!(harness.screen(100, 40).contains("1.05×"));
+        assert_ne!(harness.app.theme, harness.theme_of("nord"));
+        harness.mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            minimum.x,
+            minimum.y,
+        );
+        assert!(harness.screen(100, 40).contains("› Minimum"));
+        harness.key("right");
+        let screen = harness.screen(100, 40);
+        assert!(
+            screen
+                .lines()
+                .nth(usize::from(minimum.y))
+                .is_some_and(|row| row.contains("3.0")),
+            "{screen}"
+        );
+        harness.key("escape");
+        assert_eq!(harness.saved_overrides(), None);
+    }
+
+    #[test]
+    fn the_contrast_rows_drop_labels_when_narrow_and_go_when_short() {
+        let mut harness = Harness::new();
+        harness.key("ctrl+w");
+        harness.key("t");
+        let screen = harness.screen(30, 40);
+        let factor = harness
+            .contrast_row("contrast")
+            .unwrap_or_else(|| panic!("slider painted\n{screen}"));
+        assert!(
+            screen
+                .lines()
+                .nth(usize::from(factor.y))
+                .is_some_and(|row| row.contains("1.00×")),
+            "{screen}"
+        );
+        assert!(!screen.contains("Contrast"), "{screen}");
+        for (_, area) in harness.app.hit_regions() {
+            assert!(area.right() <= 30 && area.bottom() <= 40, "{area:?}");
+        }
+
+        let screen = harness.screen(100, 10);
+        assert!(harness.contrast_row("contrast").is_none(), "{screen}");
+        assert!(!screen.contains("Minimum"), "{screen}");
+        // The keys still adjust the contrast.
+        let before = harness.app.theme.clone();
+        harness.key("tab");
+        harness.key("right");
+        assert_ne!(harness.app.theme, before);
+        harness.key("escape");
+        assert_eq!(harness.app.theme, harness.theme_of("nord"));
     }
 }

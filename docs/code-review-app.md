@@ -1333,10 +1333,20 @@ follows bcode's again. `esc` restores what was presented. The appearance watcher
 running meanwhile, but its results wait until the picker closes, and results read from the
 state before an apply are dropped, so the applied appearance never flickers back.
 
+Below the list, a contrast slider and a minimum-contrast row adjust the contrast of the palette
+the cursor previews (for Follow Bcode, the palette bcode presents), as in bcode's picker:
+`tab` moves from the list to the slider, the minimum and back (`shift+tab` in reverse); on a
+row, `←`/`→` change the value, `↑`/`↓` move between the rows and `0` resets it; a click focuses
+a row and the wheel over it steps it. Every change previews on the whole app; `enter` also
+saves the changed values per theme in `[theme.overrides.<theme-id>]`, shared with bcode and
+the git client, and `esc` restores them. Narrow pickers drop the row labels, and pickers too
+short to keep the list above them do not show the rows (the keys still adjust them).
+
 Choices are saved in bcode's user state file (`$BCODE_TUI_STATE`, else `tui.toml` in the
 state directory: `$BCODE_STATE_DIR`, `$XDG_STATE_HOME/bcode` or `~/.local/state/bcode`).
 bcode's own appearance picker writes `[theme]`; the review's picker writes only
-`[apps.review.theme]` (`name`, `profile`), so neither changes the other. Older state files
+`[apps.review.theme]` (`name`, `profile`), so neither changes the other. Contrast is per theme
+rather than per program: every picker writes it to `[theme.overrides.<theme-id>]`. Older state files
 without an `[apps]` table read as following bcode.
 
 Precedence for the review, highest first:

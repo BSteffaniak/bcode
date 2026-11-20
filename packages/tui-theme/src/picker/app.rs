@@ -6,12 +6,22 @@
 //! chosen row. A palette or profile pinned by the app's configuration is shown as a note
 //! instead of that axis's rows, since choosing one could not take effect.
 //!
+//! Below the rows, the contrast rows ([`ContrastControls`]) adjust the contrast of the palette
+//! the cursor previews (for the follow row, the palette Bcode presents). Tab moves focus from
+//! the rows to the contrast slider, the minimum contrast and back ([`AppPicker::contrast_key`]);
+//! each edit previews at once, and applying saves the edited values per theme, shared with
+//! Bcode and every other app, beside the app's own choice.
+//!
 //! The model is UI-agnostic: an app renders [`AppPicker::rows`] with its own list component and
 //! styles, and presents each resolution the picker returns.
 
 use std::path::Path;
 
+use std::collections::BTreeMap;
+
+use super::contrast::{ContrastControls, ContrastKey, ContrastKeyOutcome, ContrastRow};
 use super::{AppearanceAxis, AppearanceSelection, LiveAppearance};
+use crate::adjustment::ContrastOverride;
 use crate::appearance::{AppearanceResolution, SavedAppearance};
 
 /// What one picker row is.
@@ -62,6 +72,19 @@ pub struct AppPicker {
     pinned_profile: String,
     bcode_summary: String,
     cursor: usize,
+    contrast: ContrastControls,
+    contrast_palette: String,
+}
+
+/// What a contrast key did in an [`AppPicker`].
+#[derive(Debug, Clone)]
+pub enum AppContrastOutcome {
+    /// A contrast value changed: present this appearance.
+    Preview(Box<AppearanceResolution>),
+    /// Focus moved between the rows and the contrast rows.
+    Moved,
+    /// The key changed nothing.
+    Ignored,
 }
 
 impl AppPicker {
@@ -86,8 +109,11 @@ impl AppPicker {
             bcode_summary: summary(&bcode),
             selection,
             cursor: 0,
+            contrast: ContrastControls::default(),
+            contrast_palette: String::new(),
         };
         picker.cursor = picker.chosen_row();
+        picker.edit_contrast_of(&opened);
         picker
     }
 
@@ -225,6 +251,97 @@ impl AppPicker {
             .unwrap_or(0)
     }
 
+    /// The contrast rows: focus, the values of [`Self::contrast_palette`] and the edits.
+    #[must_use]
+    pub const fn contrast(&self) -> &ContrastControls {
+        &self.contrast
+    }
+
+    /// The palette the contrast rows edit: the one the cursor previews.
+    #[must_use]
+    pub fn contrast_palette(&self) -> &str {
+        &self.contrast_palette
+    }
+
+    /// Focus contrast `row`, or the rows with `None`; returns whether the focus changed.
+    pub fn focus_contrast(&mut self, row: Option<ContrastRow>) -> bool {
+        self.contrast.set_focus(row)
+    }
+
+    /// Handle a contrast key. With the rows focused, only [`ContrastKey::Next`] (to the
+    /// slider) and [`ContrastKey::Previous`] (to the minimum) are handled; with a contrast row
+    /// focused, every key is ([`ContrastControls::handle_key`]), and leaving the contrast rows
+    /// returns focus to the rows.
+    pub fn contrast_key(&mut self, key: ContrastKey, live: &LiveAppearance) -> AppContrastOutcome {
+        if self.contrast.focus().is_none() {
+            let row = match key {
+                ContrastKey::Next => ContrastRow::Factor,
+                ContrastKey::Previous => ContrastRow::Minimum,
+                _ => return AppContrastOutcome::Ignored,
+            };
+            self.contrast.set_focus(Some(row));
+            return AppContrastOutcome::Moved;
+        }
+        match self.contrast.handle_key(&self.contrast_palette, key) {
+            ContrastKeyOutcome::Changed => {
+                AppContrastOutcome::Preview(Box::new(self.contrast_preview(live)))
+            }
+            ContrastKeyOutcome::Focused(_) | ContrastKeyOutcome::Left(_) => {
+                AppContrastOutcome::Moved
+            }
+            ContrastKeyOutcome::Ignored => AppContrastOutcome::Ignored,
+        }
+    }
+
+    /// Change contrast `row` one step (`raise` raises the factor or moves the floor to the
+    /// next preset), as a wheel notch over it does. Returns the appearance to present, or
+    /// `None` when the value did not change.
+    pub fn step_contrast(
+        &mut self,
+        row: ContrastRow,
+        raise: bool,
+        live: &LiveAppearance,
+    ) -> Option<AppearanceResolution> {
+        self.contrast
+            .step(&self.contrast_palette, row, raise)
+            .then(|| self.contrast_preview(live))
+    }
+
+    /// The per-theme contrast values edited so far, which [`Self::apply`] saves.
+    #[must_use]
+    pub const fn contrast_edits(&self) -> &BTreeMap<String, ContrastOverride> {
+        self.contrast.edits()
+    }
+
+    /// The appearance the cursor previews with the contrast edits.
+    fn contrast_preview(&self, live: &LiveAppearance) -> AppearanceResolution {
+        let preview = if self.following_bcode() {
+            live.bcode_appearance()
+        } else {
+            live.preview(&self.selection)
+        };
+        preview.with_contrast(self.contrast.edits())
+    }
+
+    /// `preview` with the contrast edits, its palette becoming the one the contrast rows edit.
+    fn previewed(&mut self, preview: &AppearanceResolution) -> AppearanceResolution {
+        let preview = preview.with_contrast(self.contrast.edits());
+        self.edit_contrast_of(&preview);
+        preview
+    }
+
+    /// Edit the contrast of the palette `resolution` presents, showing its values.
+    fn edit_contrast_of(&mut self, resolution: &AppearanceResolution) {
+        self.contrast_palette
+            .clone_from(&resolution.preferences.name);
+        self.contrast.show(
+            resolution
+                .preferences
+                .contrast
+                .settings_for(&self.contrast_palette),
+        );
+    }
+
     /// Put the cursor on row `row` and preview it. Returns the appearance to present, or
     /// `None` when the row cannot be selected.
     pub fn select(&mut self, row: usize, live: &LiveAppearance) -> Option<AppearanceResolution> {
@@ -242,7 +359,8 @@ impl AppPicker {
             AppPickerRowKind::Heading(_) | AppPickerRowKind::Pinned(_) => return None,
         };
         self.cursor = row;
-        Some(preview)
+        self.contrast.set_focus(None);
+        Some(self.previewed(&preview))
     }
 
     /// Move the cursor `delta` selectable rows (negative is up), clamped to the ends, and
@@ -270,19 +388,28 @@ impl AppPicker {
         self.select(row, live)
     }
 
-    /// Save the previewed choice ([`LiveAppearance::apply`]); `persist` receives the app's own
-    /// choice to write, `None` to follow Bcode's, and `present` shows the resulting appearance.
+    /// Save the previewed choice and the contrast edits
+    /// ([`LiveAppearance::apply_with_contrast`]); `persist_contrast` receives the edited
+    /// per-theme values (only when there are any), `persist` the app's own choice to write,
+    /// `None` to follow Bcode's, and `present` shows the resulting appearance.
     ///
     /// # Errors
     ///
-    /// * The error of `persist`.
+    /// * The error of `persist_contrast` or `persist`.
     pub fn apply<E>(
         &self,
         live: &LiveAppearance,
+        persist_contrast: impl FnOnce(&BTreeMap<String, ContrastOverride>) -> Result<(), E>,
         persist: impl FnOnce(Option<&SavedAppearance>) -> Result<(), E>,
         present: impl FnOnce(&AppearanceResolution),
     ) -> Result<AppearanceResolution, E> {
-        live.apply(&self.selection, persist, present)
+        live.apply_with_contrast(
+            &self.selection,
+            self.contrast.edits(),
+            persist_contrast,
+            persist,
+            present,
+        )
     }
 
     /// Close without saving; `present` shows the latest appearance again
@@ -459,6 +586,7 @@ mod tests {
         let applied = picker
             .apply(
                 &live,
+                |_| Ok(()),
                 |app| {
                     written = Some(app.cloned());
                     Ok::<(), ()>(())
@@ -556,8 +684,123 @@ mod tests {
             AppPickerRowKind::Palette(_)
         ));
         let applied = picker
-            .apply(&live, |_| Ok::<(), ()>(()), |_| {})
+            .apply(&live, |_| Ok(()), |_| Ok::<(), ()>(()), |_| {})
             .expect("saved");
         assert_eq!(applied.preferences.profile.as_deref(), Some("bare"));
+    }
+
+    #[test]
+    fn contrast_edits_the_previewed_palette_live_and_apply_saves_only_the_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = live(dir.path(), None, false);
+        let exact = live.current();
+        let mut picker = AppPicker::open("git", &live, |path| path.display().to_string());
+        // The follow row edits the palette Bcode presents.
+        assert_eq!(picker.contrast_palette(), "catppuccin-mocha");
+        assert!(matches!(
+            picker.contrast_key(ContrastKey::Raise, &live),
+            AppContrastOutcome::Ignored
+        ));
+        assert!(matches!(
+            picker.contrast_key(ContrastKey::Next, &live),
+            AppContrastOutcome::Moved
+        ));
+        assert_eq!(picker.contrast().focus(), Some(ContrastRow::Factor));
+        let mut raised = None;
+        for _ in 0..8 {
+            match picker.contrast_key(ContrastKey::Raise, &live) {
+                AppContrastOutcome::Preview(preview) => raised = Some(*preview),
+                other => panic!("{other:?}"),
+            }
+        }
+        let raised = raised.expect("previewed");
+        assert_eq!(id(&raised), "catppuccin-mocha");
+        assert_eq!(picker.contrast().shown().factor.get(), 1.4);
+        assert_ne!(
+            raised.resolved.as_ref().expect("resolves").fingerprint,
+            exact.resolved.as_ref().expect("resolves").fingerprint
+        );
+        // Another palette shows its own values; the edit stays with its palette.
+        let row = palette_row(&picker, "dracula");
+        let dracula = picker.select(row, &live).expect("selectable");
+        assert_eq!(picker.contrast().focus(), None);
+        assert_eq!(picker.contrast_palette(), "dracula");
+        assert!(picker.contrast().shown().factor.is_exact());
+        assert!(
+            dracula
+                .preferences
+                .contrast
+                .settings_for("dracula")
+                .factor
+                .is_exact()
+        );
+        assert_eq!(
+            picker
+                .select(0, &live)
+                .map(|preview| id(&preview).to_owned())
+                .as_deref(),
+            Some("catppuccin-mocha")
+        );
+        assert_eq!(picker.contrast().shown().factor.get(), 1.4);
+
+        let mut saved = None;
+        let applied = picker
+            .apply(
+                &live,
+                |values| {
+                    saved = Some(values.clone());
+                    Ok::<(), ()>(())
+                },
+                |_| panic!("the follow row keeps following"),
+                |_| {},
+            )
+            .expect("saved");
+        let saved = saved.expect("contrast saved");
+        assert_eq!(saved.keys().collect::<Vec<_>>(), ["catppuccin-mocha"]);
+        assert_eq!(
+            saved["catppuccin-mocha"],
+            ContrastOverride {
+                contrast: Some(crate::adjustment::ContrastFactor::new(1.4).expect("factor")),
+                ..ContrastOverride::default()
+            }
+        );
+        assert_eq!(
+            applied.resolved.as_ref().expect("resolves").fingerprint,
+            raised.resolved.as_ref().expect("resolves").fingerprint
+        );
+        // A watcher tick that read the state before the save does not bring the old contrast
+        // back.
+        assert!(!live.offer(exact, |_| {}));
+        assert_eq!(
+            live.current()
+                .preferences
+                .contrast
+                .settings_for("catppuccin-mocha")
+                .factor
+                .get(),
+            1.4
+        );
+    }
+
+    #[test]
+    fn cancelling_drops_the_contrast_edits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = live(dir.path(), Some("dracula"), false);
+        let exact = live.current();
+        let mut picker = AppPicker::open("review", &live, |path| path.display().to_string());
+        assert_eq!(picker.contrast_palette(), "dracula");
+        picker.contrast_key(ContrastKey::Previous, &live);
+        assert_eq!(picker.contrast().focus(), Some(ContrastRow::Minimum));
+        assert!(
+            picker
+                .step_contrast(ContrastRow::Minimum, true, &live)
+                .is_some()
+        );
+        assert_eq!(picker.contrast().shown().minimum.ratio(), Some(3.0));
+        let restored = picker.cancel(&live, |_| {});
+        assert_eq!(
+            restored.resolved.as_ref().expect("resolves").fingerprint,
+            exact.resolved.as_ref().expect("resolves").fingerprint
+        );
     }
 }

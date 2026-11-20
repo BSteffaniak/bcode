@@ -635,6 +635,17 @@ appearance watcher's results wait while the picker previews, and results read be
 are dropped, so the applied appearance never flickers back. bcode's own `[theme]` choice is never
 written by the git UI, and bcode's picker never touches `[apps.git.theme]`.
 
+Below the list, a contrast slider and a minimum-contrast row adjust the contrast of the palette
+the cursor previews (for Follow Bcode, the palette bcode presents). `tab` moves from the list to
+the slider, the minimum and back (`shift+tab` in reverse); on a row, `←`/`→` change the value
+(the factor in steps of 0.05, the floor through off, 3.0, 4.5 and 7.0), `↑`/`↓` move between
+the rows and `0` resets it. A click focuses a row and the wheel over it steps it. Every change
+previews on the whole UI; `enter` also saves the changed values per theme in
+`[theme.overrides.<theme-id>]`, shared with bcode's and the review's pickers, and `esc` restores
+them. Narrow pickers drop the row labels, and pickers too short to keep the list above them do
+not show the rows (the keys still adjust them). See
+[TUI themes](tui-themes.md#contrast).
+
 Besides the standard roles the UI reads optional `git.*` roles; see
 [TUI themes](tui-themes.md#git-client-roles).
 

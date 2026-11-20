@@ -1,6 +1,7 @@
 //! The appearance picker: opened from home and the palette, each row previewed on the whole
 //! app, `esc` restoring, `enter` saving the review's own choice (or following Bcode again)
-//! without the watcher bringing the previous appearance back, and tiny terminals.
+//! without the watcher bringing the previous appearance back, the contrast rows (live preview,
+//! reset, per-theme saving shared with Bcode, mouse) and tiny terminals.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -80,6 +81,22 @@ impl Appearance {
             .map(|theme| theme.id.clone())
     }
 
+    /// The fingerprint of the theme presented last; it changes with the contrast.
+    fn fingerprint(&self) -> Option<u64> {
+        self.presented
+            .lock()
+            .expect("presented")
+            .last()
+            .map(|theme| theme.fingerprint)
+    }
+
+    /// The `[theme.overrides]` table saved in the state file.
+    fn saved_overrides(&self) -> Option<toml::Value> {
+        let text = std::fs::read_to_string(&self.state).expect("state");
+        let document: toml::Table = text.parse().expect("toml");
+        document.get("theme")?.get("overrides").cloned()
+    }
+
     fn presentations(&self) -> usize {
         self.presented.lock().expect("presented").len()
     }
@@ -106,6 +123,11 @@ fn resolve(
     profile_pinned_by: Option<String>,
 ) -> AppearanceResolution {
     let saved = SavedAppAppearance::load(state, APPEARANCE_APP).expect("state");
+    // Contrast saved per theme refines the configured values, as configuration loading does.
+    let mut configured = configured.clone();
+    configured.contrast.apply_saved(
+        &bcode_config_layers::user_state::load_saved_theme_overrides(state).expect("state"),
+    );
     let convert = |saved: &bcode_config_layers::user_state::SavedTuiAppearance| SavedAppearance {
         theme: saved.theme.clone(),
         profile: saved.profile.clone(),
@@ -113,7 +135,7 @@ fn resolve(
     AppearanceSources {
         saved: convert(&saved.bcode),
         app_saved: saved.app.as_ref().map(convert),
-        configured: configured.clone(),
+        configured,
         user_config_dir: root.to_path_buf(),
         project_root: root.to_path_buf(),
         profile_pinned_by,
@@ -368,4 +390,188 @@ fn a_profile_pinned_by_the_review_config_is_stated_and_wins_over_bcodes() {
         appearance.watched().preferences.profile.as_deref(),
         Some("bare")
     );
+}
+
+/// The painted area of the contrast row whose hit region ends with `suffix`.
+fn contrast_row(screen: &Screen, suffix: &str) -> Option<bmux_tui::geometry::Rect> {
+    screen
+        .hits()
+        .iter()
+        .find(|hit| hit.id.as_str() == format!("review.appearance.contrast.{suffix}"))
+        .map(|hit| hit.area)
+}
+
+#[test]
+fn contrast_previews_live_resets_and_enter_saves_only_the_edited_value_for_the_theme() {
+    let appearance = Appearance::new();
+    let mut scenario = home(&appearance);
+    let exact = appearance.control.current();
+    let exact_fingerprint = exact.resolved.as_ref().expect("nord").fingerprint;
+    let stale = appearance.watched();
+    scenario.key("ctrl+t");
+    let screen = render(&mut scenario, &appearance);
+    for text in [
+        "Contrast",
+        "1.00×",
+        "Minimum",
+        "off   3.0   4.5   7.0",
+        "tab contrast",
+    ] {
+        assert!(screen.contains(text), "{text}:\n{}", screen.text());
+    }
+
+    // Tab reaches the slider of the palette the follow row presents (Bcode's nord).
+    scenario.key("tab");
+    for _ in 0..8 {
+        scenario.key("right");
+    }
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.contains("1.40×"), "{}", screen.text());
+    assert_eq!(appearance.presented().as_deref(), Some("nord"));
+    let raised = appearance.fingerprint();
+    assert_ne!(
+        raised,
+        Some(exact_fingerprint),
+        "the app previews the contrast live"
+    );
+    // `0` resets to the theme's exact colors; the edit is previewed again afterwards.
+    scenario.key("0");
+    assert_eq!(appearance.fingerprint(), Some(exact_fingerprint));
+    for _ in 0..8 {
+        scenario.key("right");
+    }
+    assert_eq!(appearance.fingerprint(), raised);
+
+    scenario.key("enter");
+    assert!(scenario.surface().appearance_picker().is_none());
+    let overrides = appearance.saved_overrides().expect("overrides saved");
+    let themes = overrides.as_table().expect("table");
+    assert_eq!(
+        themes.keys().collect::<Vec<_>>(),
+        ["nord"],
+        "only the edited theme"
+    );
+    let nord = themes["nord"].as_table().expect("nord");
+    assert_eq!(
+        nord.keys().collect::<Vec<_>>(),
+        ["contrast"],
+        "only the edited value"
+    );
+    assert_eq!(nord["contrast"].as_float(), Some(1.4));
+    assert_eq!(
+        appearance.saved().app,
+        None,
+        "the app's own choice is untouched"
+    );
+    assert_eq!(appearance.saved().bcode.theme.as_deref(), Some("nord"));
+    assert_eq!(appearance.fingerprint(), raised);
+    // A watcher tick that read the file before the save does not bring the old contrast back,
+    // and one after it resolves the saved contrast.
+    let shown = appearance.presentations();
+    appearance.control.offer(stale);
+    assert_eq!(appearance.presentations(), shown);
+    let watched = appearance.watched();
+    assert_eq!(
+        Some(watched.resolved.as_ref().expect("nord").fingerprint),
+        raised
+    );
+    appearance.control.offer(watched);
+    assert_eq!(appearance.fingerprint(), raised);
+
+    // The minimum cycles off, 3.0, 4.5, 7.0; saving it keeps the saved factor.
+    scenario.key("ctrl+t");
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.contains("1.40×"), "{}", screen.text());
+    scenario.key("shift+tab");
+    scenario.key("right");
+    scenario.key("right");
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.contains("› Minimum"), "{}", screen.text());
+    scenario.key("enter");
+    let overrides = appearance.saved_overrides().expect("overrides saved");
+    assert_eq!(overrides["nord"]["contrast"].as_float(), Some(1.4));
+    assert_eq!(overrides["nord"]["minimum_contrast"].as_float(), Some(4.5));
+}
+
+#[test]
+fn esc_restores_the_contrast_and_saves_nothing() {
+    let appearance = Appearance::new();
+    let mut scenario = home(&appearance);
+    let exact = appearance.control.current();
+    let exact_fingerprint = exact.resolved.as_ref().expect("nord").fingerprint;
+    scenario.key("ctrl+t");
+    preview(&mut scenario, &appearance, "dracula");
+    let dracula = appearance.fingerprint();
+    scenario.key("tab");
+    scenario.key("left");
+    scenario.key("down");
+    scenario.key("right");
+    assert_ne!(appearance.fingerprint(), dracula);
+    assert_eq!(appearance.presented().as_deref(), Some("dracula"));
+    scenario.key("esc");
+    assert_eq!(appearance.fingerprint(), Some(exact_fingerprint));
+    assert_eq!(appearance.saved_overrides(), None);
+    assert_eq!(appearance.saved().app, None);
+}
+
+#[test]
+fn a_click_focuses_a_contrast_row_and_the_wheel_steps_it() {
+    let appearance = Appearance::new();
+    let mut scenario = home(&appearance);
+    scenario.key("ctrl+t");
+    let screen = render(&mut scenario, &appearance);
+    let factor = contrast_row(&screen, "contrast").expect("slider painted");
+    let minimum = contrast_row(&screen, "minimum").expect("minimum painted");
+    assert!(screen.row_text(factor.y).contains("Contrast"));
+    assert!(screen.row_text(minimum.y).contains("Minimum"));
+
+    scenario.mouse(
+        bmux_tui::event::MouseEventKind::ScrollUp,
+        factor.right() - 1,
+        factor.y,
+    );
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.contains("1.05×"), "{}", screen.text());
+    scenario.click(minimum.x, minimum.y);
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.contains("› Minimum"), "{}", screen.text());
+    scenario.key("right");
+    let screen = render(&mut scenario, &appearance);
+    assert!(screen.row_text(minimum.y).contains("3.0"));
+    scenario.key("esc");
+    assert_eq!(appearance.saved_overrides(), None);
+}
+
+#[test]
+fn the_contrast_rows_drop_labels_when_narrow_and_go_when_short() {
+    let appearance = Appearance::new();
+    let mut scenario = home(&appearance);
+    scenario.key("ctrl+t");
+    scenario.resize(30, 24);
+    let screen = render(&mut scenario, &appearance);
+    let factor = contrast_row(&screen, "contrast").expect("slider painted");
+    assert!(
+        screen.row_text(factor.y).contains("1.00×"),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.contains("Contrast"), "{}", screen.text());
+    for hit in screen.hits() {
+        assert!(hit.area.right() <= 30 && hit.area.bottom() <= 24, "{hit:?}");
+    }
+
+    scenario.resize(100, 9);
+    let screen = render(&mut scenario, &appearance);
+    assert!(
+        contrast_row(&screen, "contrast").is_none(),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.contains("Minimum"), "{}", screen.text());
+    // The keys still adjust the contrast.
+    let before = appearance.fingerprint();
+    scenario.key("tab");
+    scenario.key("right");
+    assert_ne!(appearance.fingerprint(), before);
+    scenario.key("esc");
 }

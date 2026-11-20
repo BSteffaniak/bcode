@@ -1641,6 +1641,9 @@ impl App {
                 return update;
             }
         } else {
+            if let Some(update) = self.appearance_pointer(*mouse) {
+                return update;
+            }
             let Some(delta) = wheel else {
                 return Update::none();
             };

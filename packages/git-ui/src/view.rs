@@ -1827,11 +1827,18 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
             let notes = note_block
                 .as_ref()
                 .map_or(0, |block| note_rows(app, &menu.title, block));
+            // The appearance picker's contrast rows sit below its list.
+            let contrast = if menu.appearance.is_some() {
+                crate::appearance::CONTRAST_ROWS
+            } else {
+                0
+            };
             let height = u16::try_from(visible)
                 .unwrap_or(u16::MAX)
                 .saturating_add(if menu.filter.is_some() { 7 } else { 4 })
                 .saturating_add(notes)
-                .min(30u16.saturating_add(notes));
+                .saturating_add(contrast)
+                .min(30u16.saturating_add(notes).saturating_add(contrast));
             let items = list(
                 app,
                 crate::scroll::MENU_LIST.into(),
@@ -1858,6 +1865,10 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 );
             }
             column = column.flex(Flex::new(1, items));
+            if let Some(picker) = &menu.appearance {
+                let body = crate::appearance::with_contrast(column, picker, theme);
+                return Some(modal(app, &menu.title, MENU_WIDTH, height, body));
+            }
             Some(modal(app, &menu.title, MENU_WIDTH, height, column))
         }
         Popup::Text(view) => {
