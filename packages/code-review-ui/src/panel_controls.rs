@@ -18,6 +18,11 @@
 //! * **Keys.** [`ACTIONS`] names the keymap actions that run a [`Command`] on the focused
 //!   panel, with the same keys in every panel's scope; grow and shrink move an edge
 //!   [`RESIZE_STEP`] cells.
+//! * **Hints.** The focused panel's footer lists its panel keys ([`hints`]) after the
+//!   panel's own hints and before app-wide ones (palette, help, quit), so a narrow footer,
+//!   which keeps the leading hints that fit, drops them before any primary hint. Labels follow
+//!   the panel's shape: maximize reads "restore" while maximized, minimize while minimized,
+//!   and the size keys show only at the panel's normal size.
 //! * **Statuses.** What a refused close or minimize of the document says.
 
 use crate::theme::ReviewTheme;
@@ -140,6 +145,50 @@ pub const ACTIONS: [(&str, Command); 6] = [
     ("panel_reset_size", Command::ResetSize),
 ];
 
+/// Footer hints `(key, label)` for the panel keys of `kind` shown as `shape`.
+///
+/// `key` gives an action's key (action names without the `bcode.code_review.` prefix), and an
+/// action without one is left out. Grow and shrink share one hint.
+pub fn hints(
+    kind: PanelKind,
+    shape: Shape,
+    key: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let minimized = matches!(shape, Shape::Row | Shape::Strip);
+    let mut hints = Vec::new();
+    let mut push = |key: Option<String>, label: &str| {
+        if let Some(key) = key.filter(|key| !key.is_empty()) {
+            hints.push((key, label.to_owned()));
+        }
+    };
+    push(
+        key("panel_maximize"),
+        if shape == Shape::Maximized {
+            "restore"
+        } else {
+            "maximize"
+        },
+    );
+    push(
+        key("panel_minimize"),
+        if minimized { "restore" } else { "minimize" },
+    );
+    if kind.closable() {
+        push(key("panel_close"), "close panel");
+    }
+    if shape == Shape::Normal {
+        match (key("panel_grow"), key("panel_shrink")) {
+            (Some(grow), Some(shrink)) => push(Some(format!("{grow}/{shrink}")), "size"),
+            (grow, shrink) => {
+                push(grow, "grow");
+                push(shrink, "shrink");
+            }
+        }
+        push(key("panel_reset_size"), "reset size");
+    }
+    hints
+}
+
 /// The command of keymap action `action` (without its prefix).
 #[must_use]
 pub fn command(action: &str) -> Option<Command> {
@@ -160,6 +209,50 @@ pub const REVIEW_MINIMIZE_REFUSED: &str = "no open panel to take the document's 
 mod tests {
     use super::*;
     use crate::theme::IconStyle;
+
+    #[test]
+    fn hints_follow_the_panel_shape_and_skip_unbound_keys() {
+        let keys = |action: &str| {
+            let key = match action {
+                "panel_maximize" => "alt+z",
+                "panel_minimize" => "alt+c",
+                "panel_close" => "alt+w",
+                "panel_grow" => "alt+=",
+                "panel_shrink" => "alt+-",
+                "panel_reset_size" => "alt+0",
+                _ => return None,
+            };
+            Some(key.to_owned())
+        };
+        let labels = |kind, shape| {
+            hints(kind, shape, keys)
+                .into_iter()
+                .map(|(key, label)| format!("{key} {label}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(PanelKind::Files, Shape::Normal),
+            [
+                "alt+z maximize",
+                "alt+c minimize",
+                "alt+w close panel",
+                "alt+=/alt+- size",
+                "alt+0 reset size"
+            ]
+        );
+        assert_eq!(
+            labels(PanelKind::Review, Shape::Maximized),
+            ["alt+z restore", "alt+c minimize"]
+        );
+        assert_eq!(
+            labels(PanelKind::Threads, Shape::Strip),
+            ["alt+z maximize", "alt+c restore", "alt+w close panel"]
+        );
+        let only_grow = hints(PanelKind::Guide, Shape::Normal, |action: &str| {
+            (action == "panel_grow").then(|| "alt+=".to_owned())
+        });
+        assert_eq!(only_grow, [("alt+=".to_owned(), "grow".to_owned())]);
+    }
 
     #[test]
     fn every_panel_but_the_document_closes() {

@@ -3794,6 +3794,13 @@ impl Assistant {
         if self.session.is_some() {
             push(self.key_of("assistant_open"), "open in Bcode");
         }
+        for (key, label) in crate::panel_controls::hints(
+            crate::panel_controls::PanelKind::Assistant,
+            self.shape(),
+            |action| self.key_of(action),
+        ) {
+            push(Some(key), &label);
+        }
         push(self.key_of("assistant_back"), "back");
         push(self.key_of("assistant_close"), "close");
         hints

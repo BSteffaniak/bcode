@@ -766,6 +766,39 @@ fn footer_hints_follow_focus_and_the_cursor_item() {
 }
 
 #[test]
+fn focused_panel_footer_lists_panel_keys_after_its_own_hints() {
+    let fixture = fixture();
+    let (mut scenario, _) = open(&fixture, fixture_branch_compare(), 240, 40);
+    let footer = |screen: &Screen| screen.row_text(screen.height() - 1);
+    scenario.key("tab");
+    let screen = stable(&mut scenario);
+    let text = footer(&screen);
+    let at = |hint: &str| text.find(hint).unwrap_or_else(|| panic!("{hint}: {text}"));
+    assert!(at("enter open") < at("alt+z maximize"), "{text}");
+    assert!(at("alt+z maximize") < at("next pane"), "{text}");
+    for hint in [
+        "alt+c minimize",
+        "alt+w close panel",
+        "alt+=/alt+- size",
+        "alt+0 reset size",
+    ] {
+        at(hint);
+    }
+    scenario.key("alt+z");
+    let screen = stable(&mut scenario);
+    let text = footer(&screen);
+    assert!(text.contains("alt+z restore"), "{text}");
+    assert!(!text.contains("size"), "{text}");
+    // A narrow footer keeps the leading hints and drops the panel keys first.
+    scenario.key("alt+z");
+    scenario.resize(60, 20);
+    let screen = stable(&mut scenario);
+    let text = footer(&screen);
+    assert!(!text.trim().is_empty() && !text.contains('…'), "{text}");
+    assert!(!text.contains("alt+z"), "{text}");
+}
+
+#[test]
 fn ascii_icons_replace_unicode_glyphs() {
     let fixture = fixture();
     let config = ReviewViewConfig {

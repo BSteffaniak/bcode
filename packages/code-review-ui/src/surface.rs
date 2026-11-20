@@ -4429,6 +4429,9 @@ impl ReviewSurface {
     /// Contextual key hints `(key, label)` for the focused pane and the cursor item.
     fn hints(&self) -> Vec<(String, String)> {
         let key = |action: &str| self.action_keys.get(action).cloned();
+        let panel_id = self.focused_panel();
+        let panel =
+            crate::panel_controls::hints(panel_kind(panel_id), self.panels.shape(panel_id), key);
         let mut hints: Vec<(String, String)> = Vec::new();
         let mut push = |key: Option<String>, label: &str| {
             if let Some(key) = key {
@@ -4463,6 +4466,9 @@ impl ReviewSurface {
                 push(key("viewed_files_toggle"), "hide viewed");
                 push(key("files_layout_toggle"), self.file_layout_hint());
                 push(key("files_toggle"), "hide");
+                for (key, label) in &panel {
+                    push(Some(key.clone()), label);
+                }
                 push(key("focus_next"), "next pane");
                 push(key("files_back"), "back");
             }
@@ -4470,60 +4476,82 @@ impl ReviewSurface {
                 push(key("down"), "move");
                 push(key("threads_open"), "open");
                 push(key("threads_filter_next"), "filter");
+                for (key, label) in &panel {
+                    push(Some(key.clone()), label);
+                }
                 push(key("focus_next"), "next pane");
                 push(key("threads_back"), "back");
             }
             Focus::Guide => {
                 for (action, label) in guide::HINTS {
+                    if action == "focus_next" {
+                        for (key, label) in &panel {
+                            push(Some(key.clone()), label);
+                        }
+                    }
                     push(key(action), label);
                 }
             }
-            Focus::Review => {
-                let cursor = self
-                    .review
-                    .as_ref()
-                    .and_then(|review| review.cursor.as_ref());
-                let feed = self.feed_hints();
-                for (key, label) in &feed {
-                    push(Some(key.clone()), label);
-                }
-                if feed.is_empty() {
-                    for (action, label) in item_hints(cursor) {
-                        push(key(action), label);
-                    }
-                }
-                let on_gap = self
-                    .review
-                    .as_ref()
-                    .and_then(|review| review.cursor.as_ref())
-                    .is_some_and(|cursor| matches!(cursor, ItemKey::Gap { .. }));
-                if on_gap {
-                    push(key("expand_down"), "expand ↓");
-                    push(key("expand_up"), "expand ↑");
-                    push(key("expand_all"), "all");
-                }
-                push(key("assistant_toggle"), "Ask AI");
-                push(key("next_file"), "file");
-                push(key("hunk_next"), "hunk");
-                push(key("change_next"), "change");
-                if !on_gap {
-                    push(key("expand_file"), "whole file");
-                }
-                push(key("viewed"), "viewed");
-                push(key("search"), "search");
-                push(key("palette"), "commands");
-                push(key("help"), "help");
-                push(key("files_toggle"), "files");
-                push(key("focus_next"), "focus");
-                push(key("layout_toggle"), "layout");
-                push(key("wrap_toggle"), "wrap");
-                push(key("refresh"), "refresh");
-                if self.is_transient() {
-                    push(key("save_review"), "save review");
-                }
-                push(key("exit"), "quit");
+            Focus::Review => hints.extend(self.review_hints(&panel)),
+        }
+        hints
+    }
+
+    /// Key hints while the review document has focus; `panel` holds the panel keys.
+    fn review_hints(&self, panel: &[(String, String)]) -> Vec<(String, String)> {
+        let key = |action: &str| self.action_keys.get(action).cloned();
+        let mut hints: Vec<(String, String)> = Vec::new();
+        let mut push = |key: Option<String>, label: &str| {
+            if let Some(key) = key {
+                hints.push((key, label.to_owned()));
+            }
+        };
+        let cursor = self
+            .review
+            .as_ref()
+            .and_then(|review| review.cursor.as_ref());
+        let feed = self.feed_hints();
+        for (key, label) in &feed {
+            push(Some(key.clone()), label);
+        }
+        if feed.is_empty() {
+            for (action, label) in item_hints(cursor) {
+                push(key(action), label);
             }
         }
+        let on_gap = self
+            .review
+            .as_ref()
+            .and_then(|review| review.cursor.as_ref())
+            .is_some_and(|cursor| matches!(cursor, ItemKey::Gap { .. }));
+        if on_gap {
+            push(key("expand_down"), "expand ↓");
+            push(key("expand_up"), "expand ↑");
+            push(key("expand_all"), "all");
+        }
+        push(key("assistant_toggle"), "Ask AI");
+        push(key("next_file"), "file");
+        push(key("hunk_next"), "hunk");
+        push(key("change_next"), "change");
+        if !on_gap {
+            push(key("expand_file"), "whole file");
+        }
+        push(key("viewed"), "viewed");
+        push(key("search"), "search");
+        for (key, label) in panel {
+            push(Some(key.clone()), label);
+        }
+        push(key("palette"), "commands");
+        push(key("help"), "help");
+        push(key("files_toggle"), "files");
+        push(key("focus_next"), "focus");
+        push(key("layout_toggle"), "layout");
+        push(key("wrap_toggle"), "wrap");
+        push(key("refresh"), "refresh");
+        if self.is_transient() {
+            push(key("save_review"), "save review");
+        }
+        push(key("exit"), "quit");
         hints
     }
 
@@ -5876,6 +5904,15 @@ impl View for ReviewSurface {
                     .map(|key| ((*action).to_owned(), key))
             })
             .collect();
+        for (action, _) in crate::panel_controls::ACTIONS {
+            if let Some(key) = host
+                .keymap_keys(SCOPE, &format!("bcode.code_review.{action}"))
+                .into_iter()
+                .next()
+            {
+                self.action_keys.insert(action.to_owned(), key);
+            }
+        }
         for scope in [FILES_SCOPE, THREADS_SCOPE, GUIDE_SCOPE] {
             for action in crate::keymap::actions_for(scope) {
                 if let Some(key) = host.keymap_keys(scope, &action.id).into_iter().next() {
