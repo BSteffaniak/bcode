@@ -10,6 +10,9 @@
 # stays in syntax). `muted` is subtext0 (the style guide's sub-headline/label text).
 # @markup.raw.markdown_inline is undefined upstream, so Markdown inline code
 # falls back to @markup.raw (no background).
+# Terminal colors: none by default. groups/terminal.lua defines
+# terminal_color_0..15, but lib/compiler.lua sets them only when
+# `term_colors = true` (init.lua default false), so no ansi_* slots.
 #
 # Latte is a light flavour, but this palette has a single base variant, so
 # it is recorded under `dark` (the palette's only variant).
@@ -23,6 +26,8 @@ license  = "MIT"
 file = "lua/catppuccin/palettes/latte.lua, lua/catppuccin/groups/{editor,syntax,lsp,treesitter}.lua"
 
 [variants.dark.colors]
+"@constant.fg"              = "#fe640b"
+"@function.builtin.fg"      = "#fe640b"
 "@function.fg"              = "#1e66f5"
 "@keyword.fg"               = "#8839ef"
 "@markup.heading.fg"        = "#1e66f5"
@@ -31,10 +36,14 @@ file = "lua/catppuccin/palettes/latte.lua, lua/catppuccin/groups/{editor,syntax,
 "@markup.raw.fg"            = "#40a02b"
 "@number.fg"                = "#fe640b"
 "@operator.fg"              = "#04a5e5"
+"@property.fg"              = "#7287fd"
 "@punctuation.delimiter.fg" = "#7c7f93"
 "@string.fg"                = "#40a02b"
+"@tag.attribute.fg"         = "#df8e1d"
+"@tag.fg"                   = "#1e66f5"
 "@type.fg"                  = "#df8e1d"
 "@variable.fg"              = "#4c4f69"
+"@variable.parameter.fg"    = "#e64553"
 "Comment.fg"                = "#7c7f93"
 "CursorLine.bg"             = "#e9ebf1"
 "DiagnosticError.fg"        = "#d20f39"
@@ -116,6 +125,12 @@ syntax_number      = "@number.fg"
 syntax_type        = "@type.fg"
 syntax_operator    = "@operator.fg"
 syntax_punctuation = "@punctuation.delimiter.fg"
+syntax_constant    = "@constant.fg"
+syntax_parameter   = "@variable.parameter.fg"
+syntax_property    = "@property.fg"
+syntax_builtin     = "@function.builtin.fg"
+syntax_tag         = "@tag.fg"
+syntax_attribute   = "@tag.attribute.fg"
 markup_heading     = "@markup.heading.fg"
 markup_link        = "@markup.link.fg"
 markup_raw         = "@markup.raw.fg"
@@ -158,6 +173,12 @@ markup_list        = "@markup.list.fg"
 "syntax.type.fg"          = "@type.fg"
 "syntax.operator.fg"      = "@operator.fg"
 "syntax.punctuation.fg"   = "@punctuation.delimiter.fg"
+"syntax.constant.fg"      = "@constant.fg"
+"syntax.parameter.fg"     = "@variable.parameter.fg"
+"syntax.property.fg"      = "@property.fg"
+"syntax.builtin.fg"       = "@function.builtin.fg"
+"syntax.tag.fg"           = "@tag.fg"
+"syntax.attribute.fg"     = "@tag.attribute.fg"
 "syntax.heading.fg"       = "@markup.heading.fg"
 "syntax.link.fg"          = "@markup.link.fg"
 "syntax.raw.fg"           = "@markup.raw.fg"

@@ -49,21 +49,38 @@ Exact slots (all optional; `bcode theme roles` lists them as `slot` rows):
 | `diff_add_row_fg`, `diff_remove_row_fg` | text on the added/removed line fills, only when upstream sets one | `diff.added_row`, `diff.removed_row` foreground |
 | `diff_add_emphasis_bg`, `diff_remove_emphasis_bg` | intraline (word) add/remove fills, only when upstream defines separate ones | `diff.added_emphasis`, `diff.removed_emphasis` |
 | `syntax_keyword` … `syntax_punctuation` | per-token code colors (below) | `syntax.*` and `markdown.code.*` |
+| `syntax_constant` … `syntax_attribute` | refined token colors (below) | `syntax.*` and `markdown.code.*` |
 | `markup_heading` | markup headings | `markdown.heading`, `syntax.heading` |
 | `markup_link` | markup links | `link`, `markdown.link`, `syntax.link` |
 | `markup_raw` | markup literals | `syntax.raw` |
 | `markup_code`, `markup_code_bg` | Markdown inline code text and fill | `markdown.inline_code` |
 | `markup_list` | list markers | `markdown.list_marker` |
+| `ansi_black` … `ansi_bright_white` | terminal ANSI colors 0–15 | terminal output (shell tool runs, terminal views) |
+| `terminal_fg`, `terminal_bg` | terminal default foreground/background, only when upstream defines terminal-specific ones | terminal output |
 
 The syntax slots match the token kinds Bcode's highlighter distinguishes:
 `syntax_keyword`, `syntax_function`, `syntax_variable`, `syntax_string`,
 `syntax_number` (numbers, booleans, `null`), `syntax_type`,
-`syntax_operator`, `syntax_punctuation`. The highlighter does not separate
-constants, parameters, properties, builtins, tags, or attributes, so there are
-no slots for them; do not invent any.
+`syntax_operator`, `syntax_punctuation`, and the refined kinds
+`syntax_constant` (language constants, constant identifiers, escapes),
+`syntax_parameter`, `syntax_property` (properties, fields, mapping keys),
+`syntax_builtin` (builtin functions, classes, `self`/`this`), `syntax_tag` and
+`syntax_attribute` (markup tag and attribute names). The refined slots have no
+derivation: an omitted one paints those tokens with their base color (number,
+variable, function, keyword, string, or plain text), exactly as before.
 
-Terminal ANSI colors (`color0`–`color15`) have no slots: no Bcode role paints
-with them. Do not add them to palettes.
+The terminal slots are all-or-none: declare the sixteen `ansi_*` slots only
+when upstream defines all sixteen for that variant (Bcode builds a terminal
+palette only from a complete set; otherwise terminal output keeps the user's
+terminal colors). Order is ANSI index order: black, red, green, yellow, blue,
+magenta, cyan, white, then the bright variants. Record upstream's colors as
+written, even when its mapping is unusual (a bright color equal to its normal
+one, a hue in an unexpected index). Declare `terminal_fg`/`terminal_bg` only
+when the source explicitly defines terminal defaults that a terminal applies
+(a terminal port's `foreground`/`background`, VS Code `terminal.foreground`);
+Neovim's `:terminal` uses `Normal`, so do not copy `Normal`, and ignore
+variables Neovim does not read (`vim.g.terminal_color_foreground`, the Vim
+`Terminal` group).
 
 ## Finding the canonical source
 
@@ -133,6 +150,26 @@ color. When a group is undefined, Neovim's default link applies: `Number`,
 | `markup_raw` | `@markup.raw` | markup inline raw |
 | `markup_code`, `markup_code_bg` | `@markup.raw.markdown_inline` fg/bg | Markdown inline code |
 | `markup_list` | `@markup.list` | list marker |
+| `syntax_constant` | `@constant` | `constant.language` (else `constant.other`) |
+| `syntax_parameter` | `@variable.parameter` | `variable.parameter` |
+| `syntax_property` | `@property` | `variable.other.property` (else `support.type.property-name`, `meta.object-literal.key`) |
+| `syntax_builtin` | `@function.builtin` | `support.function` |
+| `syntax_tag` | `@tag` | `entity.name.tag` |
+| `syntax_attribute` | `@tag.attribute` | `entity.other.attribute-name` |
+| `ansi_*` | `vim.g.terminal_color_0` … `_15` (or the table that feeds them) | Vim `g:terminal_ansi_colors`; VS Code `terminal.ansiBlack` … `terminal.ansiBrightWhite` |
+| `terminal_fg`, `terminal_bg` | a terminal port's foreground/background in the same repository | VS Code `terminal.foreground` / `terminal.background` |
+
+Resolve the refined captures as Neovim does: follow the scheme's links; a
+capture the scheme leaves undefined falls back to its parent capture
+(`@variable.parameter` → `@variable`, `@tag.attribute` → `@tag`), then
+Neovim's default links (`@constant` → `Constant`, `@function.builtin` →
+`Special`, `@property` → `Identifier`, `@tag` → `Tag`). Use one primary
+capture per slot (the table's) so every palette is mapped the same way;
+legacy captures such as `@parameter` are not read. A chain that ends without a
+foreground omits the slot. Schemes with only legacy Vim groups map
+`syntax_constant` from `Constant` and omit the other refined slots. When
+upstream sets terminal colors only behind an option, follow its default
+configuration and say so in the reference header.
 
 ### The accent
 
@@ -193,7 +230,9 @@ comment    = "comment"
 "syntax.comment.fg" = "Comment.fg"
 ```
 
-Map every entry the palette declares in `slots`. Map roles for each upstream
+Map every entry the palette declares in `slots`; the terminal slots have no
+roles. Say in the header comment where the terminal colors come from (or that
+upstream defines none). Map roles for each upstream
 highlight group you used, so the test checks the end-to-end rendering, not
 only the palette. Also update the palette file's header comment to point at
 the reference and keep `attribution/palettes.md` accurate (source and license).
