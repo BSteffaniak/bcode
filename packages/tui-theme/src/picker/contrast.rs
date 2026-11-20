@@ -362,7 +362,7 @@ mod tests {
             Some(ContrastOverride {
                 contrast: Some(factor),
                 minimum_contrast: Some(floor),
-                contrast_parts: None,
+                ..ContrastOverride::default()
             })
         );
         assert_eq!(ContrastOverride::default().saved_over(None), None);

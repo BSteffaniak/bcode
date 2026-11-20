@@ -5803,8 +5803,9 @@ enum ThemeCommand {
         /// instead of the one next to each theme.
         #[arg(long, value_name = "PATH")]
         accepted: Option<PathBuf>,
-        /// Measure the colors your configured contrast settings
+        /// Measure the colors your configured contrast and color settings
         /// (`[tui.theme] contrast`, `minimum_contrast`, `contrast_parts`,
+        /// `vibrance`, `richness`, `background_tint`, `color_parts`,
         /// overrides and saved picker values) produce instead of the authored
         /// theme. Accepted findings describe authored themes and are not
         /// compared.

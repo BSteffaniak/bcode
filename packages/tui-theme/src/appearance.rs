@@ -94,8 +94,9 @@ pub struct ThemePreferences {
     pub paths: Vec<PathBuf>,
     /// Which colors paint terminal output.
     pub terminal_palette: TerminalPalettePreference,
-    /// Contrast adjustments (`contrast`, `minimum_contrast`, `contrast_parts` and
-    /// `[overrides.<theme-id>]`), applied on top of the resolved theme's colors.
+    /// Contrast and color adjustments (`contrast`, `minimum_contrast`, `contrast_parts`,
+    /// `vibrance`, `richness`, `background_tint`, `color_parts` and `[overrides.<theme-id>]`),
+    /// applied on top of the resolved theme's colors.
     #[serde(flatten)]
     pub contrast: crate::adjustment::ContrastPreferences,
 }
@@ -782,6 +783,22 @@ mod tests {
         ))
         .expect_err("out of range");
         assert!(error.contains("from 0.5 to 2"), "{error}");
+        // The standalone apps read these keys through the same preferences.
+        for (source, expected) in [
+            ("vibrance = -1.5", "vibrance must be a number from -1 to 1"),
+            ("richness = nan", "richness must be a number from 0 to 1"),
+            (
+                "background_tint = 2.5",
+                "background_tint must be a number from 0 to 2",
+            ),
+            ("color_parts = { text = false }", "unknown field"),
+        ] {
+            let error = ThemePreferences::from_toml(&toml::Value::Table(
+                toml::from_str(source).expect("toml"),
+            ))
+            .expect_err(source);
+            assert!(error.contains(expected), "{source}: {error}");
+        }
     }
 
     #[test]

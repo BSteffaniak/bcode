@@ -1422,12 +1422,15 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).expect("repo");
         let state = repo.join(".test-config-home/state/bcode/tui.toml");
         std::fs::create_dir_all(state.parent().expect("state dir")).expect("state dir");
-        std::fs::write(&state, "[theme.overrides.nord]\nminimum_contrast = 7\n")
-            .expect("user state");
+        std::fs::write(
+            &state,
+            "[theme.overrides.nord]\nminimum_contrast = 7\nvibrance = 0.3\n",
+        )
+        .expect("user state");
         std::fs::write(
             repo.join("bcode.toml"),
-            "[tui.theme]\nname = \"nord\"\ncontrast = 1.4\n\
-             [tui.theme.overrides.nord]\nminimum_contrast = 3\n",
+            "[tui.theme]\nname = \"nord\"\ncontrast = 1.4\nbackground_tint = 0.5\n\
+             [tui.theme.overrides.nord]\nminimum_contrast = 3\nvibrance = -0.4\n",
         )
         .expect("config");
         let loaded = load(repo);
@@ -1436,6 +1439,8 @@ mod tests {
         assert_eq!(settings.factor.get(), 1.4);
         // The saved value replaces the configured override's.
         assert_eq!(settings.minimum.ratio(), Some(7.0));
+        assert_eq!(settings.vibrance.get(), 0.3);
+        assert_eq!(settings.background_tint.get(), 0.5);
         let resolution = appearance_sources(&loaded, repo)
             .resolve(bmux_tui::capabilities::TerminalBackground::Dark);
         let exact = resolution

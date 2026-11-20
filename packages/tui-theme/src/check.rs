@@ -412,7 +412,7 @@ pub struct ThemeCheck {
     pub adjustments: Option<CheckedAdjustments>,
 }
 
-/// User contrast adjustments a check measured with ([`check_theme_adjusted`]).
+/// User contrast and color adjustments a check measured with ([`check_theme_adjusted`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CheckedAdjustments {
     /// Lightness factor.
@@ -421,6 +421,14 @@ pub struct CheckedAdjustments {
     pub minimum_contrast: Option<f64>,
     /// Adjusted parts, in order: `text`, `syntax`, `fills`, `ansi`.
     pub parts: Vec<&'static str>,
+    /// Vibrance.
+    pub vibrance: f64,
+    /// Richness.
+    pub richness: f64,
+    /// Background tint.
+    pub background_tint: f64,
+    /// Parts vibrance and richness change, in order: `syntax`, `accents`, `fills`, `ansi`.
+    pub color_parts: Vec<&'static str>,
 }
 
 impl From<&crate::adjustment::ContrastSettings> for CheckedAdjustments {
@@ -434,6 +442,18 @@ impl From<&crate::adjustment::ContrastSettings> for CheckedAdjustments {
                 ("syntax", parts.syntax),
                 ("fills", parts.fills),
                 ("ansi", parts.ansi),
+            ]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect(),
+            vibrance: settings.vibrance.get(),
+            richness: settings.richness.get(),
+            background_tint: settings.background_tint.get(),
+            color_parts: [
+                ("syntax", settings.color_parts.syntax),
+                ("accents", settings.color_parts.accents),
+                ("fills", settings.color_parts.fills),
+                ("ansi", settings.color_parts.ansi),
             ]
             .into_iter()
             .filter_map(|(name, on)| on.then_some(name))

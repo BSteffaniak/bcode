@@ -1,10 +1,14 @@
-//! User contrast adjustments, applied on top of a resolved theme's exact colors.
+//! User contrast and color adjustments, applied on top of a resolved theme's exact colors.
 //!
 //! [`apply_contrast`] changes a [`ResolvedThemeDefinition`] after resolution, so theme files and
 //! the resolution itself stay untouched; [`ContrastSettings::EXACT`] (the default) changes
 //! nothing at all.
 //!
-//! Every adjusted color is measured against the background it is painted on, in OKLCH:
+//! The color settings run first, in the order background tint, richness, vibrance (see
+//! [`color`]); contrast then runs on their result, factor before floor, so the minimum contrast
+//! is always the last step.
+//!
+//! Every contrast-adjusted color is measured against the background it is painted on, in OKLCH:
 //!
 //! * Factor: lightness moves away from (factor above 1) or toward (below 1) the background's
 //!   lightness, `L' = L_bg + (L − L_bg) × factor`, clamped to `[0, 1]`. Hue is kept. Chroma
@@ -35,9 +39,12 @@
 
 use std::collections::BTreeMap;
 
+pub mod color;
+
 pub use bcode_tui_theme_models::{
-    CONTRAST_FACTOR_MAX, CONTRAST_FACTOR_MIN, ContrastFactor, ContrastOverride, ContrastParts,
-    ContrastPreferences, ContrastSettings, MINIMUM_CONTRAST_PRESETS, MinimumContrast,
+    BackgroundTint, CONTRAST_FACTOR_MAX, CONTRAST_FACTOR_MIN, ColorParts, ContrastFactor,
+    ContrastOverride, ContrastParts, ContrastPreferences, ContrastSettings,
+    MINIMUM_CONTRAST_PRESETS, MinimumContrast, Richness, Vibrance,
 };
 use bmux_color::{Oklch, Rgb};
 use bmux_tui::style::{Color, Modifier, Style};
@@ -96,11 +103,11 @@ fn adjusted(color: Rgb, background: Rgb, settings: &ContrastSettings, floor: boo
     }
 }
 
-fn rgb_of(color: Option<Color>) -> Option<Rgb> {
+pub(crate) fn rgb_of(color: Option<Color>) -> Option<Rgb> {
     color.and_then(|color| measurable(color).ok())
 }
 
-const fn painted_reversed(style: &Style) -> bool {
+pub(crate) const fn painted_reversed(style: &Style) -> bool {
     style.modifiers.contains(Modifier::REVERSED)
 }
 
@@ -125,6 +132,15 @@ pub fn apply_contrast(theme: &mut ResolvedThemeDefinition, settings: &ContrastSe
     if settings.is_exact() {
         return;
     }
+    color::apply_color(theme, settings);
+    if !settings.contrast_is_exact() {
+        apply_contrast_steps(theme, settings);
+    }
+    theme.fingerprint = crate::definition::adjusted_fingerprint(theme);
+}
+
+/// The contrast factor and floor (see the module documentation).
+fn apply_contrast_steps(theme: &mut ResolvedThemeDefinition, settings: &ContrastSettings) {
     let parts = settings.parts;
     let canvas_fill = theme.styles.get("canvas").and_then(|style| style.bg);
     let canvas = rgb_of(canvas_fill);
@@ -139,7 +155,6 @@ pub fn apply_contrast(theme: &mut ResolvedThemeDefinition, settings: &ContrastSe
     if parts.ansi {
         adjust_ansi(&mut theme.palette, canvas, settings);
     }
-    theme.fingerprint = crate::definition::adjusted_fingerprint(theme);
 }
 
 fn adjust_fills(styles: &mut BTreeMap<String, Style>, canvas: Rgb, settings: &ContrastSettings) {
@@ -505,6 +520,10 @@ mod tests {
             factor: ContrastFactor::new(1.8).expect("factor"),
             minimum: MinimumContrast::new(7.0).expect("floor"),
             parts: ContrastParts::ALL,
+            vibrance: Vibrance::new(1.0).expect("vibrance"),
+            richness: Richness::new(1.0).expect("richness"),
+            background_tint: BackgroundTint::new(0.0).expect("tint"),
+            color_parts: ColorParts::ALL,
         };
         let exact = catalog()
             .resolve(&ThemeSelection::new("terminal-native"))

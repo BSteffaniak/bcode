@@ -2842,13 +2842,39 @@ pub struct TuiThemeConfig {
     #[config_doc(values(), value_type = "table")]
     #[serde(default)]
     pub contrast_parts: bcode_tui_theme_models::ContrastParts,
-    /// Per-theme contrast values keyed by theme id, each with any of `contrast`,
-    /// `minimum_contrast` and `contrast_parts`, replacing the global values for that theme.
+    /// Vibrance applied on top of the theme's exact colors, from -1.0 to 1.0: colorful roles
+    /// (syntax, accents, states, links, diff colors, tinted fills and the theme's ANSI colors)
+    /// gain (above 0) or lose (below 0) chroma relative to the most the sRGB gamut allows at
+    /// their lightness and hue; lightness and hue stay. `0.0` keeps the theme's colors exactly.
+    #[config_doc(values(), value_type = "number")]
+    #[serde(default)]
+    pub vibrance: bcode_tui_theme_models::Vibrance,
+    /// Richness, from 0.0 to 1.0: colorful roles move their lightness toward where their hue is
+    /// most saturated (by at most 0.15 OKLCH lightness at 1.0), keeping their relative chroma,
+    /// so pastel colors can become more saturated. `0.0` keeps the theme's colors exactly.
+    #[config_doc(values(), value_type = "number")]
+    #[serde(default)]
+    pub richness: bcode_tui_theme_models::Richness,
+    /// Background tint, from 0.0 to 2.0: scales the chroma of the canvas and neutral surfaces at
+    /// the same lightness; `0.0` is neutral grey and `1.0` keeps the theme's colors exactly.
+    #[config_doc(values(), value_type = "number")]
+    #[serde(default)]
+    pub background_tint: bcode_tui_theme_models::BackgroundTint,
+    /// Which colors `vibrance` and `richness` change, as a table of booleans that each default
+    /// to `true`: `syntax` (colorful code colors), `accents` (accent, state, link, heading and
+    /// diff colors), `fills` (selection, diff rows and state surfaces, at half strength) and
+    /// `ansi` (the theme's colored terminal colors).
+    #[config_doc(values(), value_type = "table")]
+    #[serde(default)]
+    pub color_parts: bcode_tui_theme_models::ColorParts,
+    /// Per-theme contrast and color values keyed by theme id, each with any of `contrast`,
+    /// `minimum_contrast`, `contrast_parts`, `vibrance`, `richness`, `background_tint` and
+    /// `color_parts`, replacing the global values for that theme.
     #[config_doc(
         map_key = "<theme-id>",
         values(),
         value_type = "table",
-        value_description = "Any of contrast, minimum_contrast and contrast_parts for this theme."
+        value_description = "Any of contrast, minimum_contrast, contrast_parts, vibrance, richness, background_tint and color_parts for this theme."
     )]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub overrides: BTreeMap<String, bcode_tui_theme_models::ContrastOverride>,
@@ -2884,6 +2910,10 @@ impl TuiThemeConfig {
             contrast: self.contrast,
             minimum_contrast: self.minimum_contrast,
             contrast_parts: self.contrast_parts,
+            vibrance: self.vibrance,
+            richness: self.richness,
+            background_tint: self.background_tint,
+            color_parts: self.color_parts,
             overrides: self.overrides.clone(),
         }
     }
@@ -2919,6 +2949,10 @@ impl Default for TuiThemeConfig {
             contrast: bcode_tui_theme_models::ContrastFactor::EXACT,
             minimum_contrast: bcode_tui_theme_models::MinimumContrast::OFF,
             contrast_parts: bcode_tui_theme_models::ContrastParts::ALL,
+            vibrance: bcode_tui_theme_models::Vibrance::EXACT,
+            richness: bcode_tui_theme_models::Richness::EXACT,
+            background_tint: bcode_tui_theme_models::BackgroundTint::EXACT,
+            color_parts: bcode_tui_theme_models::ColorParts::ALL,
             overrides: BTreeMap::new(),
         }
     }
@@ -8891,7 +8925,7 @@ fn inline_toml(value: &impl Serialize) -> String {
     toml::Value::try_from(value).map_or_else(|_| String::new(), |value| value.to_string())
 }
 
-/// Write the non-default contrast keys of `[tui.theme]`, with the per-theme overrides as
+/// Write the non-default contrast and color keys of `[tui.theme]`, with the per-theme overrides as
 /// inline tables so they stay inside the section.
 fn write_tui_theme_contrast_toml(
     output: &mut String,
@@ -8914,6 +8948,30 @@ fn write_tui_theme_contrast_toml(
             output,
             "contrast_parts = {}",
             inline_toml(&contrast.contrast_parts)
+        )
+        .expect("writing to string should not fail");
+    }
+    if !contrast.vibrance.is_exact() {
+        writeln!(output, "vibrance = {}", contrast.vibrance.get())
+            .expect("writing to string should not fail");
+    }
+    if !contrast.richness.is_exact() {
+        writeln!(output, "richness = {}", contrast.richness.get())
+            .expect("writing to string should not fail");
+    }
+    if !contrast.background_tint.is_exact() {
+        writeln!(
+            output,
+            "background_tint = {}",
+            contrast.background_tint.get()
+        )
+        .expect("writing to string should not fail");
+    }
+    if contrast.color_parts != bcode_tui_theme_models::ColorParts::ALL {
+        writeln!(
+            output,
+            "color_parts = {}",
+            inline_toml(&contrast.color_parts)
         )
         .expect("writing to string should not fail");
     }
@@ -12145,9 +12203,16 @@ accent_transition_curve = "ease_in_out"
             minimum_contrast = 4.5
             contrast_parts = { ansi = false }
 
+            vibrance = 0.4
+            richness = 0.25
+            background_tint = 0.5
+            color_parts = { fills = false }
+
             [tui.theme.overrides.nord]
             contrast = 0.8
             minimum_contrast = "off"
+            vibrance = -0.2
+            background_tint = 1.5
             "#,
         )
         .expect("contrast keys parse");
@@ -12158,9 +12223,17 @@ accent_transition_curve = "ease_in_out"
             Some(4.5)
         );
         assert!(!preferences.settings_for("solarized").parts.ansi);
+        let solarized = preferences.settings_for("solarized");
+        assert_eq!(solarized.vibrance.get(), 0.4);
+        assert_eq!(solarized.richness.get(), 0.25);
+        assert_eq!(solarized.background_tint.get(), 0.5);
+        assert!(!solarized.color_parts.fills && solarized.color_parts.syntax);
         let nord = preferences.settings_for("nord");
         assert_eq!(nord.factor.get(), 0.8);
         assert_eq!(nord.minimum.ratio(), None);
+        assert_eq!(nord.vibrance.get(), -0.2);
+        assert_eq!(nord.richness.get(), 0.25);
+        assert_eq!(nord.background_tint.get(), 1.5);
 
         let rendered = super::config_to_toml(&parsed);
         let round_trip: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
@@ -12170,9 +12243,22 @@ accent_transition_curve = "ease_in_out"
             "[tui.theme]\ncontrast = 0",
             "[tui.theme]\nminimum_contrast = 30",
             "[tui.theme]\ncontrast_parts = { borders = false }",
+            "[tui.theme]\nvibrance = 1.5",
+            "[tui.theme]\nvibrance = nan",
+            "[tui.theme]\nrichness = -0.5",
+            "[tui.theme]\nbackground_tint = 3",
+            "[tui.theme]\ncolor_parts = { text = true }",
+            "[tui.theme.overrides.nord]\nrichness = 2",
         ] {
             assert!(toml::from_str::<BcodeConfig>(invalid).is_err(), "{invalid}");
         }
+        let error = toml::from_str::<BcodeConfig>("[tui.theme]\nvibrance = 1.5")
+            .expect_err("out of range")
+            .to_string();
+        assert!(
+            error.contains("vibrance must be a number from -1 to 1"),
+            "{error}"
+        );
     }
 
     #[test]

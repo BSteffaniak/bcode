@@ -340,6 +340,18 @@ pub fn write_check_report(
                 adjustments.parts.join(", ")
             }
         )?;
+        writeln!(
+            writer,
+            "measured with vibrance {:.2}, richness {:.2}, background tint {:.2}, color parts {}",
+            adjustments.vibrance,
+            adjustments.richness,
+            adjustments.background_tint,
+            if adjustments.color_parts.is_empty() {
+                "none".to_owned()
+            } else {
+                adjustments.color_parts.join(", ")
+            }
+        )?;
     }
     for finding in &report.findings {
         write_finding(finding, writer)?;
@@ -1091,6 +1103,35 @@ accent = "#30306a"
         assert!(
             text.contains("measured with contrast 1.00, minimum contrast 7.0"),
             "{text}"
+        );
+        assert!(
+            text.contains("measured with vibrance 0.00, richness 0.00, background tint 1.00"),
+            "{text}"
+        );
+
+        // The color settings are measured too: greying the canvas changes what is measured.
+        let grey: ContrastPreferences =
+            toml::from_str("background_tint = 0.0\nvibrance = 0.5").expect("preferences");
+        let (colored, _) = contrast_findings(Some(&grey));
+        let colored_measured = colored.adjustments.as_ref().expect("measured");
+        assert_eq!(colored_measured.background_tint, 0.0);
+        assert_eq!(colored_measured.vibrance, 0.5);
+        assert_eq!(
+            colored_measured.color_parts,
+            ["syntax", "accents", "fills", "ansi"]
+        );
+        let canvas = |report: &bcode_tui_theme::check::ThemeCheck| {
+            serde_json::to_value(report).expect("json")["variants"][0]["contrast"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["background"] == "canvas")
+                .map(|row| row["bg"].clone())
+        };
+        assert_ne!(
+            canvas(&colored),
+            canvas(&authored),
+            "the canvas is measured greyed"
         );
         let error = run_check(
             &CheckOptions {
