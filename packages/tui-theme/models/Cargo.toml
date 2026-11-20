@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "config"]
+description = "Theme contrast preference types shared by bcode configuration and theme resolution"
+edition     = { workspace = true }
+keywords    = ["bcode", "contrast", "theme", "models"]
+license     = { workspace = true }
+name        = "bcode_tui_theme_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+toml = { workspace = true, features = ["display"] }
+
+[features]
+default          = []
+fail-on-warnings = []

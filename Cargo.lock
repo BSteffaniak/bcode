@@ -3982,6 +3982,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_tui_theme_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "toml 1.2.1+spec-1.1.0",
+]
+
+[[package]]
 name = "bcode_tui_transcript"
 version = "0.0.1-alpha.0"
 dependencies = [
