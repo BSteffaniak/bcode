@@ -107,6 +107,7 @@ members = [
     "packages/markdown-render",
     "packages/feedback",
     "packages/feedback/cli",
+    "packages/feedback/client",
     "packages/feedback/models",
     "packages/usage",
     "packages/usage/models",
@@ -282,6 +283,7 @@ bcode_eval_plugin                       = { version = "0.0.1-alpha.0", default-f
 bcode_fake_provider_plugin              = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/fake-provider-plugin" }
 bcode_feedback                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback" }
 bcode_feedback_cli                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback/cli" }
+bcode_feedback_client                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback/client" }
 bcode_feedback_models                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/feedback/models" }
 bcode_feedback_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/feedback-plugin" }
 bcode_file_references_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/file-references-plugin" }

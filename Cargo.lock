@@ -2364,13 +2364,26 @@ name = "bcode_feedback_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
- "bcode_config",
+ "bcode_feedback_client",
  "bcode_feedback_models",
  "bcode_session_models",
  "clap",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "bcode_feedback_client"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_client",
+ "bcode_config",
+ "bcode_feedback_models",
+ "bcode_session_models",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3548,6 +3561,7 @@ dependencies = [
 name = "bcode_session_bridge_models"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_feedback_models",
  "serde",
  "serde_json",
 ]
@@ -3578,6 +3592,9 @@ dependencies = [
  "bcode_client",
  "bcode_config",
  "bcode_fake_provider_plugin",
+ "bcode_feedback_client",
+ "bcode_feedback_models",
+ "bcode_feedback_plugin",
  "bcode_ipc",
  "bcode_model",
  "bcode_model_catalog",

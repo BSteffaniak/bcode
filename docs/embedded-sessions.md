@@ -130,7 +130,7 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   (`{"id": n, "request": {"op": ...}}`); the bridge writes `BridgeFrame`s: `response` frames
   carrying `ok` (a `kind`-tagged response) or `error` (`code`, `message`), and `event` frames.
   Requests run concurrently; responses are matched by id.
-* Versions: `BRIDGE_PROTOCOL_VERSION` is 1 and the window is the current version and up to two
+* Versions: `BRIDGE_PROTOCOL_VERSION` is 2 and the window is the current version and up to two
   earlier ones (`VersionRange::supported()`). `hello` must come first (`hello_required`
   otherwise); it returns the highest shared version, the bridge's window and the Bcode version,
   or `version_mismatch` with a message naming both ranges and whether to update the application
@@ -144,8 +144,12 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   remember), `register_tools` (tools and agent profiles), `claim_session`, `release_session`,
   `tool_result`, `list_agents`, `list_models` (efforts and USD prices per million tokens when
   known), `usage`, `import_sdk_session`, `open_command` (`[bcode, "tui", <id>]` with the bridge's
-  own executable). Events: `observation`, `observation_ended`, `tool_invoke`, `tool_cancel`,
-  `claim_lost`, `tools_lost`.
+  own executable). Protocol 2 adds `feedback_submit` (record an item, then start its triage in
+  the feedback intake session, optionally claiming that session for the application's tools and
+  carrying the application's own triage instructions), `feedback_get`, `feedback_list` and
+  `feedback_attach`; a connection that negotiated protocol 1 gets `unsupported_request`.
+  Events: `observation`, `observation_ended`, `tool_invoke`, `tool_cancel`, `claim_lost`,
+  `tools_lost`.
 * Every operation is an adapter over an existing daemon application operation through an
   ordinary `BcodeClient` of the bridge's own daemon (`BcodeClient::default_endpoint`, auto-start
   and exact match). Daemon error codes pass through unchanged, such as

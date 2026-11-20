@@ -13,6 +13,8 @@ version     = { workspace = true }
 [dependencies]
 bcode_agent_profile = { workspace = true }
 bcode_client = { workspace = true }
+bcode_feedback_client = { workspace = true }
+bcode_feedback_models = { workspace = true }
 bcode_model = { workspace = true }
 bcode_session_bridge_models = { workspace = true }
 bcode_session_models = { workspace = true }
@@ -34,6 +36,7 @@ bcode_config = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = [
     "script-controls",
 ] }
+bcode_feedback_plugin = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_model_catalog = { workspace = true }
 bcode_plugin = { workspace = true }

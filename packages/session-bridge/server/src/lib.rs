@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+mod feedback;
+
 use bcode_client::client_tools::{ClientToolHandle, ClientToolRequest};
 use bcode_client::{BcodeClient, ClientError};
 use bcode_session_bridge_models::{
@@ -118,6 +120,8 @@ where
     });
     let mut handlers = JoinSet::new();
     let mut negotiated = false;
+    // The negotiated protocol version; requests newer than it are refused.
+    let mut version = 0;
     let mut lines = BufReader::new(reader).lines();
     let result = loop {
         let line = match lines.next_line().await {
@@ -141,6 +145,9 @@ where
                 versions,
             } if !negotiated => {
                 let result = bridge.hello(versions);
+                if let Ok(BridgeResponse::Hello(hello)) = &result {
+                    version = hello.version;
+                }
                 negotiated = result.is_ok();
                 bridge.respond(frame.id, result).await;
             }
@@ -159,6 +166,21 @@ where
                         Err(error(
                             "hello_required",
                             "negotiate the protocol version with hello first",
+                        )),
+                    )
+                    .await;
+            }
+            request if request.min_version() > version => {
+                bridge
+                    .respond(
+                        frame.id,
+                        Err(error(
+                            "unsupported_request",
+                            &format!(
+                                "this request needs bridge protocol {}; version {version} was \
+                                 negotiated",
+                                request.min_version()
+                            ),
                         )),
                     )
                     .await;
@@ -534,6 +556,32 @@ impl Bridge {
                         .collect(),
                 })
                 .map_err(client_error),
+            BridgeRequest::FeedbackSubmit {
+                item,
+                instructions,
+                claim,
+                skip_triage,
+            } => {
+                self.feedback_submit(&item, instructions.as_deref(), claim, skip_triage)
+                    .await
+            }
+            BridgeRequest::FeedbackGet { id } => bcode_feedback_client::get(
+                client,
+                &bcode_feedback_models::GetFeedbackRequest { id },
+            )
+            .await
+            .map(|item| BridgeResponse::Feedback { item })
+            .map_err(|failure| feedback::error(&failure)),
+            BridgeRequest::FeedbackList { query } => bcode_feedback_client::list(client, &query)
+                .await
+                .map(BridgeResponse::FeedbackPage)
+                .map_err(|failure| feedback::error(&failure)),
+            BridgeRequest::FeedbackAttach { attachment } => {
+                bcode_feedback_client::attach(client, &attachment)
+                    .await
+                    .map(|item| BridgeResponse::Feedback { item })
+                    .map_err(|failure| feedback::error(&failure))
+            }
             BridgeRequest::OpenCommand { session_id: id } => {
                 session_id(&id)?;
                 Ok(BridgeResponse::Command {

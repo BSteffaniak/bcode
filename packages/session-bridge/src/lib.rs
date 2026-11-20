@@ -103,6 +103,17 @@ impl Drop for Shared {
     }
 }
 
+/// A recorded feedback item and how its triage started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackSubmission {
+    /// The item, recorded whether or not triage started.
+    pub item: models::bcode_feedback_models::FeedbackItem,
+    /// The intake turn triaging it, when triage started.
+    pub intake: Option<models::FeedbackIntake>,
+    /// Why triage did not start.
+    pub triage_error: Option<models::BridgeError>,
+}
+
 /// Unsolicited events from the bridge, in arrival order. Ends when the bridge closes.
 #[derive(Debug)]
 pub struct BridgeEvents {
@@ -663,6 +674,96 @@ impl BridgeClient {
         }
     }
 
+    /// Record feedback, then hand it to the feedback intake session (bridge protocol 2).
+    ///
+    /// With `claim`, the intake session is claimed for this application's registered tools
+    /// first, so the intake agent can call them. The item is recorded even when triage cannot
+    /// start; the response's `triage_error` says why.
+    ///
+    /// # Errors
+    ///
+    /// Returns `unsupported_request` from a bridge that negotiated protocol 1, `invalid_request`
+    /// for a malformed item, or a transport error.
+    pub async fn feedback_submit(
+        &self,
+        item: models::bcode_feedback_models::RecordFeedbackRequest,
+        instructions: Option<String>,
+        claim: bool,
+    ) -> Result<FeedbackSubmission, BridgeClientError> {
+        match self
+            .request(BridgeRequest::FeedbackSubmit {
+                item,
+                instructions,
+                claim,
+                skip_triage: false,
+            })
+            .await?
+        {
+            BridgeResponse::FeedbackSubmitted {
+                item,
+                intake,
+                triage_error,
+            } => Ok(FeedbackSubmission {
+                item,
+                intake,
+                triage_error,
+            }),
+            _ => Err(BridgeClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one feedback item (bridge protocol 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns `not_found`, `unsupported_request`, or a transport error.
+    pub async fn feedback_get(
+        &self,
+        id: models::bcode_feedback_models::FeedbackId,
+    ) -> Result<models::bcode_feedback_models::FeedbackItem, BridgeClientError> {
+        self.feedback_item(BridgeRequest::FeedbackGet { id }).await
+    }
+
+    /// List feedback items, newest first (bridge protocol 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns `invalid_request` for a bad page limit, `unsupported_request`, or a transport
+    /// error.
+    pub async fn feedback_list(
+        &self,
+        query: models::bcode_feedback_models::FeedbackQuery,
+    ) -> Result<models::bcode_feedback_models::FeedbackPage, BridgeClientError> {
+        match self.request(BridgeRequest::FeedbackList { query }).await? {
+            BridgeResponse::FeedbackPage(page) => Ok(page),
+            _ => Err(BridgeClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Copy a file or directory into a feedback item (bridge protocol 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns `attachment_rejected` for a missing, linked or oversized source, `not_found`,
+    /// `unsupported_request`, or a transport error.
+    pub async fn feedback_attach(
+        &self,
+        attachment: models::bcode_feedback_models::AttachFeedbackRequest,
+    ) -> Result<models::bcode_feedback_models::FeedbackItem, BridgeClientError> {
+        self.feedback_item(BridgeRequest::FeedbackAttach { attachment })
+            .await
+    }
+
+    async fn feedback_item(
+        &self,
+        request: BridgeRequest,
+    ) -> Result<models::bcode_feedback_models::FeedbackItem, BridgeClientError> {
+        match self.request(request).await? {
+            BridgeResponse::Feedback { item } => Ok(item),
+            _ => Err(BridgeClientError::UnexpectedResponse),
+        }
+    }
+
     /// The command that opens a session in `bcode tui` with the installed executable.
     ///
     /// # Errors
@@ -765,7 +866,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_bridge_models::{BRIDGE_PROTOCOL_VERSION, ViewItemKind};
+    use bcode_session_bridge_models::ViewItemKind;
 
     type Scripted = (
         Result<(BridgeClient, BridgeEvents), BridgeClientError>,
@@ -806,7 +907,7 @@ mod tests {
         let observing = "{\"frame\":\"event\",\"event\":{\"event\":\"observation\",\"observation_id\":\"o\",\"sequence\":0,\"view\":{\"session_id\":\"s\",\"items\":[{\"id\":\"1\",\"kind\":\"hologram\",\"text\":\"3D\"}]}}}\n{\"frame\":\"event\",\"event\":{\"event\":\"teleport\"}}\n{\"frame\":\"response\",\"id\":ID,\"ok\":{\"kind\":\"observing\",\"observation_id\":\"o\",\"added_later\":true}}";
         let (connected, bridge) = scripted(vec![hello, observing]).await;
         let (client, mut events) = connected.expect("connected");
-        assert_eq!(client.hello().version, BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(client.hello().version, 1, "the version the bridge negotiated");
         assert_eq!(client.observe("s", 10).await.expect("observe"), "o");
         let Some(BridgeEvent::Observation { view, .. }) = events.recv().await else {
             panic!("expected an observation");

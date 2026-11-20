@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 bcode_client = { workspace = true }
-bcode_config = { workspace = true }
+bcode_feedback_client = { workspace = true }
 bcode_feedback_models = { workspace = true }
 bcode_session_models = { workspace = true }
 clap = { workspace = true, features = [

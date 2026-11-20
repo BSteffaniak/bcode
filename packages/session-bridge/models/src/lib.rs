@@ -20,10 +20,14 @@
 
 use std::collections::BTreeMap;
 
+pub use bcode_feedback_models;
 use serde::{Deserialize, Serialize};
 
 /// Bridge protocol version this build speaks natively.
-pub const BRIDGE_PROTOCOL_VERSION: u32 = 1;
+pub const BRIDGE_PROTOCOL_VERSION: u32 = 2;
+
+/// First protocol version with the `feedback_*` requests.
+pub const FEEDBACK_PROTOCOL_VERSION: u32 = 2;
 
 /// How many earlier protocol versions a bridge keeps accepting.
 pub const BRIDGE_COMPATIBILITY_WINDOW: u32 = 2;
@@ -313,6 +317,53 @@ pub enum BridgeRequest {
         /// The session.
         session_id: String,
     },
+    /// Record feedback, then hand it to the feedback intake session (protocol 2).
+    ///
+    /// The item is recorded before triage starts: when triage cannot start, the response still
+    /// carries the item, with `triage_error` saying why.
+    FeedbackSubmit {
+        /// The feedback.
+        item: bcode_feedback_models::RecordFeedbackRequest,
+        /// What this application offers the intake agent, such as its own tools for capturing
+        /// context around the feedback.
+        #[serde(default)]
+        instructions: Option<String>,
+        /// Claim the intake session for this bridge's registered tools before triage starts.
+        #[serde(default)]
+        claim: bool,
+        /// Record only; do not start triage.
+        #[serde(default)]
+        skip_triage: bool,
+    },
+    /// Read one feedback item (protocol 2).
+    FeedbackGet {
+        /// The item.
+        id: bcode_feedback_models::FeedbackId,
+    },
+    /// List feedback items, newest first (protocol 2).
+    FeedbackList {
+        /// Filters and page.
+        query: bcode_feedback_models::FeedbackQuery,
+    },
+    /// Copy a file or directory into a feedback item (protocol 2).
+    FeedbackAttach {
+        /// What to attach.
+        attachment: bcode_feedback_models::AttachFeedbackRequest,
+    },
+}
+
+impl BridgeRequest {
+    /// The oldest protocol version that has this request.
+    #[must_use]
+    pub const fn min_version(&self) -> u32 {
+        match self {
+            Self::FeedbackSubmit { .. }
+            | Self::FeedbackGet { .. }
+            | Self::FeedbackList { .. }
+            | Self::FeedbackAttach { .. } => FEEDBACK_PROTOCOL_VERSION,
+            _ => 1,
+        }
+    }
 }
 
 /// Largest page [`BridgeRequest::ListSessions`] returns.
@@ -437,8 +488,35 @@ pub enum BridgeResponse {
         /// Program and arguments.
         argv: Vec<String>,
     },
+    /// A recorded feedback item and how its triage started.
+    FeedbackSubmitted {
+        /// The item, recorded whether or not triage started.
+        item: bcode_feedback_models::FeedbackItem,
+        /// The intake turn triaging it, when triage started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intake: Option<FeedbackIntake>,
+        /// Why triage did not start, when it was asked for and failed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        triage_error: Option<BridgeError>,
+    },
+    /// One feedback item.
+    Feedback {
+        /// The item.
+        item: bcode_feedback_models::FeedbackItem,
+    },
+    /// A page of feedback items.
+    FeedbackPage(bcode_feedback_models::FeedbackPage),
     /// The request succeeded and has nothing to report.
     Done,
+}
+
+/// The intake turn triaging a submitted feedback item. Observe the session to follow it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackIntake {
+    /// The intake session.
+    pub session_id: String,
+    /// The turn.
+    pub turn_id: String,
 }
 
 /// Answer to [`BridgeRequest::Hello`].

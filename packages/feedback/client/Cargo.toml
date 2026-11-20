@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Typed feedback service calls and intake turns over a Bcode daemon client"
+edition     = { workspace = true }
+keywords    = ["bcode", "feedback", "client"]
+license     = { workspace = true }
+name        = "bcode_feedback_client"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_client          = { workspace = true }
+bcode_config          = { workspace = true }
+bcode_feedback_models = { workspace = true }
+bcode_session_models  = { workspace = true }
+serde                 = { workspace = true, features = ["derive", "std"] }
+serde_json            = { workspace = true, features = ["std"] }
+thiserror             = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -12,7 +12,6 @@
 //! Applications that do not link Bcode shell out to `bcode-feedback submit`, passing a
 //! [`RecordFeedbackRequest`] as JSON on stdin with `--request-json`.
 
-mod intake;
 mod render;
 
 use std::collections::BTreeSet;
@@ -20,11 +19,10 @@ use std::io::Read as _;
 use std::time::Duration;
 
 use bcode_client::BcodeClient;
+use bcode_feedback_client as feedback;
 use bcode_feedback_models::{
-    Actor, FEEDBACK_PLUGIN_ID, FEEDBACK_SERVICE_INTERFACE_ID, Facet, FeedbackId, FeedbackItem,
-    FeedbackPage, FeedbackQuery, FeedbackStatus, GetFeedbackRequest, IntakeSession,
-    LinkFeedbackRequest, LinkKind, OP_GET, OP_INTAKE_SESSION, OP_LINK, OP_LIST, OP_RECORD,
-    OP_SET_STATUS, RecordFeedbackRequest, SetFeedbackStatusRequest, TriageState,
+    Actor, Facet, FeedbackId, FeedbackItem, FeedbackQuery, FeedbackStatus, GetFeedbackRequest,
+    LinkFeedbackRequest, LinkKind, RecordFeedbackRequest, SetFeedbackStatusRequest, TriageState,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -221,11 +219,15 @@ pub async fn run(cli: FeedbackCli, client: &BcodeClient) -> Result<(), String> {
         FeedbackCommand::Submit(args) => submit(client, args).await,
         FeedbackCommand::List(args) => {
             let json = args.json;
-            let page: FeedbackPage = call(client, OP_LIST, &list_query(args)).await?;
+            let page = feedback::list(client, &list_query(args))
+                .await
+                .map_err(text)?;
             render::page(&page, json)
         }
         FeedbackCommand::Show { id, json } => {
-            let item: FeedbackItem = call(client, OP_GET, &GetFeedbackRequest { id }).await?;
+            let item = feedback::get(client, &GetFeedbackRequest { id })
+                .await
+                .map_err(text)?;
             render::item(&item, json)
         }
         FeedbackCommand::Inbox { json } => inbox(client, json).await,
@@ -233,20 +235,22 @@ pub async fn run(cli: FeedbackCli, client: &BcodeClient) -> Result<(), String> {
         FeedbackCommand::Dismiss(args) => set_status(client, args, FeedbackStatus::Dismissed).await,
         FeedbackCommand::Reopen(args) => set_status(client, args, FeedbackStatus::Open).await,
         FeedbackCommand::Link { from, to, kind } => {
-            let item: FeedbackItem = call(
+            let item = feedback::link(
                 client,
-                OP_LINK,
                 &LinkFeedbackRequest {
                     from,
                     to,
                     kind: kind.into(),
                 },
             )
-            .await?;
+            .await
+            .map_err(text)?;
             render::item(&item, false)
         }
         FeedbackCommand::Session => {
-            let session = intake::ensure_session(client).await?;
+            let session = feedback::ensure_intake_session(client)
+                .await
+                .map_err(text)?;
             println!("{session}");
             Ok(())
         }
@@ -286,17 +290,16 @@ async fn submit(client: &BcodeClient, args: SubmitArgs) -> Result<(), String> {
                 .collect(),
         }
     };
-    request.validate().map_err(|error| error.to_string())?;
-    let item: FeedbackItem = call(client, OP_RECORD, &request).await?;
+    let item = feedback::record(client, &request).await.map_err(text)?;
     if args.no_triage {
         return render::submitted(&item, None, None, args.json);
     }
     // The item is recorded; a triage failure is reported but the item stays.
-    match intake::send(client, &item, args.wait.map(Duration::from_secs)).await {
-        Ok(outcome) => render::submitted(
+    match triage(client, &item, args.wait.map(Duration::from_secs)).await {
+        Ok((session_id, reply)) => render::submitted(
             &item,
-            Some(&outcome.session_id.to_string()),
-            outcome.reply.as_deref(),
+            Some(&session_id.to_string()),
+            reply.as_deref(),
             args.json,
         ),
         Err(error) => {
@@ -307,6 +310,30 @@ async fn submit(client: &BcodeClient, args: SubmitArgs) -> Result<(), String> {
             ))
         }
     }
+}
+
+/// Hand a recorded item to the intake session, waiting for the reply when asked.
+async fn triage(
+    client: &BcodeClient,
+    item: &FeedbackItem,
+    wait: Option<Duration>,
+) -> Result<(bcode_session_models::SessionId, Option<String>), feedback::FeedbackClientError> {
+    let session_id = feedback::ensure_intake_session(client).await?;
+    // Watch before submitting so the turn's outcome cannot be missed.
+    let mut watcher = match wait {
+        Some(_) => Some(client.watch_session(session_id, 0).await.map_err(|error| {
+            feedback::FeedbackClientError::Intake(format!("watching the intake session: {error}"))
+        })?),
+        None => None,
+    };
+    let receipt = feedback::submit_to_intake(client, session_id, item, None).await?;
+    let reply = match (wait, watcher.as_mut()) {
+        (Some(timeout), Some(watcher)) => {
+            Some(feedback::wait_for_reply(client, watcher, &receipt, timeout).await?)
+        }
+        _ => None,
+    };
+    Ok((session_id, reply))
 }
 
 fn list_query(args: ListArgs) -> FeedbackQuery {
@@ -324,19 +351,18 @@ fn list_query(args: ListArgs) -> FeedbackQuery {
 }
 
 async fn inbox(client: &BcodeClient, json: bool) -> Result<(), String> {
-    let resolved: FeedbackPage = call(
+    let resolved = feedback::list(
         client,
-        OP_LIST,
         &FeedbackQuery {
             statuses: BTreeSet::from([FeedbackStatus::AgentResolved]),
             limit: bcode_feedback_models::MAX_PAGE_LIMIT,
             ..FeedbackQuery::default()
         },
     )
-    .await?;
-    let open: FeedbackPage = call(
+    .await
+    .map_err(text)?;
+    let open = feedback::list(
         client,
-        OP_LIST,
         &FeedbackQuery {
             statuses: BTreeSet::from([FeedbackStatus::Open]),
             triage_state: Some(TriageState::Triaged),
@@ -344,7 +370,8 @@ async fn inbox(client: &BcodeClient, json: bool) -> Result<(), String> {
             ..FeedbackQuery::default()
         },
     )
-    .await?;
+    .await
+    .map_err(text)?;
     let questions: Vec<FeedbackItem> = open
         .items
         .into_iter()
@@ -362,9 +389,8 @@ async fn set_status(
     args: StatusArgs,
     status: FeedbackStatus,
 ) -> Result<(), String> {
-    let item: FeedbackItem = call(
+    let item = feedback::set_status(
         client,
-        OP_SET_STATUS,
         &SetFeedbackStatusRequest {
             id: args.id,
             status,
@@ -374,35 +400,14 @@ async fn set_status(
             commits: Vec::new(),
         },
     )
-    .await?;
+    .await
+    .map_err(text)?;
     render::item(&item, false)
 }
 
-/// Call one `bcode.feedback/v1` operation.
-async fn call<R: serde::de::DeserializeOwned>(
-    client: &BcodeClient,
-    operation: &str,
-    payload: &(impl serde::Serialize + Sync),
-) -> Result<R, String> {
-    let payload = serde_json::to_vec(payload).map_err(|error| error.to_string())?;
-    let response = client
-        .invoke_plugin_service(
-            FEEDBACK_PLUGIN_ID.into(),
-            FEEDBACK_SERVICE_INTERFACE_ID.into(),
-            operation.into(),
-            payload,
-        )
-        .await
-        .map_err(|error| format!("feedback service unavailable: {error}"))?;
-    if let Some(error) = response.error {
-        return Err(format!("{} ({})", error.message, error.code));
-    }
-    serde_json::from_slice(&response.payload)
-        .map_err(|error| format!("unexpected feedback service response: {error}"))
-}
-
-async fn intake_session(client: &BcodeClient) -> Result<IntakeSession, String> {
-    call(client, OP_INTAKE_SESSION, &()).await
+#[allow(clippy::needless_pass_by_value)] // Used as a `map_err` adapter.
+fn text(error: feedback::FeedbackClientError) -> String {
+    error.to_string()
 }
 
 #[cfg(test)]
