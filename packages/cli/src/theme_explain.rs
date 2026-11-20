@@ -258,6 +258,8 @@ pub struct ExplainInputs {
     pub variant: ResolvedThemeVariant,
     /// Theme discovery roots.
     pub roots: Vec<ThemeDiscoveryRoot>,
+    /// Configured contrast values with the per-theme values saved in user state.
+    pub contrast: bcode_tui_theme::adjustment::ContrastPreferences,
     /// Plugin manifest default rule layers (see [`plugin_rule_layers`]).
     pub plugin_layers: Vec<RuleLayer>,
     /// Facts and properties those plugins declare, registered with the
@@ -423,10 +425,16 @@ pub fn load_explain_inputs(
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
     let plugins = configured_plugin_layers(&config);
+    let mut contrast = config.tui.theme.contrast_preferences();
+    // An unreadable state file keeps the configured values; the TUI reports it.
+    if let Ok(saved) = bcode_config::load_tui_contrast_overrides() {
+        contrast.apply_saved(&saved);
+    }
     Ok(ExplainInputs {
         theme,
         profile,
         overlays,
+        contrast,
         variant: bcode_tui::theme::resolve_variant_for_config(config.tui.theme.variant),
         roots: configured_roots(&config, &project_root()),
         plugin_layers: plugins.layers,
@@ -808,6 +816,7 @@ mod tests {
             overlays,
             variant: ResolvedThemeVariant::Dark,
             roots,
+            contrast: bcode_tui_theme::adjustment::ContrastPreferences::default(),
             plugin_layers: Vec::new(),
             plugin_schemas: PluginPresentationSchemas::default(),
             skipped_plugins: Vec::new(),

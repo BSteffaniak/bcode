@@ -1215,6 +1215,7 @@ fn write_theme_command(
             json,
             bless,
             accepted,
+            with_adjustments,
         } => theme_check::run_check(
             &theme_check::CheckOptions {
                 selection: theme_check::CheckSelection::new(theme.as_deref(), all),
@@ -1222,6 +1223,7 @@ fn write_theme_command(
                 json,
                 bless,
                 accepted: accepted.as_deref(),
+                with_adjustments,
             },
             writer,
         )?,
@@ -5801,6 +5803,13 @@ enum ThemeCommand {
         /// instead of the one next to each theme.
         #[arg(long, value_name = "PATH")]
         accepted: Option<PathBuf>,
+        /// Measure the colors your configured contrast settings
+        /// (`[tui.theme] contrast`, `minimum_contrast`, `contrast_parts`,
+        /// overrides and saved picker values) produce instead of the authored
+        /// theme. Accepted findings describe authored themes and are not
+        /// compared.
+        #[arg(long, conflicts_with = "bless")]
+        with_adjustments: bool,
     },
     /// List theme profiles (bundled and discovered) with descriptions.
     Profiles {

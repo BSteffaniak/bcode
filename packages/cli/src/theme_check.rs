@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 
 use bcode_presentation_policy::models::PluginPresentationSchemas;
 use bcode_presentation_policy::{CompiledPolicy, DiagnosticSeverity, PolicyRegistry};
+use bcode_tui_theme::adjustment::ContrastPreferences;
 use bcode_tui_theme::check::accepted::{ACCEPTED_FILE_NAME, MAX_ACCEPTED_FILE_BYTES};
 use bcode_tui_theme::check::{
     Acceptance, AcceptanceItem, AcceptancePolicy, AcceptedFindings, BlessSummary, CheckFinding,
-    ContrastOutcome, FindingCategory, ThemeCheck, VariantCheck, check_theme,
+    ContrastOutcome, FindingCategory, ThemeCheck, VariantCheck, check_theme_adjusted,
 };
 use bcode_tui_theme::definition::{
     ResolvedThemeDefinition, ThemeCatalog, ThemeDefinition, ThemeKind, parse_theme_definition,
@@ -185,10 +186,17 @@ impl CheckCatalog {
         base: &str,
         overlays: &[String],
         schemas: &PluginPresentationSchemas,
+        contrast: Option<&ContrastPreferences>,
     ) -> Result<ThemeCheck, CliError> {
-        let mut report = check_theme(&self.catalog, base, overlays, &[], |resolved| {
-            presentation_findings(resolved, schemas)
-        })
+        let settings = contrast.map(|contrast| contrast.settings_for(base));
+        let mut report = check_theme_adjusted(
+            &self.catalog,
+            base,
+            overlays,
+            &[],
+            settings.as_ref(),
+            |resolved| presentation_findings(resolved, schemas),
+        )
         .map_err(|error| CliError::Theme(error.to_string()))?;
         report
             .findings
@@ -210,7 +218,8 @@ impl CheckCatalog {
 /// Profiles and bases are checked as overlays over the default theme. The
 /// fact and property `schemas` of the enabled plugins are registered, so theme
 /// rules that set a declared plugin property are type-checked instead of
-/// reported as unknown.
+/// reported as unknown. With `contrast`, the colors its settings for the
+/// checked theme produce are measured instead of the authored ones.
 ///
 /// # Errors
 ///
@@ -220,6 +229,7 @@ pub fn check_target_with_origin(
     target: &CheckTarget,
     roots: &[ThemeDiscoveryRoot],
     schemas: &PluginPresentationSchemas,
+    contrast: Option<&ContrastPreferences>,
 ) -> Result<CheckedTheme, CliError> {
     let mut catalog = CheckCatalog::discover(roots)?;
     let (base, overlays, origin) = match target {
@@ -238,12 +248,13 @@ pub fn check_target_with_origin(
             (base, overlays, ThemeOrigin::File(path.clone()))
         }
     };
-    let report = catalog.check(&base, &overlays, schemas)?;
+    let report = catalog.check(&base, &overlays, schemas, contrast)?;
     Ok(CheckedTheme { report, origin })
 }
 
 /// Check every definition in the catalog: themes alone, profiles and bases
-/// over the default theme, in catalog order.
+/// over the default theme, in catalog order, measuring the colors `contrast`
+/// produces when it is set.
 ///
 /// # Errors
 ///
@@ -251,6 +262,7 @@ pub fn check_target_with_origin(
 pub fn check_all(
     roots: &[ThemeDiscoveryRoot],
     schemas: &PluginPresentationSchemas,
+    contrast: Option<&ContrastPreferences>,
 ) -> Result<Vec<CheckedTheme>, CliError> {
     let catalog = CheckCatalog::discover(roots)?;
     let ids: Vec<String> = catalog
@@ -262,7 +274,7 @@ pub fn check_all(
         .map(|id| {
             let (base, overlays) = selection_for(&catalog.catalog, id);
             Ok(CheckedTheme {
-                report: catalog.check(&base, &overlays, schemas)?,
+                report: catalog.check(&base, &overlays, schemas, contrast)?,
                 origin: catalog.origin(id),
             })
         })
@@ -314,6 +326,21 @@ pub fn write_check_report(
         format!(" + {}", report.overlays.join(" + "))
     };
     writeln!(writer, "theme {}{overlays}", report.theme)?;
+    if let Some(adjustments) = &report.adjustments {
+        writeln!(
+            writer,
+            "measured with contrast {:.2}, minimum contrast {}, parts {}",
+            adjustments.contrast,
+            adjustments
+                .minimum_contrast
+                .map_or_else(|| "off".to_owned(), |ratio| format!("{ratio:.1}")),
+            if adjustments.parts.is_empty() {
+                "none".to_owned()
+            } else {
+                adjustments.parts.join(", ")
+            }
+        )?;
+    }
     for finding in &report.findings {
         write_finding(finding, writer)?;
     }
@@ -490,6 +517,8 @@ impl<'a> CheckSelection<'a> {
 }
 
 /// Options of `bcode theme check`.
+// One field per command-line flag.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckOptions<'a> {
     /// What to check.
@@ -502,6 +531,9 @@ pub struct CheckOptions<'a> {
     pub bless: bool,
     /// Accepted-findings file to use instead of each theme's own.
     pub accepted: Option<&'a Path>,
+    /// Measure the colors the configured contrast settings produce instead of the authored
+    /// ones. Accepted findings describe authored themes, so they are not compared.
+    pub with_adjustments: bool,
 }
 
 /// Run `bcode theme check`.
@@ -514,16 +546,22 @@ pub struct CheckOptions<'a> {
 ///
 /// Returns an error when configuration cannot be loaded, the theme cannot be
 /// read or resolved, an accepted-findings file cannot be read or written,
-/// `bless` targets the bundled accepted findings without `--accepted`, output
-/// fails, or the check fails.
+/// `bless` targets the bundled accepted findings without `--accepted`, `bless`
+/// is combined with `with_adjustments`, output fails, or the check fails.
 pub fn run_check(
     options: &CheckOptions<'_>,
     writer: &mut impl std::io::Write,
 ) -> Result<(), CliError> {
+    if options.bless && options.with_adjustments {
+        return Err(CliError::InvalidArguments(
+            "--bless accepts findings of authored themes; drop --with-adjustments".to_owned(),
+        ));
+    }
     let inputs = crate::theme_explain::load_explain_inputs(None, None)?;
+    let contrast = options.with_adjustments.then_some(&inputs.contrast);
     let all = options.selection == CheckSelection::All;
     let mut checked = if all {
-        check_all(&inputs.roots, &inputs.plugin_schemas)?
+        check_all(&inputs.roots, &inputs.plugin_schemas, contrast)?
     } else {
         let theme = match options.selection {
             CheckSelection::Theme(theme) => Some(theme),
@@ -534,13 +572,16 @@ pub fn run_check(
             &target,
             &inputs.roots,
             &inputs.plugin_schemas,
+            contrast,
         )?]
     };
     let mut store = AcceptedStore::default();
     if options.bless {
         bless(&checked, options, &mut store, writer)?;
     }
-    apply_accepted(&mut checked, options.accepted, &mut store)?;
+    if !options.with_adjustments {
+        apply_accepted(&mut checked, options.accepted, &mut store)?;
+    }
     let reports: Vec<&ThemeCheck> = checked.iter().map(|theme| &theme.report).collect();
     if options.json {
         if all {
@@ -556,7 +597,22 @@ pub fn run_check(
             write_check_report(report, false, writer)?;
         }
     }
+    if options.with_adjustments {
+        return adjusted_check_result(&reports);
+    }
     check_result(&reports, options.strict)
+}
+
+/// Fail when the colors the user's contrast settings produce have warnings. There is nothing
+/// to accept: accepted findings describe authored themes.
+fn adjusted_check_result(reports: &[&ThemeCheck]) -> Result<(), CliError> {
+    let warnings: usize = reports.iter().map(|report| report.warning_count()).sum();
+    if warnings == 0 {
+        return Ok(());
+    }
+    Err(CliError::Theme(format!(
+        "theme check found {warnings} finding(s) with the configured contrast adjustments"
+    )))
 }
 
 /// Compare each checked selection with its accepted findings (from
@@ -739,7 +795,7 @@ mod tests {
         roots: &[ThemeDiscoveryRoot],
         schemas: &PluginPresentationSchemas,
     ) -> Result<ThemeCheck, CliError> {
-        check_target_with_origin(target, roots, schemas).map(|checked| checked.report)
+        check_target_with_origin(target, roots, schemas, None).map(|checked| checked.report)
     }
 
     fn roots() -> (tempfile::TempDir, Vec<ThemeDiscoveryRoot>) {
@@ -793,7 +849,7 @@ fg = "$accent"
     fn every_bundled_theme_passes_strict_with_the_bundled_accepted_findings() {
         let (_directory, roots) = roots();
         let mut checked =
-            check_all(&roots, &PluginPresentationSchemas::default()).expect("check all");
+            check_all(&roots, &PluginPresentationSchemas::default(), None).expect("check all");
         assert_eq!(
             checked.len(),
             ThemeCatalog::bundled()
@@ -846,6 +902,7 @@ accent = "#30306a"
             &CheckTarget::File(path.to_path_buf()),
             roots,
             &PluginPresentationSchemas::default(),
+            None,
         )
         .expect("check")
     }
@@ -995,6 +1052,59 @@ accent = "#30306a"
     }
 
     #[test]
+    fn with_adjustments_measures_the_colors_the_contrast_settings_produce() {
+        let (_directory, roots) = roots();
+        let contrast_findings = |contrast: Option<&ContrastPreferences>| {
+            let report = check_target_with_origin(
+                &CheckTarget::Id("solarized".to_owned()),
+                &roots,
+                &PluginPresentationSchemas::default(),
+                contrast,
+            )
+            .expect("check")
+            .report;
+            let count = report
+                .all_findings()
+                .filter(|finding| finding.category == FindingCategory::Contrast)
+                .count();
+            (report, count)
+        };
+        let (authored, authored_count) = contrast_findings(None);
+        assert!(authored.adjustments.is_none());
+        assert!(authored_count > 0, "solarized has upstream low contrast");
+        let floor: ContrastPreferences =
+            toml::from_str("minimum_contrast = 7.0").expect("preferences");
+        let (adjusted, adjusted_count) = contrast_findings(Some(&floor));
+        assert!(
+            adjusted_count < authored_count,
+            "{adjusted_count} < {authored_count}"
+        );
+        let measured = adjusted
+            .adjustments
+            .as_ref()
+            .expect("measured with adjustments");
+        assert_eq!(measured.minimum_contrast, Some(7.0));
+        assert_eq!(measured.parts, ["text", "syntax", "fills", "ansi"]);
+        let mut text = Vec::new();
+        write_check_report(&adjusted, false, &mut text).expect("text");
+        let text = String::from_utf8(text).expect("utf8");
+        assert!(
+            text.contains("measured with contrast 1.00, minimum contrast 7.0"),
+            "{text}"
+        );
+        let error = run_check(
+            &CheckOptions {
+                bless: true,
+                with_adjustments: true,
+                ..CheckOptions::default()
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("bless needs authored themes");
+        assert!(error.to_string().contains("--with-adjustments"), "{error}");
+    }
+
+    #[test]
     fn blessing_a_bundled_theme_needs_an_explicit_file() {
         let (directory, roots) = roots();
         let checked = || {
@@ -1002,6 +1112,7 @@ accent = "#30306a"
                 &CheckTarget::Id("solarized".to_owned()),
                 &roots,
                 &PluginPresentationSchemas::default(),
+                None,
             )
             .expect("check")
         };
@@ -1309,6 +1420,7 @@ set = { plugin = { "test.git.max_files" = 99 } }
                     json: true,
                     bless: false,
                     accepted: None,
+                    with_adjustments: false,
                 }
             }) if theme == "nord"
         ));
@@ -1323,9 +1435,39 @@ set = { plugin = { "test.git.max_files" = 99 } }
                     json: false,
                     bless: false,
                     accepted: None,
+                    with_adjustments: false,
                 }
             })
         ));
+        let cli = crate::Cli::try_parse_from([
+            "bcode",
+            "theme",
+            "check",
+            "solarized",
+            "--with-adjustments",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(crate::Commands::Theme {
+                command: crate::ThemeCommand::Check {
+                    with_adjustments: true,
+                    bless: false,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            crate::Cli::try_parse_from([
+                "bcode",
+                "theme",
+                "check",
+                "--bless",
+                "--with-adjustments",
+            ])
+            .is_err(),
+            "--bless and --with-adjustments conflict"
+        );
         let cli = crate::Cli::try_parse_from([
             "bcode",
             "theme",
