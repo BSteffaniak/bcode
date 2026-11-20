@@ -10,7 +10,8 @@
 # the values here reproduce that exactly: CursorLine.bg =
 # blend(text, 0.05, background), Visual.bg = blend(dimmed1, 0.15, background),
 # DiffAdd.bg = blend(accent4, 0.1, dark1), DiffDelete.bg = blend(accent1, 0.1,
-# dark1). Highlight specs are merged in the port's load order (groups editor,
+# dark1); their foregrounds (diffEditorOverview inserted/removed) are the row
+# text. Highlight specs are merged in the port's load order (groups editor,
 # extra, semantic, syntax; eager plugins blink, lsp, treesitter) with default
 # options.
 #
@@ -51,7 +52,9 @@ file = "lua/monokai-pro/palette/classic.lua + theme/scheme.lua + theme/groups/*.
 "DiagnosticInfo.fg"              = "#66d9ef"
 "DiagnosticWarn.fg"              = "#fd971f"
 "DiffAdd.bg"                     = "#2b321b"
+"DiffAdd.fg"                     = "#7ba427"
 "DiffDelete.bg"                  = "#331f22"
+"DiffDelete.fg"                  = "#b42456"
 "FloatBorder.fg"                 = "#919288"
 "LineNr.fg"                      = "#57584f"
 "Normal.bg"                      = "#272822"
@@ -103,6 +106,8 @@ diff_add           = "accent4"
 diff_remove        = "accent1"
 diff_add_bg        = "DiffAdd.bg"
 diff_remove_bg     = "DiffDelete.bg"
+diff_add_row_fg    = "DiffAdd.fg"
+diff_remove_row_fg = "DiffDelete.fg"
 syntax_keyword     = "@keyword.fg"
 syntax_function    = "@function.fg"
 syntax_variable    = "@variable.fg"
@@ -139,6 +144,8 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "diffRemoved.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
+"diff.added_row.fg"       = "DiffAdd.fg"
+"diff.removed_row.fg"     = "DiffDelete.fg"
 "syntax.keyword.fg"       = "@keyword.fg"
 "syntax.function.fg"      = "@function.fg"
 "syntax.variable.fg"      = "@variable.fg"

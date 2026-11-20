@@ -14,10 +14,9 @@
 # primary fg; there is no secondary fg), markup_link (@markup.link resolves to
 # Underlined, which has no color) and markup_code_bg. diffAdded/diffRemoved also
 # keep Neovim's defaults, so diff_add/diff_remove use the scheme's git colors
-# (GitSignsAdd/GitSignsDelete). DiffAdd/DiffDelete paint dark text on a full
-# sign_add/sign_delete fill (fg = bg); Bcode's diff row fill sits under the
-# diff text color, and the same color for both would hide the text, so
-# diff_add_bg/diff_remove_bg are omitted. NormalFloat uses the editor
+# (GitSignsAdd/GitSignsDelete). DiffAdd/DiffDelete paint dark text (bg) on a
+# full sign_add/sign_delete fill: diff_add_bg/diff_remove_bg are the fills and
+# diff_add_row_fg/diff_remove_row_fg the row text. NormalFloat uses the editor
 # background, so surface equals background. purple is distinct from magenta and
 # maps to violet. Hue names follow the palette (cyan, green, red, yellow), not the
 # terminal colors.
@@ -45,6 +44,10 @@ file = "lua/night-owl/palette.lua"
 "Comment.fg"                = "#637777"
 "CursorLine.bg"             = "#021320"
 "DiagnosticError.fg"        = "#ef5350"
+"DiffAdd.bg"                = "#9ccc65"
+"DiffAdd.fg"                = "#021727"
+"DiffDelete.bg"             = "#ef5350"
+"DiffDelete.fg"             = "#021727"
 "FloatBorder.fg"            = "#5f7e97"
 "Function.fg"               = "#82aaff"
 "GitSignsAdd.fg"            = "#9ccc65"
@@ -97,6 +100,10 @@ line_highlight     = "dark2"
 gutter             = "line_number_fg"
 diff_add           = "sign_add"
 diff_remove        = "sign_delete"
+diff_add_bg        = "sign_add"
+diff_remove_bg     = "sign_delete"
+diff_add_row_fg    = "bg"
+diff_remove_row_fg = "bg"
 syntax_keyword     = "@keyword.fg"
 syntax_function    = "@function.fg"
 syntax_variable    = "@variable.fg"
@@ -124,6 +131,10 @@ markup_list        = "@markup.list.fg"
 "state.error.fg"          = "DiagnosticError.fg"
 "diff.added.fg"           = "GitSignsAdd.fg"
 "diff.removed.fg"         = "GitSignsDelete.fg"
+"diff.added_row.bg"       = "DiffAdd.bg"
+"diff.removed_row.bg"     = "DiffDelete.bg"
+"diff.added_row.fg"       = "DiffAdd.fg"
+"diff.removed_row.fg"     = "DiffDelete.fg"
 "title.fg"                = "Function.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"

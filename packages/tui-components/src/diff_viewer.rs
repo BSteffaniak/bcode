@@ -17,6 +17,23 @@ pub fn diff_viewer_style(theme: bmux_tui_components::theme::ComponentTheme) -> D
     theme.into()
 }
 
+/// Diff-viewer styles for painting rows, honouring a row's own text color.
+///
+/// A theme whose added or removed row style carries a foreground (text drawn
+/// on that row fill) paints the row's marker and body text in it; the
+/// standalone `added`/`removed` colors are unchanged otherwise. Syntax colors
+/// still apply over the row text.
+#[must_use]
+pub const fn with_row_text(mut style: DiffViewerStyle) -> DiffViewerStyle {
+    if let Some(fg) = style.added_row.fg {
+        style.added = style.added.fg(fg);
+    }
+    if let Some(fg) = style.removed_row.fg {
+        style.removed = style.removed.fg(fg);
+    }
+    style
+}
+
 /// Input used to render Bcode diff viewer rows.
 #[derive(Debug, Clone, Copy)]
 pub struct DiffViewerInput<'a> {
@@ -137,7 +154,8 @@ pub fn diff_viewer_layout_with_style(
     width: u16,
     style: DiffViewerStyle,
 ) -> DiffViewerProjection {
-    let document = diff_from_text_at_lines_with_palette(
+    #[cfg_attr(not(feature = "syntax"), allow(unused_mut))]
+    let mut document = diff_from_text_at_lines_with_palette(
         input.label,
         input.old_text,
         input.new_text,
@@ -146,11 +164,13 @@ pub fn diff_viewer_layout_with_style(
         #[cfg(feature = "syntax")]
         input.syntax_palette,
     );
+    #[cfg(feature = "syntax")]
+    plain_text_takes_row_text(&mut document, input.syntax_palette, &style);
     bmux_tui_components::diff_viewer::diff_viewer_document_layout_with_style(
         generic_input(input),
         document,
         width,
-        style,
+        with_row_text(style),
     )
 }
 
@@ -193,6 +213,32 @@ fn apply_syntax(label: &str, document: &mut DiffDocument, palette: Option<Syntax
                 style: syntax_style(span.style),
             })
             .collect();
+    }
+}
+
+/// On added and removed rows whose style carries its own text color, highlighted plain text
+/// (the palette's text color) takes that color; other syntax colors stay.
+#[cfg(feature = "syntax")]
+fn plain_text_takes_row_text(
+    document: &mut DiffDocument,
+    palette: Option<SyntaxPalette>,
+    style: &DiffViewerStyle,
+) {
+    let plain = Some(palette.unwrap_or_default().text.to_tui());
+    for line in &mut document.lines {
+        let row = match line.kind {
+            DiffLineKind::Added => style.added_row.fg,
+            DiffLineKind::Removed => style.removed_row.fg,
+            DiffLineKind::Context | DiffLineKind::HunkHeader | DiffLineKind::FileHeader => None,
+        };
+        let Some(fg) = row else {
+            continue;
+        };
+        for span in &mut line.syntax_spans {
+            if span.style.fg == plain {
+                span.style.fg = Some(fg);
+            }
+        }
     }
 }
 
@@ -252,6 +298,45 @@ mod tests {
                 .iter()
                 .flat_map(|line| &line.syntax_spans)
                 .any(|span| { span.style.fg == Some(Color::Rgb(11, 12, 13)) })
+        );
+    }
+
+    #[test]
+    fn row_text_color_paints_text_on_its_row_fill() {
+        use bmux_tui::prelude::{Color, Style};
+
+        let fill = Color::Rgb(156, 204, 101);
+        let ink = Color::Rgb(2, 23, 39);
+        let style = DiffViewerStyle {
+            added: Style::new().fg(fill),
+            added_row: Style::new().fg(ink).bg(fill),
+            ..DiffViewerStyle::default()
+        };
+        let input = DiffViewerInput {
+            label: "notes.txt",
+            old_text: "kept\n",
+            new_text: "kept\nfresh words\n",
+            old_start_line: 1,
+            new_start_line: 1,
+            line_numbers_known: true,
+            title: "notes.txt",
+            subtitle: None,
+            argument_bytes: None,
+            truncated: false,
+            #[cfg(feature = "syntax")]
+            syntax_palette: None,
+            layout: DiffViewerLayout::Unified,
+        };
+        let rows = diff_viewer_layout_with_style(input, 40, style).rows;
+        let fresh = rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("fresh"))
+            .expect("added text is rendered");
+        assert_eq!((fresh.style.fg, fresh.style.bg), (Some(ink), Some(fill)));
+        assert_eq!(
+            with_row_text(DiffViewerStyle::default()),
+            DiffViewerStyle::default()
         );
     }
 

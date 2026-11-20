@@ -49,6 +49,10 @@ pub struct DerivedStyle {
     pub fg: Option<&'static str>,
     /// Background expression.
     pub bg: Option<&'static str>,
+    /// Foreground expression applied only when it resolves. A palette without
+    /// the colors it names leaves the role's foreground unset instead of
+    /// skipping the role.
+    pub optional_fg: Option<&'static str>,
     /// Modifier names.
     pub modifiers: &'static [&'static str],
 }
@@ -58,6 +62,7 @@ impl DerivedStyle {
         Self {
             fg: Some(expr),
             bg: None,
+            optional_fg: None,
             modifiers: &[],
         }
     }
@@ -66,6 +71,7 @@ impl DerivedStyle {
         Self {
             fg: None,
             bg: Some(expr),
+            optional_fg: None,
             modifiers: &[],
         }
     }
@@ -77,6 +83,11 @@ impl DerivedStyle {
 
     const fn and_bg(mut self, expr: &'static str) -> Self {
         self.bg = Some(expr);
+        self
+    }
+
+    const fn and_optional_fg(mut self, expr: &'static str) -> Self {
+        self.optional_fg = Some(expr);
         self
     }
 }
@@ -161,6 +172,14 @@ pub const EXACT_PALETTE: &[(&str, &str)] = &[
     ("diff_remove", "removed diff lines: diff.removed"),
     ("diff_add_bg", "added row fill: diff.added_row"),
     ("diff_remove_bg", "removed row fill: diff.removed_row"),
+    (
+        "diff_add_row_fg",
+        "text on added row fills: diff.added_row foreground",
+    ),
+    (
+        "diff_remove_row_fg",
+        "text on removed row fills: diff.removed_row foreground",
+    ),
     (
         "diff_add_emphasis_bg",
         "intraline added fill: diff.added_emphasis",
@@ -752,21 +771,15 @@ pub const ROLES: &[RoleSpec] = &[
         "markdown.keyboard",
         RoleCategory::Markdown,
         "keyboard keys (HTML <kbd>)",
-        Some(DerivedStyle {
-            fg: Some(TEXT),
-            bg: Some(RULE),
-            modifiers: &[],
-        }),
+        Some(DerivedStyle::fg(TEXT).and_bg(RULE)),
     ),
     role(
         "markdown.highlight",
         RoleCategory::Markdown,
         "highlighted text (HTML <mark>)",
-        Some(DerivedStyle {
-            fg: Some(TEXT),
-            bg: Some("mix(or($warning, $yellow, $accent), $background, 0.4)"),
-            modifiers: &[],
-        }),
+        Some(
+            DerivedStyle::fg(TEXT).and_bg("mix(or($warning, $yellow, $accent), $background, 0.4)"),
+        ),
     ),
     role(
         "markdown.code.text",
@@ -1050,17 +1063,19 @@ pub const ROLES: &[RoleSpec] = &[
         "diff.added_row",
         RoleCategory::Source,
         "added row background",
-        Some(DerivedStyle::bg(
-            "or($diff_add_bg, mix(or($success, $green), $background, 0.14))",
-        )),
+        Some(
+            DerivedStyle::bg("or($diff_add_bg, mix(or($success, $green), $background, 0.14))")
+                .and_optional_fg("$diff_add_row_fg"),
+        ),
     ),
     role(
         "diff.removed_row",
         RoleCategory::Source,
         "removed row background",
-        Some(DerivedStyle::bg(
-            "or($diff_remove_bg, mix(or($error, $red), $background, 0.14))",
-        )),
+        Some(
+            DerivedStyle::bg("or($diff_remove_bg, mix(or($error, $red), $background, 0.14))")
+                .and_optional_fg("$diff_remove_row_fg"),
+        ),
     ),
     role(
         "diff.added_emphasis",
@@ -1157,7 +1172,10 @@ mod tests {
     fn derivation_expressions_parse() {
         for spec in ROLES {
             if let Some(derive) = spec.derive {
-                for expr in [derive.fg, derive.bg].into_iter().flatten() {
+                for expr in [derive.fg, derive.bg, derive.optional_fg]
+                    .into_iter()
+                    .flatten()
+                {
                     crate::expr::parse(expr)
                         .unwrap_or_else(|error| panic!("{}: {error}", spec.key));
                 }

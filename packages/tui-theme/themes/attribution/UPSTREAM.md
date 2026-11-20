@@ -46,6 +46,7 @@ Exact slots (all optional; `bcode theme roles` lists them as `slot` rows):
 | `gutter` | line-number foreground | `source.gutter` |
 | `diff_add`, `diff_remove` | added/removed line text in diff buffers | `diff.added`, `diff.removed` |
 | `diff_add_bg`, `diff_remove_bg` | added/removed line fills | `diff.added_row`, `diff.removed_row` |
+| `diff_add_row_fg`, `diff_remove_row_fg` | text on the added/removed line fills, only when upstream sets one | `diff.added_row`, `diff.removed_row` foreground |
 | `diff_add_emphasis_bg`, `diff_remove_emphasis_bg` | intraline (word) add/remove fills, only when upstream defines separate ones | `diff.added_emphasis`, `diff.removed_emphasis` |
 | `syntax_keyword` … `syntax_punctuation` | per-token code colors (below) | `syntax.*` and `markdown.code.*` |
 | `markup_heading` | markup headings | `markdown.heading`, `syntax.heading` |
@@ -118,6 +119,7 @@ color. When a group is undefined, Neovim's default link applies: `Number`,
 | `gutter` | `LineNr` fg | line-number foreground |
 | `diff_add`, `diff_remove` | `diffAdded` / `diffRemoved` fg (git colors) | inserted/deleted text |
 | `diff_add_bg`, `diff_remove_bg` | `DiffAdd` / `DiffDelete` bg | inserted/deleted line background |
+| `diff_add_row_fg`, `diff_remove_row_fg` | `DiffAdd` / `DiffDelete` fg | text on the inserted/deleted line background |
 | `syntax_keyword` | `@keyword` | keyword token |
 | `syntax_function` | `@function` | function token |
 | `syntax_variable` | `@variable` | variable token |

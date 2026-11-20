@@ -229,23 +229,33 @@ fn line_spans(
     gutter_width: usize,
     theme: &GitTheme,
 ) -> Vec<Span> {
-    let mut spans: Vec<Span> = tokens.map_or_else(
-        || vec![Span::styled(content.to_owned(), theme.text)],
-        |tokens| {
-            tokens
-                .into_iter()
-                .map(|token| {
-                    let style = syntax_style(theme, &token);
-                    Span::styled(token.content, style)
-                })
-                .collect()
-        },
-    );
     let (row_style, sign, sign_style) = match line.kind {
         DiffLineKind::Added => (theme.added_row, "+", theme.added),
         DiffLineKind::Removed => (theme.removed_row, "-", theme.removed),
         DiffLineKind::Context => (Style::new(), " ", theme.muted),
     };
+    // A row style with its own text color paints the marker and unhighlighted text on its
+    // fill; syntax colors still apply over it.
+    let row_text = |style: Style| row_style.fg.map_or(style, |fg| style.fg(fg));
+    let sign_style = row_text(sign_style);
+    let mut spans: Vec<Span> = tokens.map_or_else(
+        || vec![Span::styled(content.to_owned(), row_text(theme.text))],
+        |tokens| {
+            tokens
+                .into_iter()
+                .map(|token| {
+                    let style = syntax_style(theme, &token);
+                    // Plain text takes the row's text color, as unhighlighted text does.
+                    let style = if token.style.role == bcode_syntax_render::SyntaxRole::Text {
+                        row_text(style)
+                    } else {
+                        style
+                    };
+                    Span::styled(token.content, style)
+                })
+                .collect()
+        },
+    );
     if let Some((start, end)) = emphasis {
         let emphasis_style = if line.kind == DiffLineKind::Added {
             theme.added_emphasis
@@ -600,6 +610,38 @@ mod tests {
             content_style.fg,
             theme.syntax(bcode_syntax_render::SyntaxRole::Comment).fg
         );
+    }
+
+    #[test]
+    fn row_text_color_paints_marker_and_plain_text_on_the_fill() {
+        use bmux_tui::style::Color;
+
+        let ink = Color::Rgb(2, 23, 39);
+        let fill = Color::Rgb(156, 204, 101);
+        let mut theme = theme();
+        theme.added_row = Style::new().fg(ink).bg(fill);
+        let diff = "diff --git a/notes b/notes\n--- a/notes\n+++ b/notes\n@@ -1 +1,2 @@\n kept\n+fresh words\n";
+        let rows = present_file(
+            0,
+            &file(diff),
+            &SideTexts::default(),
+            &theme,
+            &SyntaxHighlighter::new(),
+            DiffOptions {
+                highlight: false,
+                file_headers: false,
+            },
+        );
+        let added = rows.iter().find(|row| row.kind == RowKind::Added).unwrap();
+        for content in ["+", "fresh words"] {
+            let span = added
+                .line
+                .spans
+                .iter()
+                .find(|span| span.content == content)
+                .unwrap_or_else(|| panic!("{content} rendered"));
+            assert_eq!((span.style.fg, span.style.bg), (Some(ink), Some(fill)));
+        }
     }
 
     #[test]

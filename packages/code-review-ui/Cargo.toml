@@ -28,6 +28,7 @@ bcode_session_view = { workspace = true, features = ["client"] }
 bcode_session_view_models = { workspace = true }
 bcode_syntax_render = { workspace = true }
 bcode_tool_models = { workspace = true }
+bcode_tui_components = { workspace = true, features = ["diff-viewer"] }
 bcode_tui_theme = { workspace = true, features = ["components"] }
 bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true }

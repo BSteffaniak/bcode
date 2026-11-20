@@ -13,7 +13,8 @@
 # fallback: `@keyword` -> Keyword, `@function` -> Function, `@string` -> String,
 # `@number` -> Number, `@type` -> Type, `@markup.link` -> Underlined, `@markup.list`
 # -> `@markup` -> Special, and `@markup.raw.markdown_inline` -> `@markup.raw`, which
-# sets no background, so `markup_code_bg` is omitted.
+# sets no background, so `markup_code_bg` is omitted. DiffDelete sets the removed
+# row text (vcs.removed); DiffAdd sets only a fill, so `diff_add_row_fg` is omitted.
 #
 # Hues follow the theme's syntax roles so every flavor maps alike: blue = syn.fun,
 # cyan = syn.type, green = syn.string, magenta = syn.number, orange = syn.constant,
@@ -50,6 +51,7 @@ file = "lua/kanagawa/colors.lua, lua/kanagawa/themes.lua, lua/kanagawa/highlight
 "DiagnosticWarn.fg"              = "#ff9e3b"
 "DiffAdd.bg"                     = "#2b3328"
 "DiffDelete.bg"                  = "#43242b"
+"DiffDelete.fg"                  = "#c34043"
 "FloatBorder.fg"                 = "#54546d"
 "LineNr.fg"                      = "#625e5a"
 "Normal.bg"                      = "#181616"
@@ -116,6 +118,7 @@ diff_add           = "vcs.added"
 diff_remove        = "vcs.removed"
 diff_add_bg        = "diff.add"
 diff_remove_bg     = "diff.delete"
+diff_remove_row_fg = "vcs.removed"
 syntax_keyword     = "@keyword.fg"
 syntax_function    = "@function.fg"
 syntax_variable    = "@variable.fg"
@@ -150,6 +153,7 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "diffRemoved.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
+"diff.removed_row.fg"     = "DiffDelete.fg"
 "title.fg"                = "Title.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"

@@ -26,7 +26,8 @@
 #   VertSplit; its background is #688060).
 # * `diff_add` is the DiffAdd foreground. `diffAdded`/`diffRemoved` link to
 #   Neovim's default Added/Removed colors, and DiffDelete's foreground (#333333)
-#   colors filler lines, not removed text, so `diff_remove` is omitted.
+#   colors filler lines, not removed text, so `diff_remove` and
+#   `diff_remove_row_fg` are omitted; `diff_add_row_fg` is the DiffAdd foreground.
 palette  = "zenburn"
 scheme   = "Zenburn (default options)"
 source   = "https://github.com/jnurmine/Zenburn"
@@ -87,6 +88,7 @@ gutter             = "LineNr.fg"
 diff_add           = "DiffAdd.fg"
 diff_add_bg        = "DiffAdd.bg"
 diff_remove_bg     = "DiffDelete.bg"
+diff_add_row_fg    = "DiffAdd.fg"
 syntax_keyword     = "@keyword.fg"
 syntax_function    = "@function.fg"
 syntax_string      = "@string.fg"
@@ -113,6 +115,7 @@ markup_list        = "@markup.list.fg"
 "diff.added.fg"           = "DiffAdd.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
+"diff.added_row.fg"       = "DiffAdd.fg"
 "markdown.text.fg"        = "Normal.fg"
 "markdown.heading.fg"     = "@markup.heading.fg"
 "markdown.link.fg"        = "@markup.link.fg"

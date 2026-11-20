@@ -2043,6 +2043,7 @@ dependencies = [
  "bcode_session_view_models",
  "bcode_syntax_render",
  "bcode_tool_models",
+ "bcode_tui_components",
  "bcode_tui_theme",
  "bmux_color",
  "bmux_keyboard",

@@ -1210,6 +1210,12 @@ impl<'a> PaletteResolver<'a> {
             style = style.bg(color);
             sources.extend(source.map(|slot| (AdjustedChannel::Background, slot)));
         }
+        if let Some(fg) = derive.optional_fg
+            && let Some((color, source)) = self.derived_color(fg)
+        {
+            style = style.fg(color);
+            sources.extend(source.map(|slot| (AdjustedChannel::Foreground, slot)));
+        }
         let modifiers = derive
             .modifiers
             .iter()

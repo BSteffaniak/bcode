@@ -855,19 +855,10 @@ slot = "border_focused"
 theme = "flexoki"
 variant = "dark"
 kind = "contrast"
-foreground = "diff.added_row"
-background = "diff.added_row"
-ratio = 1.95
-slot = "text"
-
-[[accepted]]
-theme = "flexoki"
-variant = "dark"
-kind = "contrast"
 foreground = "diff.removed_row"
 background = "diff.removed_row"
-ratio = 2.71
-slot = "text"
+ratio = 3.97
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "flexoki"
@@ -902,17 +893,8 @@ variant = "light"
 kind = "contrast"
 foreground = "diff.added_row"
 background = "diff.added_row"
-ratio = 4.24
-slot = "text"
-
-[[accepted]]
-theme = "flexoki"
-variant = "light"
-kind = "contrast"
-foreground = "diff.removed_row"
-background = "diff.removed_row"
-ratio = 2.98
-slot = "text"
+ratio = 4.38
+slot = "diff_add_row_fg"
 
 [[accepted]]
 theme = "flexoki"
@@ -1485,6 +1467,15 @@ slot = "border_focused"
 theme = "kanagawa"
 variant = "dark"
 kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.7
+slot = "diff_remove_row_fg"
+
+[[accepted]]
+theme = "kanagawa"
+variant = "dark"
+kind = "contrast"
 foreground = "state.error"
 background = "canvas"
 ratio = 3.66
@@ -1523,8 +1514,8 @@ variant = "light"
 kind = "contrast"
 foreground = "diff.removed_row"
 background = "diff.removed_row"
-ratio = 3.44
-slot = "text"
+ratio = 1.99
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1638,6 +1629,15 @@ slot = "border_focused"
 theme = "kanagawa-dragon"
 variant = "dark"
 kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.7
+slot = "diff_remove_row_fg"
+
+[[accepted]]
+theme = "kanagawa-dragon"
+variant = "dark"
+kind = "contrast"
 foreground = "state.error"
 background = "canvas"
 ratio = 4.04
@@ -1656,10 +1656,28 @@ slot = "border_focused"
 theme = "kanagawa-dragon"
 variant = "light"
 kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.7
+slot = "diff_remove_row_fg"
+
+[[accepted]]
+theme = "kanagawa-dragon"
+variant = "light"
+kind = "contrast"
 foreground = "state.error"
 background = "canvas"
 ratio = 4.04
 slot = "error"
+
+[[accepted]]
+theme = "melange"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 4.09
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "melange"
@@ -1696,6 +1714,15 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.8
 slot = "diff_remove"
+
+[[accepted]]
+theme = "melange"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 4.15
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "melange"
@@ -1845,6 +1872,15 @@ slot = "accent"
 theme = "monokai-classic"
 variant = "dark"
 kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.44
+slot = "diff_remove_row_fg"
+
+[[accepted]]
+theme = "monokai-classic"
+variant = "dark"
+kind = "contrast"
 foreground = "state.error"
 background = "canvas"
 ratio = 3.92
@@ -1858,6 +1894,15 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.95
 slot = "comment"
+
+[[accepted]]
+theme = "monokai-classic"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.44
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -2675,8 +2720,8 @@ variant = "dark"
 kind = "contrast"
 foreground = "diff.added_row"
 background = "diff.added_row"
-ratio = 4.11
-slot = "text"
+ratio = 4.05
+slot = "diff_add_row_fg"
 
 [[accepted]]
 theme = "solarized"
@@ -2684,8 +2729,8 @@ variant = "dark"
 kind = "contrast"
 foreground = "diff.removed_row"
 background = "diff.removed_row"
-ratio = 4.11
-slot = "text"
+ratio = 2.81
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "solarized"
@@ -2855,8 +2900,8 @@ variant = "light"
 kind = "contrast"
 foreground = "diff.added_row"
 background = "diff.added_row"
-ratio = 3.63
-slot = "text"
+ratio = 2.61
+slot = "diff_add_row_fg"
 
 [[accepted]]
 theme = "solarized"
@@ -2873,8 +2918,8 @@ variant = "light"
 kind = "contrast"
 foreground = "diff.removed_row"
 background = "diff.removed_row"
-ratio = 3.63
-slot = "text"
+ratio = 3.77
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "solarized"
@@ -3501,10 +3546,28 @@ slot = "violet"
 theme = "vesper"
 variant = "dark"
 kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.65
+slot = "diff_add_row_fg"
+
+[[accepted]]
+theme = "vesper"
+variant = "dark"
+kind = "contrast"
 foreground = "diff.removed"
 background = "canvas"
 ratio = 2.77
 slot = "diff_remove"
+
+[[accepted]]
+theme = "vesper"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.77
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "vesper"
@@ -3528,10 +3591,28 @@ slot = "text"
 theme = "vesper"
 variant = "light"
 kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.65
+slot = "diff_add_row_fg"
+
+[[accepted]]
+theme = "vesper"
+variant = "light"
+kind = "contrast"
 foreground = "diff.removed"
 background = "canvas"
 ratio = 2.77
 slot = "diff_remove"
+
+[[accepted]]
+theme = "vesper"
+variant = "light"
+kind = "contrast"
+foreground = "diff.removed_row"
+background = "diff.removed_row"
+ratio = 2.77
+slot = "diff_remove_row_fg"
 
 [[accepted]]
 theme = "vesper"
@@ -3559,6 +3640,15 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.93
 slot = "orange"
+
+[[accepted]]
+theme = "zenburn"
+variant = "dark"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.27
+slot = "diff_add_row_fg"
 
 [[accepted]]
 theme = "zenburn"
@@ -3595,6 +3685,15 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.25
 slot = "magenta"
+
+[[accepted]]
+theme = "zenburn"
+variant = "light"
+kind = "contrast"
+foreground = "diff.added_row"
+background = "diff.added_row"
+ratio = 3.27
+slot = "diff_add_row_fg"
 
 [[accepted]]
 theme = "zenburn"

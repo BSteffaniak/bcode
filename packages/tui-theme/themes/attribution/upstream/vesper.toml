@@ -20,7 +20,8 @@
 # terminal_color_3 yellowDark). magenta is the port's `purple` (also the function
 # color). accent is yellowDark, Vesper's signature peach (also `warn`). muted is fgInactive (StatusLineNC),
 # border_focused the palette's borderFocus. The port draws diff rows on the
-# normal background (DiffAdd/DiffDelete bg = bg). Omitted: markup_link
+# normal background (DiffAdd/DiffDelete bg = bg) in the diff text colors.
+# Omitted: markup_link
 # (@markup.link -> Underlined has no color), markup_code_bg (no background),
 # success (no DiagnosticOk).
 palette  = "vesper"
@@ -108,6 +109,8 @@ diff_add           = "DiffAdd.fg"
 diff_remove        = "DiffDelete.fg"
 diff_add_bg        = "bg"
 diff_remove_bg     = "bg"
+diff_add_row_fg    = "DiffAdd.fg"
+diff_remove_row_fg = "DiffDelete.fg"
 syntax_keyword     = "@keyword.fg"
 syntax_function    = "@function.fg"
 syntax_variable    = "@variable.fg"
@@ -143,6 +146,8 @@ markup_list        = "@markup.list.fg"
 "diff.removed.fg"         = "DiffDelete.fg"
 "diff.added_row.bg"       = "DiffAdd.bg"
 "diff.removed_row.bg"     = "DiffDelete.bg"
+"diff.added_row.fg"       = "DiffAdd.fg"
+"diff.removed_row.fg"     = "DiffDelete.fg"
 "syntax.keyword.fg"       = "@keyword.fg"
 "syntax.function.fg"      = "@function.fg"
 "syntax.variable.fg"      = "@variable.fg"

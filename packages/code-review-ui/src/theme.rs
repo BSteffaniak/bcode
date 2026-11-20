@@ -633,6 +633,8 @@ impl ReviewTheme {
         // A theme whose diff roles carry only modifiers (no colors) keeps those modifiers.
         let added = fg_only(diff.added).unwrap_or_else(|| component.success.patch(diff.added));
         let removed = fg_only(diff.removed).unwrap_or_else(|| component.error.patch(diff.removed));
+        // Rows paint the theme's row text color, when it has one, over their fills.
+        let diff = bcode_tui_components::diff_viewer::with_row_text(diff);
         let gutter = diff.muted;
         let components = components(&component, &tiers, cursor_bg);
         Self {
