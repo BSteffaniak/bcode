@@ -827,11 +827,78 @@ and the terminal's sixteen-color palette — are never adjusted, so
 `terminal-native` stays transparent. A per-theme override's `contrast_parts`
 replaces the global table as a whole (its unset keys are `true`).
 
-The appearance picker has a contrast slider and a minimum-contrast row below
-its columns. Tab cycles palettes, profiles, contrast, and minimum (Shift+Tab in
-reverse); on a contrast row, Left and Right change the value (the factor in
-steps of 0.05, the floor through off, 3.0, 4.5, and 7.0), Up and Down move
-between the rows, and `0` resets the factor to 1.0 or the floor to off. A click
+### Vibrance, richness and background tint
+
+Three color settings make dull themes more vivid (or calmer) on top of the
+same exact colors. Like contrast, they run after resolution, their defaults
+change nothing, and they can be set globally or per theme:
+
+```toml
+[tui.theme]
+vibrance = 0.4               # -1.0 to 1.0; 0.0 (default) keeps the theme's colors
+richness = 0.5               # 0.0 to 1.0; 0.0 (default) keeps the theme's colors
+background_tint = 0.5        # 0.0 to 2.0; 1.0 (default) keeps the theme's colors
+color_parts = { ansi = false } # syntax, accents, fills, ansi; each defaults to true
+
+[tui.theme.overrides.tokyonight-moon]
+richness = 0.6
+```
+
+All three work in OKLCH against the sRGB gamut. For a color with lightness
+`L`, chroma `C` and hue `H`, `Cmax(L, H)` is the most chroma sRGB can show at
+that lightness and hue and `r = C / Cmax(L, H)` is its relative chroma. Hue is
+always kept and every result stays in gamut (by losing chroma, never lightness
+or hue).
+
+* `vibrance` changes relative chroma at the same lightness and hue: a positive
+  value `v` gives `r + (1 − r) × v`, a negative one `r × (1 + v)`. `1.0`
+  reaches the gamut edge and `-1.0` is grey. Muted themes such as Nord,
+  Everforest or Zenburn sit well inside the gamut and gain the most.
+* `richness` moves each color's lightness toward the lightness where its hue
+  reaches its largest chroma (the hue's cusp), by `(L_cusp − L) × richness` but
+  never more than `0.15 × richness`, and keeps the color's relative chroma
+  there. Pastel themes whose accents already sit at the gamut edge for their
+  lightness (Dracula, Tokyo Night Moon) can only become more saturated this
+  way. The bound keeps themes recognisable.
+* `background_tint` scales the chroma of the canvas and neutral surfaces
+  (raised and overlay panels, line highlight, gutter and border backgrounds,
+  the theme's terminal background) at the same lightness: `0.0` is neutral grey,
+  `2.0` twice as tinted. A strongly tinted canvas (Solarized, Tokyo Night Storm,
+  Catppuccin Frappé) dulls the accents painted on it; lowering the tint makes
+  them read more vividly. It is the only color setting that changes the
+  canvas, and it ignores `color_parts`.
+
+Vibrance and richness change colorful roles only, chosen by role:
+
+* `syntax`: `syntax.*` and `markdown.code.*` colors other than plain code,
+  variables, punctuation and comments;
+* `accents`: accent, title, link, focused controls, states, activity, colored
+  transcript labels, tool status titles, Markdown headings, links, inline code,
+  list markers, alerts and checked tasks, and diff title, added, removed and
+  hunk colors;
+* `fills`: tinted fills (active selection, diff rows and intraline emphasis,
+  state surfaces, inline code and highlight fills), at half strength;
+* `ansi`: the theme's ANSI colors except black, white and bright black.
+
+Text, muted text, comments, punctuation, borders, the canvas and neutral
+surfaces never change with vibrance or richness. A colorful role the theme
+paints with its text, muted, comment or border color counts as that neutral
+color and stays, as does a grey without a perceptible hue.
+
+The steps run in a fixed order: background tint, richness, vibrance, then the
+contrast factor and finally `minimum_contrast`, so the contrast floor always
+has the last word on readability (richness can move a color toward its
+background). Terminal-owned colors stay untouched.
+
+### Adjusting in the picker
+
+The appearance picker has a contrast slider, a minimum-contrast row and
+vibrance, richness and background-tint sliders below its columns. Tab cycles
+palettes, profiles and each row (Shift+Tab in reverse); on a row, Left and
+Right change the value (the sliders in steps of 0.05, the floor through off,
+3.0, 4.5, and 7.0), Up and Down move between the rows, and `0` resets the row to
+the value that keeps the theme's colors (contrast and background tint 1.0,
+vibrance and richness 0.0, the floor off). A click
 focuses a row and the mouse wheel over it steps its value. Changes preview
 live for the selected palette; Enter saves the values you changed for each
 palette you changed in user state (`[theme.overrides.<theme-id>]` in the state
@@ -843,15 +910,15 @@ above them do not show the rows (the keys still adjust them).
 The git client and the review app read the same `[tui.theme]` keys and the
 values saved by the picker, so their colors and terminal views match. Their own
 appearance pickers (`ctrl+w t` in `bcode git`, `ctrl+t` in the review) have the
-same contrast and minimum rows below their lists, with the same keys, mouse
-behavior, and narrow-size degradation; Tab moves between the list and the two
-rows. The rows edit the palette the cursor previews (for **Follow Bcode**, the
+same contrast, minimum, vibrance, richness and background-tint rows below
+their lists, with the same keys, mouse behavior, and narrow-size degradation;
+Tab moves between the list and the rows. The rows edit the palette the cursor previews (for **Follow Bcode**, the
 palette bcode presents), Enter saves the changed values to the same
-`[theme.overrides.<theme-id>]`, so a theme's contrast is the same in bcode, the
-git client, and the review, and Escape restores what the picker opened with.
+`[theme.overrides.<theme-id>]`, so a theme's contrast and color are the same in
+bcode, the git client, and the review, and Escape restores what the picker opened with.
 
 `bcode theme check` measures the authored theme. `--with-adjustments` measures
-the colors your contrast settings produce for the checked theme instead (the
+the colors your contrast and color settings produce for the checked theme instead (the
 report names the settings, and fails when they leave warnings). Accepted
 findings describe authored themes, so they are not compared, and
 `--with-adjustments` cannot be combined with `--bless`:
@@ -948,7 +1015,7 @@ the preview and keep the columns. The preview exposes the selected palette's id,
 validation state other than `valid`, and dark/light variant availability. Moving the selection
 previews the complete live app, Enter persists through the existing user-state effect, and Escape
 restores the configured presentation. Below the columns, the contrast rows adjust the selected
-palette's contrast (see Contrast).
+palette's contrast and color (see Contrast).
 
 ## Authoring examples
 
