@@ -249,6 +249,25 @@ A successful verified `Hello` is full application readiness. Lifecycle readiness
 
 Lifecycle must preserve a responsive foreign endpoint and report incompatibility rather than deleting it. Endpoint and record cleanup is permitted only with positive stale evidence.
 
+### Daemon connection resilience
+
+A daemon keeps its startup lock for its whole life, so a daemon that lives on without
+serving blocks every client of its build: each waits out the startup budget and fails
+with a coordination timeout. The daemon therefore never lingers on its clients:
+
+* A connection whose client is gone does not outlive it in a handshake: `Hello` and
+  `Ping`, like status reads and long polls, are cancelled when the client disconnects
+  or the daemon stops. A daemon that stalls answering handshakes would otherwise keep one
+  connection per client retry until it runs out of file descriptors.
+* A failed `accept` that concerns one connection or a momentary shortage (descriptor or
+  buffer exhaustion, an aborted connection) is retried with bounded backoff; it does not
+  close the listener.
+* Shutdown waits a bounded grace period for client connections to finish, then stops the
+  rest and continues its cleanup, so the daemon exits and releases its startup lock.
+
+When a client's startup coordination times out on a lock whose owner is a verified live
+process, the error names that process, so a stuck daemon can be identified and stopped.
+
 ### In-process hosts
 
 A process may register one in-process daemon host

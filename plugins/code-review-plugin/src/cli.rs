@@ -46,7 +46,7 @@ fn invoke_with_execution(
             bcode_code_review_ui::ReviewLaunch::with_bypass(execution.bypasses_permissions());
         Box::pin(bcode_code_review_ui::cli::run_with(
             cli.command,
-            bcode,
+            bcode_code_review_ui::ReviewBcode::running_or_installed(bcode),
             launch,
         ))
         .await

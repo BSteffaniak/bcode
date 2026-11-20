@@ -49,6 +49,7 @@ mod permission_mode;
 pub use command_application::CommandApplicationHandle;
 mod activity_changes;
 mod activity_watch;
+pub mod embedded_host;
 pub mod harness;
 pub mod harness_auth;
 pub mod harness_dispatch;
@@ -5961,6 +5962,7 @@ async fn run_constructed_server_inner(
     bcode_metrics::startup::ready();
     bcode_daemon_lifecycle::notify_launcher_ready();
     let mut clients = JoinSet::new();
+    let mut accept_backoff = ACCEPT_RETRY_MIN;
     let accept_result = loop {
         tokio::select! {
             biased;
@@ -5973,7 +5975,28 @@ async fn run_constructed_server_inner(
             }
             stream = listener.accept() => {
                 let stream = match stream {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        accept_backoff = ACCEPT_RETRY_MIN;
+                        stream
+                    }
+                    Err(error) if is_transient_accept_error(&error) => {
+                        // Out of descriptors or a connection aborted before it was accepted:
+                        // keep serving the connected clients and accept again once some close.
+                        tracing::warn!(
+                            target: "bcode_server::accept",
+                            %error,
+                            retry_ms = accept_backoff.as_millis(),
+                            "accepting a client failed; retrying"
+                        );
+                        tokio::select! {
+                            biased;
+                            () = host_shutdown.cancelled() => break Ok(()),
+                            _ = shutdown.recv() => break Ok(()),
+                            () = tokio::time::sleep(accept_backoff) => {}
+                        }
+                        accept_backoff = (accept_backoff * 2).min(ACCEPT_RETRY_MAX);
+                        continue;
+                    }
                     Err(error) => break Err(ServerError::from(error)),
                 };
                 let client = handle_client(stream, Arc::clone(&state));
@@ -5990,14 +6013,13 @@ async fn run_constructed_server_inner(
     tracing::info!(target: "bcode_server::shutdown", stage = "listener_release", "shutdown stage completed");
     state.request_shutdown();
     // Let admitted requests and registered-client cleanup finish before deactivating
-    // the plugins they may still be using. Cancellation is not completion.
-    trace_shutdown_stage("client_drain", async {
-        while let Some(completed) = clients.join_next().await {
-            if let Err(error) = completed {
-                tracing::warn!(%error, "client connection task failed during shutdown");
-            }
-        }
-    })
+    // the plugins they may still be using. Cancellation is not completion, but a connection
+    // stalled for good must not keep the daemon (and its startup lock) alive: those are stopped
+    // after a grace period.
+    trace_shutdown_stage(
+        "client_drain",
+        drain_clients(&mut clients, CLIENT_DRAIN_GRACE),
+    )
     .await;
     shutdown_constructed_server(state, accept_result).await
 }
@@ -6115,6 +6137,68 @@ async fn stop_catalog_refresh(state: &ServerState) {
         {
             tracing::warn!(%error, "catalog refresh task failed during shutdown");
         }
+    }
+}
+
+/// First pause after a transient `accept` failure; doubled per consecutive failure.
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(50);
+/// Longest pause between `accept` retries.
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+/// How long shutdown waits for client connections to finish before stopping them.
+const CLIENT_DRAIN_GRACE: Duration = Duration::from_secs(30);
+
+/// Whether a failed `accept` concerns one connection or a momentary resource shortage rather
+/// than the listener itself, so the daemon keeps listening.
+fn is_transient_accept_error(error: &bcode_ipc::IpcTransportError) -> bool {
+    let bcode_ipc::IpcTransportError::Io(error) = error else {
+        return false;
+    };
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Wait for client connection tasks to finish, stopping those still running after `grace`.
+///
+/// Each task normally ends promptly at shutdown: it announces the shutdown, and long polls and
+/// handshakes are cancelled. A task that does not (a request stalled behind work that never
+/// completes) must not keep the daemon from exiting: until it exits it keeps its startup lock,
+/// so no replacement daemon can start for its clients.
+async fn drain_clients(clients: &mut JoinSet<()>, grace: Duration) {
+    let drained = tokio::time::timeout(grace, async {
+        while let Some(completed) = clients.join_next().await {
+            if let Err(error) = completed {
+                tracing::warn!(%error, "client connection task failed during shutdown");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            target: "bcode_server::shutdown",
+            remaining = clients.len(),
+            grace_secs = grace.as_secs(),
+            "client connections did not finish in time; stopping them"
+        );
+        clients.shutdown().await;
     }
 }
 
@@ -6892,14 +6976,22 @@ async fn run_client_operation(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Option<Result<(), ServerError>> {
-    // Only pure inspection and long polls are cancellable here. Mutating requests retain their
-    // existing completion semantics even after shutdown or peer disconnection. A long poll may
-    // wait indefinitely for a change, so neither a gone client nor a stopping daemon waits on it.
+    // Only pure inspection, the connection handshake and long polls are cancellable here.
+    // Mutating requests retain their existing completion semantics even after shutdown or peer
+    // disconnection. A long poll may wait indefinitely for a change, so neither a gone client nor
+    // a stopping daemon waits on it. A handshake only describes its own connection, which
+    // `close_client` releases, so a client that gave up waiting for it does not keep its
+    // connection open: otherwise a stalled daemon accumulates one per retry until it runs out of
+    // file descriptors.
     let long_poll = matches!(
         &request,
         Request::PullSessionActivityWatch { .. } | Request::WaitSessionOpenProgress { .. }
     );
-    let cancel_on_shutdown = long_poll || matches!(&request, Request::ServerStatus { .. });
+    let cancel_on_shutdown = long_poll
+        || matches!(
+            &request,
+            Request::ServerStatus { .. } | Request::Hello { .. } | Request::Ping
+        );
     let mut shutdown = state.subscribe_shutdown();
     let cancel_on_disconnect = matches!(
         &request,
@@ -48324,6 +48416,107 @@ mod tests {
             builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
         builder.tempdir()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock guard is held on purpose: it is the stall under test"
+    )]
+    async fn a_stalled_handshake_releases_its_connection_when_the_client_gives_up() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = test_socket_dir().expect("IPC socket directory");
+        let path = socket_dir.path().join("stalled.sock");
+        let listener =
+            LocalIpcListener::bind(&IpcEndpoint::unix_socket(path.clone())).expect("IPC listener");
+        // Every handshake now waits behind this lock, as behind a daemon that stopped answering.
+        let held = state.client_runtime_contexts.lock().await;
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state).await
+        });
+        let mut client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        let hello = bcode_ipc::request_envelope(
+            1,
+            &Request::Hello {
+                client_name: "stalled".to_owned(),
+                runtime_context: None,
+                daemon_namespace: bcode_ipc::daemon_namespace(),
+                artifact_id: Some(bcode_ipc::ArtifactId::current()),
+                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                state_location_id: state.daemon_status.state_location_id.clone(),
+            },
+        )
+        .expect("hello");
+        bcode_ipc::send_envelope(&mut client, &hello)
+            .await
+            .expect("send hello");
+        let mut answer = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.read(&mut answer))
+                .await
+                .is_err(),
+            "the handshake must stall"
+        );
+        // The client gives up. The daemon must close its end while the stall lasts.
+        client.shutdown().await.expect("half-close");
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+            .await
+            .expect("the connection outlived its client while the handshake stalled");
+        assert!(closed.is_ok_and(|_| rest.is_empty()), "no answer was sent");
+        drop(held);
+        // Releasing the client's state finishes once the stall ends.
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("connection cleanup finishes")
+            .expect("connection task")
+            .expect("connection handling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_exhaustion_does_not_stop_accepting() {
+        let error =
+            |code| bcode_ipc::IpcTransportError::Io(std::io::Error::from_raw_os_error(code));
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(is_transient_accept_error(&error(code)), "errno {code}");
+        }
+        assert!(is_transient_accept_error(
+            &bcode_ipc::IpcTransportError::Io(std::io::ErrorKind::ConnectionAborted.into())
+        ));
+        assert!(!is_transient_accept_error(&error(libc::EBADF)));
+        assert!(!is_transient_accept_error(&error(libc::EINVAL)));
+        assert!(!is_transient_accept_error(
+            &bcode_ipc::IpcTransportError::UnsupportedEndpoint
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_client_connections_that_outlive_the_grace() {
+        let mut clients = JoinSet::new();
+        clients.spawn(async {});
+        clients.spawn(std::future::pending::<()>());
+        let started = tokio::time::Instant::now();
+        drain_clients(&mut clients, Duration::from_secs(30)).await;
+        assert!(clients.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_does_not_wait_out_the_grace_for_finished_clients() {
+        let mut clients = JoinSet::new();
+        clients.spawn(tokio::time::sleep(Duration::from_secs(1)));
+        let started = tokio::time::Instant::now();
+        drain_clients(&mut clients, Duration::from_secs(30)).await;
+        assert!(clients.is_empty());
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 
     #[cfg(unix)]

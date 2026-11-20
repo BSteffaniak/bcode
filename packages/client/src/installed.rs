@@ -40,6 +40,9 @@ pub enum InstalledBcodeError {
     /// `BCODE_BIN` is set but does not name an executable file.
     #[error("BCODE_BIN does not name an executable file: {0}")]
     InvalidOverride(PathBuf),
+    /// The Bcode executable the app was given is not an executable file.
+    #[error("not an executable file: {0}")]
+    NotExecutable(PathBuf),
     /// The installed Bcode has no running daemon, and starting one was not allowed.
     #[error("Bcode is not running; start bcode and try again")]
     NotRunning,
@@ -116,6 +119,33 @@ impl BcodeClient {
         let executable = bcode_daemon_lifecycle::installed_bcode_executable().ok_or_else(|| {
             not_found(std::env::var_os(bcode_daemon_lifecycle::BCODE_BIN_ENV).as_deref())
         })?;
+        Self::for_verified_executable(executable, start).await
+    }
+
+    /// [`Self::for_installed_bcode`] for the Bcode executable at `executable` (a path the user
+    /// chose, such as a command-line option), instead of locating one.
+    ///
+    /// # Errors
+    ///
+    /// * [`InstalledBcodeError::NotExecutable`] when `executable` is not an executable file.
+    /// * Otherwise as [`Self::for_installed_bcode`], except for the errors about locating
+    ///   the executable.
+    pub async fn for_bcode_executable(
+        executable: &Path,
+        start: InstalledDaemonStart,
+    ) -> Result<InstalledBcode, InstalledBcodeError> {
+        let canonical = bcode_daemon_lifecycle::installed_bcode_executable_from(
+            Some(executable.as_os_str()),
+            None,
+        )
+        .ok_or_else(|| InstalledBcodeError::NotExecutable(executable.to_path_buf()))?;
+        Self::for_verified_executable(canonical, start).await
+    }
+
+    async fn for_verified_executable(
+        executable: PathBuf,
+        start: InstalledDaemonStart,
+    ) -> Result<InstalledBcode, InstalledBcodeError> {
         let target = verified_target(&executable, start).await?;
         let (config, launch) = crate::load_current_client_config()?;
         let mut client = Self::for_daemon(target, &config, crate::current_working_directory())?;
@@ -206,5 +236,21 @@ mod tests {
             error.to_string(),
             "BCODE_BIN does not name an executable file: /opt/bcode-typo"
         );
+    }
+
+    #[tokio::test]
+    async fn a_named_bcode_that_is_not_an_executable_file_is_refused_before_anything_runs() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("bcode");
+        let not_executable = directory.path().join("notes.txt");
+        std::fs::write(&not_executable, b"not a program").expect("file");
+        for path in [missing, not_executable, directory.path().to_path_buf()] {
+            let error = BcodeClient::for_bcode_executable(&path, InstalledDaemonStart::Never).await;
+            assert!(
+                matches!(&error, Err(InstalledBcodeError::NotExecutable(named)) if *named == path),
+                "{}: {error:?}",
+                path.display()
+            );
+        }
     }
 }

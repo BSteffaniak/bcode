@@ -218,8 +218,19 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   database credentials); shell commands remove them alongside Bcode's own private variables
   and the configured `tools.shell.remove_env` (`bcode_config::host_environment`).
 * Diagnostics are `tracing` events; the daemon never writes to the application's terminal.
+* `bcode_server::embedded_host::EmbeddedDaemonHost::register` does all of the above for the
+  common case: it builds the daemon's runtime (threads named by the application, 8 MiB stacks),
+  registers the in-process host, keeps the daemons it starts, and stops them gracefully with
+  `EmbeddedDaemonHost::shutdown` when the application exits.
 * bdata hosts its daemon this way when its assistant runs embedded, and speaks to it through the
   session bridge over an in-memory transport (`bcode_session_bridge_server::serve`).
+* The standalone review app (`bcode-review`) hosts its daemon this way by default and reaches it
+  as a client of its own artifact; it needs no bridge, being built from the same revision.
+  `--bcode <path>` or `BCODE_BIN` select an installed Bcode instead (the option wins), whose
+  daemon it verifies and starts when needed (`BcodeClient::for_bcode_executable`,
+  `BcodeClient::for_installed_bcode`). A project configuration file cannot choose the executable.
+  Either way sessions open in the installed Bcode's terminal app. `bcode review` uses the running
+  Bcode's own daemon.
 
 ### App-contributed agent profiles
 
@@ -345,7 +356,8 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   `packages/bcode/examples/application_session.rs` creates a session, admits a turn, observes
   bounded semantic snapshots and answers permissions. `BcodeClient::for_installed_bcode` finds the
   user's executable (`BCODE_BIN` or `PATH`), verifies its daemon for this process's state and
-  configuration scope, and starts it if needed.
+  configuration scope, and starts it if needed; `BcodeClient::for_bcode_executable` does the same
+  for an executable the user named.
 * **The review app** creates daemon sessions with `create_session_in_working_directory` and records
   which review a session belongs to in its own table (`review_assistant_sessions`). Its
   `code_review.*` tools are daemon plugin tools, which find the calling session through the

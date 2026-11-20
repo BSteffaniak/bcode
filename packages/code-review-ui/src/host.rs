@@ -731,10 +731,14 @@ pub enum BcodeAccess {
         /// The running Bcode executable.
         program: PathBuf,
     },
-    /// The app is its own executable (`bcode-review`): the user's installed Bcode is located,
-    /// verified, and started when needed on first use
-    /// ([`bcode_client::BcodeClient::for_installed_bcode`]).
-    Installed,
+    /// The app is its own executable (`bcode-review`) using the user's installed Bcode:
+    /// `executable` when given, else the one located from `BCODE_BIN` or `PATH`
+    /// ([`bcode_client::BcodeClient::for_installed_bcode`]). It is verified, and its daemon
+    /// started when needed, on first use.
+    Installed {
+        /// The Bcode executable the user chose (`--bcode`), if any.
+        executable: Option<PathBuf>,
+    },
 }
 
 /// The Bcode daemon behind the standalone host, connected lazily for [`BcodeAccess::Installed`]
@@ -753,10 +757,13 @@ impl BcodeConnection {
         if let Some(installed) = installed.as_ref() {
             return Ok(installed.client().clone());
         }
-        let connected = bcode_client::BcodeClient::for_installed_bcode(
-            bcode_client::InstalledDaemonStart::IfNeeded,
-        )
-        .await
+        let start = bcode_client::InstalledDaemonStart::IfNeeded;
+        let connected = match &self.access {
+            BcodeAccess::Installed {
+                executable: Some(executable),
+            } => bcode_client::BcodeClient::for_bcode_executable(executable, start).await,
+            _ => bcode_client::BcodeClient::for_installed_bcode(start).await,
+        }
         .map_err(|error| HostError::failed(error.to_string()))?;
         let client = connected.client().clone();
         *installed = Some(connected);
@@ -770,7 +777,7 @@ impl BcodeConnection {
         let gone = error.is_daemon_unavailable()
             || matches!(error, bcode_client::ClientError::IncompatibleDaemon { .. });
         if gone
-            && matches!(self.access, BcodeAccess::Installed)
+            && matches!(self.access, BcodeAccess::Installed { .. })
             && let Ok(mut installed) = self.installed.try_lock()
         {
             *installed = None;
@@ -782,7 +789,7 @@ impl BcodeConnection {
     fn program(&self) -> String {
         let program = match &self.access {
             BcodeAccess::Running { program, .. } => Some(program.clone()),
-            BcodeAccess::Installed => self
+            BcodeAccess::Installed { executable } => self
                 .installed
                 .try_lock()
                 .ok()
@@ -791,6 +798,7 @@ impl BcodeConnection {
                         .as_ref()
                         .map(|installed| installed.executable().to_path_buf())
                 })
+                .or_else(|| executable.clone())
                 .or_else(bcode_client::installed_bcode_executable),
         };
         program.map_or_else(
@@ -947,7 +955,15 @@ fn parse_session(session_id: &str) -> Result<SessionId, HostError> {
 }
 
 fn client_error(error: &bcode_client::ClientError) -> HostError {
-    if error.is_daemon_unavailable() {
+    if matches!(
+        error,
+        bcode_client::ClientError::DaemonStart(_)
+            | bcode_client::ClientError::DaemonStartupTimeout { .. }
+    ) {
+        // Starting Bcode was attempted and failed; why (a stuck daemon holding the startup
+        // lock, a crash on start) is what the user needs, not that it is not running.
+        HostError::failed(format!("Bcode could not be started: {error}"))
+    } else if error.is_daemon_unavailable() {
         HostError::failed("Bcode is not running; start bcode and try again")
     } else if let bcode_client::ClientError::Server { code, message } = error {
         HostError {

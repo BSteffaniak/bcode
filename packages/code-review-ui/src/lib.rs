@@ -85,5 +85,5 @@ mod testing;
 mod tests;
 
 pub use app::{ReviewApp, RouteName};
-pub use run::{ReviewLaunch, RunError, RunOptions, build_app, render_text, run};
+pub use run::{ReviewBcode, ReviewLaunch, RunError, RunOptions, build_app, render_text, run};
 pub use surface::{Focus, ReviewSurface, SCOPE};

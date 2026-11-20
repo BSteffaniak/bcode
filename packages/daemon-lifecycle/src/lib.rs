@@ -3001,10 +3001,18 @@ pub enum DaemonStartError {
         endpoint: String,
     },
     /// Another process held the namespace startup lock beyond the bounded startup window.
-    #[error("timed out waiting for daemon startup coordination lock at {}", lock_path.display())]
+    #[error(
+        "timed out waiting for daemon startup coordination lock at {}{}",
+        lock_path.display(),
+        holder.map_or_else(String::new, |pid| format!(
+            "; Bcode process {pid} holds it without answering (if it is stuck, stop it with `kill {pid}` and try again)"
+        ))
+    )]
     StartupCoordinationTimeout {
         /// Namespace-scoped startup lock path.
         lock_path: PathBuf,
+        /// The live process that claims the lock, when its claim could be verified.
+        holder: Option<u32>,
     },
 }
 
@@ -3669,7 +3677,8 @@ fn publish_startup_owner_at(file: &fs::File, path: &Path, handoff: &str) -> std:
 }
 
 #[cfg(unix)]
-fn observe_startup_owner(file: &fs::File) {
+/// Log the startup lock's claimed owner, returning its pid when the claim is verified.
+fn observe_startup_owner(file: &fs::File) -> Option<u32> {
     let owner = read_startup_owner(file)
         .ok()
         .flatten()
@@ -3684,6 +3693,9 @@ fn observe_startup_owner(file: &fs::File) {
         verified_process = owner.as_ref().is_some_and(StartupOwnerDescriptor::process_verified),
         kernel_lock_owner = "unknown",
         "fresh startup descriptor observation");
+    owner
+        .filter(StartupOwnerDescriptor::process_verified)
+        .map(|owner| owner.pid)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3831,11 +3843,14 @@ impl StartupLock {
                     }
                     if started.elapsed() >= timeout {
                         #[cfg(unix)]
-                        observe_startup_owner(&file);
+                        let holder = observe_startup_owner(&file);
+                        #[cfg(not(unix))]
+                        let holder = None;
                         observe(StartupLockObservation::Timeout, started.elapsed());
                         wait_phase.fail();
                         return Err(DaemonStartError::StartupCoordinationTimeout {
                             lock_path: path,
+                            holder,
                         });
                     }
                     tokio::time::sleep(
@@ -3872,6 +3887,7 @@ impl StartupLock {
                     if started.elapsed() >= timeout {
                         return Err(DaemonStartError::StartupCoordinationTimeout {
                             lock_path: path,
+                            holder: None,
                         });
                     }
                     tokio::time::sleep(Self::POLL_INTERVAL).await;
@@ -5801,7 +5817,7 @@ mod startup_lock_tests {
             .expect_err("active owner must not be replaced");
         assert!(matches!(
             error,
-            DaemonStartError::StartupCoordinationTimeout { lock_path } if lock_path == path
+            DaemonStartError::StartupCoordinationTimeout { lock_path, holder: None } if lock_path == path
         ));
         assert!(path.exists());
         drop(first);

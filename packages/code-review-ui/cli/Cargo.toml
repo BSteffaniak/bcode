@@ -15,7 +15,14 @@ name = "bcode-review"
 path = "src/main.rs"
 
 [dependencies]
+bcode_bundled_plugins = { workspace = true, features = [
+    "static-bundled-plugins",
+] }
+bcode_client = { workspace = true }
 bcode_code_review_ui = { workspace = true }
+bcode_config = { workspace = true }
+bcode_daemon_lifecycle = { workspace = true }
+bcode_server = { workspace = true }
 clap = { workspace = true, features = [
     "derive",
     "std",

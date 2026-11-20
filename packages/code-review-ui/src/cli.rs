@@ -172,7 +172,8 @@ fn selector_invocation(
 }
 
 /// Run `command`: open the app, or publish. `bcode_program` is the Bcode executable the app
-/// runs inside, when it does (see [`crate::RunOptions::bcode_program`]).
+/// runs inside, when it does; otherwise it uses the installed Bcode (see
+/// [`crate::ReviewBcode::running_or_installed`]).
 ///
 /// # Errors
 ///
@@ -184,20 +185,21 @@ pub async fn run(
 ) -> Result<(), CliError> {
     Box::pin(run_with(
         command,
-        bcode_program,
+        crate::ReviewBcode::running_or_installed(bcode_program),
         crate::ReviewLaunch::default(),
     ))
     .await
 }
 
-/// [`run`] as `launch` asked (`--dangerously-bypass-all-permissions`).
+/// [`run`] with the Bcode `bcode` names, as `launch` asked
+/// (`--dangerously-bypass-all-permissions`).
 ///
 /// # Errors
 ///
 /// Returns [`CliError`] as [`run`] does.
 pub async fn run_with(
     command: Option<ReviewCommand>,
-    bcode_program: Option<PathBuf>,
+    bcode: crate::ReviewBcode,
     launch: crate::ReviewLaunch,
 ) -> Result<(), CliError> {
     match invocation(command)? {
@@ -214,7 +216,7 @@ pub async fn run_with(
                 config,
                 host: None,
                 entry,
-                bcode_program,
+                bcode,
                 launch,
             }))
             .await?;

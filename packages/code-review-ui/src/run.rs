@@ -65,13 +65,67 @@ pub struct RunOptions {
     pub host: Option<Arc<dyn ReviewHost>>,
     /// What the app opens first.
     pub entry: Entry,
-    /// The Bcode executable the app runs inside (`bcode review`): the standalone host opens
-    /// sessions with it and may start the daemon from it. `None` (the standalone `bcode-review`
-    /// binary) uses the user's installed Bcode (`BCODE_BIN`, else `bcode` on the path), whose
-    /// daemon it verifies and starts when needed, since this executable cannot serve as one.
-    pub bcode_program: Option<PathBuf>,
+    /// Which Bcode the standalone host works with (unused with a `host`).
+    pub bcode: ReviewBcode,
     /// What the launch asked for (`--dangerously-bypass-all-permissions`).
     pub launch: ReviewLaunch,
+}
+
+/// Which Bcode the app works with: whose daemon serves its sessions and plugin services, and
+/// which executable opens a session in Bcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewBcode {
+    /// The app runs inside this Bcode executable (`bcode review`): the daemon is this
+    /// executable's own, started from it when needed, and sessions open with it.
+    Running {
+        /// The running Bcode executable.
+        program: PathBuf,
+    },
+    /// This process hosts Bcode's daemon in-process (its host is registered, for example with
+    /// `bcode_server::embedded_host::EmbeddedDaemonHost`): the daemon starts inside the app
+    /// when needed, and sessions open with `open_with`, the installed Bcode, else `bcode` from
+    /// the path.
+    Embedded {
+        /// The Bcode executable that opens sessions, if known.
+        open_with: Option<PathBuf>,
+    },
+    /// The user's installed Bcode: `executable` when given, else `BCODE_BIN`, else `bcode` on
+    /// the path. Its daemon is verified, and started when needed, since this app's executable
+    /// cannot serve as one.
+    Installed {
+        /// The Bcode executable the user chose, if any.
+        executable: Option<PathBuf>,
+    },
+}
+
+impl ReviewBcode {
+    /// [`Self::Running`] inside `program` when there is one, else the located installed Bcode.
+    #[must_use]
+    pub fn running_or_installed(program: Option<PathBuf>) -> Self {
+        program.map_or(Self::Installed { executable: None }, |program| {
+            Self::Running { program }
+        })
+    }
+
+    /// How the standalone host reaches this Bcode.
+    fn access(self) -> BcodeAccess {
+        let own_daemon = |program| BcodeAccess::Running {
+            client: Box::new(
+                bcode_client::BcodeClient::default_endpoint()
+                    .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart),
+            ),
+            program,
+        };
+        match self {
+            Self::Running { program } => own_daemon(program),
+            Self::Embedded { open_with } => own_daemon(
+                open_with
+                    .or_else(bcode_client::installed_bcode_executable)
+                    .unwrap_or_else(|| PathBuf::from("bcode")),
+            ),
+            Self::Installed { executable } => BcodeAccess::Installed { executable },
+        }
+    }
 }
 
 /// What a review launch asked for.
@@ -260,15 +314,7 @@ pub fn build_app(options: RunOptions) -> Result<App, RunError> {
         let resolution = sources.resolve(background);
         let (theme, theme_diagnostics) = HostTheme::from_resolution(&resolution);
         diagnostics.extend(theme_diagnostics);
-        let access = options
-            .bcode_program
-            .map_or(BcodeAccess::Installed, |program| BcodeAccess::Running {
-                client: Box::new(
-                    bcode_client::BcodeClient::default_endpoint()
-                        .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart),
-                ),
-                program,
-            });
+        let access = options.bcode.access();
         let standalone = Arc::new(StandaloneHost::new(access, theme));
         let control = Arc::new(AppearanceControl::new(
             resolution,
@@ -665,7 +711,7 @@ mod tests {
             config,
             host,
             entry: Entry::Home,
-            bcode_program: None,
+            bcode: ReviewBcode::Installed { executable: None },
             launch: ReviewLaunch::default(),
         }
     }
@@ -719,7 +765,10 @@ mod tests {
             .build()
             .expect("runtime");
         let _guard = runtime.enter();
-        let host = StandaloneHost::new(BcodeAccess::Installed, HostTheme::fallback());
+        let host = StandaloneHost::new(
+            BcodeAccess::Installed { executable: None },
+            HostTheme::fallback(),
+        );
         let frames = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&frames);
         host.connect_redraw(Arc::new(move || {
