@@ -75,6 +75,7 @@ pub(super) fn host_theme(accent: Rgb) -> ComponentStyles {
             heading: syntax,
             link: syntax,
             raw: syntax,
+            ..bcode_syntax_render::SyntaxPalette::default()
         },
         ..bcode_tui_theme::components::component_styles(None, accent_color)
     }

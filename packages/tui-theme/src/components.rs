@@ -260,6 +260,7 @@ fn syntax_palette(
         heading: color("syntax.heading", info_color),
         link: color("syntax.link", info_color),
         raw: color("syntax.raw", success_color),
+        ..SyntaxPalette::default()
     }
 }
 

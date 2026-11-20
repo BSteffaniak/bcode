@@ -282,6 +282,7 @@ mod tests {
             heading: color,
             link: color,
             raw: color,
+            ..SyntaxPalette::default()
         };
         let document = diff_from_text_at_lines_with_palette(
             "file.rs",

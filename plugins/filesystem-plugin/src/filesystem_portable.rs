@@ -123,6 +123,7 @@ impl VisualContext for bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
                 heading: bcode_syntax_render::SyntaxColor::from_tui(theme.syntax.heading.into()),
                 link: bcode_syntax_render::SyntaxColor::from_tui(theme.syntax.link.into()),
                 raw: bcode_syntax_render::SyntaxColor::from_tui(theme.syntax.raw.into()),
+                ..bcode_syntax_render::SyntaxPalette::default()
             },
         })
     }

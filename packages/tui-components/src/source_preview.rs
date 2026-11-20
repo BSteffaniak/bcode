@@ -311,6 +311,7 @@ mod tests {
             heading: color,
             link: color,
             raw: color,
+            ..SyntaxPalette::default()
         };
         let rows = source_preview_lines(
             "fn main() {}",

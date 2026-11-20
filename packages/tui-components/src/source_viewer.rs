@@ -257,6 +257,7 @@ mod tests {
             heading: color,
             link: color,
             raw: color,
+            ..SyntaxPalette::default()
         };
         let rows = source_viewer_rows(
             SourceViewerInput {

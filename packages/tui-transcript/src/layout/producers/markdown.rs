@@ -564,6 +564,7 @@ pub fn syntax_palette(theme: &ResolvedThemeDefinition) -> SyntaxPalette {
         heading: color("heading", info),
         link: color("link", info),
         raw: color("raw", success),
+        ..SyntaxPalette::default()
     }
 }
 

@@ -308,17 +308,20 @@ impl GitTheme {
         }
     }
 
-    /// Style for a syntax token role.
+    /// Style for a syntax token role; refined roles use their nearest base role.
     #[must_use]
     pub const fn syntax(&self, role: SyntaxRole) -> Style {
         self.syntax[match role {
             SyntaxRole::Text => 0,
             SyntaxRole::Comment => 1,
-            SyntaxRole::Keyword => 2,
-            SyntaxRole::Function => 3,
-            SyntaxRole::Variable => 4,
+            SyntaxRole::Keyword | SyntaxRole::Tag => 2,
+            SyntaxRole::Function | SyntaxRole::Builtin => 3,
+            SyntaxRole::Variable
+            | SyntaxRole::Parameter
+            | SyntaxRole::Property
+            | SyntaxRole::Attribute => 4,
             SyntaxRole::String => 5,
-            SyntaxRole::Number => 6,
+            SyntaxRole::Number | SyntaxRole::Constant => 6,
             SyntaxRole::Type => 7,
             SyntaxRole::Operator => 8,
             SyntaxRole::Punctuation => 9,
