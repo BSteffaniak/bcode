@@ -3553,6 +3553,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_session_bridge_runtime"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_agent_runtime",
+ "bcode_bundled_plugins",
+ "bcode_client",
+ "bcode_daemon_lifecycle",
+ "bcode_server",
+ "bcode_session_bridge",
+ "bcode_session_bridge_server",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bcode_session_bridge_server"
 version = "0.0.1-alpha.0"
 dependencies = [

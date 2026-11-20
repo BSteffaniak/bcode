@@ -252,6 +252,12 @@ impl BridgeClient {
         Ok((Self { shared, hello }, BridgeEvents { receiver }))
     }
 
+    /// Tie a bridge process the caller started to this connection: it is waited for when the
+    /// connection closes and killed when the last handle is dropped.
+    pub async fn adopt_process(&self, child: tokio::process::Child) {
+        *self.shared.child.lock().await = Some(child);
+    }
+
     /// What the bridge negotiated: the version, its window and the installed Bcode's version.
     #[must_use]
     pub const fn hello(&self) -> &Hello {

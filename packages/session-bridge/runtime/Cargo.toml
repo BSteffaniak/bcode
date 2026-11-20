@@ -1,0 +1,40 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Choose and start the Bcode that serves an application's session bridge: installed or embedded"
+edition     = { workspace = true }
+keywords    = ["bcode", "bridge", "embedded", "runtime"]
+license     = { workspace = true }
+name        = "bcode_session_bridge_runtime"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_agent_runtime         = { workspace = true, optional = true }
+bcode_bundled_plugins       = { workspace = true, optional = true }
+bcode_client                = { workspace = true, optional = true }
+bcode_daemon_lifecycle      = { workspace = true, optional = true }
+bcode_server                = { workspace = true, optional = true }
+bcode_session_bridge        = { workspace = true }
+bcode_session_bridge_server = { workspace = true, optional = true }
+serde                       = { workspace = true, features = ["derive", "std"] }
+thiserror                   = { workspace = true }
+tokio                       = { workspace = true, features = ["io-util", "process", "rt", "sync", "time"] }
+tracing                     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
+
+[features]
+default = []
+# Host Bcode's daemon and session bridge inside the application's process.
+embedded = [
+    "dep:bcode_agent_runtime",
+    "dep:bcode_bundled_plugins",
+    "dep:bcode_client",
+    "dep:bcode_daemon_lifecycle",
+    "dep:bcode_server",
+    "dep:bcode_session_bridge_server",
+]
+fail-on-warnings = []

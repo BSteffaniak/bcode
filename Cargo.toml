@@ -132,6 +132,7 @@ members = [
     "packages/session-view/models",
     "packages/session-import",
     "packages/session-bridge",
+    "packages/session-bridge/runtime",
     "packages/session-bridge/models",
     "packages/session-bridge/server",
     "packages/session-search",
@@ -343,6 +344,7 @@ bcode_sdk_session_import_plugin         = { version = "0.0.1-alpha.0", default-f
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_bridge                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge" }
+bcode_session_bridge_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/runtime" }
 bcode_session_bridge_models             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/models" }
 bcode_session_bridge_server             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/server" }
 bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }

@@ -440,6 +440,22 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
         ],
     ),
     (
+        // Applications outside Bcode link the bridge runtime; without its `embedded` feature it
+        // only starts an installed Bcode's bridge, so none of Bcode's daemon stack comes along.
+        "bcode_session_bridge_runtime",
+        "packages/session-bridge/runtime",
+        "",
+        &["bcode_session_bridge"],
+        &[
+            "bcode_server",
+            "bcode_client",
+            "bcode_plugin",
+            "bcode_bundled_plugins",
+            "bcode_session",
+            "bcode_tui",
+        ],
+    ),
+    (
         // Applications shell out to the feedback command line; it reaches the store only
         // through the daemon's feedback service, never by opening it or hosting plugins.
         "bcode_feedback_cli",
