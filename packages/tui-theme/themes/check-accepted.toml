@@ -13,6 +13,7 @@ foreground = "text.muted"
 background = "canvas"
 ratio = 2.83
 slot = "muted"
+reason = "upstream Ayu dark: muted fg_idle #565b66 on bg #0b0e14"
 
 [[accepted]]
 theme = "ayu"
@@ -22,6 +23,7 @@ foreground = "transcript.meta"
 background = "canvas"
 ratio = 2.83
 slot = "muted"
+reason = "upstream Ayu dark: muted fg_idle #565b66 on bg #0b0e14"
 
 [[accepted]]
 theme = "ayu"
@@ -31,6 +33,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 1.8
 slot = "accent"
+reason = "upstream Ayu light: accent #ffaa33 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -40,6 +43,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.13
 slot = "border_focused"
+reason = "upstream Ayu light: border_focused comment #abadb1 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -49,6 +53,7 @@ foreground = "control.focused"
 background = "canvas"
 ratio = 1.8
 slot = "accent"
+reason = "upstream Ayu light: accent #ffaa33 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -58,6 +63,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.17
 slot = "diff_add"
+reason = "upstream Ayu light: diff_add vcs_added #6cbf43 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -67,6 +73,7 @@ foreground = "diff.hunk"
 background = "canvas"
 ratio = 2.24
 slot = "info"
+reason = "upstream Ayu light: info tag #55b4d4 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -76,6 +83,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.48
 slot = "diff_remove"
+reason = "upstream Ayu light: diff_remove vcs_removed #ff7383 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -85,6 +93,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.24
 slot = "info"
+reason = "upstream Ayu light: info tag #55b4d4 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -94,6 +103,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 2.22
 slot = "markup_heading"
+reason = "upstream Ayu light: markup_heading @markup.heading.fg #fa8d3e on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -103,6 +113,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 1.63
 slot = "markup_code"
+reason = "upstream Ayu light: markup_code @markup.raw.markdown_inline.fg #ffaa33 on the derived inline code fill"
 
 [[accepted]]
 theme = "ayu"
@@ -112,6 +123,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.24
 slot = "info"
+reason = "upstream Ayu light: info tag #55b4d4 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -121,6 +133,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.53
 slot = "error"
+reason = "upstream Ayu light: error #e65050 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -130,6 +143,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.98
 slot = "error"
+reason = "upstream Ayu light: error #e65050 on its derived error surface"
 
 [[accepted]]
 theme = "ayu"
@@ -139,6 +153,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 2.24
 slot = "info"
+reason = "upstream Ayu light: info tag #55b4d4 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -148,6 +163,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 1.99
 slot = "info"
+reason = "upstream Ayu light: info tag #55b4d4 on its derived info surface"
 
 [[accepted]]
 theme = "ayu"
@@ -157,6 +173,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.35
 slot = "green"
+reason = "upstream Ayu light: green string #86b300 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -166,6 +183,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.07
 slot = "green"
+reason = "upstream Ayu light: green string #86b300 on its derived success surface"
 
 [[accepted]]
 theme = "ayu"
@@ -175,6 +193,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.22
 slot = "warning"
+reason = "upstream Ayu light: warning keyword #fa8d3e on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -184,6 +203,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 1.99
 slot = "warning"
+reason = "upstream Ayu light: warning keyword #fa8d3e on its derived warning surface"
 
 [[accepted]]
 theme = "ayu"
@@ -193,6 +213,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.13
 slot = "comment"
+reason = "upstream Ayu light: comment #abadb1 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -202,6 +223,7 @@ foreground = "title"
 background = "canvas"
 ratio = 1.8
 slot = "accent"
+reason = "upstream Ayu light: accent #ffaa33 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -211,6 +233,7 @@ foreground = "tool.running.title"
 background = "canvas"
 ratio = 2.24
 slot = "info"
+reason = "upstream Ayu light: info tag #55b4d4 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -220,6 +243,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.35
 slot = "green"
+reason = "upstream Ayu light: green string #86b300 on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -229,6 +253,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.2
 slot = "magenta"
+reason = "upstream Ayu light: magenta constant #a37acc on bg #f8f9fa"
 
 [[accepted]]
 theme = "ayu"
@@ -238,6 +263,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 1.8
 slot = "accent"
+reason = "upstream Ayu light: accent #ffaa33 on bg #f8f9fa"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -247,6 +273,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.95
 slot = "diff_add"
+reason = "upstream Catppuccin Latte: diff_add diffAdded.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -256,6 +283,7 @@ foreground = "diff.hunk"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -265,6 +293,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.81
 slot = "markup_link"
+reason = "upstream Catppuccin Latte: markup_link @markup.link.fg #7287fd on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -274,6 +303,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 4.34
 slot = "markup_heading"
+reason = "upstream Catppuccin Latte: markup_heading @markup.heading.fg #1e66f5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -283,6 +313,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.65
 slot = "markup_code"
+reason = "upstream Catppuccin Latte: markup_code @markup.raw.fg #40a02b on the derived inline code fill"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -292,6 +323,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.81
 slot = "markup_link"
+reason = "upstream Catppuccin Latte: markup_link @markup.link.fg #7287fd on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -301,6 +333,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 4.39
 slot = "text"
+reason = "upstream Catppuccin Latte: text #4c4f69 on Visual.bg #bcc0cc"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -310,6 +343,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -319,6 +353,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.16
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on its derived info surface"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -328,6 +363,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.95
 slot = "success"
+reason = "upstream Catppuccin Latte: success DiagnosticOk.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -337,6 +373,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.54
 slot = "success"
+reason = "upstream Catppuccin Latte: success DiagnosticOk.fg #40a02b on its derived success surface"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -346,6 +383,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.31
 slot = "warning"
+reason = "upstream Catppuccin Latte: warning DiagnosticWarn.fg #df8e1d on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -355,6 +393,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.05
 slot = "warning"
+reason = "upstream Catppuccin Latte: warning DiagnosticWarn.fg #df8e1d on its derived warning surface"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -364,6 +403,7 @@ foreground = "tool.running.title"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -373,6 +413,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.95
 slot = "success"
+reason = "upstream Catppuccin Latte: success DiagnosticOk.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -382,6 +423,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.95
 slot = "diff_add"
+reason = "upstream Catppuccin Latte: diff_add diffAdded.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -391,6 +433,7 @@ foreground = "diff.hunk"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -400,6 +443,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.81
 slot = "markup_link"
+reason = "upstream Catppuccin Latte: markup_link @markup.link.fg #7287fd on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -409,6 +453,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 4.34
 slot = "markup_heading"
+reason = "upstream Catppuccin Latte: markup_heading @markup.heading.fg #1e66f5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -418,6 +463,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.65
 slot = "markup_code"
+reason = "upstream Catppuccin Latte: markup_code @markup.raw.fg #40a02b on the derived inline code fill"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -427,6 +473,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.81
 slot = "markup_link"
+reason = "upstream Catppuccin Latte: markup_link @markup.link.fg #7287fd on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -436,6 +483,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 4.39
 slot = "text"
+reason = "upstream Catppuccin Latte: text #4c4f69 on Visual.bg #bcc0cc"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -445,6 +493,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -454,6 +503,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.16
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on its derived info surface"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -463,6 +513,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.95
 slot = "success"
+reason = "upstream Catppuccin Latte: success DiagnosticOk.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -472,6 +523,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.54
 slot = "success"
+reason = "upstream Catppuccin Latte: success DiagnosticOk.fg #40a02b on its derived success surface"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -481,6 +533,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.31
 slot = "warning"
+reason = "upstream Catppuccin Latte: warning DiagnosticWarn.fg #df8e1d on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -490,6 +543,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.05
 slot = "warning"
+reason = "upstream Catppuccin Latte: warning DiagnosticWarn.fg #df8e1d on its derived warning surface"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -499,6 +553,7 @@ foreground = "tool.running.title"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Latte: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-latte"
@@ -508,6 +563,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.95
 slot = "success"
+reason = "upstream Catppuccin Latte: success DiagnosticOk.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -517,6 +573,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.95
 slot = "diff_add"
+reason = "upstream Catppuccin Mocha light: diff_add diffAdded.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -526,6 +583,7 @@ foreground = "diff.hunk"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Mocha light: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -535,6 +593,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.81
 slot = "markup_link"
+reason = "upstream Catppuccin Mocha light: markup_link @markup.link.fg #7287fd on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -544,6 +603,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 4.34
 slot = "markup_heading"
+reason = "upstream Catppuccin Mocha light: markup_heading @markup.heading.fg #1e66f5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -553,6 +613,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.65
 slot = "markup_code"
+reason = "upstream Catppuccin Mocha light: markup_code @markup.raw.fg #40a02b on the derived inline code fill"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -562,6 +623,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.81
 slot = "markup_link"
+reason = "upstream Catppuccin Mocha light: markup_link @markup.link.fg #7287fd on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -571,6 +633,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 4.39
 slot = "text"
+reason = "upstream Catppuccin Mocha light: text #4c4f69 on Visual.bg #bcc0cc"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -580,6 +643,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Mocha light: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -589,6 +653,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.16
 slot = "info"
+reason = "upstream Catppuccin Mocha light: info DiagnosticInfo.fg #04a5e5 on its derived info surface"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -598,6 +663,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.95
 slot = "success"
+reason = "upstream Catppuccin Mocha light: success DiagnosticOk.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -607,6 +673,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.54
 slot = "success"
+reason = "upstream Catppuccin Mocha light: success DiagnosticOk.fg #40a02b on its derived success surface"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -616,6 +683,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.31
 slot = "warning"
+reason = "upstream Catppuccin Mocha light: warning DiagnosticWarn.fg #df8e1d on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -625,6 +693,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.05
 slot = "warning"
+reason = "upstream Catppuccin Mocha light: warning DiagnosticWarn.fg #df8e1d on its derived warning surface"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -634,6 +703,7 @@ foreground = "tool.running.title"
 background = "canvas"
 ratio = 2.46
 slot = "info"
+reason = "upstream Catppuccin Mocha light: info DiagnosticInfo.fg #04a5e5 on base #eff1f5"
 
 [[accepted]]
 theme = "catppuccin-mocha"
@@ -643,6 +713,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.95
 slot = "success"
+reason = "upstream Catppuccin Mocha light: success DiagnosticOk.fg #40a02b on base #eff1f5"
 
 [[accepted]]
 theme = "dracula"
@@ -652,6 +723,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 4.11
 slot = "markup_code"
+reason = "upstream Dracula light: markup_code @markup.raw.fg #846e15 on the derived inline code fill"
 
 [[accepted]]
 theme = "everforest"
@@ -661,6 +733,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -670,6 +743,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.55
 slot = "border_focused"
+reason = "upstream Everforest light: border_focused grey1 #939f91 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -679,6 +753,7 @@ foreground = "control.focused"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -688,6 +763,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.69
 slot = "diff_add"
+reason = "upstream Everforest light: diff_add diffAdded.fg #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -697,6 +773,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.79
 slot = "markup_link"
+reason = "upstream Everforest light: markup_link @markup.link.fg #35a77c on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -706,6 +783,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 2.48
 slot = "markup_heading"
+reason = "upstream Everforest light: markup_heading @markup.heading.fg #f57d26 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -715,6 +793,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.45
 slot = "markup_code"
+reason = "upstream Everforest light: markup_code @markup.raw.markdown_inline.fg #8da101 on the derived inline code fill"
 
 [[accepted]]
 theme = "everforest"
@@ -724,6 +803,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.79
 slot = "markup_link"
+reason = "upstream Everforest light: markup_link @markup.link.fg #35a77c on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -733,6 +813,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.03
 slot = "error"
+reason = "upstream Everforest light: error red #f85552 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -742,6 +823,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.6
 slot = "error"
+reason = "upstream Everforest light: error red #f85552 on its derived error surface"
 
 [[accepted]]
 theme = "everforest"
@@ -751,6 +833,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 3.12
 slot = "info"
+reason = "upstream Everforest light: info blue #3a94c5 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -760,6 +843,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.67
 slot = "info"
+reason = "upstream Everforest light: info blue #3a94c5 on its derived info surface"
 
 [[accepted]]
 theme = "everforest"
@@ -769,6 +853,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.69
 slot = "success"
+reason = "upstream Everforest light: success green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -778,6 +863,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.34
 slot = "success"
+reason = "upstream Everforest light: success green #8da101 on its derived success surface"
 
 [[accepted]]
 theme = "everforest"
@@ -787,6 +873,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.12
 slot = "warning"
+reason = "upstream Everforest light: warning yellow #dfa000 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -796,6 +883,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 1.91
 slot = "warning"
+reason = "upstream Everforest light: warning yellow #dfa000 on its derived warning surface"
 
 [[accepted]]
 theme = "everforest"
@@ -805,6 +893,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.55
 slot = "comment"
+reason = "upstream Everforest light: comment grey1 #939f91 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -814,6 +903,7 @@ foreground = "title"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -823,6 +913,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.69
 slot = "success"
+reason = "upstream Everforest light: success green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -832,6 +923,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 2.83
 slot = "magenta"
+reason = "upstream Everforest light: magenta purple #df69ba on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "everforest"
@@ -841,6 +933,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "flexoki"
@@ -850,6 +943,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.6
 slot = "border_focused"
+reason = "upstream Flexoki dark: border_focused tx-3 #575653 on bg #100f0f"
 
 [[accepted]]
 theme = "flexoki"
@@ -859,6 +953,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 3.97
 slot = "diff_remove_row_fg"
+reason = "upstream Flexoki dark: diff_remove_row_fg bg-2 #1c1b1a on re #d14d41"
 
 [[accepted]]
 theme = "flexoki"
@@ -868,6 +963,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.41
 slot = "error"
+reason = "upstream Flexoki dark: error re #d14d41 on bg #100f0f"
 
 [[accepted]]
 theme = "flexoki"
@@ -877,6 +973,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.6
 slot = "comment"
+reason = "upstream Flexoki dark: comment tx-3 #575653 on bg #100f0f"
 
 [[accepted]]
 theme = "flexoki"
@@ -886,6 +983,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.99
 slot = "border_focused"
+reason = "upstream Flexoki light: border_focused tx-3 #b7b5ac on bg #fffcf0"
 
 [[accepted]]
 theme = "flexoki"
@@ -895,6 +993,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 4.38
 slot = "diff_add_row_fg"
+reason = "upstream Flexoki light: diff_add_row_fg bg #fffcf0 on gr #66800b"
 
 [[accepted]]
 theme = "flexoki"
@@ -904,6 +1003,7 @@ foreground = "link"
 background = "canvas"
 ratio = 4.43
 slot = "info"
+reason = "upstream Flexoki light: info cy #24837b on bg #fffcf0"
 
 [[accepted]]
 theme = "flexoki"
@@ -913,6 +1013,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 4.2
 slot = "markup_code"
+reason = "upstream Flexoki light: markup_code @markup.raw.markdown_inline.fg #6f6e69 on the derived inline code fill"
 
 [[accepted]]
 theme = "flexoki"
@@ -922,6 +1023,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 4.43
 slot = "info"
+reason = "upstream Flexoki light: info cy #24837b on bg #fffcf0"
 
 [[accepted]]
 theme = "flexoki"
@@ -931,6 +1033,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 4.43
 slot = "info"
+reason = "upstream Flexoki light: info cy #24837b on bg #fffcf0"
 
 [[accepted]]
 theme = "flexoki"
@@ -940,6 +1043,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 3.62
 slot = "info"
+reason = "upstream Flexoki light: info cy #24837b on its derived info surface"
 
 [[accepted]]
 theme = "flexoki"
@@ -949,6 +1053,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 4.38
 slot = "success"
+reason = "upstream Flexoki light: success gr #66800b on bg #fffcf0"
 
 [[accepted]]
 theme = "flexoki"
@@ -958,6 +1063,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 3.59
 slot = "success"
+reason = "upstream Flexoki light: success gr #66800b on its derived success surface"
 
 [[accepted]]
 theme = "flexoki"
@@ -967,6 +1073,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 3.39
 slot = "warning"
+reason = "upstream Flexoki light: warning ye #ad8301 on bg #fffcf0"
 
 [[accepted]]
 theme = "flexoki"
@@ -976,6 +1083,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.86
 slot = "warning"
+reason = "upstream Flexoki light: warning ye #ad8301 on its derived warning surface"
 
 [[accepted]]
 theme = "flexoki"
@@ -985,6 +1093,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 1.99
 slot = "comment"
+reason = "upstream Flexoki light: comment tx-3 #b7b5ac on bg #fffcf0"
 
 [[accepted]]
 theme = "forest-floor"
@@ -994,6 +1103,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1003,6 +1113,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.55
 slot = "border_focused"
+reason = "upstream Everforest light: border_focused grey1 #939f91 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1012,6 +1123,7 @@ foreground = "control.focused"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1021,6 +1133,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.69
 slot = "diff_add"
+reason = "upstream Everforest light: diff_add diffAdded.fg #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1030,6 +1143,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.79
 slot = "markup_link"
+reason = "upstream Everforest light: markup_link @markup.link.fg #35a77c on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1039,6 +1153,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 2.48
 slot = "markup_heading"
+reason = "upstream Everforest light: markup_heading @markup.heading.fg #f57d26 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1048,6 +1163,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.45
 slot = "markup_code"
+reason = "upstream Everforest light: markup_code @markup.raw.markdown_inline.fg #8da101 on the derived inline code fill"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1057,6 +1173,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.79
 slot = "markup_link"
+reason = "upstream Everforest light: markup_link @markup.link.fg #35a77c on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1066,6 +1183,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.03
 slot = "error"
+reason = "upstream Everforest light: error red #f85552 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1075,6 +1193,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.6
 slot = "error"
+reason = "upstream Everforest light: error red #f85552 on its derived error surface"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1084,6 +1203,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 3.12
 slot = "info"
+reason = "upstream Everforest light: info blue #3a94c5 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1093,6 +1213,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.67
 slot = "info"
+reason = "upstream Everforest light: info blue #3a94c5 on its derived info surface"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1102,6 +1223,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.69
 slot = "success"
+reason = "upstream Everforest light: success green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1111,6 +1233,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.34
 slot = "success"
+reason = "upstream Everforest light: success green #8da101 on its derived success surface"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1120,6 +1243,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.12
 slot = "warning"
+reason = "upstream Everforest light: warning yellow #dfa000 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1129,6 +1253,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 1.91
 slot = "warning"
+reason = "upstream Everforest light: warning yellow #dfa000 on its derived warning surface"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1138,6 +1263,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.55
 slot = "comment"
+reason = "upstream Everforest light: comment grey1 #939f91 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1147,6 +1273,7 @@ foreground = "title"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1156,6 +1283,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.69
 slot = "success"
+reason = "upstream Everforest light: success green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1165,6 +1293,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 2.83
 slot = "magenta"
+reason = "upstream Everforest light: magenta purple #df69ba on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "forest-floor"
@@ -1174,6 +1303,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 2.69
 slot = "accent"
+reason = "upstream Everforest light: accent green #8da101 on bg0 #fdf6e3"
 
 [[accepted]]
 theme = "github"
@@ -1183,6 +1313,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.09
 slot = "border_focused"
+reason = "upstream GitHub dark: border_focused border.default #161b22 on bg1 #0d1117"
 
 [[accepted]]
 theme = "github"
@@ -1192,6 +1323,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.45
 slot = "border_focused"
+reason = "upstream GitHub light: border_focused border.default #d0d7de on bg1 #ffffff"
 
 [[accepted]]
 theme = "github-dimmed"
@@ -1201,6 +1333,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.72
 slot = "border_focused"
+reason = "upstream GitHub Dimmed: border_focused border.default #444c56 on bg1 #22272e"
 
 [[accepted]]
 theme = "github-dimmed"
@@ -1210,6 +1343,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 3.85
 slot = "text"
+reason = "upstream GitHub Dimmed: text fg1 #adbac7 on sel0 #36557e"
 
 [[accepted]]
 theme = "github-dimmed"
@@ -1219,6 +1353,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.05
 slot = "error"
+reason = "upstream GitHub Dimmed: error diag.error #e5534b on bg1 #22272e"
 
 [[accepted]]
 theme = "github-dimmed"
@@ -1228,6 +1363,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.72
 slot = "border_focused"
+reason = "upstream GitHub Dimmed: border_focused border.default #444c56 on bg1 #22272e"
 
 [[accepted]]
 theme = "github-dimmed"
@@ -1237,6 +1373,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 3.85
 slot = "text"
+reason = "upstream GitHub Dimmed: text fg1 #adbac7 on sel0 #36557e"
 
 [[accepted]]
 theme = "github-dimmed"
@@ -1246,6 +1383,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.05
 slot = "error"
+reason = "upstream GitHub Dimmed: error diag.error #e5534b on bg1 #22272e"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1255,6 +1393,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 4.24
 slot = "text"
+reason = "upstream Gruvbox dark: text fg1 #ebdbb2 on dark_green #62693e"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1264,6 +1403,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.28
 slot = "error"
+reason = "upstream Gruvbox dark: error red #fb4934 on bg0 #282828"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1273,6 +1413,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.32
 slot = "accent"
+reason = "upstream Gruvbox light: accent yellow #b57614 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1282,6 +1423,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 4.28
 slot = "markup_heading"
+reason = "upstream Gruvbox light: markup_heading @markup.heading.fg #79740e on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1291,6 +1433,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.77
 slot = "markup_code"
+reason = "upstream Gruvbox light: markup_code @markup.raw.markdown_inline.fg #79740e on the derived inline code fill"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1300,6 +1443,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 4.28
 slot = "success"
+reason = "upstream Gruvbox light: success green #79740e on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1309,6 +1453,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 3.32
 slot = "warning"
+reason = "upstream Gruvbox light: warning yellow #b57614 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1318,6 +1463,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.81
 slot = "warning"
+reason = "upstream Gruvbox light: warning yellow #b57614 on its derived warning surface"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1327,6 +1473,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.32
 slot = "accent"
+reason = "upstream Gruvbox light: accent yellow #b57614 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox"
@@ -1336,6 +1483,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.32
 slot = "accent"
+reason = "upstream Gruvbox light: accent yellow #b57614 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1345,6 +1493,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.48
 slot = "accent"
+reason = "upstream Gruvbox Material light: accent yellow #b47109 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1354,6 +1503,7 @@ foreground = "link"
 background = "canvas"
 ratio = 4.35
 slot = "markup_link"
+reason = "upstream Gruvbox Material light: markup_link @markup.link.fg #4c7a5d on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1363,6 +1513,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 3.75
 slot = "markup_heading"
+reason = "upstream Gruvbox Material light: markup_heading @markup.heading.fg #c35e0a on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1372,6 +1523,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.78
 slot = "markup_code"
+reason = "upstream Gruvbox Material light: markup_code @markup.raw.markdown_inline.fg #6c782e on the derived inline code fill"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1381,6 +1533,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 4.35
 slot = "markup_link"
+reason = "upstream Gruvbox Material light: markup_link @markup.link.fg #4c7a5d on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1390,6 +1543,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.25
 slot = "error"
+reason = "upstream Gruvbox Material light: error red #c14a4a on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1399,6 +1553,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 4.24
 slot = "success"
+reason = "upstream Gruvbox Material light: success green #6c782e on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1408,6 +1563,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 3.48
 slot = "warning"
+reason = "upstream Gruvbox Material light: warning yellow #b47109 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1417,6 +1573,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.92
 slot = "warning"
+reason = "upstream Gruvbox Material light: warning yellow #b47109 on its derived warning surface"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1426,6 +1583,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.48
 slot = "accent"
+reason = "upstream Gruvbox Material light: accent yellow #b47109 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1435,6 +1593,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 4.43
 slot = "magenta"
+reason = "upstream Gruvbox Material light: magenta purple #945e80 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "gruvbox-material"
@@ -1444,6 +1603,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.48
 slot = "accent"
+reason = "upstream Gruvbox Material light: accent yellow #b47109 on bg0 #fbf1c7"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1453,6 +1613,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.23
 slot = "border_focused"
+reason = "upstream Kanagawa dark: border_focused ui.float.fg_border #54546d on ui.bg #1f1f28"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1462,6 +1623,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.7
 slot = "diff_remove_row_fg"
+reason = "upstream Kanagawa dark: diff_remove_row_fg vcs.removed #c34043 on diff.delete #43242b"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1471,6 +1633,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.66
 slot = "error"
+reason = "upstream Kanagawa dark: error diag.error #e82424 on ui.bg #1f1f28"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1480,6 +1643,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 4.15
 slot = "info"
+reason = "upstream Kanagawa dark: info diag.info #658594 on ui.bg #1f1f28"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1489,6 +1653,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.97
 slot = "diff_add"
+reason = "upstream Kanagawa light: diff_add vcs.added #6e915f on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1498,6 +1663,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 4.47
 slot = "text"
+reason = "upstream Kanagawa light: text ui.fg #545464 on diff.add #b7d0ae"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1507,6 +1673,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 1.99
 slot = "diff_remove_row_fg"
+reason = "upstream Kanagawa light: diff_remove_row_fg vcs.removed #d7474b on diff.delete #d9a594"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1516,6 +1683,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.69
 slot = "markup_link"
+reason = "upstream Kanagawa light: markup_link @markup.link.fg #6693bf on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1525,6 +1693,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.94
 slot = "markup_code"
+reason = "upstream Kanagawa light: markup_code @markup.raw.markdown_inline.fg #6f894e on the derived inline code fill"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1534,6 +1703,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.69
 slot = "markup_link"
+reason = "upstream Kanagawa light: markup_link @markup.link.fg #6693bf on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1543,6 +1713,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.71
 slot = "error"
+reason = "upstream Kanagawa light: error diag.error #e82424 on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1552,6 +1723,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 3.09
 slot = "error"
+reason = "upstream Kanagawa light: error diag.error #e82424 on its derived error surface"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1561,6 +1733,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 3.96
 slot = "info"
+reason = "upstream Kanagawa light: info diag.info #5a7785 on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1570,6 +1743,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 3.26
 slot = "success"
+reason = "upstream Kanagawa light: success diag.ok #6f894e on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1579,6 +1753,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.77
 slot = "success"
+reason = "upstream Kanagawa light: success diag.ok #6f894e on its derived success surface"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1588,6 +1763,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.16
 slot = "warning"
+reason = "upstream Kanagawa light: warning diag.warning #e98a00 on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1597,6 +1773,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 1.93
 slot = "warning"
+reason = "upstream Kanagawa light: warning diag.warning #e98a00 on its derived warning surface"
 
 [[accepted]]
 theme = "kanagawa"
@@ -1606,6 +1783,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.93
 slot = "comment"
+reason = "upstream Kanagawa light: comment syn.comment #8a8980 on ui.bg #f2ecbc"
 
 [[accepted]]
 theme = "kanagawa-dragon"
@@ -1615,6 +1793,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.45
 slot = "border_focused"
+reason = "upstream Kanagawa Dragon: border_focused ui.float.fg_border #54546d on ui.bg #181616"
 
 [[accepted]]
 theme = "kanagawa-dragon"
@@ -1624,6 +1803,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.7
 slot = "diff_remove_row_fg"
+reason = "upstream Kanagawa Dragon: diff_remove_row_fg vcs.removed #c34043 on diff.delete #43242b"
 
 [[accepted]]
 theme = "kanagawa-dragon"
@@ -1633,6 +1813,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.04
 slot = "error"
+reason = "upstream Kanagawa Dragon: error diag.error #e82424 on ui.bg #181616"
 
 [[accepted]]
 theme = "kanagawa-dragon"
@@ -1642,6 +1823,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.45
 slot = "border_focused"
+reason = "upstream Kanagawa Dragon: border_focused ui.float.fg_border #54546d on ui.bg #181616"
 
 [[accepted]]
 theme = "kanagawa-dragon"
@@ -1651,6 +1833,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.7
 slot = "diff_remove_row_fg"
+reason = "upstream Kanagawa Dragon: diff_remove_row_fg vcs.removed #c34043 on diff.delete #43242b"
 
 [[accepted]]
 theme = "kanagawa-dragon"
@@ -1660,6 +1843,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.04
 slot = "error"
+reason = "upstream Kanagawa Dragon: error diag.error #e82424 on ui.bg #181616"
 
 [[accepted]]
 theme = "melange"
@@ -1669,6 +1853,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 4.09
 slot = "diff_remove_row_fg"
+reason = "upstream Melange dark: diff_remove_row_fg a.com #c1a78e on d.red #7d2a2f"
 
 [[accepted]]
 theme = "melange"
@@ -1678,6 +1863,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.97
 slot = "accent"
+reason = "upstream Melange light: accent b.yellow #a06d00 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1687,6 +1873,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.81
 slot = "diff_add"
+reason = "upstream Melange light: diff_add c.green #6e9b72 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1696,6 +1883,7 @@ foreground = "diff.hunk"
 background = "canvas"
 ratio = 2.79
 slot = "info"
+reason = "upstream Melange light: info c.blue #7892bd on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1705,6 +1893,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.8
 slot = "diff_remove"
+reason = "upstream Melange light: diff_remove c.red #c77b8b on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1714,6 +1903,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 4.15
 slot = "diff_remove_row_fg"
+reason = "upstream Melange light: diff_remove_row_fg a.com #7d6658 on d.red #f1dedf"
 
 [[accepted]]
 theme = "melange"
@@ -1723,6 +1913,7 @@ foreground = "link"
 background = "canvas"
 ratio = 2.79
 slot = "markup_link"
+reason = "upstream Melange light: markup_link @markup.link.url.fg #7892bd on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1732,6 +1923,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 3.98
 slot = "markup_heading"
+reason = "upstream Melange light: markup_heading @markup.heading.fg #bc5c00 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1741,6 +1933,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 2.79
 slot = "markup_link"
+reason = "upstream Melange light: markup_link @markup.link.url.fg #7892bd on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1750,6 +1943,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 2.8
 slot = "error"
+reason = "upstream Melange light: error c.red #c77b8b on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1759,6 +1953,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.42
 slot = "error"
+reason = "upstream Melange light: error c.red #c77b8b on its derived error surface"
 
 [[accepted]]
 theme = "melange"
@@ -1768,6 +1963,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 2.79
 slot = "info"
+reason = "upstream Melange light: info c.blue #7892bd on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1777,6 +1973,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.41
 slot = "info"
+reason = "upstream Melange light: info c.blue #7892bd on its derived info surface"
 
 [[accepted]]
 theme = "melange"
@@ -1786,6 +1983,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.81
 slot = "success"
+reason = "upstream Melange light: success c.green #6e9b72 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1795,6 +1993,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.43
 slot = "success"
+reason = "upstream Melange light: success c.green #6e9b72 on its derived success surface"
 
 [[accepted]]
 theme = "melange"
@@ -1804,6 +2003,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 3.97
 slot = "warning"
+reason = "upstream Melange light: warning b.yellow #a06d00 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1813,6 +2013,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 3.29
 slot = "warning"
+reason = "upstream Melange light: warning b.yellow #a06d00 on its derived warning surface"
 
 [[accepted]]
 theme = "melange"
@@ -1822,6 +2023,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.97
 slot = "accent"
+reason = "upstream Melange light: accent b.yellow #a06d00 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1831,6 +2033,7 @@ foreground = "tool.failed.title"
 background = "canvas"
 ratio = 2.8
 slot = "error"
+reason = "upstream Melange light: error c.red #c77b8b on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1840,6 +2043,7 @@ foreground = "tool.running.title"
 background = "canvas"
 ratio = 2.79
 slot = "info"
+reason = "upstream Melange light: info c.blue #7892bd on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1849,6 +2053,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.81
 slot = "success"
+reason = "upstream Melange light: success c.green #6e9b72 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "melange"
@@ -1858,6 +2063,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.97
 slot = "accent"
+reason = "upstream Melange light: accent b.yellow #a06d00 on a.bg #f1f1f1"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -1867,6 +2073,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.44
 slot = "diff_remove_row_fg"
+reason = "upstream Monokai Classic: diff_remove_row_fg DiffDelete.fg #b42456 on DiffDelete.bg #331f22"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -1876,6 +2083,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.92
 slot = "error"
+reason = "upstream Monokai Classic: error accent1 #f92672 on background #272822"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -1885,6 +2093,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.95
 slot = "comment"
+reason = "upstream Monokai Classic: comment dimmed3 #6e7066 on background #272822"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -1894,6 +2103,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.44
 slot = "diff_remove_row_fg"
+reason = "upstream Monokai Classic: diff_remove_row_fg DiffDelete.fg #b42456 on DiffDelete.bg #331f22"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -1903,6 +2113,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.92
 slot = "error"
+reason = "upstream Monokai Classic: error accent1 #f92672 on background #272822"
 
 [[accepted]]
 theme = "monokai-classic"
@@ -1912,6 +2123,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.95
 slot = "comment"
+reason = "upstream Monokai Classic: comment dimmed3 #6e7066 on background #272822"
 
 [[accepted]]
 theme = "night-owl"
@@ -1921,6 +2133,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.49
 slot = "violet"
+reason = "upstream Night Owl: violet purple #7e57c2 on bg #021727"
 
 [[accepted]]
 theme = "night-owl"
@@ -1930,6 +2143,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.49
 slot = "violet"
+reason = "upstream Night Owl: violet purple #7e57c2 on bg #021727"
 
 [[accepted]]
 theme = "nightfox"
@@ -1939,6 +2153,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.64
 slot = "error"
+reason = "upstream Nightfox dark: error diag.error #c94f6d on bg1 #192330"
 
 [[accepted]]
 theme = "nightfox"
@@ -1948,6 +2163,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.24
 slot = "border_focused"
+reason = "upstream Nightfox light: border_focused fg3 #a8a3b3 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -1957,6 +2173,7 @@ foreground = "link"
 background = "canvas"
 ratio = 3.46
 slot = "markup_link"
+reason = "upstream Nightfox light: markup_link @markup.link.fg #907aa9 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -1966,6 +2183,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.82
 slot = "markup_code"
+reason = "upstream Nightfox light: markup_code @markup.raw.fg #56949f on the derived inline code fill"
 
 [[accepted]]
 theme = "nightfox"
@@ -1975,6 +2193,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 3.46
 slot = "markup_link"
+reason = "upstream Nightfox light: markup_link @markup.link.fg #907aa9 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -1984,6 +2203,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.84
 slot = "error"
+reason = "upstream Nightfox light: error diag.error #b4637a on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -1993,6 +2213,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 3.18
 slot = "error"
+reason = "upstream Nightfox light: error diag.error #b4637a on its derived error surface"
 
 [[accepted]]
 theme = "nightfox"
@@ -2002,6 +2223,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 3.67
 slot = "success"
+reason = "upstream Nightfox light: success diag.ok #618774 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -2011,6 +2233,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 3.07
 slot = "success"
+reason = "upstream Nightfox light: success diag.ok #618774 on its derived success surface"
 
 [[accepted]]
 theme = "nightfox"
@@ -2020,6 +2243,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.05
 slot = "warning"
+reason = "upstream Nightfox light: warning diag.warn #ea9d34 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -2029,6 +2253,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 1.85
 slot = "warning"
+reason = "upstream Nightfox light: warning diag.warn #ea9d34 on its derived warning surface"
 
 [[accepted]]
 theme = "nightfox"
@@ -2038,6 +2263,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.72
 slot = "comment"
+reason = "upstream Nightfox light: comment #9893a5 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "nightfox"
@@ -2047,6 +2273,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.46
 slot = "magenta"
+reason = "upstream Nightfox light: magenta magenta.base #907aa9 on bg1 #faf4ed"
 
 [[accepted]]
 theme = "one"
@@ -2056,6 +2283,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.31
 slot = "border_focused"
+reason = "upstream One dark: border_focused grey #5c6370 on bg0 #282c34"
 
 [[accepted]]
 theme = "one"
@@ -2065,6 +2293,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.37
 slot = "error"
+reason = "upstream One dark: error red #e86671 on bg0 #282c34"
 
 [[accepted]]
 theme = "one"
@@ -2074,6 +2303,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.31
 slot = "comment"
+reason = "upstream One dark: comment grey #5c6370 on bg0 #282c34"
 
 [[accepted]]
 theme = "one"
@@ -2083,6 +2313,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.87
 slot = "accent"
+reason = "upstream One light: accent blue #4078f2 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2092,6 +2323,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.46
 slot = "border_focused"
+reason = "upstream One light: border_focused grey #a0a1a7 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2101,6 +2333,7 @@ foreground = "link"
 background = "canvas"
 ratio = 3.87
 slot = "markup_link"
+reason = "upstream One light: markup_link @markup.link.fg #4078f2 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2110,6 +2343,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 3.06
 slot = "markup_heading"
+reason = "upstream One light: markup_heading @markup.heading.fg #c18401 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2119,6 +2353,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.69
 slot = "markup_code"
+reason = "upstream One light: markup_code @markup.raw.fg #50a14f on the derived inline code fill"
 
 [[accepted]]
 theme = "one"
@@ -2128,6 +2363,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 3.87
 slot = "markup_link"
+reason = "upstream One light: markup_link @markup.link.fg #4078f2 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2137,6 +2373,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.51
 slot = "error"
+reason = "upstream One light: error red #e45649 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2146,6 +2383,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.95
 slot = "error"
+reason = "upstream One light: error red #e45649 on its derived error surface"
 
 [[accepted]]
 theme = "one"
@@ -2155,6 +2393,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 4.0
 slot = "info"
+reason = "upstream One light: info cyan #0184bc on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2164,6 +2403,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 3.31
 slot = "info"
+reason = "upstream One light: info cyan #0184bc on its derived info surface"
 
 [[accepted]]
 theme = "one"
@@ -2173,6 +2413,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 3.07
 slot = "success"
+reason = "upstream One light: success green #50a14f on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2182,6 +2423,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.62
 slot = "success"
+reason = "upstream One light: success green #50a14f on its derived success surface"
 
 [[accepted]]
 theme = "one"
@@ -2191,6 +2433,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.46
 slot = "comment"
+reason = "upstream One light: comment grey #a0a1a7 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2200,6 +2443,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.87
 slot = "accent"
+reason = "upstream One light: accent blue #4078f2 on bg0 #fafafa"
 
 [[accepted]]
 theme = "one"
@@ -2209,6 +2453,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.87
 slot = "accent"
+reason = "upstream One light: accent blue #4078f2 on bg0 #fafafa"
 
 [[accepted]]
 theme = "oxocarbon"
@@ -2218,6 +2463,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.02
 slot = "border_focused"
+reason = "upstream Oxocarbon: border_focused blend #131313 on base00 #161616"
 
 [[accepted]]
 theme = "oxocarbon"
@@ -2227,6 +2473,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.31
 slot = "comment"
+reason = "upstream Oxocarbon: comment base03 #525252 on base00 #161616"
 
 [[accepted]]
 theme = "oxocarbon"
@@ -2236,6 +2483,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.02
 slot = "border_focused"
+reason = "upstream Oxocarbon: border_focused blend #131313 on base00 #161616"
 
 [[accepted]]
 theme = "oxocarbon"
@@ -2245,6 +2493,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.31
 slot = "comment"
+reason = "upstream Oxocarbon: comment base03 #525252 on base00 #161616"
 
 [[accepted]]
 theme = "poimandres"
@@ -2254,6 +2503,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.05
 slot = "border_focused"
+reason = "upstream Poimandres: border_focused background3 #171922 on background2 #1b1e28"
 
 [[accepted]]
 theme = "poimandres"
@@ -2263,6 +2513,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.94
 slot = "text"
+reason = "upstream Poimandres: text #e4f0fb on DiffAdd.bg #3c8178"
 
 [[accepted]]
 theme = "poimandres"
@@ -2272,6 +2523,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.5
 slot = "markup_code"
+reason = "upstream Poimandres: markup_code @markup.raw.fg #767c9d on the derived inline code fill"
 
 [[accepted]]
 theme = "poimandres"
@@ -2281,6 +2533,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 1.05
 slot = "border_focused"
+reason = "upstream Poimandres: border_focused background3 #171922 on background2 #1b1e28"
 
 [[accepted]]
 theme = "poimandres"
@@ -2290,6 +2543,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.94
 slot = "text"
+reason = "upstream Poimandres: text #e4f0fb on DiffAdd.bg #3c8178"
 
 [[accepted]]
 theme = "poimandres"
@@ -2299,6 +2553,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.5
 slot = "markup_code"
+reason = "upstream Poimandres: markup_code @markup.raw.fg #767c9d on the derived inline code fill"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2308,6 +2563,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.46
 slot = "accent"
+reason = "upstream Rosé Pine light: accent iris #907aa9 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2317,6 +2573,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.72
 slot = "border_focused"
+reason = "upstream Rosé Pine light: border_focused FloatBorder.fg #9893a5 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2326,6 +2583,7 @@ foreground = "link"
 background = "canvas"
 ratio = 3.46
 slot = "markup_link"
+reason = "upstream Rosé Pine light: markup_link @markup.link.url.fg #907aa9 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2335,6 +2593,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 3.13
 slot = "markup_heading"
+reason = "upstream Rosé Pine light: markup_heading @markup.heading.fg #56949f on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2344,6 +2603,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.3
 slot = "orange"
+reason = "upstream Rosé Pine light: orange rose #d7827e on the derived inline code fill"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2353,6 +2613,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 3.46
 slot = "markup_link"
+reason = "upstream Rosé Pine light: markup_link @markup.link.url.fg #907aa9 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2362,6 +2623,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.84
 slot = "error"
+reason = "upstream Rosé Pine light: error DiagnosticError.fg #b4637a on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2371,6 +2633,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 3.18
 slot = "error"
+reason = "upstream Rosé Pine light: error DiagnosticError.fg #b4637a on its derived error surface"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2380,6 +2643,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 3.13
 slot = "info"
+reason = "upstream Rosé Pine light: info DiagnosticInfo.fg #56949f on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2389,6 +2653,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.66
 slot = "info"
+reason = "upstream Rosé Pine light: info DiagnosticInfo.fg #56949f on its derived info surface"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2398,6 +2663,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 3.23
 slot = "success"
+reason = "upstream Rosé Pine light: success DiagnosticOk.fg #6d8f89 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2407,6 +2673,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.74
 slot = "success"
+reason = "upstream Rosé Pine light: success DiagnosticOk.fg #6d8f89 on its derived success surface"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2416,6 +2683,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.05
 slot = "warning"
+reason = "upstream Rosé Pine light: warning DiagnosticWarn.fg #ea9d34 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2425,6 +2693,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 1.85
 slot = "warning"
+reason = "upstream Rosé Pine light: warning DiagnosticWarn.fg #ea9d34 on its derived warning surface"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2434,6 +2703,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.46
 slot = "accent"
+reason = "upstream Rosé Pine light: accent iris #907aa9 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2443,6 +2713,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.46
 slot = "magenta"
+reason = "upstream Rosé Pine light: magenta iris #907aa9 on base #faf4ed"
 
 [[accepted]]
 theme = "rose-pine"
@@ -2452,6 +2723,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.46
 slot = "accent"
+reason = "upstream Rosé Pine light: accent iris #907aa9 on base #faf4ed"
 
 [[accepted]]
 theme = "solarized"
@@ -2461,6 +2733,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 4.07
 slot = "accent"
+reason = "upstream Solarized dark: accent blue #268bd2 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2470,6 +2743,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 4.05
 slot = "diff_add_row_fg"
+reason = "upstream Solarized dark: diff_add_row_fg green #859900 on base02 #073642"
 
 [[accepted]]
 theme = "solarized"
@@ -2479,6 +2753,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.81
 slot = "diff_remove_row_fg"
+reason = "upstream Solarized dark: diff_remove_row_fg red #dc322f on base02 #073642"
 
 [[accepted]]
 theme = "solarized"
@@ -2488,6 +2763,7 @@ foreground = "link"
 background = "canvas"
 ratio = 3.42
 slot = "markup_link"
+reason = "upstream Solarized dark: markup_link violet #6c71c4 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2497,6 +2773,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 3.25
 slot = "markup_heading"
+reason = "upstream Solarized dark: markup_heading orange #cb4b16 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2506,6 +2783,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 2.95
 slot = "markup_code"
+reason = "upstream Solarized dark: markup_code red #dc322f on the derived inline code fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2515,6 +2793,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 3.42
 slot = "markup_link"
+reason = "upstream Solarized dark: markup_link violet #6c71c4 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2524,6 +2803,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.24
 slot = "red"
+reason = "upstream Solarized dark: red #dc322f on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2533,6 +2813,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.74
 slot = "red"
+reason = "upstream Solarized dark: red #dc322f on its derived error surface"
 
 [[accepted]]
 theme = "solarized"
@@ -2542,6 +2823,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 4.07
 slot = "blue"
+reason = "upstream Solarized dark: blue #268bd2 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2551,6 +2833,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.78
 slot = "comment"
+reason = "upstream Solarized dark: comment base01 #586e75 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2560,6 +2843,7 @@ foreground = "text.muted"
 background = "canvas"
 ratio = 2.78
 slot = "muted"
+reason = "upstream Solarized dark: muted base01 #586e75 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2569,6 +2853,7 @@ foreground = "text.primary"
 background = "surface.overlay"
 ratio = 4.2
 slot = "text"
+reason = "upstream Solarized dark: text base0 #839496 on the derived surface.overlay fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2578,6 +2863,7 @@ foreground = "text.primary"
 background = "surface.raised"
 ratio = 4.44
 slot = "text"
+reason = "upstream Solarized dark: text base0 #839496 on the derived surface.raised fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2587,6 +2873,7 @@ foreground = "title"
 background = "canvas"
 ratio = 4.07
 slot = "accent"
+reason = "upstream Solarized dark: accent blue #268bd2 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2596,6 +2883,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.42
 slot = "violet"
+reason = "upstream Solarized dark: violet #6c71c4 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2605,6 +2893,7 @@ foreground = "transcript.meta"
 background = "canvas"
 ratio = 2.78
 slot = "muted"
+reason = "upstream Solarized dark: muted base01 #586e75 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2614,6 +2903,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 4.07
 slot = "accent"
+reason = "upstream Solarized dark: accent blue #268bd2 on base03 #002b36"
 
 [[accepted]]
 theme = "solarized"
@@ -2623,6 +2913,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.41
 slot = "accent"
+reason = "upstream Solarized light: accent blue #268bd2 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2632,6 +2923,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.97
 slot = "diff_add"
+reason = "upstream Solarized light: diff_add green #859900 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2641,6 +2933,7 @@ foreground = "diff.added_emphasis"
 background = "diff.added_emphasis"
 ratio = 3.01
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on the derived diff.added_emphasis fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2650,6 +2943,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 2.61
 slot = "diff_add_row_fg"
+reason = "upstream Solarized light: diff_add_row_fg green #859900 on base2 #eee8d5"
 
 [[accepted]]
 theme = "solarized"
@@ -2659,6 +2953,7 @@ foreground = "diff.removed_emphasis"
 background = "diff.removed_emphasis"
 ratio = 2.73
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on the derived diff.removed_emphasis fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2668,6 +2963,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 3.77
 slot = "diff_remove_row_fg"
+reason = "upstream Solarized light: diff_remove_row_fg red #dc322f on base2 #eee8d5"
 
 [[accepted]]
 theme = "solarized"
@@ -2677,6 +2973,7 @@ foreground = "diff.text"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2686,6 +2983,7 @@ foreground = "link"
 background = "canvas"
 ratio = 4.05
 slot = "markup_link"
+reason = "upstream Solarized light: markup_link violet #6c71c4 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2695,6 +2993,7 @@ foreground = "markdown.code_block_text"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2704,6 +3003,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 4.27
 slot = "markup_heading"
+reason = "upstream Solarized light: markup_heading orange #cb4b16 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2713,6 +3013,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.94
 slot = "markup_code"
+reason = "upstream Solarized light: markup_code red #dc322f on the derived inline code fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2722,6 +3023,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 4.05
 slot = "markup_link"
+reason = "upstream Solarized light: markup_link violet #6c71c4 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2731,6 +3033,7 @@ foreground = "markdown.text"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2740,6 +3043,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 2.99
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on the derived selection.active fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2749,6 +3053,7 @@ foreground = "source.text"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2758,6 +3063,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.28
 slot = "red"
+reason = "upstream Solarized light: red #dc322f on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2767,6 +3073,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 3.41
 slot = "blue"
+reason = "upstream Solarized light: blue #268bd2 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2776,6 +3083,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.87
 slot = "blue"
+reason = "upstream Solarized light: blue #268bd2 on its derived info surface"
 
 [[accepted]]
 theme = "solarized"
@@ -2785,6 +3093,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.97
 slot = "green"
+reason = "upstream Solarized light: green #859900 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2794,6 +3103,7 @@ foreground = "state.success.surface"
 background = "state.success.surface"
 ratio = 2.54
 slot = "green"
+reason = "upstream Solarized light: green #859900 on its derived success surface"
 
 [[accepted]]
 theme = "solarized"
@@ -2803,6 +3113,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 2.97
 slot = "yellow"
+reason = "upstream Solarized light: yellow #b58900 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2812,6 +3123,7 @@ foreground = "state.warning.surface"
 background = "state.warning.surface"
 ratio = 2.54
 slot = "yellow"
+reason = "upstream Solarized light: yellow #b58900 on its derived warning surface"
 
 [[accepted]]
 theme = "solarized"
@@ -2821,6 +3133,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.47
 slot = "comment"
+reason = "upstream Solarized light: comment base1 #93a1a1 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2830,6 +3143,7 @@ foreground = "syntax.text"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2839,6 +3153,7 @@ foreground = "text.muted"
 background = "canvas"
 ratio = 2.47
 slot = "muted"
+reason = "upstream Solarized light: muted base1 #93a1a1 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2848,6 +3163,7 @@ foreground = "text.primary"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2857,6 +3173,7 @@ foreground = "text.primary"
 background = "surface.overlay"
 ratio = 3.7
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on the derived surface.overlay fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2866,6 +3183,7 @@ foreground = "text.primary"
 background = "surface.raised"
 ratio = 3.9
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on the derived surface.raised fill"
 
 [[accepted]]
 theme = "solarized"
@@ -2875,6 +3193,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.41
 slot = "accent"
+reason = "upstream Solarized light: accent blue #268bd2 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2884,6 +3203,7 @@ foreground = "tool.output"
 background = "canvas"
 ratio = 4.12
 slot = "text"
+reason = "upstream Solarized light: text base00 #657b83 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2893,6 +3213,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.97
 slot = "green"
+reason = "upstream Solarized light: green #859900 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2902,6 +3223,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 4.05
 slot = "violet"
+reason = "upstream Solarized light: violet #6c71c4 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2911,6 +3233,7 @@ foreground = "transcript.meta"
 background = "canvas"
 ratio = 2.47
 slot = "muted"
+reason = "upstream Solarized light: muted base1 #93a1a1 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "solarized"
@@ -2920,6 +3243,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.41
 slot = "accent"
+reason = "upstream Solarized light: accent blue #268bd2 on base3 #fdf6e3"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2929,6 +3253,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.73
 slot = "diff_remove"
+reason = "upstream Tokyo Night dark: diff_remove git.delete #914c54 on bg #1a1b26"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2938,6 +3263,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.54
 slot = "markup_code"
+reason = "upstream Tokyo Night dark: markup_code @markup.raw.markdown_inline.fg #7aa2f7 on @markup.raw.markdown_inline.bg #414868"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2947,6 +3273,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.16
 slot = "error"
+reason = "upstream Tokyo Night dark: error #db4b4b on bg #1a1b26"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2956,6 +3283,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.76
 slot = "comment"
+reason = "upstream Tokyo Night dark: comment #565f89 on bg #1a1b26"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2965,6 +3293,7 @@ foreground = "accent"
 background = "canvas"
 ratio = 3.1
 slot = "accent"
+reason = "upstream Tokyo Night light: accent blue #2e7de9 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2974,6 +3303,7 @@ foreground = "border.focused"
 background = "canvas"
 ratio = 2.71
 slot = "border_focused"
+reason = "upstream Tokyo Night light: border_focused border_highlight #4094a3 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2983,6 +3313,7 @@ foreground = "diff.added"
 background = "canvas"
 ratio = 2.62
 slot = "diff_add"
+reason = "upstream Tokyo Night light: diff_add git.add #4197a4 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -2992,6 +3323,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.56
 slot = "text"
+reason = "upstream Tokyo Night light: text fg #3760bf on diff.add #b7ced5"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3001,6 +3333,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.53
 slot = "diff_remove"
+reason = "upstream Tokyo Night light: diff_remove git.delete #c47981 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3010,6 +3343,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 3.27
 slot = "text"
+reason = "upstream Tokyo Night light: text fg #3760bf on diff.delete #dababe"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3019,6 +3353,7 @@ foreground = "link"
 background = "canvas"
 ratio = 3.22
 slot = "markup_link"
+reason = "upstream Tokyo Night light: markup_link @markup.link.fg #118c74 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3028,6 +3363,7 @@ foreground = "markdown.heading"
 background = "canvas"
 ratio = 3.1
 slot = "markup_heading"
+reason = "upstream Tokyo Night light: markup_heading @markup.heading.fg #2e7de9 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3037,6 +3373,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 1.67
 slot = "markup_code"
+reason = "upstream Tokyo Night light: markup_code @markup.raw.markdown_inline.fg #2e7de9 on @markup.raw.markdown_inline.bg #a1a6c5"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3046,6 +3383,7 @@ foreground = "markdown.link"
 background = "canvas"
 ratio = 3.22
 slot = "markup_link"
+reason = "upstream Tokyo Night light: markup_link @markup.link.fg #118c74 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3055,6 +3393,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 3.27
 slot = "text"
+reason = "upstream Tokyo Night light: text fg #3760bf on bg_visual #b7c1e3"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3064,6 +3403,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.78
 slot = "error"
+reason = "upstream Tokyo Night light: error #c64343 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3073,6 +3413,7 @@ foreground = "state.info"
 background = "canvas"
 ratio = 3.27
 slot = "info"
+reason = "upstream Tokyo Night light: info #07879d on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3082,6 +3423,7 @@ foreground = "state.info.surface"
 background = "state.info.surface"
 ratio = 2.76
 slot = "info"
+reason = "upstream Tokyo Night light: info #07879d on its derived info surface"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3091,6 +3433,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 4.03
 slot = "green"
+reason = "upstream Tokyo Night light: green #587539 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3100,6 +3443,7 @@ foreground = "state.warning"
 background = "canvas"
 ratio = 3.74
 slot = "warning"
+reason = "upstream Tokyo Night light: warning #8c6c3e on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3109,6 +3453,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.53
 slot = "comment"
+reason = "upstream Tokyo Night light: comment #848cb5 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3118,6 +3463,7 @@ foreground = "text.primary"
 background = "surface.overlay"
 ratio = 3.98
 slot = "text"
+reason = "upstream Tokyo Night light: text fg #3760bf on bg_float #d0d5e3"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3127,6 +3473,7 @@ foreground = "text.primary"
 background = "surface.raised"
 ratio = 3.98
 slot = "text"
+reason = "upstream Tokyo Night light: text fg #3760bf on bg_float #d0d5e3"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3136,6 +3483,7 @@ foreground = "title"
 background = "canvas"
 ratio = 3.1
 slot = "accent"
+reason = "upstream Tokyo Night light: accent blue #2e7de9 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight"
@@ -3145,6 +3493,7 @@ foreground = "transcript.user.label"
 background = "canvas"
 ratio = 3.1
 slot = "accent"
+reason = "upstream Tokyo Night light: accent blue #2e7de9 on bg #e1e2e7"
 
 [[accepted]]
 theme = "tokyonight-moon"
@@ -3154,6 +3503,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.69
 slot = "markup_code"
+reason = "upstream Tokyo Night Moon: markup_code @markup.raw.markdown_inline.fg #82aaff on @markup.raw.markdown_inline.bg #444a73"
 
 [[accepted]]
 theme = "tokyonight-moon"
@@ -3163,6 +3513,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.0
 slot = "error"
+reason = "upstream Tokyo Night Moon: error #c53b53 on bg #222436"
 
 [[accepted]]
 theme = "tokyonight-moon"
@@ -3172,6 +3523,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.58
 slot = "error"
+reason = "upstream Tokyo Night Moon: error #c53b53 on its derived error surface"
 
 [[accepted]]
 theme = "tokyonight-moon"
@@ -3181,6 +3533,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.69
 slot = "markup_code"
+reason = "upstream Tokyo Night Moon: markup_code @markup.raw.markdown_inline.fg #82aaff on @markup.raw.markdown_inline.bg #444a73"
 
 [[accepted]]
 theme = "tokyonight-moon"
@@ -3190,6 +3543,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.0
 slot = "error"
+reason = "upstream Tokyo Night Moon: error #c53b53 on bg #222436"
 
 [[accepted]]
 theme = "tokyonight-moon"
@@ -3199,6 +3553,7 @@ foreground = "state.error.surface"
 background = "state.error.surface"
 ratio = 2.58
 slot = "error"
+reason = "upstream Tokyo Night Moon: error #c53b53 on its derived error surface"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3208,6 +3563,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.33
 slot = "diff_remove"
+reason = "upstream Tokyo Night Storm: diff_remove git.delete #914c54 on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3217,6 +3573,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.54
 slot = "markup_code"
+reason = "upstream Tokyo Night Storm: markup_code @markup.raw.markdown_inline.fg #7aa2f7 on @markup.raw.markdown_inline.bg #414868"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3226,6 +3583,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.55
 slot = "error"
+reason = "upstream Tokyo Night Storm: error #db4b4b on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3235,6 +3593,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.35
 slot = "comment"
+reason = "upstream Tokyo Night Storm: comment #565f89 on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3244,6 +3603,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 4.37
 slot = "violet"
+reason = "upstream Tokyo Night Storm: violet purple #9d7cd8 on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3253,6 +3613,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.33
 slot = "diff_remove"
+reason = "upstream Tokyo Night Storm: diff_remove git.delete #914c54 on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3262,6 +3623,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.54
 slot = "markup_code"
+reason = "upstream Tokyo Night Storm: markup_code @markup.raw.markdown_inline.fg #7aa2f7 on @markup.raw.markdown_inline.bg #414868"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3271,6 +3633,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 3.55
 slot = "error"
+reason = "upstream Tokyo Night Storm: error #db4b4b on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3280,6 +3643,7 @@ foreground = "syntax.comment"
 background = "canvas"
 ratio = 2.35
 slot = "comment"
+reason = "upstream Tokyo Night Storm: comment #565f89 on bg #24283b"
 
 [[accepted]]
 theme = "tokyonight-storm"
@@ -3289,6 +3653,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 4.37
 slot = "violet"
+reason = "upstream Tokyo Night Storm: violet purple #9d7cd8 on bg #24283b"
 
 [[accepted]]
 theme = "vesper"
@@ -3298,6 +3663,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.65
 slot = "diff_add_row_fg"
+reason = "upstream Vesper: diff_add_row_fg DiffAdd.fg #497569 on bg #101010"
 
 [[accepted]]
 theme = "vesper"
@@ -3307,6 +3673,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.77
 slot = "diff_remove"
+reason = "upstream Vesper: diff_remove DiffDelete.fg #884848 on bg #101010"
 
 [[accepted]]
 theme = "vesper"
@@ -3316,6 +3683,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.77
 slot = "diff_remove_row_fg"
+reason = "upstream Vesper: diff_remove_row_fg DiffDelete.fg #884848 on bg #101010"
 
 [[accepted]]
 theme = "vesper"
@@ -3325,6 +3693,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.53
 slot = "markup_code"
+reason = "upstream Vesper: markup_code @markup.raw.markdown_inline.fg #65737e on the derived inline code fill"
 
 [[accepted]]
 theme = "vesper"
@@ -3334,6 +3703,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 3.62
 slot = "text"
+reason = "upstream Vesper: text fg #cccccc on Visual.bg #656565"
 
 [[accepted]]
 theme = "vesper"
@@ -3343,6 +3713,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.65
 slot = "diff_add_row_fg"
+reason = "upstream Vesper: diff_add_row_fg DiffAdd.fg #497569 on bg #101010"
 
 [[accepted]]
 theme = "vesper"
@@ -3352,6 +3723,7 @@ foreground = "diff.removed"
 background = "canvas"
 ratio = 2.77
 slot = "diff_remove"
+reason = "upstream Vesper: diff_remove DiffDelete.fg #884848 on bg #101010"
 
 [[accepted]]
 theme = "vesper"
@@ -3361,6 +3733,7 @@ foreground = "diff.removed_row"
 background = "diff.removed_row"
 ratio = 2.77
 slot = "diff_remove_row_fg"
+reason = "upstream Vesper: diff_remove_row_fg DiffDelete.fg #884848 on bg #101010"
 
 [[accepted]]
 theme = "vesper"
@@ -3370,6 +3743,7 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.53
 slot = "markup_code"
+reason = "upstream Vesper: markup_code @markup.raw.markdown_inline.fg #65737e on the derived inline code fill"
 
 [[accepted]]
 theme = "vesper"
@@ -3379,6 +3753,7 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 3.62
 slot = "text"
+reason = "upstream Vesper: text fg #cccccc on Visual.bg #656565"
 
 [[accepted]]
 theme = "zenburn"
@@ -3388,6 +3763,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.27
 slot = "diff_add_row_fg"
+reason = "upstream Zenburn: diff_add_row_fg DiffAdd.fg #709080 on DiffAdd.bg #313c36"
 
 [[accepted]]
 theme = "zenburn"
@@ -3397,6 +3773,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.09
 slot = "red"
+reason = "upstream Zenburn: red terminal_ansi_colors[1] #cc9393 on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3406,6 +3783,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.35
 slot = "green"
+reason = "upstream Zenburn: green terminal_ansi_colors[2] #5f7f5f on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3415,6 +3793,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.35
 slot = "green"
+reason = "upstream Zenburn: green terminal_ansi_colors[2] #5f7f5f on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3424,6 +3803,7 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.25
 slot = "magenta"
+reason = "upstream Zenburn: magenta terminal_ansi_colors[5] #8f8f8f on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3433,6 +3813,7 @@ foreground = "diff.added_row"
 background = "diff.added_row"
 ratio = 3.27
 slot = "diff_add_row_fg"
+reason = "upstream Zenburn: diff_add_row_fg DiffAdd.fg #709080 on DiffAdd.bg #313c36"
 
 [[accepted]]
 theme = "zenburn"
@@ -3442,6 +3823,7 @@ foreground = "state.error"
 background = "canvas"
 ratio = 4.09
 slot = "red"
+reason = "upstream Zenburn: red terminal_ansi_colors[1] #cc9393 on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3451,6 +3833,7 @@ foreground = "state.success"
 background = "canvas"
 ratio = 2.35
 slot = "green"
+reason = "upstream Zenburn: green terminal_ansi_colors[2] #5f7f5f on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3460,6 +3843,7 @@ foreground = "tool.succeeded.title"
 background = "canvas"
 ratio = 2.35
 slot = "green"
+reason = "upstream Zenburn: green terminal_ansi_colors[2] #5f7f5f on Normal.bg #3f3f3f"
 
 [[accepted]]
 theme = "zenburn"
@@ -3469,3 +3853,4 @@ foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.25
 slot = "magenta"
+reason = "upstream Zenburn: magenta terminal_ansi_colors[5] #8f8f8f on Normal.bg #3f3f3f"

@@ -1205,4 +1205,23 @@ yellow = "#8c6c3e"
              `bcode theme check --all --bless --accepted packages/tui-theme/themes/check-accepted.toml`"
         );
     }
+
+    /// Every finding accepted for a bundled theme says why (for example the upstream color it
+    /// reproduces exactly).
+    #[test]
+    fn every_bundled_accepted_finding_has_a_reason() {
+        let accepted = AcceptedFindings::bundled().expect("bundled accepted findings");
+        let unexplained: Vec<String> = accepted
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .reason
+                    .as_deref()
+                    .is_none_or(|reason| reason.trim().is_empty())
+            })
+            .map(|entry| format!("{}: {}", entry.theme, entry.describe()))
+            .collect();
+        assert_eq!(unexplained, Vec::<String>::new());
+    }
 }

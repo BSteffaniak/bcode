@@ -673,7 +673,10 @@ every theme): it rewrites those themes' entries, keeps the `reason` of each
 entry that still occurs, records current ratios, removes stale entries, leaves
 other themes' entries alone, and writes the file sorted by key, so the result
 is deterministic and reviewable. Review the diff before committing it, and add
-a `reason` to say why each finding is acceptable.
+a `reason` to say why each finding is acceptable. Every entry for a bundled
+theme has one (the crate's tests require it), naming the upstream color kept
+exactly and what it is measured on, for example
+`upstream Solarized light: yellow #b58900 on base3 #fdf6e3`.
 
 ```console
 bcode theme check ./my-theme.toml --bless
