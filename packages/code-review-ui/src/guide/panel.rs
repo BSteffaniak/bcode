@@ -993,7 +993,7 @@ fn outline_trailing(
             format!("{} stale", theme.icons.guide_stale),
             theme.guide.problem,
         )
-    } else if active.reviewed(&entry.id) {
+    } else if active.shows_reviewed(entry) {
         Span::styled(theme.icons.viewed, theme.viewed)
     } else {
         Span::styled(theme.icons.unviewed, theme.muted)

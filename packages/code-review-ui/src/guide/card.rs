@@ -128,10 +128,8 @@ impl GuideCard {
                 depth: entry.depth,
                 state: match entry.state {
                     SectionState::Planned => CardSectionState::Planned,
+                    _ if active.shows_reviewed(entry) => CardSectionState::Reviewed,
                     SectionState::Provisional { .. } => CardSectionState::Provisional,
-                    SectionState::Written if active.reviewed(&entry.id) => {
-                        CardSectionState::Reviewed
-                    }
                     SectionState::Written => CardSectionState::Written,
                 },
                 current: index == active.selected,

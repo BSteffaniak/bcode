@@ -780,7 +780,48 @@ fn a_stack_of_three_layers_gets_one_layer_guide_each_linked_from_the_stack_guide
         );
     }
 
-    // Stepping to a layer shows that layer's guide (`guide.follow_layer`).
+    // The conversation's synthesis turn ends: the stack guide is complete and the run ends.
+    let synthesis = host
+        .turns()
+        .iter()
+        .rev()
+        .find(|(session, request)| *session == parent && request.text.contains("layer guides"))
+        .map(|(_, request)| request.text.clone())
+        .expect("synthesis text");
+    let mut items = vec![user("Hello"), answer("Hi."), user(&synthesis)];
+    let mut running = snapshot(items.clone());
+    running.runtime.active_turn_id = Some("turn-synthesis".to_owned());
+    deliver(&mut scenario, &parent, running);
+    items.push(answer("Synthesized."));
+    deliver(&mut scenario, &parent, snapshot(items));
+    let stack_status = |backend: &TestBackend| {
+        backend
+            .call_now(GetGuideVersionRequest {
+                repo_path: fixture.root().to_path_buf(),
+                guide_id: stack_id.clone(),
+                version: None,
+            })
+            .version
+            .expect("stack version")
+            .version
+            .status
+    };
+    for _ in 0..20 {
+        if stack_status(&backend) == GuideStatus::Complete {
+            break;
+        }
+        settled(&mut scenario);
+    }
+    assert_eq!(stack_status(&backend), GuideStatus::Complete);
+    assert!(
+        scenario
+            .surface()
+            .review()
+            .is_some_and(|review| !review.fan_out_running()),
+        "the fan-out ends with the synthesis"
+    );
+
+    // Stepping through the layers shows each layer's own guide (`guide.follow_layer`).
     let shown = |scenario: &crate::testing::harness::Scenario<crate::app::ReviewApp>| {
         scenario
             .surface()
@@ -790,19 +831,31 @@ fn a_stack_of_three_layers_gets_one_layer_guide_each_linked_from_the_stack_guide
     };
     scenario.key("esc");
     settled(&mut scenario);
-    scenario.key(".");
-    for _ in 0..10 {
-        if shown(&scenario).is_some_and(|id| links.contains(&id)) {
-            break;
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..links.len() {
+        scenario.key(".");
+        let fresh = |scenario: &crate::testing::harness::Scenario<crate::app::ReviewApp>| {
+            shown(scenario).filter(|id| links.contains(id) && !seen.contains(id))
+        };
+        for _ in 0..10 {
+            if fresh(&scenario).is_some() {
+                break;
+            }
+            settled(&mut scenario);
         }
-        settled(&mut scenario);
+        let id = fresh(&scenario).unwrap_or_else(|| {
+            panic!(
+                "{:?} after {seen:?}: {}",
+                shown(&scenario),
+                settled(&mut scenario).text()
+            )
+        });
+        seen.push(id);
     }
-    assert!(
-        shown(&scenario).is_some_and(|id| links.contains(&id)),
-        "{:?}: {}",
-        shown(&scenario),
-        settled(&mut scenario).text()
-    );
+    let mut expected = links;
+    expected.sort();
+    seen.sort();
+    assert_eq!(seen, expected, "every layer's guide is shown in turn");
 }
 
 /// The guide grant `session`'s binding records: its guide and mode.
@@ -964,46 +1017,274 @@ fn stop_while_a_child_is_being_created_stops_that_child_too() {
 }
 
 #[test]
-fn resuming_stops_children_still_recorded_running_before_starting_new_ones() {
+fn a_guide_message_with_the_last_turns_text_waits_for_its_own_turn() {
+    let mut setup = setup_with(backend(serial()), 170, 50, true);
+    let parent = conversation(&mut setup);
+    let host = setup.backend.host();
+    let ui = host.context();
+    let grant = |guide: &str| bcode_code_review_models::GuideGrant {
+        guide_id: guide.to_owned(),
+        version: None,
+        mode: GrantMode::Generate,
+    };
+    // The conversation's last turn asked "Hello"; a guide message asks it again, then another
+    // guide message with another grant waits for that second turn to end.
+    setup
+        .scenario
+        .surface_mut()
+        .send_guide_message("Hello", Some(grant("guide-a")), &ui);
+    setup.settle();
+    setup
+        .scenario
+        .surface_mut()
+        .send_guide_message("Next", Some(grant("guide-b")), &ui);
+    for _ in 0..4 {
+        setup.settle();
+    }
+    let sent = |text: &str| {
+        host.turns()
+            .iter()
+            .filter(|(session, request)| *session == parent && request.text == text)
+            .count()
+    };
+    assert_eq!(sent("Hello"), 2, "the second Hello is sent");
+    assert_eq!(
+        sent("Next"),
+        0,
+        "the earlier Hello turn does not end the second one"
+    );
+
+    // The second Hello's own turn runs and ends: the held message is sent.
+    let mut items = vec![user("Hello"), answer("Hi."), user("Hello")];
+    let mut running = snapshot(items.clone());
+    running.runtime.active_turn_id = Some("turn-2".to_owned());
+    setup.deliver(&parent, running);
+    assert_eq!(sent("Next"), 0, "held while the turn runs");
+    items.push(answer("Hi again."));
+    setup.deliver(&parent, snapshot(items));
+    settle_until(&mut setup, "the held message is sent", |_| {
+        sent("Next") == 1
+    });
+}
+
+/// Children write every area of a serial fan-out; `before_last` runs once the last child
+/// exists, before it writes.
+fn write_every_area(setup: &mut Setup, before_last: impl FnOnce(&mut Setup)) -> String {
+    settle_until(setup, "the fan-out starts", |setup| {
+        progress(setup).is_some() && !setup.backend.host().child_sessions().is_empty()
+    });
+    let (guide_id, _, generation) = progress(setup).expect("progress");
+    let areas: Vec<String> = generation
+        .areas
+        .iter()
+        .map(|area| area.area_id.clone())
+        .collect();
+    let mut before_last = Some(before_last);
+    for (index, area_id) in areas.iter().enumerate() {
+        settle_until(setup, "the area's child runs", |setup| {
+            child_of(setup, area_id).is_some()
+        });
+        if index + 1 == areas.len()
+            && let Some(before_last) = before_last.take()
+        {
+            before_last(setup);
+        }
+        let child = child_of(setup, area_id).expect("child");
+        child_writes_its_area(setup, &guide_id, &child, area_id);
+    }
+    guide_id
+}
+
+#[test]
+fn a_synthesis_message_that_fails_marks_the_run_and_f_retries_it() {
     let mut setup = setup_with(backend(serial()), 170, 50, true);
     let parent = conversation(&mut setup);
     fan_out(&mut setup);
-    settle_until(&mut setup, "the first child runs", |setup| {
+    let guide_id = write_every_area(&mut setup, |setup| {
+        setup.backend.host().fail_next_submit("unavailable");
+    });
+    let asked = |setup: &Setup| {
+        setup
+            .backend
+            .host()
+            .turns()
+            .iter()
+            .filter(|(session, request)| *session == parent && request.text.contains("Synthesize"))
+            .count()
+    };
+    let screen = {
+        settle_until(&mut setup, "the failure shows", |setup| {
+            setup
+                .scenario
+                .surface()
+                .review()
+                .and_then(crate::surface::ReviewSurface::fan_out_phase)
+                .is_some_and(|phase| phase.starts_with("synthesis not sent"))
+        });
+        setup.settle()
+    };
+    assert_eq!(asked(&setup), 0, "the failed message was not recorded");
+    assert!(
+        screen.text().contains("Retry synthesis"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        setup
+            .app()
+            .review()
+            .is_some_and(crate::surface::ReviewSurface::fan_out_running),
+        "the run waits for a retry"
+    );
+
+    // `f` in the guide asks again; the synthesis turn ends and the version is complete.
+    setup.scenario.key("esc");
+    setup.settle();
+    // The guide toggle opens, focuses or closes the panel: press it until the guide has focus.
+    for _ in 0..3 {
+        let screen = setup.settle();
+        if screen
+            .row_text(screen.height() - 1)
+            .contains("next citation")
+        {
+            break;
+        }
+        setup.scenario.key("alt+g");
+    }
+    setup.scenario.key("f");
+    settle_until(&mut setup, "synthesis is asked again", |setup| {
+        asked(setup) == 1
+    });
+    let synthesis = synthesis_text(&setup, &parent);
+    let mut items = vec![user("Hello"), answer("Hi."), user(&synthesis)];
+    let mut running = snapshot(items.clone());
+    running.runtime.active_turn_id = Some("turn-synthesis".to_owned());
+    setup.deliver(&parent, running);
+    items.push(answer("Synthesized."));
+    setup.deliver(&parent, snapshot(items));
+    settle_until(&mut setup, "the fan-out ends", |setup| {
+        setup
+            .app()
+            .review()
+            .is_some_and(|review| !review.fan_out_running())
+    });
+    assert_eq!(stored(&setup, &guide_id).0, GuideStatus::Complete);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn resuming_adopts_children_still_recorded_running_instead_of_starting_new_ones() {
+    let mut setup = setup_with(
+        backend(GuideConfig {
+            max_parallel: 16,
+            ..serial()
+        }),
+        170,
+        50,
+        true,
+    );
+    conversation(&mut setup);
+    fan_out(&mut setup);
+    settle_until(&mut setup, "every child runs", |setup| {
         progress(setup).is_some_and(|(_, _, generation)| {
-            generation
-                .areas
-                .iter()
-                .any(|area| area.status == GuideAreaStatus::Running)
+            generation.areas.len() >= 2
+                && generation
+                    .areas
+                    .iter()
+                    .all(|area| area.status == GuideAreaStatus::Running)
         })
     });
     let (guide_id, _, _) = progress(&setup).expect("progress");
     let (_, generation) = stored(&setup, &guide_id);
-    let old = generation
+    let children: Vec<(String, String)> = generation
         .areas
         .iter()
-        .find_map(|area| area.session_id.clone())
-        .expect("a running child");
+        .map(|area| {
+            (
+                area.area_id.clone(),
+                area.session_id.clone().expect("a running child"),
+            )
+        })
+        .collect();
+    let (first_area, first) = children[0].clone();
+    let (second_area, second) = children[1].clone();
+    // While the app is closed, the first child writes its area and ends.
+    let (path, line) = cited_line(&setup);
+    assert!(write_as(
+        &setup,
+        &first,
+        &guide_id,
+        &serde_json::json!([{"op": "area_result", "area_id": first_area, "sections": [
+            {"id": "a1", "kind": "step", "title": "Area one", "body": "Changes here [[1]].",
+             "citations": [{"path": path, "side": "new", "start_line": line, "end_line": line}]}
+        ]}]),
+    ));
 
-    // The screen is rebuilt while the child runs: the run is dropped, the guide offers Resume.
     setup.reopen(170, 50);
-    let mut reopened = setup;
-    let _ = parent;
-    conversation(&mut reopened);
-    reopened.scenario.key("esc");
-    reopened.settle();
-    reopened.scenario.key("alt+g");
-    settle_until(&mut reopened, "the guide is read", |setup| {
+    conversation(&mut setup);
+    setup.scenario.key("esc");
+    setup.settle();
+    setup.scenario.key("alt+g");
+    settle_until(&mut setup, "the guide is read", |setup| {
         progress(setup).is_some()
     });
-    let before = reopened.backend.host().child_sessions().len();
-    reopened.scenario.key("f");
-    settle_until(&mut reopened, "a new child writes the area", |setup| {
-        setup.backend.host().child_sessions().len() > before
+    let before = setup.backend.host().child_sessions().len();
+    setup.scenario.key("f");
+    setup.settle();
+    // The first child already finished; the second still runs; the rest end without writing.
+    setup.deliver(&first, snapshot(vec![user("write"), answer("Done.")]));
+    let mut running = snapshot(vec![user("write")]);
+    running.runtime.active_turn_id = Some("turn-1".to_owned());
+    setup.deliver(&second, running);
+    for (_, child) in &children[2..] {
+        setup.deliver(child, snapshot(vec![user("write"), answer("Gave up.")]));
+    }
+    settle_until(&mut setup, "the finished child's area is ready", |setup| {
+        stored(setup, &guide_id)
+            .1
+            .area(&first_area)
+            .is_some_and(|area| area.status == GuideAreaStatus::Complete)
     });
-    assert!(
-        reopened.backend.host().cancelled_turns().contains(&old),
-        "the earlier child is stopped before the area gets a new one"
+    let (_, generation) = stored(&setup, &guide_id);
+    let area = generation.area(&second_area).expect("second area");
+    assert_eq!(
+        (area.status, area.session_id.as_deref()),
+        (GuideAreaStatus::Running, Some(second.as_str())),
+        "the running child keeps its area"
     );
+    let cancelled = setup.backend.host().cancelled_turns();
+    assert!(
+        !cancelled.contains(&first) && !cancelled.contains(&second),
+        "adopted children are not stopped: {cancelled:?}"
+    );
+    for (area_id, child) in &children[2..] {
+        settle_until(&mut setup, "an unwritten area gets a new child", |setup| {
+            stored(setup, &guide_id)
+                .1
+                .area(area_id)
+                .and_then(|area| area.session_id.clone())
+                .is_some_and(|session| session != *child)
+        });
+        assert!(
+            setup.backend.host().cancelled_turns().contains(child),
+            "a child that ended without writing is stopped"
+        );
+    }
+    let new = setup.backend.host().child_sessions().len() - before;
+    assert_eq!(
+        new,
+        children.len() - 2,
+        "only unwritten areas get new children"
+    );
+
+    // The adopted child writes its area and ends: it counts like any other.
+    child_writes_its_area(&mut setup, &guide_id, &second, &second_area);
+    settle_until(&mut setup, "the adopted child's area is ready", |setup| {
+        stored(setup, &guide_id)
+            .1
+            .area(&second_area)
+            .is_some_and(|area| area.status == GuideAreaStatus::Complete)
+    });
 }
 
 /// Run the palette command whose description starts with `description`.

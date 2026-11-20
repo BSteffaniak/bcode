@@ -413,6 +413,8 @@ pub struct Assistant {
     held: VecDeque<Held>,
     /// Tickets of guide messages whose turn ended, not taken yet.
     settled: Vec<u64>,
+    /// Tickets of guide messages that could not be sent, with why, not taken yet.
+    failed: Vec<(u64, String)>,
     input: RefCell<TextInputState>,
     policy: TextInputPolicy,
     /// Whether messages carry what is on screen.
@@ -510,6 +512,7 @@ impl Assistant {
             in_flight: Cell::new(0),
             held: VecDeque::new(),
             settled: Vec::new(),
+            failed: Vec::new(),
             input: RefCell::new(empty_input()),
             policy,
             context: true,
@@ -1347,6 +1350,24 @@ impl Assistant {
         std::mem::take(&mut self.settled)
     }
 
+    /// Tickets of guide messages that could not be sent since the last call, with why: their
+    /// turn will not run.
+    pub fn take_failed(&mut self) -> Vec<(u64, String)> {
+        std::mem::take(&mut self.failed)
+    }
+
+    /// The transcript id of the newest user message the active conversation's feed shows.
+    fn newest_message(&self) -> Option<bcode_session_view_models::TranscriptViewItemId> {
+        let session = self.session.as_deref()?;
+        self.agents
+            .state(session)?
+            .feed
+            .turns
+            .iter()
+            .rev()
+            .find_map(|turn| turn.message.clone())
+    }
+
     /// Whether the active conversation has a turn running, or a message sent whose turn has not
     /// ended yet.
     fn busy(&self) -> bool {
@@ -1358,25 +1379,32 @@ impl Assistant {
     }
 
     /// End the turns of sent messages the session's transcript shows answered: once no turn
-    /// runs and nothing is in flight, the newest message the transcript ends with and every
-    /// one before it. Then send the next held message.
+    /// runs and nothing is in flight, the oldest message the transcript's last turn answers
+    /// (its question, in a turn that started after the message was sent) and every one before
+    /// it. Turns are told apart by their user message's transcript id, so a message sent again
+    /// with the same text is not ended by the earlier turn. Then send the next held message.
     fn settle(&mut self, ui: &UiContext) {
         if !self.unsettled.is_empty()
             && !self.starting
             && self.in_flight.get() == 0
             && !self.working()
-            && let Some(last) = self
+            && let Some((last, id)) = self
                 .session
                 .as_deref()
                 .and_then(|session| self.agents.state(session))
-                .and_then(|state| state.feed.turns.last().map(|turn| turn.question.clone()))
+                .and_then(|state| state.feed.turns.last())
+                .and_then(|turn| Some((turn.question.clone(), turn.message.clone()?)))
             && let Some(at) = self
                 .unsettled
                 .iter()
-                .rposition(|message| message.question == last)
+                .position(|message| message.question == last && message.after.as_ref() != Some(&id))
         {
             for message in self.unsettled.drain(..=at) {
                 self.settled.extend(message.ticket);
+            }
+            // The turn is taken: later messages are answered only by turns after it.
+            for message in &mut self.unsettled {
+                message.after = Some(id.clone());
             }
         }
         if self.busy() {
@@ -1427,19 +1455,24 @@ impl Assistant {
     ) -> Outcome {
         let text = text.trim_end().to_owned();
         if text.trim().is_empty() {
+            self.failed
+                .extend(ticket.map(|ticket| (ticket, "the message is empty".to_owned())));
             return Outcome::Ignored;
         }
         if text.len() > MAX_MESSAGE_BYTES {
-            self.notice = Some(("the message is too long for the assistant".to_owned(), true));
+            let reason = "the message is too long for the assistant";
+            self.failed
+                .extend(ticket.map(|ticket| (ticket, reason.to_owned())));
+            self.notice = Some((reason.to_owned(), true));
             return Outcome::Redraw;
         }
         self.serve_tools();
         if self.tools.is_none() {
-            self.notice = Some((
-                "the assistant needs the review app's tools, which this host cannot provide"
-                    .to_owned(),
-                true,
-            ));
+            let reason =
+                "the assistant needs the review app's tools, which this host cannot provide";
+            self.failed
+                .extend(ticket.map(|ticket| (ticket, reason.to_owned())));
+            self.notice = Some((reason.to_owned(), true));
             return Outcome::Redraw;
         }
         let regrant = self.guide_grant != grant;
@@ -1465,8 +1498,10 @@ impl Assistant {
         let mut context = self.context_blocks(place);
         context.extend(extra);
         self.guide_grant = grant;
+        let after = self.newest_message();
         self.unsettled.push_back(Unsettled {
             question: crate::agent::feed::question_of(&text),
+            after,
             ticket,
         });
         let request = TurnRequest {
@@ -1797,17 +1832,40 @@ impl Assistant {
         if matches!(done, Done::Sent { .. } | Done::Started { .. }) {
             self.in_flight.set(self.in_flight.get().saturating_sub(1));
         }
-        if matches!(
-            done,
-            Done::Sent { result: Err(error), retried, .. }
-                if *retried || error.code != crate::host::REQUEST_ONLY_CONTEXT_UNAVAILABLE
-        ) {
-            // The message's turn will not run: its newest unsettled entry is dropped.
-            self.unsettled.pop_back();
+        if let Done::Sent {
+            request,
+            result: Err(error),
+            retried,
+            ..
+        } = done
+            && (*retried || error.code != crate::host::REQUEST_ONLY_CONTEXT_UNAVAILABLE)
+        {
+            // The message's turn will not run: its newest unsettled entry is dropped, and a
+            // guide message's ticket reports the failure.
+            let question = crate::agent::feed::question_of(&request.text);
+            let at = self
+                .unsettled
+                .iter()
+                .rposition(|message| message.question == question)
+                .or_else(|| self.unsettled.len().checked_sub(1));
+            if let Some(message) = at.and_then(|at| self.unsettled.remove(at))
+                && let Some(ticket) = message.ticket
+            {
+                self.failed.push((ticket, error.message.clone()));
+            }
         }
-        if matches!(done, Done::Started { epoch, result: Err(_) } if *epoch == self.epoch) {
+        if let Done::Started {
+            epoch,
+            result: Err(error),
+        } = done
+            && *epoch == self.epoch
+        {
             // No session: none of the conversation's messages runs.
-            self.unsettled.clear();
+            let failed = self
+                .unsettled
+                .drain(..)
+                .filter_map(|message| message.ticket.map(|ticket| (ticket, error.clone())));
+            self.failed.extend(failed);
         }
     }
 
@@ -5034,6 +5092,9 @@ mod tests {
 struct Unsettled {
     /// The message as the session's transcript names its turn.
     question: String,
+    /// The transcript id of the newest user message when it was sent (or of the turn that
+    /// ended the message before it): only a later turn answers it.
+    after: Option<bcode_session_view_models::TranscriptViewItemId>,
     /// The guide message's ticket, when it has one.
     ticket: Option<u64>,
 }

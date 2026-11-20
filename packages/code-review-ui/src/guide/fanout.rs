@@ -168,17 +168,26 @@ pub fn resume_label(generation: &GenerationState, key: &str) -> String {
     )
 }
 
-/// Make a stopped or interrupted fan-out runnable again: areas not written are queued (their
-/// sessions forgotten, so new children write them).
-pub fn requeue(generation: &mut GenerationState) {
+/// Make a fan-out the app closed on runnable again, adopting its children.
+///
+/// Areas recorded running keep their sessions (the children may still run, or have
+/// finished), and every other area not written is queued for a new child. Returns the
+/// adopted sessions.
+pub fn requeue_adopting(generation: &mut GenerationState) -> Vec<String> {
+    let mut adopted = Vec::new();
     for area in &mut generation.areas {
-        if area.status != GuideAreaStatus::Complete {
-            area.status = GuideAreaStatus::Queued;
-            area.session_id = None;
-            area.message = None;
+        match (&area.status, &area.session_id) {
+            (GuideAreaStatus::Complete, _) => {}
+            (GuideAreaStatus::Running, Some(session)) => adopted.push(session.clone()),
+            _ => {
+                area.status = GuideAreaStatus::Queued;
+                area.session_id = None;
+                area.message = None;
+            }
         }
     }
     generation.note = None;
+    adopted
 }
 
 /// Stop every area not done.
@@ -615,14 +624,25 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_fan_out_resumes_its_missing_areas_only() {
-        use GuideAreaStatus::{Cancelled, Complete, Failed, Running};
-        let mut state = generation(&[Complete, Running, Failed, Cancelled, Complete], 2);
+    fn a_resumed_fan_out_adopts_running_children_and_queues_the_missing_areas() {
+        use GuideAreaStatus::{Cancelled, Complete, Failed, Queued, Running};
+        let mut state = generation(
+            &[Complete, Running, Failed, Cancelled, Complete, Running],
+            4,
+        );
         state.areas[1].session_id = Some("s".to_owned());
-        assert_eq!(resume_label(&state, "f"), "2/5 areas ready · f Resume");
-        requeue(&mut state);
-        assert_eq!(to_start(&state), vec!["a1".to_owned(), "a2".to_owned()]);
-        assert_eq!(state.areas[1].session_id, None);
+        assert_eq!(resume_label(&state, "f"), "2/6 areas ready · f Resume");
+        assert_eq!(requeue_adopting(&mut state), vec!["s".to_owned()]);
+        assert_eq!(
+            (state.areas[1].status, state.areas[1].session_id.as_deref()),
+            (Running, Some("s"))
+        );
+        // A running area without a recorded child has nothing to adopt.
+        assert_eq!(state.areas[5].status, Queued);
+        assert_eq!(
+            to_start(&state),
+            vec!["a2".to_owned(), "a3".to_owned(), "a5".to_owned()]
+        );
         assert_eq!(state.areas[0].status, Complete);
     }
 

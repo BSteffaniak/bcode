@@ -294,6 +294,16 @@ impl ActiveGuide {
         !files.is_empty() && files.is_subset(&self.viewed)
     }
 
+    /// Whether `entry` shows as reviewed wherever sections are listed (the panel's outline and
+    /// the assistant's guide card): written or provisional, not stale, and
+    /// [`Self::reviewed`] — marked, or every in-diff file it cites viewed.
+    #[must_use]
+    pub fn shows_reviewed(&self, entry: &SectionEntry) -> bool {
+        entry.state != SectionState::Planned
+            && !self.stale.contains(&entry.id)
+            && self.reviewed(&entry.id)
+    }
+
     /// Where citation `id` is, at the lines it moved to when it moved.
     #[must_use]
     pub fn target(&self, id: &str) -> Option<CiteTarget> {
@@ -777,6 +787,39 @@ mod tests {
                 .banner()
                 .is_some_and(|banner| banner.kind == BannerKind::Note)
         );
+    }
+
+    #[test]
+    fn the_card_and_the_outline_agree_on_sections_reviewed_through_viewed_files() {
+        use crate::guide::CardSectionState::{Provisional, Reviewed, Written};
+        let mut provisional = section("s2", &["c2"], Vec::new());
+        provisional.state = SectionState::Provisional {
+            origin: bcode_code_review_models::ProvisionalOrigin::Expand,
+            thread_id: None,
+        };
+        let mut guide = active(
+            vec![section("s1", &["c1"], Vec::new()), provisional],
+            vec![citation("c1", 1, 2), citation("c2", 5, 9)],
+        );
+        let card_states = |guide: &ActiveGuide| {
+            crate::guide::GuideCard::of(guide, 0)
+                .sections
+                .iter()
+                .map(|section| section.state)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(card_states(&guide), [Written, Provisional]);
+        // Viewing the file both sections cite reviews them, unmarked.
+        guide.viewed.insert(("src".to_owned(), "a.rs".to_owned()));
+        assert!(guide.marks.is_empty());
+        for entry in &guide.entries {
+            assert!(guide.shows_reviewed(entry), "{}", entry.id);
+        }
+        assert_eq!(card_states(&guide), [Reviewed, Reviewed]);
+        // A stale section shows as stale in the outline, so the card does not count it.
+        guide.stale.insert("s1".to_owned());
+        assert!(!guide.shows_reviewed(&guide.entries[0]));
+        assert_eq!(card_states(&guide), [Written, Reviewed]);
     }
 
     #[test]

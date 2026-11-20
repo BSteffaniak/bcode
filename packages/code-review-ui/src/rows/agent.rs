@@ -1183,6 +1183,7 @@ mod tests {
             ],
             earlier: 0,
             thread: None,
+            message: None,
         };
         // The screen shows v2 (a refresh forked it): the older turn's card names v1.
         let shown = card(2);
@@ -1206,6 +1207,7 @@ mod tests {
             )],
             earlier: 0,
             thread: None,
+            message: None,
         };
         assert_eq!(turn_version(&newer, &shown), 2);
         assert!(matches!(
@@ -1231,6 +1233,7 @@ mod tests {
             ],
             earlier: 0,
             thread: None,
+            message: None,
         };
         assert_eq!(turn_version(&failed, &shown), 2);
     }

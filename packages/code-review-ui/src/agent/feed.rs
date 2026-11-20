@@ -117,6 +117,9 @@ pub struct Turn {
     /// The id the review tools give the thread the question was asked from, when the review
     /// prompt names one.
     pub thread: Option<String>,
+    /// The transcript id of the user message that started the turn; `None` for items before
+    /// the first question inside the observed window.
+    pub message: Option<bcode_session_view_models::TranscriptViewItemId>,
     /// Items, oldest first (the newest [`MAX_TURN_ITEMS`]).
     pub items: Vec<FeedItem>,
     /// Items dropped before the first kept one.
@@ -190,6 +193,7 @@ impl Feed {
                 turns.push(Turn {
                     question: question_of(&message.text),
                     thread: thread_of(&message.text),
+                    message: Some(item.id.clone()),
                     ..Turn::default()
                 });
                 if turns.len() > MAX_TURNS {

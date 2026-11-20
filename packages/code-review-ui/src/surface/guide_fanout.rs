@@ -19,7 +19,10 @@
 //! * **Stopping and resuming.** Stopping the conversation's turn (or `shift+x`) stops the
 //!   conversation and every child, keeping what was written. The progress lives in the stored
 //!   version, so after a stop or the app closing the panel offers "4/5 areas ready · Resume":
-//!   missing areas are written again by new children, or the guide is synthesized.
+//!   children recorded running are adopted (followed until they end; an area one ends without
+//!   writing gets a new child), missing areas are written again by new children, and then the
+//!   guide is synthesized. A synthesis message that cannot be sent marks the run failed; the
+//!   guide key retries it.
 
 use super::ReviewSurface;
 use super::guide::Prefer;
@@ -80,6 +83,9 @@ enum Synthesis {
     Waiting,
     /// Asked for with the guide message of this ticket, whose turn has not ended.
     Asked { ticket: u64 },
+    /// The synthesis message could not be sent ([`FanOutRun::synthesis_error`] says why); the
+    /// guide key (or Resume) asks again.
+    Failed,
     /// Done.
     Done,
 }
@@ -107,6 +113,8 @@ pub struct FanOutRun {
     generation: GenerationState,
     status: GuideStatus,
     synthesis: Synthesis,
+    /// Why the synthesis message could not be sent, while [`Synthesis::Failed`].
+    synthesis_error: Option<String>,
     verifier: Verifier,
 }
 
@@ -149,6 +157,9 @@ pub(super) struct FanOutUi {
     reply: Option<oneshot::Sender<ClientToolReply>>,
     /// Children seen working, so an idle child counts as finished only after its turn ran.
     seen_working: BTreeSet<String>,
+    /// Children a resumed fan-out adopted from the run the app closed on: one seen idle once
+    /// observed has finished, and an area it did not write is queued for a new child.
+    adopted: BTreeSet<String>,
     /// Tickets of guide messages whose turn ended, not looked at yet.
     settled: BTreeSet<u64>,
     /// Changes whenever what the fan-out shows changes.
@@ -177,6 +188,32 @@ impl ReviewSurface {
         fan.settled.retain(|ticket| Some(*ticket) == waited);
     }
 
+    /// Tell the screen the guide messages (by ticket) that could not be sent, with why: a
+    /// synthesis message among them marks the run's synthesis failed, to retry.
+    pub fn guide_messages_failed(&mut self, failed: Vec<(u64, String)>) {
+        let Some(run) = self.guide.fan_out.run.as_mut() else {
+            return;
+        };
+        let Synthesis::Asked { ticket } = run.synthesis else {
+            return;
+        };
+        let Some((_, error)) = failed.into_iter().find(|(failed, _)| *failed == ticket) else {
+            return;
+        };
+        run.synthesis = Synthesis::Failed;
+        run.synthesis_error = Some(error.clone());
+        let key = self
+            .action_keys
+            .get("guide_fan_out")
+            .cloned()
+            .unwrap_or_else(|| "the guide's fan-out key".to_owned());
+        self.set_status(
+            format!("could not ask the assistant to synthesize the guide: {error}; {key} retries"),
+            StatusSeverity::Error,
+        );
+        self.bump_fan_out();
+    }
+
     /// The children of the fan-out running (to follow like AI cards).
     pub(super) fn fan_out_sessions(&self) -> Vec<String> {
         let Some(run) = self.guide.fan_out.run.as_ref() else {
@@ -192,6 +229,12 @@ impl ReviewSurface {
                 _ => None,
             })
             .collect()
+    }
+
+    /// What the fan-out shows it does now (`combining areas`, a failed synthesis), if any.
+    #[must_use]
+    pub fn fan_out_phase(&self) -> Option<String> {
+        self.fan_out_view()?.phase
     }
 
     /// Whether a fan-out runs.
@@ -214,6 +257,14 @@ impl ReviewSurface {
     pub(super) fn guide_fan_out_key(&mut self, host: &UiContext) -> Action {
         if self.guide.fan_out.confirm.is_some() {
             self.confirm_fan_out(host);
+        } else if let Some(run) = self
+            .guide
+            .fan_out
+            .run
+            .clone()
+            .filter(|run| run.synthesis == Synthesis::Failed)
+        {
+            self.retry_synthesis(&run, host);
         } else if self.fan_out_resumable() {
             self.resume_fan_out(host);
         } else if self.guide.fan_out.run.is_some() {
@@ -571,9 +622,12 @@ impl ReviewSurface {
                 continue;
             };
             live.insert(session.clone(), state.feed.tokens);
+            let adopted_and_ended = self.guide.fan_out.adopted.contains(session)
+                && state.phase == crate::agent::AgentPhase::Answered;
             if state.working {
                 self.guide.fan_out.seen_working.insert(session.clone());
             } else if self.guide.fan_out.seen_working.contains(session)
+                || adopted_and_ended
                 || state.phase == crate::agent::AgentPhase::Failed
             {
                 finished.push((area.area_id.clone(), state.feed.tokens));
@@ -636,17 +690,41 @@ impl ReviewSurface {
                     self.synthesized(&run, host);
                 }
             }
+            // Waits for the guide key to retry.
+            Synthesis::Failed => {}
             Synthesis::Done => self.after_synthesis(&run, host),
         }
     }
 
+    /// Ask the conversation to synthesize the guide again after its message failed.
+    fn retry_synthesis(&mut self, run: &FanOutRun, host: &UiContext) {
+        if self.guide.fan_out.busy > 0 {
+            self.set_status(
+                "the fan-out is still settling; retry in a moment",
+                StatusSeverity::Info,
+            );
+            return;
+        }
+        if let Some(stored) = self.guide.fan_out.run.as_mut() {
+            stored.synthesis_error = None;
+        }
+        self.ask_synthesis(run, host);
+        self.bump_fan_out();
+    }
+
     /// Record the areas whose child ended: written (its area row, or its layer guide) or not.
+    /// An adopted child's area it did not write is queued for a new child instead, and the
+    /// child's turn is stopped in case it still runs.
     fn finish_areas(&mut self, run: &FanOutRun, finished: Vec<(String, u64)>, host: &UiContext) {
+        let mut adopted = BTreeMap::new();
         for (area_id, _) in &finished {
             if let Some(area) = run.generation.area(area_id)
                 && let Some(session) = &area.session_id
             {
                 self.guide.fan_out.seen_working.remove(session);
+                if self.guide.fan_out.adopted.remove(session) {
+                    adopted.insert(area_id.clone(), session.clone());
+                }
             }
         }
         self.guide.fan_out.busy += 1;
@@ -659,17 +737,34 @@ impl ReviewSurface {
             let result = async {
                 let outcomes =
                     area_outcomes(&services, &repo, &guide_id, version, &areas, &finished).await?;
+                for (area_id, session) in &adopted {
+                    if outcomes
+                        .get(area_id)
+                        .is_some_and(|(status, _, _)| *status != GuideAreaStatus::Complete)
+                    {
+                        drop(services.host().cancel_turn(session.clone()).await);
+                    }
+                }
                 update(&services, repo, guide_id, version, move |stored| {
                     let Some(generation) = stored.generation.as_mut() else {
                         return;
                     };
                     for (area_id, (status, tokens, message)) in &outcomes {
+                        let rewrite =
+                            adopted.contains_key(area_id) && *status != GuideAreaStatus::Complete;
                         if let Some(area) = generation.area_mut(area_id)
                             && !area.status.is_terminal()
                         {
-                            area.status = *status;
                             area.tokens = area.tokens.max(*tokens);
-                            area.message.clone_from(message);
+                            if rewrite {
+                                // Written again by a new child.
+                                area.status = GuideAreaStatus::Queued;
+                                area.session_id = None;
+                                area.message = None;
+                            } else {
+                                area.status = *status;
+                                area.message.clone_from(message);
+                            }
                         }
                     }
                     fanout::total_tokens(generation);
@@ -1068,15 +1163,13 @@ impl ReviewSurface {
         };
         let version = &active.version;
         let mut generation = version.generation.clone().unwrap_or_default();
-        // Children recorded running may still run (the screen was rebuilt while they did):
-        // they are stopped before new children write their areas, so no area has two writers.
-        let orphans: Vec<String> = generation
-            .areas
-            .iter()
-            .filter(|area| area.status == GuideAreaStatus::Running)
-            .filter_map(|area| area.session_id.clone())
-            .collect();
-        fanout::requeue(&mut generation);
+        // Children recorded running may still run (the app closed while they did), or have
+        // finished: they are adopted and followed, and their areas are written by them; only
+        // an area an adopted child ends without writing gets a new child. Areas recorded
+        // without a running child are written again by new children.
+        let adopted = fanout::requeue_adopting(&mut generation);
+        self.guide.fan_out.adopted = adopted.into_iter().collect();
+        self.guide.fan_out.seen_working.clear();
         let strategy = version.origin.strategy.unwrap_or(GuideStrategy::Areas);
         let run = FanOutRun {
             guide_id: active.guide.guide_id.clone(),
@@ -1088,6 +1181,7 @@ impl ReviewSurface {
             generation: generation.clone(),
             status: GuideStatus::Generating,
             synthesis: Synthesis::Waiting,
+            synthesis_error: None,
             verifier: Verifier::Idle,
         };
         self.guide.fan_out.busy += 1;
@@ -1095,9 +1189,6 @@ impl ReviewSurface {
         let (services, inbox) = (self.services.clone(), self.inbox.clone());
         let (guide_id, number) = (run.guide_id.clone(), run.version);
         host.spawn(Box::pin(async move {
-            for session in orphans {
-                drop(services.host().cancel_turn(session).await);
-            }
             let result = update(&services, repo, guide_id, number, move |stored| {
                 stored.generation = Some(generation.clone());
                 stored.status = GuideStatus::Generating;
@@ -1149,8 +1240,22 @@ impl ReviewSurface {
             view.phase = match (&run.synthesis, &run.verifier) {
                 (_, Verifier::Running(_)) => Some("checking claims".to_owned()),
                 (Synthesis::Asked { .. }, _) => Some("combining areas".to_owned()),
+                (Synthesis::Failed, _) => Some(format!(
+                    "synthesis not sent: {}",
+                    run.synthesis_error
+                        .as_deref()
+                        .unwrap_or("the message failed")
+                )),
                 _ => run.generation.note.clone(),
             };
+            if run.synthesis == Synthesis::Failed {
+                let key = key("guide_fan_out");
+                view.resume = Some(if key.is_empty() {
+                    "Retry synthesis".to_owned()
+                } else {
+                    format!("{key} Retry synthesis")
+                });
+            }
             view.permission = self
                 .fan_out_permission()
                 .map(|(area, tool)| format!("{area} wants {tool}"));
@@ -1383,6 +1488,7 @@ async fn begin(
         generation,
         status,
         synthesis: Synthesis::Waiting,
+        synthesis_error: None,
         verifier: Verifier::Idle,
     })
 }

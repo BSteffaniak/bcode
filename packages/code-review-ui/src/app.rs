@@ -339,6 +339,20 @@ impl ReviewApp {
         &self.assistant
     }
 
+    /// Send `text` as a guide message bound with `grant`, as a guide action would.
+    #[cfg(test)]
+    pub(crate) fn send_guide_message(
+        &mut self,
+        text: &str,
+        grant: Option<bcode_code_review_models::GuideGrant>,
+        host: &UiContext,
+    ) {
+        let place = self.place(true);
+        let _ = self
+            .assistant
+            .send_guide_message(text, grant, Vec::new(), None, &place, host);
+    }
+
     /// Where the Ask AI button was painted in the last frame.
     #[must_use]
     pub const fn assistant_button(&self) -> Option<Rect> {
@@ -502,6 +516,7 @@ impl ReviewApp {
         if let Route::Review(review) = &mut self.route {
             review.set_assistant(self.assistant.session(), self.assistant.working());
             review.guide_messages_settled(self.assistant.take_settled());
+            review.guide_messages_failed(self.assistant.take_failed());
         }
         for call in self.assistant.take_tool_calls() {
             self.answer_tool(call, host);

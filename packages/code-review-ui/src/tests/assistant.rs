@@ -85,10 +85,35 @@ pub(super) fn tool(id: &str, name: &str, arguments: &str) -> TranscriptViewItem 
     )
 }
 
+/// A session snapshot of `items`. Messages get ids from their place in the transcript and
+/// their text, standing in for the event-derived ids Bcode gives them: one delivered again
+/// keeps its id, and another message (the same text later, or other text in its place) gets
+/// another.
 pub(super) fn snapshot(items: Vec<TranscriptViewItem>) -> SessionViewSnapshot {
     let mut snapshot = SessionViewSnapshot::empty();
     snapshot.connection_status = SessionConnectionViewStatus::Attached;
-    snapshot.transcript.items = items;
+    snapshot.transcript.items = items
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut item)| {
+            if matches!(
+                item.kind,
+                TranscriptViewItemKind::UserMessage { .. }
+                    | TranscriptViewItemKind::AssistantMessage { .. }
+            ) {
+                let text = match &item.kind {
+                    TranscriptViewItemKind::UserMessage { message }
+                    | TranscriptViewItemKind::AssistantMessage { message } => message.text.as_str(),
+                    _ => "",
+                };
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(text, &mut hash);
+                let text = std::hash::Hasher::finish(&hash);
+                item.id = TranscriptViewItemId::new(format!("message:{index}:{text:016x}"));
+            }
+            item
+        })
+        .collect();
     snapshot
 }
 
