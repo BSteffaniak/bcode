@@ -10,6 +10,7 @@
 //! file stay with the program.
 
 pub mod app;
+pub mod contrast;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -657,11 +658,20 @@ fn profile_outcome(selected: Option<&ProfileRow>) -> AppearanceOutcome {
     })
 }
 
-/// The saved choices an appearance was resolved from: Bcode's and the app's own.
-type SavedChoices = (SavedAppearance, Option<SavedAppearance>);
+/// The saved choices an appearance was resolved from: Bcode's, the app's own and the contrast
+/// values (configured with the saved ones folded in).
+type SavedChoices = (
+    SavedAppearance,
+    Option<SavedAppearance>,
+    crate::adjustment::ContrastPreferences,
+);
 
 fn saved_choices(resolution: &AppearanceResolution) -> SavedChoices {
-    (resolution.saved.clone(), resolution.app_saved.clone())
+    (
+        resolution.saved.clone(),
+        resolution.app_saved.clone(),
+        resolution.configured.contrast.clone(),
+    )
 }
 
 /// The appearance an app presents while its watcher and its picker both change it.
@@ -677,6 +687,9 @@ fn saved_choices(resolution: &AppearanceResolution) -> SavedChoices {
 /// it for this app only, or, when the selection
 /// [follows Bcode](AppearanceSelection::following_bcode), removes it so the app follows Bcode's
 /// choice again.
+///
+/// Contrast edited in the picker is per theme and shared with every program
+/// ([`Self::apply_with_contrast`]).
 #[derive(Debug)]
 pub struct LiveAppearance {
     state: Mutex<LiveState>,
@@ -806,11 +819,8 @@ impl LiveAppearance {
     }
 
     /// Save `selection` with `persist`, which receives the app's own choice to write (`None`
-    /// removes it, so the app follows Bcode's), and end the preview. Nothing is written when
-    /// the choice is unchanged. The applied appearance becomes the latest, and resolutions of
-    /// the previous saved choices are ignored from now on. `present` shows the latest
-    /// appearance under the same lock as [`Self::offer`], so a watched appearance offered
-    /// meanwhile is never replaced by an older one. Returns the applied appearance.
+    /// removes it, so the app follows Bcode's), and end the preview
+    /// ([`Self::apply_with_contrast`] without contrast edits).
     ///
     /// # Errors
     ///
@@ -822,20 +832,54 @@ impl LiveAppearance {
         persist: impl FnOnce(Option<&SavedAppearance>) -> Result<(), E>,
         present: impl FnOnce(&AppearanceResolution),
     ) -> Result<AppearanceResolution, E> {
+        self.apply_with_contrast(selection, &BTreeMap::new(), |_| Ok(()), persist, present)
+    }
+
+    /// Save the per-theme contrast values `contrast` edited with `persist_contrast` (skipped
+    /// when there are none), then `selection` with `persist`, which receives the app's own
+    /// choice to write (`None` removes it, so the app follows Bcode's), and end the preview.
+    /// Nothing is written when the choice is unchanged. The applied appearance becomes the
+    /// latest, and resolutions of the previous saved choices are ignored from now on.
+    /// `present` shows the latest appearance under the same lock as [`Self::offer`], so a
+    /// watched appearance offered meanwhile is never replaced by an older one. Returns the
+    /// applied appearance.
+    ///
+    /// # Errors
+    ///
+    /// * The error of `persist_contrast` or `persist`; the preview ends and `present` shows
+    ///   the latest appearance, which keeps whatever was saved before the error.
+    pub fn apply_with_contrast<E>(
+        &self,
+        selection: &AppearanceSelection,
+        contrast: &BTreeMap<String, crate::adjustment::ContrastOverride>,
+        persist_contrast: impl FnOnce(
+            &BTreeMap<String, crate::adjustment::ContrastOverride>,
+        ) -> Result<(), E>,
+        persist: impl FnOnce(Option<&SavedAppearance>) -> Result<(), E>,
+        present: impl FnOnce(&AppearanceResolution),
+    ) -> Result<AppearanceResolution, E> {
         let mut state = self.lock();
         state.previewing = false;
-        let app = state.app_choice(selection);
-        if app != state.latest.app_saved {
-            if let Err(error) = persist(app.as_ref()) {
-                present(&state.latest);
-                return Err(error);
+        let prior = saved_choices(&state.latest);
+        let saved = (|| {
+            if !contrast.is_empty() {
+                persist_contrast(contrast)?;
+                state.latest = state.latest.with_contrast(contrast);
             }
-            let prior = saved_choices(&state.latest);
-            state.latest = state.latest.with_saved(&state.latest.saved, app.as_ref());
+            let app = state.app_choice(selection);
+            if app != state.latest.app_saved {
+                persist(app.as_ref())?;
+                state.latest = state.latest.with_saved(&state.latest.saved, app.as_ref());
+            }
+            Ok(())
+        })();
+        if saved_choices(&state.latest) != prior {
             state.superseded = Some(prior);
         }
         present(&state.latest);
-        Ok(state.latest.clone())
+        let latest = state.latest.clone();
+        drop(state);
+        saved.map(|()| latest)
     }
 }
 

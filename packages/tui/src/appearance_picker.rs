@@ -18,8 +18,9 @@ use bcode_tui_theme::picker::AppearanceSelection;
 use bmux_keyboard::KeyStroke;
 
 use super::appearance_picker_axes::{PaletteAxisState, ProfileAxisState};
-pub use super::appearance_picker_contrast::{ContrastControls, ContrastRow};
 use super::theme::{ProfileCatalogEntry, ThemeCatalogEntry};
+pub use bcode_tui_theme::picker::contrast::{ContrastControls, ContrastRow};
+use bcode_tui_theme::picker::contrast::{ContrastExit, ContrastKey, ContrastKeyOutcome};
 
 pub use bcode_tui_theme::picker::AppearanceAxis;
 use bcode_tui_theme::picker::AppearanceOutcome;
@@ -191,17 +192,6 @@ impl AppearancePickerState {
         }
     }
 
-    fn reset_contrast(&mut self, row: ContrastRow) -> AppearancePickerOutcome {
-        let Some(palette) = self.selection.selected_palette().map(str::to_owned) else {
-            return AppearancePickerOutcome::Ignored;
-        };
-        if self.contrast.reset(&palette, row) {
-            AppearancePickerOutcome::ContrastChanged(palette)
-        } else {
-            AppearancePickerOutcome::Ignored
-        }
-    }
-
     /// Return focus from the contrast rows to `axis`.
     fn focus_axis(&mut self, axis: AppearanceAxis) -> AppearancePickerOutcome {
         self.contrast.set_focus(None);
@@ -333,7 +323,7 @@ impl AppearancePickerState {
         let outcome = match (self.contrast.focus(), action) {
             (_, Some("tui.control.cancel")) => AppearancePickerOutcome::Cancel,
             (_, Some("tui.control.submit")) => self.apply(),
-            (Some(row), _) => self.handle_contrast_key(row, action, stroke),
+            (Some(_), _) => self.handle_contrast_key(action, stroke),
             (None, Some("tui.control.up")) => self.selection.step(false).into(),
             (None, Some("tui.control.down")) => self.selection.step(true).into(),
             (None, Some("tui.control.left")) => {
@@ -356,38 +346,45 @@ impl AppearancePickerState {
         outcome
     }
 
-    /// Handle a key while contrast `row` has focus: the horizontal keys change its value, `0`
-    /// resets it, the vertical keys move between the rows, and the focus keys continue the
-    /// cycle through the columns.
+    /// Handle a key while a contrast row has focus ([`ContrastControls::handle_key`]): the
+    /// horizontal keys change its value, `0` resets it, the vertical keys move between the
+    /// rows, and the focus keys continue the cycle through the columns.
     fn handle_contrast_key(
         &mut self,
-        row: ContrastRow,
         action: Option<&str>,
         stroke: KeyStroke,
     ) -> AppearancePickerOutcome {
-        match action {
-            Some("tui.control.left") => self.step_contrast(row, false),
-            Some("tui.control.right") => self.step_contrast(row, true),
-            Some("tui.control.up") => match row {
-                ContrastRow::Factor => self.focus_axis(self.axis()),
-                ContrastRow::Minimum => self.focus_contrast(ContrastRow::Factor),
-            },
-            Some("tui.control.down") => match row {
-                ContrastRow::Factor => self.focus_contrast(ContrastRow::Minimum),
-                ContrastRow::Minimum => AppearancePickerOutcome::Ignored,
-            },
-            Some("tui.control.focus_next") => match row {
-                ContrastRow::Factor => self.focus_contrast(ContrastRow::Minimum),
-                ContrastRow::Minimum => self.focus_axis(AppearanceAxis::Palette),
-            },
-            Some("tui.control.focus_previous") => match row {
-                ContrastRow::Factor => self.focus_axis(AppearanceAxis::Profile),
-                ContrastRow::Minimum => self.focus_contrast(ContrastRow::Factor),
-            },
+        let key = match action {
+            Some("tui.control.left") => ContrastKey::Lower,
+            Some("tui.control.right") => ContrastKey::Raise,
+            Some("tui.control.up") => ContrastKey::Up,
+            Some("tui.control.down") => ContrastKey::Down,
+            Some("tui.control.focus_next") => ContrastKey::Next,
+            Some("tui.control.focus_previous") => ContrastKey::Previous,
             None if stroke == KeyStroke::simple(bmux_keyboard::KeyCode::Char('0')) => {
-                self.reset_contrast(row)
+                ContrastKey::Reset
             }
-            _ => AppearancePickerOutcome::Ignored,
+            _ => return AppearancePickerOutcome::Ignored,
+        };
+        let editing = matches!(
+            key,
+            ContrastKey::Lower | ContrastKey::Raise | ContrastKey::Reset
+        );
+        let palette = self.selection.selected_palette().map(str::to_owned);
+        if palette.is_none() && editing {
+            // Without a palette there is nothing to edit; focus still moves.
+            return AppearancePickerOutcome::Ignored;
+        }
+        let palette = palette.unwrap_or_default();
+        match self.contrast.handle_key(&palette, key) {
+            ContrastKeyOutcome::Changed => AppearancePickerOutcome::ContrastChanged(palette),
+            ContrastKeyOutcome::Focused(row) => AppearancePickerOutcome::ContrastFocused(row),
+            ContrastKeyOutcome::Left(exit) => self.focus_axis(match exit {
+                ContrastExit::Above => self.axis(),
+                ContrastExit::After => AppearanceAxis::Palette,
+                ContrastExit::Before => AppearanceAxis::Profile,
+            }),
+            ContrastKeyOutcome::Ignored => AppearancePickerOutcome::Ignored,
         }
     }
 

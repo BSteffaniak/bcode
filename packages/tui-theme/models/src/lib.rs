@@ -312,6 +312,14 @@ impl ContrastOverride {
             },
         }
     }
+
+    /// The values to save when these edits change a theme whose saved values are `prior`:
+    /// each value the edits set replaces the saved one and the others stay. `None` when
+    /// nothing is left to save.
+    #[must_use]
+    pub fn saved_over(self, prior: Option<Self>) -> Option<Self> {
+        Some(prior.unwrap_or_default().overlaid_with(self)).filter(|saved| !saved.is_empty())
+    }
 }
 
 /// The contrast adjustments applied to one resolved theme.

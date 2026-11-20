@@ -3906,7 +3906,6 @@ dependencies = [
  "bcode_tool",
  "bcode_tui_components",
  "bcode_tui_theme",
- "bcode_tui_theme_models",
  "bcode_tui_transcript",
  "bcode_usage_models",
  "bcode_vim_edit_plugin",

@@ -48,7 +48,7 @@ const PREVIEW_MIN_HEIGHT: u16 = 7;
 /// Shortest body that stacks both columns (a header and one row each).
 const STACKED_MIN_HEIGHT: u16 = 4;
 /// The contrast rows, in painted order.
-const CONTRAST_ROWS: [ContrastRow; 2] = [ContrastRow::Factor, ContrastRow::Minimum];
+const CONTRAST_ROWS: [ContrastRow; 2] = ContrastRow::ALL;
 /// Rows the columns keep above the contrast rows (a header and two rows).
 pub const CONTRAST_MIN_COLUMNS_HEIGHT: u16 = 3;
 /// Narrowest contrast control that keeps its row label beside it.
@@ -404,13 +404,7 @@ fn render_contrast_row(
     }
     match layout.row {
         ContrastRow::Factor => {
-            let range = bcode_tui_theme_models::CONTRAST_FACTOR_MAX
-                - bcode_tui_theme_models::CONTRAST_FACTOR_MIN;
-            let position =
-                (shown.factor.get() - bcode_tui_theme_models::CONTRAST_FACTOR_MIN) / range;
-            // Hundredths of the range: exact for every value on the 0.05 slider grid.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let value = (position * 100.0).round().clamp(0.0, 100.0) as u64;
+            let value = bcode_tui_theme::picker::contrast::factor_position(shown.factor);
             let label = format!("{}×", shown.factor);
             let gauge = ProgressBarComponent::new(
                 "appearance.contrast",
@@ -443,13 +437,7 @@ fn render_contrast_row(
         ContrastRow::Minimum => {
             let current = shown.minimum;
             let mut spans = Vec::new();
-            let choices = std::iter::once(bcode_tui_theme::adjustment::MinimumContrast::OFF).chain(
-                bcode_tui_theme_models::MINIMUM_CONTRAST_PRESETS
-                    .iter()
-                    .filter_map(|ratio| {
-                        bcode_tui_theme::adjustment::MinimumContrast::new(*ratio).ok()
-                    }),
-            );
+            let choices = bcode_tui_theme::picker::contrast::minimum_choices();
             let mut listed = false;
             for (index, choice) in choices.enumerate() {
                 if index > 0 {

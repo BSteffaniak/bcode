@@ -7315,15 +7315,9 @@ pub fn update_tui_contrast_override_at(
     let _guard = TUI_STATE_UPDATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let saved = load_tui_contrast_overrides_from(path)?
-        .remove(theme_id)
-        .unwrap_or_default()
-        .overlaid_with(*values);
-    bcode_config_layers::user_state::save_theme_override(
-        path,
-        theme_id,
-        Some(&saved).filter(|saved| !saved.is_empty()),
-    )
+    bcode_config_layers::user_state::update_theme_override(path, theme_id, |prior| {
+        values.saved_over(prior)
+    })
     .map_err(ConfigError::from)?;
     Ok(path.to_path_buf())
 }

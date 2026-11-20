@@ -12,7 +12,6 @@ pub(crate) mod activity;
 pub(crate) mod app;
 pub(crate) mod appearance_picker;
 mod appearance_picker_axes;
-mod appearance_picker_contrast;
 pub(crate) mod appearance_picker_render;
 mod appearance_picker_sample;
 pub(crate) mod artifact_stream;

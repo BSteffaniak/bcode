@@ -275,37 +275,92 @@ pub fn save_theme_override<T: serde::Serialize>(
     theme_id: &str,
     values: Option<&T>,
 ) -> Result<(), LayersError> {
+    check_theme_id(theme_id)?;
+    let values = values
+        .map(override_table)
+        .transpose()
+        .map_err(|message| LayersError::Composition { message })?;
+    edit_state(path, |document| {
+        write_theme_override(document, theme_id, values)
+    })
+}
+
+/// Change the values saved for `theme_id` in the state file at `path` in one read and write.
+///
+/// `update` receives the saved values of `[theme.overrides.<theme-id>]` (`None` when there are
+/// none) and returns the values to save (`None` removes them). Every other section and key
+/// stays as it is, and the file is replaced atomically.
+///
+/// # Errors
+///
+/// * [`LayersError::Io`] when the file cannot be read or written.
+/// * [`LayersError::Composition`] when `theme_id` is empty, the existing file is not TOML, a
+///   section on the way is not a table, the saved values do not parse as `T`, or the updated
+///   values are not a table.
+pub fn update_theme_override<T: serde::de::DeserializeOwned + serde::Serialize>(
+    path: &Path,
+    theme_id: &str,
+    update: impl FnOnce(Option<T>) -> Option<T>,
+) -> Result<(), LayersError> {
+    check_theme_id(theme_id)?;
+    edit_state(path, |document| {
+        let prior = document
+            .get("theme")
+            .and_then(|theme| theme.get("overrides"))
+            .and_then(|overrides| overrides.get(theme_id))
+            .cloned()
+            .map(|values| {
+                values.try_into::<T>().map_err(|error| {
+                    format!("[theme.overrides.{theme_id}]: {}", error.message().trim())
+                })
+            })
+            .transpose()?;
+        let values = update(prior).as_ref().map(override_table).transpose()?;
+        write_theme_override(document, theme_id, values)
+    })
+}
+
+fn check_theme_id(theme_id: &str) -> Result<(), LayersError> {
     if theme_id.trim().is_empty() {
         return Err(LayersError::Composition {
             message: "theme id must not be empty".to_owned(),
         });
     }
-    let values = values
-        .map(|values| match toml::Value::try_from(values) {
-            Ok(toml::Value::Table(table)) => Ok(table),
-            Ok(_) => Err("saved theme values are not a table".to_owned()),
-            Err(error) => Err(error.to_string()),
-        })
-        .transpose()
-        .map_err(|message| LayersError::Composition { message })?;
-    edit_state(path, |document| {
-        let theme =
-            table_entry(document, "theme").ok_or_else(|| "[theme] is not a table".to_owned())?;
-        let overrides = table_entry(theme, "overrides")
-            .ok_or_else(|| "[theme.overrides] is not a table".to_owned())?;
-        match values {
-            Some(values) if !values.is_empty() => {
-                overrides.insert(theme_id.to_owned(), toml::Value::Table(values));
-            }
-            _ => {
-                overrides.remove(theme_id);
-            }
+    Ok(())
+}
+
+/// `values` as the table saved for one theme.
+fn override_table<T: serde::Serialize>(values: &T) -> Result<toml::Table, String> {
+    match toml::Value::try_from(values) {
+        Ok(toml::Value::Table(table)) => Ok(table),
+        Ok(_) => Err("saved theme values are not a table".to_owned()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Write `values` as `[theme.overrides.<theme_id>]` of `document`; `None` or an empty table
+/// removes them, and an emptied `[theme.overrides]` goes too.
+fn write_theme_override(
+    document: &mut toml::Table,
+    theme_id: &str,
+    values: Option<toml::Table>,
+) -> Result<(), String> {
+    let theme =
+        table_entry(document, "theme").ok_or_else(|| "[theme] is not a table".to_owned())?;
+    let overrides = table_entry(theme, "overrides")
+        .ok_or_else(|| "[theme.overrides] is not a table".to_owned())?;
+    match values {
+        Some(values) if !values.is_empty() => {
+            overrides.insert(theme_id.to_owned(), toml::Value::Table(values));
         }
-        if overrides.is_empty() {
-            theme.remove("overrides");
+        _ => {
+            overrides.remove(theme_id);
         }
-        Ok(())
-    })
+    }
+    if overrides.is_empty() {
+        theme.remove("overrides");
+    }
+    Ok(())
 }
 
 /// Replace the app's own theme choice (`[apps.<app>.theme]`) in the state file at `path`.
@@ -506,6 +561,19 @@ mod tests {
         save_theme_override(&path, "nord", Some(&values)).expect("save override");
         save_theme_override(&path, "dracula", Some(&values)).expect("save override");
         save_theme_override(&path, "dracula", None::<&toml::Table>).expect("remove override");
+        // An update reads the saved values and replaces them in one write.
+        update_theme_override::<toml::Table>(&path, "nord", |prior| {
+            let mut values = prior.expect("saved values");
+            values.insert("minimum_contrast".to_owned(), toml::Value::Float(4.5));
+            Some(values)
+        })
+        .expect("update override");
+        update_theme_override::<toml::Table>(&path, "nord", |prior| {
+            let mut values = prior.expect("saved values");
+            values.remove("minimum_contrast");
+            Some(values)
+        })
+        .expect("update override");
         let loaded = load_saved_theme_overrides::<toml::Table>(&path).expect("load");
         assert_eq!(loaded.keys().collect::<Vec<_>>(), ["nord"]);
         assert_eq!(loaded["nord"], values);

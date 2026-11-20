@@ -317,6 +317,22 @@ impl AppearanceResolution {
             diagnostics: self.diagnostics.clone(),
         }
     }
+
+    /// The appearance with the per-theme contrast values `values` overlaid on the configured
+    /// ones (each value they set replaces the configured one, as saved values do): the same
+    /// choices, catalog and variant, so nothing is discovered again.
+    #[must_use]
+    pub fn with_contrast(
+        &self,
+        values: &std::collections::BTreeMap<String, crate::adjustment::ContrastOverride>,
+    ) -> Self {
+        if values.is_empty() {
+            return self.clone();
+        }
+        let mut adjusted = self.clone();
+        adjusted.configured.contrast.apply_saved(values);
+        adjusted.with_saved(&self.saved, self.app_saved.as_ref())
+    }
 }
 
 /// The saved choices that apply when configuration pins the palette (`theme_pinned_by`) or
