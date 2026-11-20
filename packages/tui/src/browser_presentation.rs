@@ -151,11 +151,13 @@ fn export_with_actions_and_visual_policy(
     // The resolved definition drives the browser transcript engine; the flat styles
     // carry only the chrome roles (composer, permission, question, latest bar).
     // Transcript presentation the native V2 host applies from the same configuration:
-    // reasoning visibility (structure), live-text pacing and reduced motion.
+    // reasoning visibility (structure), live-text pacing, reduced motion and raw HTML in
+    // Markdown.
     let transcript = json!({
         "reasoning": reasoning_policy(config.thinking),
         "streaming": streaming.normalized(),
         "reduce_motion": config.reduce_motion,
+        "markdown_html": config.markdown.html,
     });
     let mut contents = json!({"schema_version":1,"revision":"pending","theme":definition,"styles":styles,
             "bindings":bindings,"interaction":config.interactions,"visual_policy":visual_policy,
@@ -458,6 +460,22 @@ mod tests {
             serde_json::to_value(config.interactions).unwrap()
         );
         assert!(result["styles"].as_object().unwrap().len() <= 64);
+    }
+
+    #[test]
+    fn exports_the_configured_markdown_html_mode() {
+        let mut config = bcode_config::TuiConfig::default();
+        let exported = |config: &bcode_config::TuiConfig| -> Value {
+            serde_json::from_str(&export(config, Path::new(".")).unwrap()).unwrap()
+        };
+        assert_eq!(exported(&config)["transcript"]["markdown_html"], "render");
+        config.markdown.html = bcode_config::TuiMarkdownHtmlMode::Raw;
+        let raw = exported(&config);
+        assert_eq!(raw["transcript"]["markdown_html"], "raw");
+        assert_ne!(
+            raw["revision"],
+            exported(&bcode_config::TuiConfig::default())["revision"]
+        );
     }
 
     #[test]

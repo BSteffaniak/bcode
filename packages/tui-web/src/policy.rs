@@ -45,6 +45,34 @@ pub struct BrowserTranscriptPolicy {
     /// Reduced motion (`[tui] reduce_motion`): navigation is instant.
     #[serde(default)]
     pub reduce_motion: bool,
+    /// Raw HTML embedded in Markdown (`[tui.markdown] html`).
+    #[serde(default)]
+    pub markdown_html: BrowserMarkdownHtml,
+}
+
+/// Presentation of raw HTML embedded in Markdown, as the native configuration spells it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserMarkdownHtml {
+    /// GitHub's sanitized element subset is rendered.
+    #[default]
+    Render,
+    /// Tags are removed and their text kept.
+    Strip,
+    /// HTML source is shown as text.
+    Raw,
+}
+
+impl BrowserMarkdownHtml {
+    /// The Markdown renderer mode this policy selects.
+    #[must_use]
+    pub const fn mode(self) -> bcode_markdown_render::MarkdownHtmlMode {
+        match self {
+            Self::Render => bcode_markdown_render::MarkdownHtmlMode::Render,
+            Self::Strip => bcode_markdown_render::MarkdownHtmlMode::Strip,
+            Self::Raw => bcode_markdown_render::MarkdownHtmlMode::Raw,
+        }
+    }
 }
 
 impl BrowserTranscriptPolicy {

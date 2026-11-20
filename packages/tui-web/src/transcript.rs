@@ -82,6 +82,8 @@ pub struct BrowserTranscript {
     theme: Arc<ResolvedThemeDefinition>,
     /// `<details>` open state by content key.
     details_open: BTreeMap<String, bool>,
+    /// Raw HTML presentation from the installed policy.
+    markdown_html: bcode_markdown_render::MarkdownHtmlMode,
     /// The render configuration must be rebuilt.
     render_dirty: bool,
     /// The unresolved submission shown as a pending row (identity, text).
@@ -121,6 +123,7 @@ impl BrowserTranscript {
             attached: false,
             theme: Arc::new(ResolvedThemeDefinition::empty("default", "Default")),
             details_open: BTreeMap::new(),
+            markdown_html: bcode_markdown_render::MarkdownHtmlMode::default(),
             render_dirty: true,
             pending: None,
             handoffs: Vec::new(),
@@ -525,6 +528,7 @@ impl BrowserTranscript {
         .compile_with_host_parts();
         let motion = MotionConfig::for_motion(theme.chrome.motion, transcript.reduce_motion);
         self.theme = theme;
+        self.markdown_html = transcript.markdown_html.mode();
         let update = self.engine.set_structure_config(structure, at);
         self.absorb(update);
         let update = self.engine.set_motion(motion, at);
@@ -566,6 +570,7 @@ impl BrowserTranscript {
             theme: Arc::clone(&self.theme),
             markdown: MarkdownOptions {
                 details_open: self.details_open.clone(),
+                html: self.markdown_html,
                 ..MarkdownOptions::default()
             },
             plugin_visuals: self.visuals.accepted().clone(),

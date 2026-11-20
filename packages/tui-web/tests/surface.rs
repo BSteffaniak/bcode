@@ -1236,6 +1236,33 @@ fn markdown_transcript_and_configured_editor_share_a_local_surface() {
 }
 
 #[test]
+fn markdown_html_follows_the_installed_policy() {
+    let reply = "Press <kbd>Enter</kbd> to <b>send</b>";
+    let frame_with = |html: Option<&str>| {
+        let mut log = Log::new(vec![user(1, "keys?"), assistant(2, reply)]);
+        let policy = html.map(|html| {
+            let mut policy = serde_json::to_value(bcode_tui_web::BrowserPolicy {
+                schema_version: 1,
+                revision: format!("html-{html}"),
+                ..bcode_tui_web::BrowserPolicy::default()
+            })
+            .unwrap();
+            policy["transcript"]["markdown_html"] = serde_json::json!(html);
+            policy
+        });
+        let mut surface = mounted(80, 20, &mut log, policy.as_ref());
+        present(&mut surface).text()
+    };
+    let rendered = frame_with(None);
+    assert!(rendered.contains("send"), "{rendered}");
+    assert!(!rendered.contains("<b>"), "{rendered}");
+    let raw = frame_with(Some("raw"));
+    assert!(raw.contains("<b>send</b>"), "{raw}");
+    let stripped = frame_with(Some("strip"));
+    assert!(stripped.contains("Press Enter to send"), "{stripped}");
+}
+
+#[test]
 fn a_sent_submission_is_a_pending_row_until_its_message_is_incorporated() {
     let mut log = Log::new(conversation(1));
     let mut surface = mounted(60, 16, &mut log, None);
