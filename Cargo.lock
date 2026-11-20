@@ -2391,6 +2391,7 @@ dependencies = [
  "bcode_feedback",
  "bcode_feedback_cli",
  "bcode_feedback_models",
+ "bcode_model_schema",
  "bcode_plugin_sdk",
  "bcode_tool",
  "clap",

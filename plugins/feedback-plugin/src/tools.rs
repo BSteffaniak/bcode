@@ -1,6 +1,6 @@
 //! `feedback.*` model tools. Every tool acts as [`Actor::Agent`] and returns redacted items.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use bcode_feedback_models::{
     Actor, Facet, FeedbackId, FeedbackItem, FeedbackQuery, FeedbackStatus, LinkFeedbackRequest,
@@ -110,7 +110,7 @@ fn run(
                     facets: args
                         .facets
                         .into_iter()
-                        .map(|(key, value)| Facet::new(key, value))
+                        .map(|facet| Facet::new(facet.key, facet.value))
                         .collect(),
                 },
                 now,
@@ -193,7 +193,7 @@ struct SearchArgs {
     #[serde(default)]
     tags: BTreeSet<String>,
     #[serde(default)]
-    facets: BTreeMap<String, String>,
+    facets: Vec<FacetArg>,
     text: Option<String>,
     before: Option<String>,
     limit: Option<usize>,
@@ -207,12 +207,27 @@ impl SearchArgs {
             triage_state: self.triage_state,
             category: self.category,
             tags: self.tags,
-            facets: self.facets.into_iter().collect(),
+            facets: self
+                .facets
+                .into_iter()
+                .map(|facet| (facet.key, facet.value))
+                .collect(),
             text: self.text,
             before: self.before.as_deref().map(parse_id).transpose()?,
             limit: self.limit.unwrap_or(25),
         })
     }
+}
+
+/// One facet as a key/value record.
+///
+/// Facets travel as an array of records rather than a JSON object map because strict
+/// provider tool dialects close every object and cannot express string-keyed maps.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FacetArg {
+    key: String,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -227,7 +242,7 @@ struct RecordArgs {
     app: String,
     text: String,
     #[serde(default)]
-    facets: BTreeMap<String, String>,
+    facets: Vec<FacetArg>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +282,21 @@ pub fn definitions() -> Vec<ToolDefinition> {
     let id = json!({"type": "string", "description": "Feedback id, such as fb-12"});
     let statuses = json!(["open", "agent_resolved", "verified", "dismissed"]);
     let label = json!({"type": "string", "pattern": "^[a-z0-9._-]{1,64}$"});
+    let facets = |description: &str| {
+        json!({
+            "type": "array",
+            "description": description,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "pattern": "^[a-z0-9._-]{1,64}$"},
+                    "value": {"type": "string"}
+                },
+                "required": ["key", "value"],
+                "additionalProperties": false
+            }
+        })
+    };
     vec![
         tool(
             SEARCH,
@@ -279,7 +309,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "triage_state": {"enum": ["pending", "triaged"]},
                 "category": label,
                 "tags": {"type": "array", "items": label, "description": "Items must have every tag"},
-                "facets": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Exact facet key/value pairs"},
+                "facets": facets("Exact facet key/value pairs; items must match every one"),
                 "text": {"type": "string", "description": "Case-insensitive substring of the text, title or summary"},
                 "before": {"type": "string", "description": "next_before from a previous page"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_LIMIT}
@@ -299,7 +329,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             &json!({
                 "app": {"type": "string", "pattern": "^[a-z0-9._-]{1,64}$", "description": "Application id, such as bcode, bdata or bmux"},
                 "text": {"type": "string"},
-                "facets": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Context such as {\"bcode.model\": \"...\"}"}
+                "facets": facets("Context such as [{\"key\": \"bcode.model\", \"value\": \"...\"}]")
             }),
             &["app", "text"],
         ),

@@ -224,12 +224,52 @@ fn invalid_tool_arguments_are_reported_to_the_model() {
 }
 
 #[test]
-fn every_tool_schema_is_closed() {
+fn every_tool_schema_is_closed_and_strict_portable() {
+    let strict = bcode_model_schema::SchemaDialect {
+        object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+        ..bcode_model_schema::SchemaDialect::default()
+    };
     for definition in crate::tools::definitions() {
         assert_eq!(
             definition.input_schema["additionalProperties"], false,
             "{}",
             definition.name
         );
+        if let Err(error) = bcode_model_schema::normalize(&definition.input_schema, &strict) {
+            panic!("{} is not strict-portable: {error}", definition.name);
+        }
     }
+}
+
+#[test]
+fn tools_record_and_search_facets_as_key_value_records() {
+    let (_dir, mut plugin) = plugin();
+    let recorded = tool(
+        &mut plugin,
+        "feedback.record",
+        json!({
+            "app": "bcode",
+            "text": "slow",
+            "facets": [{"key": "bcode.model", "value": "gpt-6-luna"}]
+        }),
+    );
+    assert!(!recorded.is_error, "{}", recorded.output);
+    let found = tool(
+        &mut plugin,
+        "feedback.search",
+        json!({"facets": [{"key": "bcode.model", "value": "gpt-6-luna"}]}),
+    );
+    assert!(!found.is_error, "{}", found.output);
+    let found: Value = serde_json::from_str(&found.output).unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    let missing = tool(
+        &mut plugin,
+        "feedback.search",
+        json!({"facets": [{"key": "bcode.model", "value": "other"}]}),
+    );
+    let missing: Value = serde_json::from_str(&missing.output).unwrap();
+    assert_eq!(
+        missing["items"].as_array().unwrap().as_slice(),
+        [] as [Value; 0]
+    );
 }
