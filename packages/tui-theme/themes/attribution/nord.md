@@ -1,14 +1,16 @@
 # Nord palette attribution
 
-The bundled `nord.toml` theme is adapted from the Nord color palette.
+The bundled `palettes/nord.toml` palette takes its colors exactly from the Nord
+color palette and its official Visual Studio Code theme (see `upstream/nord.toml`).
 
 * Project: Nord — “An arctic, north-bluish color palette”
 * Author and copyright: Copyright (c) 2016-present Sven Greb <development@svengreb.de>
 * Source: https://github.com/nordtheme/nord
-* Palette source used: https://github.com/nordtheme/nord/blob/develop/src/nord.scss
+* Palette source used: https://github.com/nordtheme/nord/blob/1cef71605416a222e57225b544540ce0fcec18d4/src/nord.scss
+* Editor mapping used: https://github.com/nordtheme/visual-studio-code/blob/8ead09822c02d0d49d0f764104505e5a34d3689f/themes/nord-color-theme.json (MIT, same author)
 * License: MIT
 * License source: https://github.com/nordtheme/nord/blob/develop/license
-* Retrieved and reviewed: 2026-08-04
+* Retrieved and reviewed: 2026-08-04 (palette); 2026-11-20 (exact palette and editor mapping)
 
 ## MIT License
 

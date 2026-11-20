@@ -12,7 +12,7 @@ Swatches name terminal-controlled colors (`default` and the 16 ANSI colors) inst
 
 ### 1. terminal-native
 
-Also rendered identically by: `amber`, `aurora`, `ayu`, `ayu-mirage`, `blueprint`, `catppuccin-frappe`, `catppuccin-latte`, `catppuccin-macchiato`, `catppuccin-mocha`, `claude-code`, `dracula`, `dusk`, `ember`, `everforest`, `flexoki`, `github`, `github-dimmed`, `glacier`, `gruvbox`, `gruvbox-material`, `kanagawa`, `kanagawa-dragon`, `melange`, `modus`, `monochrome`, `monokai-classic`, `moss`, `neon-noir`, `night-owl`, `nightfox`, `one`, `oxocarbon`, `paper`, `phosphor`, `poimandres`, `rose-pine`, `rose-pine-moon`, `solarized`, `tokyonight`, `tokyonight-moon`, `tokyonight-storm`, `vesper`, `zenburn`.
+Also rendered identically by: `amber`, `aurora`, `ayu`, `ayu-mirage`, `blueprint`, `catppuccin-frappe`, `catppuccin-latte`, `catppuccin-macchiato`, `catppuccin-mocha`, `claude-code`, `dracula`, `dusk`, `ember`, `everforest`, `flexoki`, `github`, `github-dimmed`, `glacier`, `gruvbox`, `gruvbox-material`, `kanagawa`, `kanagawa-dragon`, `melange`, `modus`, `monochrome`, `monokai-classic`, `moss`, `neon-noir`, `night-owl`, `nightfox`, `nord`, `one`, `oxocarbon`, `paper`, `phosphor`, `poimandres`, `rose-pine`, `rose-pine-moon`, `solarized`, `tokyonight`, `tokyonight-moon`, `tokyonight-storm`, `vesper`, `zenburn`.
 
 ```text
 You
@@ -162,7 +162,7 @@ Bcode
 
 ### 3. bcode
 
-Also rendered identically by: `bcode-dark`, `bcode-light`, `high-contrast`, `nord`, `terminal-native-structured`.
+Also rendered identically by: `bcode-dark`, `bcode-light`, `high-contrast`, `terminal-native-structured`.
 
 ```text
 │
@@ -1104,7 +1104,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `night-owl` | `#021727` | `#d6deeb` | `#798797` | `#5f7e97` | `#262a39` | `#021727` | `#1d3b53` | `#82aaff` | `#c5e478` | `#ffd602` | `#ef5350` |
 | `night-shift` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#f05f5c` |
 | `nightfox` | `#192330` | `#cdcecf` | `#aeafb0` | `#71839b` | `#131a24` | `#131a24` | `#2b3b51` | `#719cd6` | `#81b29a` | `#dbc074` | `#c94f6d` |
-| `nord` | `#2e3440` | `#eceff4` | `#8492aa` | `#88c0d0` | `#4c566a` | `#3b4252` | `#434c5e` | `#81a1c1` | `#a3be8c` | `#ebcb8b` | `#e17f87` |
+| `nord` | `#2e3440` | `#d8dee9` | `#8f95a1` | `#3b4252` | `#3b4252` | `#3b4252` | `#434c5e` | `#88c0d0` | `#a3be8c` | `#ebcb8b` | `#bf616a` |
 | `one` | `#282c34` | `#abb2bf` | `#848b98` | `#5c6370` | `#3b3f4c` | `#31353f` | `#3b3f4c` | `#56b6c2` | `#98c379` | `#e5c07b` | `#e86671` |
 | `oxocarbon` | `#161616` | `#d0d0d0` | `#7e7e7e` | `#131313` | `#262626` | `#131313` | `#393939` | `#78a9ff` | `#42be65` | `#be95ff` | `#ee5396` |
 | `paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
@@ -1170,7 +1170,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `night-owl` | `#021727` | `#d6deeb` | `#798797` | `#5f7e97` | `#262a39` | `#021727` | `#1d3b53` | `#82aaff` | `#c5e478` | `#ffd602` | `#ef5350` |
 | `night-shift` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#f05f5c` |
 | `nightfox` | `#faf4ed` | `#575279` | `#625c87` | `#a8a3b3` | `#ebe5df` | `#ebe5df` | `#d0d8d8` | `#286983` | `#618774` | `#ea9d34` | `#b4637a` |
-| `nord` | `#2e3440` | `#eceff4` | `#8492aa` | `#88c0d0` | `#4c566a` | `#3b4252` | `#434c5e` | `#81a1c1` | `#a3be8c` | `#ebcb8b` | `#e17f87` |
+| `nord` | `#2e3440` | `#d8dee9` | `#8f95a1` | `#3b4252` | `#3b4252` | `#3b4252` | `#434c5e` | `#88c0d0` | `#a3be8c` | `#ebcb8b` | `#bf616a` |
 | `one` | `#fafafa` | `#383a42` | `#818387` | `#a0a1a7` | `#dcdcdc` | `#f0f0f0` | `#dcdcdc` | `#0184bc` | `#50a14f` | `#986801` | `#e45649` |
 | `oxocarbon` | `#161616` | `#d0d0d0` | `#7e7e7e` | `#131313` | `#262626` | `#131313` | `#393939` | `#78a9ff` | `#42be65` | `#be95ff` | `#ee5396` |
 | `paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |

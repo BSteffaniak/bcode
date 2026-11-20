@@ -430,6 +430,7 @@ mod tests {
         ("solarized", ResolvedThemeVariant::Light),
         ("zenburn", ResolvedThemeVariant::Dark),
         ("tokyonight-storm", ResolvedThemeVariant::Dark),
+        ("nord", ResolvedThemeVariant::Dark),
     ];
 
     #[test]

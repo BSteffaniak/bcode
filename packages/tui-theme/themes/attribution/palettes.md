@@ -19,6 +19,7 @@ for Bcode; `claude-code` is measured from Claude Code's renderer.
 | `rose-pine*` | Rosé Pine (main, moon, dawn) | github.com/rose-pine/neovim | MIT |
 | `kanagawa*` | Kanagawa (wave, lotus, dragon) | github.com/rebelot/kanagawa.nvim | MIT |
 | `everforest` | Everforest (medium background) | github.com/sainnhe/everforest | MIT |
+| `nord` | Nord | github.com/nordtheme/visual-studio-code (palette: github.com/nordtheme/nord, MIT); license text in `nord.md` | MIT |
 | `one` | One Dark (dark, light) | github.com/navarasu/onedark.nvim | MIT |
 | `solarized` | Solarized (dark, light) | github.com/altercation/solarized (group mapping: github.com/altercation/vim-colors-solarized) | MIT |
 | `github*` | GitHub (dark default, light default, dark dimmed) | github.com/projekt0n/github-nvim-theme | MIT |

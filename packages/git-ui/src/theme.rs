@@ -449,7 +449,7 @@ mod tests {
             declared.style("syntax.parameter")
         );
 
-        let undeclared = resolve("nord");
+        let undeclared = resolve("paper");
         assert_eq!(undeclared.style("syntax.constant"), None);
         let theme = GitTheme::from_definition(&undeclared);
         assert_eq!(

@@ -1383,9 +1383,34 @@ set = { plugin = { "test.git.max_files" = 99 } }
 
     #[test]
     fn contrast_adjustments_are_informational_in_text_and_json() {
-        let (_directory, roots) = roots();
+        let (directory, roots) = roots();
+        // A user theme that opts its authored colors into contrast enforcement, with an error
+        // red below 4.5:1 on its canvas.
+        std::fs::create_dir_all(directory.path().join("themes")).expect("themes dir");
+        write_fixture(
+            &directory,
+            "themes/enforced.toml",
+            r##"
+schema_version = 1
+id = "enforced"
+extends = ["terminal-native-structured"]
+contrast = "enforce"
+
+[palette]
+background = "#2e3440"
+error = "#bf616a"
+text = "#eceff4"
+
+[styles.canvas]
+bg = "$background"
+fg = "$text"
+
+[styles."state.error"]
+fg = "$error"
+"##,
+        );
         let report = check_target(
-            &CheckTarget::Id("nord".to_owned()),
+            &CheckTarget::Id("enforced".to_owned()),
             &roots,
             &PluginPresentationSchemas::default(),
         )

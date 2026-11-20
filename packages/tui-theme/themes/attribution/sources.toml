@@ -101,6 +101,9 @@ status = "upstream"
 [palettes.nightfox]
 status = "upstream"
 
+[palettes.nord]
+status = "upstream"
+
 [palettes.one]
 status = "upstream"
 

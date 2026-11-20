@@ -2276,6 +2276,86 @@ slot = "magenta"
 reason = "upstream Nightfox light: magenta magenta.base #907aa9 on bg1 #faf4ed"
 
 [[accepted]]
+theme = "nord"
+variant = "dark"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.24
+slot = "border_focused"
+reason = "upstream Nord: border_focused focusBorder nord1 #3b4252 on editor.background nord0 #2e3440 (Nord keeps borders deliberately subtle)"
+
+[[accepted]]
+theme = "nord"
+variant = "dark"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.05
+slot = "error"
+reason = "upstream Nord: error editorError.foreground nord11 #bf616a on editor.background nord0 #2e3440"
+
+[[accepted]]
+theme = "nord"
+variant = "dark"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.43
+slot = "comment"
+reason = "upstream Nord: comment #616e88 on editor.background nord0 #2e3440"
+
+[[accepted]]
+theme = "nord"
+variant = "dark"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.4
+slot = "magenta"
+reason = "upstream Nord: magenta nord15 #b48ead on editor.background nord0 #2e3440"
+
+[[accepted]]
+theme = "nord"
+variant = "light"
+kind = "contrast"
+foreground = "border.focused"
+background = "canvas"
+ratio = 1.24
+slot = "border_focused"
+reason = "upstream Nord: border_focused focusBorder nord1 #3b4252 on editor.background nord0 #2e3440 (Nord keeps borders deliberately subtle)"
+
+[[accepted]]
+theme = "nord"
+variant = "light"
+kind = "contrast"
+foreground = "state.error"
+background = "canvas"
+ratio = 3.05
+slot = "error"
+reason = "upstream Nord: error editorError.foreground nord11 #bf616a on editor.background nord0 #2e3440"
+
+[[accepted]]
+theme = "nord"
+variant = "light"
+kind = "contrast"
+foreground = "syntax.comment"
+background = "canvas"
+ratio = 2.43
+slot = "comment"
+reason = "upstream Nord: comment #616e88 on editor.background nord0 #2e3440"
+
+[[accepted]]
+theme = "nord"
+variant = "light"
+kind = "contrast"
+foreground = "transcript.assistant.label"
+background = "canvas"
+ratio = 4.4
+slot = "magenta"
+reason = "upstream Nord: magenta nord15 #b48ead on editor.background nord0 #2e3440"
+
+[[accepted]]
 theme = "one"
 variant = "dark"
 kind = "contrast"

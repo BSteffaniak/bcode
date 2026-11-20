@@ -18,7 +18,6 @@ pub const BUNDLED_THEMES: &[(&str, &str)] = &[
         "high-contrast",
         include_str!("../themes/high-contrast.toml"),
     ),
-    ("nord", include_str!("../themes/nord.toml")),
     ("seeded-base", include_str!("../themes/seeded-base.toml")),
     ("amber", include_str!("../themes/palettes/amber.toml")),
     ("aurora", include_str!("../themes/palettes/aurora.toml")),
@@ -86,6 +85,7 @@ pub const BUNDLED_THEMES: &[(&str, &str)] = &[
         "neon-noir",
         include_str!("../themes/palettes/neon-noir.toml"),
     ),
+    ("nord", include_str!("../themes/palettes/nord.toml")),
     (
         "night-owl",
         include_str!("../themes/palettes/night-owl.toml"),

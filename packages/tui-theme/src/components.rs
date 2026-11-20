@@ -384,10 +384,6 @@ mod tests {
 
         // Without a complete set terminal output keeps the terminal's own colors.
         assert_eq!(
-            terminal_palette(&bundled("nord", ResolvedThemeVariant::Dark)),
-            None
-        );
-        assert_eq!(
             terminal_palette(&bundled("catppuccin-mocha", ResolvedThemeVariant::Dark)),
             None
         );

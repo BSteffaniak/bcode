@@ -1,0 +1,213 @@
+# Upstream reference for the `nord` palette. Nord has no official Neovim port;
+# the official editor theme, Nord Visual Studio Code (`file` at `revision`), is
+# the source of the slot mapping: its `colors` (workbench) and `tokenColors`
+# (TextMate scopes), resolved as VS Code does (a scope rule also colors its
+# more specific scopes, so variable.other.property takes `variable.other`).
+# Upstream writes token hex in uppercase; values here are lowercase.
+# The named palette colors nord0..nord15 come from the palette specification,
+# src/nord.scss in https://github.com/nordtheme/nord at
+# 1cef71605416a222e57225b544540ce0fcec18d4 (MIT); the hues use those names
+# (blue is nord9, which is also the terminal blue; nord10, the darker
+# import/preprocessor blue, has no slot). Nord has no purple distinct from
+# magenta (nord15), so violet is omitted.
+#
+# The accent is nord8 (#88c0d0): the specification names it "the accent color
+# of the color palette ... main color for primary UI elements", and the VS Code
+# theme leads its UI with it (textLink, activityBar.activeBorder,
+# list.activeSelectionBackground). success is nord14, which the specification
+# names the color of "success visualizations"; info is
+# debugConsole.infoForeground (nord8; VS Code defines no editorInfo color).
+# surface is the hover widget (editorWidget.background is the canvas itself).
+# selection: editor.selectionBackground is #434c5ecc (translucent); the slot
+# uses upstream's opaque value of the same color, editorSuggestWidget's
+# selected background (#434c5e, nord2, which the specification names the
+# selection color). diff_add/diff_remove are markup.inserted/markup.deleted.
+# Not mapped, because upstream defines no opaque equivalent: `muted` (the
+# secondary foregrounds descriptionForeground #d8dee9e6 and
+# tab.inactiveForeground #d8dee966 are translucent), the diff row fills
+# (diffEditor.insertedTextBackground #81a1c133 and removedTextBackground
+# #bf616a4d are translucent), and `markup_code_bg` (inline raw sets no
+# background). Markdown roles read the `text.html.markdown` rules.
+# Terminal colors: terminal.ansiBlack .. terminal.ansiBrightWhite and the
+# terminal default terminal.foreground / terminal.background from the same
+# file (the same sixteen colors nordtheme/vim sets as g:terminal_color_0..15).
+palette  = "nord"
+scheme   = "Nord"
+source   = "https://github.com/nordtheme/visual-studio-code"
+revision = "8ead09822c02d0d49d0f764104505e5a34d3689f"
+license  = "MIT"
+
+[variants.dark]
+file = "themes/nord-color-theme.json; named colors: src/nord.scss (nordtheme/nord @ 1cef71605416a222e57225b544540ce0fcec18d4)"
+
+[variants.dark.colors]
+nord0                                                     = "#2e3440"
+nord1                                                     = "#3b4252"
+nord2                                                     = "#434c5e"
+nord3                                                     = "#4c566a"
+nord4                                                     = "#d8dee9"
+nord5                                                     = "#e5e9f0"
+nord6                                                     = "#eceff4"
+nord7                                                     = "#8fbcbb"
+nord8                                                     = "#88c0d0"
+nord9                                                     = "#81a1c1"
+nord10                                                    = "#5e81ac"
+nord11                                                    = "#bf616a"
+nord12                                                    = "#d08770"
+nord13                                                    = "#ebcb8b"
+nord14                                                    = "#a3be8c"
+nord15                                                    = "#b48ead"
+"editor.background"                                       = "#2e3440"
+"editor.foreground"                                       = "#d8dee9"
+"editor.lineHighlightBackground"                          = "#3b4252"
+"editorLineNumber.foreground"                             = "#4c566a"
+"editorHoverWidget.background"                            = "#3b4252"
+"editorSuggestWidget.selectedBackground"                  = "#434c5e"
+"panel.border"                                            = "#3b4252"
+focusBorder                                               = "#3b4252"
+"debugConsole.infoForeground"                             = "#88c0d0"
+"editorWarning.foreground"                                = "#ebcb8b"
+"editorError.foreground"                                  = "#bf616a"
+"terminal.background"                                     = "#2e3440"
+"terminal.foreground"                                     = "#d8dee9"
+"terminal.ansiBlack"                                      = "#3b4252"
+"terminal.ansiRed"                                        = "#bf616a"
+"terminal.ansiGreen"                                      = "#a3be8c"
+"terminal.ansiYellow"                                     = "#ebcb8b"
+"terminal.ansiBlue"                                       = "#81a1c1"
+"terminal.ansiMagenta"                                    = "#b48ead"
+"terminal.ansiCyan"                                       = "#88c0d0"
+"terminal.ansiWhite"                                      = "#e5e9f0"
+"terminal.ansiBrightBlack"                                = "#4c566a"
+"terminal.ansiBrightRed"                                  = "#bf616a"
+"terminal.ansiBrightGreen"                                = "#a3be8c"
+"terminal.ansiBrightYellow"                               = "#ebcb8b"
+"terminal.ansiBrightBlue"                                 = "#81a1c1"
+"terminal.ansiBrightMagenta"                              = "#b48ead"
+"terminal.ansiBrightCyan"                                 = "#8fbcbb"
+"terminal.ansiBrightWhite"                                = "#eceff4"
+comment                                                   = "#616e88"
+keyword                                                   = "#81a1c1"
+"keyword.operator"                                        = "#81a1c1"
+"entity.name.function"                                    = "#88c0d0"
+"entity.name.class"                                       = "#8fbcbb"
+"variable.other"                                          = "#d8dee9"
+"variable.parameter"                                      = "#d8dee9"
+string                                                    = "#a3be8c"
+"constant.numeric"                                        = "#b48ead"
+"constant.language"                                       = "#81a1c1"
+punctuation                                               = "#eceff4"
+"support.function"                                        = "#88c0d0"
+"entity.name.tag"                                         = "#81a1c1"
+"entity.other.attribute-name"                             = "#8fbcbb"
+"markup.inserted"                                         = "#a3be8c"
+"markup.deleted"                                          = "#bf616a"
+"markup.heading"                                          = "#88c0d0"
+"text.html.markdown string.other.link.title"              = "#88c0d0"
+"text.html.markdown markup.inline.raw"                    = "#8fbcbb"
+"text.html.markdown beginning.punctuation.definition.list" = "#81a1c1"
+
+[variants.dark.slots]
+background          = "editor.background"
+text                = "editor.foreground"
+accent              = "nord8"
+blue                = "nord9"
+cyan                = "nord8"
+green               = "nord14"
+magenta             = "nord15"
+orange              = "nord12"
+red                 = "nord11"
+yellow              = "nord13"
+info                = "debugConsole.infoForeground"
+success             = "nord14"
+warning             = "editorWarning.foreground"
+error               = "editorError.foreground"
+comment             = "comment"
+border              = "panel.border"
+border_focused      = "focusBorder"
+surface             = "editorHoverWidget.background"
+selection           = "editorSuggestWidget.selectedBackground"
+line_highlight      = "editor.lineHighlightBackground"
+gutter              = "editorLineNumber.foreground"
+diff_add            = "markup.inserted"
+diff_remove         = "markup.deleted"
+syntax_keyword      = "keyword"
+syntax_function     = "entity.name.function"
+syntax_variable     = "variable.other"
+syntax_string       = "string"
+syntax_number       = "constant.numeric"
+syntax_type         = "entity.name.class"
+syntax_operator     = "keyword.operator"
+syntax_punctuation  = "punctuation"
+syntax_constant     = "constant.language"
+syntax_parameter    = "variable.parameter"
+syntax_property     = "variable.other"
+syntax_builtin      = "support.function"
+syntax_tag          = "entity.name.tag"
+syntax_attribute    = "entity.other.attribute-name"
+markup_heading      = "markup.heading"
+markup_link         = "text.html.markdown string.other.link.title"
+markup_raw          = "text.html.markdown markup.inline.raw"
+markup_code         = "text.html.markdown markup.inline.raw"
+markup_list         = "text.html.markdown beginning.punctuation.definition.list"
+ansi_black          = "terminal.ansiBlack"
+ansi_red            = "terminal.ansiRed"
+ansi_green          = "terminal.ansiGreen"
+ansi_yellow         = "terminal.ansiYellow"
+ansi_blue           = "terminal.ansiBlue"
+ansi_magenta        = "terminal.ansiMagenta"
+ansi_cyan           = "terminal.ansiCyan"
+ansi_white          = "terminal.ansiWhite"
+ansi_bright_black   = "terminal.ansiBrightBlack"
+ansi_bright_red     = "terminal.ansiBrightRed"
+ansi_bright_green   = "terminal.ansiBrightGreen"
+ansi_bright_yellow  = "terminal.ansiBrightYellow"
+ansi_bright_blue    = "terminal.ansiBrightBlue"
+ansi_bright_magenta = "terminal.ansiBrightMagenta"
+ansi_bright_cyan    = "terminal.ansiBrightCyan"
+ansi_bright_white   = "terminal.ansiBrightWhite"
+terminal_fg         = "terminal.foreground"
+terminal_bg         = "terminal.background"
+
+[variants.dark.roles]
+"canvas.bg"               = "editor.background"
+"canvas.fg"               = "editor.foreground"
+"text.primary.fg"         = "editor.foreground"
+"border.default.fg"       = "panel.border"
+"border.focused.fg"       = "focusBorder"
+"surface.raised.bg"       = "editorHoverWidget.background"
+"surface.overlay.bg"      = "editorHoverWidget.background"
+"selection.active.bg"     = "editorSuggestWidget.selectedBackground"
+"selection.inactive.bg"   = "editor.lineHighlightBackground"
+"source.gutter.fg"        = "editorLineNumber.foreground"
+"state.info.fg"           = "debugConsole.infoForeground"
+"state.success.fg"        = "nord14"
+"state.warning.fg"        = "editorWarning.foreground"
+"state.error.fg"          = "editorError.foreground"
+"diff.added.fg"           = "markup.inserted"
+"diff.removed.fg"         = "markup.deleted"
+"markdown.text.fg"        = "editor.foreground"
+"markdown.heading.fg"     = "markup.heading"
+"markdown.link.fg"        = "text.html.markdown string.other.link.title"
+"link.fg"                 = "text.html.markdown string.other.link.title"
+"markdown.inline_code.fg" = "text.html.markdown markup.inline.raw"
+"markdown.list_marker.fg" = "text.html.markdown beginning.punctuation.definition.list"
+"syntax.text.fg"          = "editor.foreground"
+"syntax.comment.fg"       = "comment"
+"syntax.keyword.fg"       = "keyword"
+"syntax.function.fg"      = "entity.name.function"
+"syntax.variable.fg"      = "variable.other"
+"syntax.string.fg"        = "string"
+"syntax.number.fg"        = "constant.numeric"
+"syntax.type.fg"          = "entity.name.class"
+"syntax.operator.fg"      = "keyword.operator"
+"syntax.punctuation.fg"   = "punctuation"
+"syntax.constant.fg"      = "constant.language"
+"syntax.parameter.fg"     = "variable.parameter"
+"syntax.property.fg"      = "variable.other"
+"syntax.builtin.fg"       = "support.function"
+"syntax.tag.fg"           = "entity.name.tag"
+"syntax.attribute.fg"     = "entity.other.attribute-name"
+"syntax.heading.fg"       = "markup.heading"
+"syntax.link.fg"          = "text.html.markdown string.other.link.title"
+"syntax.raw.fg"           = "text.html.markdown markup.inline.raw"

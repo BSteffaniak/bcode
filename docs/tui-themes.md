@@ -950,7 +950,7 @@ render path; `--check` fails when it is stale.
 * `bcode-dark` and `bcode-light` provide first-party opaque palettes.
 * `monochrome` emphasizes glyphs and modifiers rather than color distinctions.
 * `high-contrast` provides strong focus, selection, warning, error, and success distinctions.
-* `nord` adapts the Nord palette under its MIT license; source, copyright, and license text are recorded in `packages/tui-theme/themes/attribution/nord.md`.
+* `nord` takes its colors exactly from the Nord palette and its official Visual Studio Code theme (MIT); source, copyright, and license text are recorded in `packages/tui-theme/themes/attribution/nord.md` and `attribution/upstream/nord.toml`.
 
 ## Authoring format
 

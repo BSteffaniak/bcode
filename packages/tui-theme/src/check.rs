@@ -1157,11 +1157,33 @@ yellow = "#8c6c3e"
         assert!(report.summary.infos >= adjusted);
     }
 
+    /// A theme that opts its authored colors into contrast enforcement, with an error red that
+    /// reads below 4.5:1 on its canvas.
+    const ENFORCED_AUTHORED: &str = r##"
+schema_version = 1
+id = "enforced"
+extends = ["terminal-native-structured"]
+contrast = "enforce"
+
+[palette]
+background = "#2e3440"
+error = "#bf616a"
+text = "#eceff4"
+
+[styles.canvas]
+bg = "$background"
+fg = "$text"
+
+[styles."state.error"]
+fg = "$error"
+modifiers = ["bold"]
+"##;
+
     #[test]
     fn enforced_authored_adjustments_do_not_fail_strict() {
         let report = check_theme(
-            &ThemeCatalog::bundled().expect("bundled"),
-            "nord",
+            &catalog_with(ENFORCED_AUTHORED),
+            "enforced",
             &[],
             &[],
             |_| Vec::new(),
@@ -1172,7 +1194,7 @@ yellow = "#8c6c3e"
             .iter()
             .flat_map(|variant| &variant.adjustments)
             .find(|row| row.role == "state.error" && row.background == "canvas")
-            .expect("nord's authored error red is adjusted");
+            .expect("the authored error red is adjusted");
         assert_eq!(error.channel, AdjustmentChannel::Fg);
         assert_eq!(error.before, "#bf616a");
         assert_eq!(error.after, "#e17f87");

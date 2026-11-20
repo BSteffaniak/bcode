@@ -1785,13 +1785,25 @@ set = { disclosure = "expanded", detail = "verbose" }
 
     #[test]
     fn contrast_adjustments_reject_roles_outside_the_pair_table() {
-        let catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        let mut catalog = ThemeCatalog::bundled().expect("bundled themes parse");
+        catalog.insert(
+            parse_theme_definition(
+                "enforced.toml",
+                r#"
+schema_version = 2
+id = "enforced"
+extends = ["nord"]
+contrast = "enforce"
+"#,
+            )
+            .expect("enforced theme parses"),
+        );
         let resolved = catalog
-            .resolve(&ThemeSelection::new("nord").variant(ResolvedThemeVariant::Dark))
-            .expect("nord resolves");
+            .resolve(&ThemeSelection::new("enforced").variant(ResolvedThemeVariant::Dark))
+            .expect("enforced resolves");
         let mut encoded = serde_json::to_value(&resolved).expect("serializes");
         let adjustment = &mut encoded["contrast_adjustments"][0];
-        assert!(adjustment.is_object(), "nord has contrast adjustments");
+        assert!(adjustment.is_object(), "the theme has contrast adjustments");
         adjustment["role"] = "not.a.pair".into();
         let error = serde_json::from_value::<ResolvedThemeDefinition>(encoded)
             .expect_err("unknown pair role is rejected");
