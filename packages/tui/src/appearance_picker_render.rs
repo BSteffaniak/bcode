@@ -1,12 +1,15 @@
 //! Combined palette × profile picker rendering and hit testing.
 //!
 //! One layout definition, [`appearance_layout`], places the two axis columns,
-//! the preview pane, and the diagnostic row. Painting and mouse hit testing
-//! both derive their rectangles from it, so a click always lands on what was
-//! painted, and a wheel notch always scrolls the column under the pointer.
-//! Narrow modals degrade explicitly: first the preview is dropped, then the
-//! columns stack vertically, and finally only the active axis column is
-//! shown.
+//! the preview pane, the contrast rows and the diagnostic row. Painting and
+//! mouse hit testing both derive their rectangles from it, so a click always
+//! lands on what was painted, and a wheel notch always scrolls the column (or
+//! steps the contrast row) under the pointer. Narrow modals degrade
+//! explicitly: first the preview is dropped, then the columns stack
+//! vertically, and finally only the active axis column is shown. The contrast
+//! rows need the body to keep at least [`CONTRAST_MIN_COLUMNS_HEIGHT`] rows
+//! for the columns, and drop their labels before their controls when narrow;
+//! without room they are not painted (the keys still adjust them).
 
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
@@ -15,11 +18,17 @@ use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span};
 use bmux_tui::style::Modifier;
+use bmux_tui::text_width::display_width;
 use bmux_tui_components::modal_frame::{
     ModalFrame, ModalFrameComponent, ModalPlacement, ModalSizing,
 };
+use bmux_tui_components::progress_bar::{
+    ProgressBarComponent, ProgressBarPolicy, ProgressBarStyles, ProgressBarValue,
+};
 
-use super::appearance_picker::{APPEARANCE_PICKER_SCOPE, AppearanceAxis, AppearancePickerState};
+use super::appearance_picker::{
+    APPEARANCE_PICKER_SCOPE, AppearanceAxis, AppearancePickerState, ContrastRow,
+};
 use super::render::TuiTheme;
 use super::theme::ThemeCatalogEntry;
 
@@ -38,6 +47,17 @@ const PREVIEW_MIN_WIDTH: u16 = 36;
 const PREVIEW_MIN_HEIGHT: u16 = 7;
 /// Shortest body that stacks both columns (a header and one row each).
 const STACKED_MIN_HEIGHT: u16 = 4;
+/// The contrast rows, in painted order.
+const CONTRAST_ROWS: [ContrastRow; 2] = [ContrastRow::Factor, ContrastRow::Minimum];
+/// Rows the columns keep above the contrast rows (a header and two rows).
+pub const CONTRAST_MIN_COLUMNS_HEIGHT: u16 = 3;
+/// Narrowest contrast control that keeps its row label beside it.
+const CONTRAST_CONTROL_MIN_WIDTH: u16 = 12;
+/// Gap between a contrast row's label and its control.
+const CONTRAST_LABEL_GAP: u16 = 1;
+/// Marker before the focused contrast row's label (and blank space before the others).
+const CONTRAST_FOCUS_MARKER: &str = "› ";
+const CONTRAST_BLUR_MARKER: &str = "  ";
 
 /// How the body degrades with the available area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +127,8 @@ pub struct AppearanceLayout {
     pub preview: Option<Rect>,
     /// Diagnostic row for skipped catalog entries.
     pub diagnostic: Option<Rect>,
+    /// Contrast rows, when the body has room for them.
+    pub contrast: Option<[ContrastRowLayout; 2]>,
 }
 
 impl AppearanceLayout {
@@ -114,6 +136,79 @@ impl AppearanceLayout {
     pub fn columns(&self) -> impl Iterator<Item = AppearanceColumn> {
         self.palette.into_iter().chain(self.profile)
     }
+
+    /// Return the painted contrast rows, slider first.
+    pub fn contrast_rows(&self) -> impl Iterator<Item = ContrastRowLayout> {
+        self.contrast.into_iter().flatten()
+    }
+}
+
+/// One painted contrast row: its label (when it fits) and its control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContrastRowLayout {
+    /// Which row.
+    pub row: ContrastRow,
+    /// The whole row; a press anywhere on it focuses the row.
+    pub area: Rect,
+    /// Focus marker and label.
+    pub label: Option<Rect>,
+    /// The slider or value list.
+    pub control: Rect,
+}
+
+/// Cells the widest contrast label takes with its focus marker and gap.
+fn contrast_label_width() -> u16 {
+    let label = CONTRAST_ROWS
+        .iter()
+        .map(|row| display_width(row.label()))
+        .max()
+        .unwrap_or(0)
+        + display_width(CONTRAST_FOCUS_MARKER);
+    u16::try_from(label)
+        .unwrap_or(u16::MAX)
+        .saturating_add(CONTRAST_LABEL_GAP)
+}
+
+fn contrast_row_layout(row: ContrastRow, area: Rect) -> ContrastRowLayout {
+    let label = contrast_label_width();
+    if area.width >= label.saturating_add(CONTRAST_CONTROL_MIN_WIDTH) {
+        ContrastRowLayout {
+            row,
+            area,
+            label: Some(Rect::new(
+                area.x,
+                area.y,
+                label - CONTRAST_LABEL_GAP,
+                area.height,
+            )),
+            control: Rect::new(area.x + label, area.y, area.width - label, area.height),
+        }
+    } else {
+        ContrastRowLayout {
+            row,
+            area,
+            label: None,
+            control: area,
+        }
+    }
+}
+
+/// Split the contrast rows off the bottom of `body` when the columns keep
+/// [`CONTRAST_MIN_COLUMNS_HEIGHT`] rows above them.
+fn split_contrast(body: Rect) -> (Rect, Option<[ContrastRowLayout; 2]>) {
+    let rows = u16::try_from(CONTRAST_ROWS.len()).unwrap_or(u16::MAX);
+    if body.width == 0 || body.height < rows.saturating_add(CONTRAST_MIN_COLUMNS_HEIGHT) {
+        return (body, None);
+    }
+    let top = body.bottom() - rows;
+    let row = |index: u16| Rect::new(body.x, top + index, body.width, 1);
+    (
+        Rect::new(body.x, body.y, body.width, body.height - rows),
+        Some([
+            contrast_row_layout(ContrastRow::Factor, row(0)),
+            contrast_row_layout(ContrastRow::Minimum, row(1)),
+        ]),
+    )
 }
 
 /// Lay out the picker body inside the modal content area.
@@ -135,6 +230,7 @@ pub fn appearance_layout(
     } else {
         (content, None)
     };
+    let (body, contrast) = split_contrast(body);
     let columns_width = COLUMN_MIN_WIDTH * 2 + COLUMN_GAP;
     let side_by_side = |area: Rect| {
         let left = area.width.saturating_sub(COLUMN_GAP) / 2;
@@ -173,6 +269,7 @@ pub fn appearance_layout(
                 body.height,
             )),
             diagnostic,
+            contrast,
         };
     }
     if body.width >= columns_width {
@@ -183,6 +280,7 @@ pub fn appearance_layout(
             profile: Some(profile),
             preview: None,
             diagnostic,
+            contrast,
         };
     }
     if body.height >= STACKED_MIN_HEIGHT {
@@ -199,6 +297,7 @@ pub fn appearance_layout(
             )),
             preview: None,
             diagnostic,
+            contrast,
         };
     }
     let column = AppearanceColumn::new(active, body);
@@ -208,6 +307,7 @@ pub fn appearance_layout(
         profile: (active == AppearanceAxis::Profile).then_some(column),
         preview: None,
         diagnostic,
+        contrast,
     }
 }
 
@@ -252,6 +352,9 @@ pub fn render_appearance_picker_with_keymap(
     if let Some(preview) = body.preview {
         render_preview(picker, preview, frame, theme);
     }
+    for row in body.contrast_rows() {
+        render_contrast_row(picker, row, frame, theme);
+    }
     let diagnostics = picker.palettes().diagnostics();
     if let (Some(row), Some(diagnostic)) = (body.diagnostic, diagnostics.first()) {
         let more = match diagnostics.len() - 1 {
@@ -266,6 +369,113 @@ pub fn render_appearance_picker_with_keymap(
             )]),
             theme.overlay,
         );
+    }
+}
+
+/// Paint one contrast row: the focus marker and label, then the factor slider
+/// (a line gauge over the accepted range, labelled with the value) or the
+/// minimum-contrast choices with the current one highlighted.
+fn render_contrast_row(
+    picker: &AppearancePickerState,
+    layout: ContrastRowLayout,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+) {
+    let focused = picker.contrast().focus() == Some(layout.row);
+    let shown = picker.contrast().shown();
+    frame.fill(LocalRect::terminal(layout.area), " ", theme.overlay);
+    if let Some(label) = layout.label {
+        let (marker, style) = if focused {
+            (
+                CONTRAST_FOCUS_MARKER,
+                theme.focused.add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (CONTRAST_BLUR_MARKER, theme.muted)
+        };
+        frame.write_line_with_fallback_style(
+            LocalRect::terminal(label),
+            &Line::from_spans(vec![Span::styled(
+                format!("{marker}{}", layout.row.label()),
+                style,
+            )]),
+            theme.overlay,
+        );
+    }
+    match layout.row {
+        ContrastRow::Factor => {
+            let range = bcode_tui_theme_models::CONTRAST_FACTOR_MAX
+                - bcode_tui_theme_models::CONTRAST_FACTOR_MIN;
+            let position =
+                (shown.factor.get() - bcode_tui_theme_models::CONTRAST_FACTOR_MIN) / range;
+            // Hundredths of the range: exact for every value on the 0.05 slider grid.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let value = (position * 100.0).round().clamp(0.0, 100.0) as u64;
+            let label = format!("{}×", shown.factor);
+            let gauge = ProgressBarComponent::new(
+                "appearance.contrast",
+                ProgressBarValue::determinate(value, 100),
+            )
+            .label(&label)
+            .policy(ProgressBarPolicy::compact().line_gauge())
+            .styles({
+                let filled = if focused { theme.focused } else { theme.text };
+                ProgressBarStyles {
+                    filled,
+                    empty: theme.muted,
+                    label: filled,
+                    complete: filled,
+                    indeterminate: filled,
+                    background: theme.overlay,
+                }
+            });
+            let gauge_layout = gauge.layout(
+                Constraints::tight(layout.control.size()),
+                &mut LayoutCx::new(),
+            );
+            frame.with_child(
+                i32::from(layout.control.x),
+                i64::from(layout.control.y),
+                LocalRect::new(0, 0, layout.control.width, layout.control.height),
+                |cx| gauge.paint(&gauge_layout, cx),
+            );
+        }
+        ContrastRow::Minimum => {
+            let current = shown.minimum;
+            let mut spans = Vec::new();
+            let choices = std::iter::once(bcode_tui_theme::adjustment::MinimumContrast::OFF).chain(
+                bcode_tui_theme_models::MINIMUM_CONTRAST_PRESETS
+                    .iter()
+                    .filter_map(|ratio| {
+                        bcode_tui_theme::adjustment::MinimumContrast::new(*ratio).ok()
+                    }),
+            );
+            let mut listed = false;
+            for (index, choice) in choices.enumerate() {
+                if index > 0 {
+                    spans.push(Span::styled(" ", theme.overlay));
+                }
+                let chosen = choice == current;
+                listed |= chosen;
+                let style = match (chosen, focused) {
+                    (true, true) => theme.selection,
+                    (true, false) => theme
+                        .text
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
+                    (false, _) => theme.muted,
+                };
+                spans.push(Span::styled(format!(" {choice} "), style));
+            }
+            if !listed {
+                // A configured floor between the presets is shown as it is.
+                spans.push(Span::styled(format!("  {current}"), theme.text));
+            }
+            frame.write_line_with_fallback_style(
+                LocalRect::terminal(layout.control),
+                &Line::from_spans(spans),
+                theme.overlay,
+            );
+        }
     }
 }
 
@@ -301,7 +511,8 @@ fn render_column(
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
-    let active = picker.axis() == column.axis;
+    // A focused contrast row takes the focus from the columns.
+    let active = picker.axis() == column.axis && picker.contrast().focus().is_none();
     if let Some(header) = column.header {
         let (marker, style) = if active {
             ("› ", theme.focused.add_modifier(Modifier::BOLD))
@@ -464,6 +675,8 @@ pub enum AppearanceHit {
     Axis(AppearanceAxis),
     /// One absolute row of an axis.
     Row(AppearanceAxis, usize),
+    /// A contrast row: focus it.
+    Contrast(ContrastRow),
 }
 
 /// Resolve a left mouse press against the painted layout.
@@ -507,11 +720,34 @@ pub fn appearance_picker_wheel(
         .map(|column| (column.axis, forward))
 }
 
+/// Resolve a vertical wheel notch over a painted contrast row: the row and
+/// whether the notch raises its value (scrolling up raises it).
+#[must_use]
+pub fn appearance_picker_contrast_wheel(
+    picker: &AppearancePickerState,
+    mouse: MouseEvent,
+    frame_area: Rect,
+    theme: TuiTheme,
+) -> Option<(ContrastRow, bool)> {
+    let raise = match mouse.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    appearance_picker_layout(picker, frame_area, theme)
+        .contrast_rows()
+        .find(|row| row.area.contains(mouse.position))
+        .map(|row| (row.row, raise))
+}
+
 fn hit_in_layout(
     picker: &AppearancePickerState,
     layout: &AppearanceLayout,
     point: Point,
 ) -> Option<AppearanceHit> {
+    if let Some(row) = layout.contrast_rows().find(|row| row.area.contains(point)) {
+        return Some(AppearanceHit::Contrast(row.row));
+    }
     let column = layout
         .columns()
         .find(|column| column.area().contains(point))?;
@@ -594,6 +830,7 @@ mod tests {
                     .map(|column| column.area())
                     .chain(layout.preview)
                     .chain(layout.diagnostic)
+                    .chain(layout.contrast_rows().map(|row| row.area))
                     .collect::<Vec<_>>();
                 for rect in &painted {
                     assert!(
@@ -961,6 +1198,93 @@ mod tests {
         assert!(buffer.cells().iter().any(|cell| {
             cell.style.bg == theme.selection.bg && cell.style.fg == theme.selection.fg
         }));
+    }
+
+    #[test]
+    fn contrast_rows_paint_their_values_and_hits_agree_at_every_size() {
+        let theme = TuiTheme::for_theme_id("bcode-dark");
+        for area in [
+            Rect::new(0, 0, 130, 44),
+            Rect::new(0, 0, 50, 20),
+            Rect::new(0, 0, 30, 12),
+            Rect::new(0, 0, 12, 12),
+            Rect::new(0, 0, 6, 12),
+            Rect::new(0, 0, 40, 9),
+            Rect::new(0, 0, 40, 6),
+            Rect::new(0, 0, 1, 1),
+        ] {
+            let mut picker = picker(AppearanceAxis::Palette);
+            picker.focus_contrast(ContrastRow::Minimum);
+            let (buffer, _) = render_into(&mut picker, area);
+            let layout = appearance_picker_layout(&picker, area, theme);
+            let content = appearance_picker_modal(theme).content_area(area);
+            if content.height < 2 + CONTRAST_MIN_COLUMNS_HEIGHT {
+                assert!(layout.contrast.is_none(), "{area:?}");
+            }
+            for row in layout.contrast_rows() {
+                assert!(
+                    row.area.x >= content.x
+                        && row.area.right() <= content.right()
+                        && row.area.bottom() <= content.bottom(),
+                    "{area:?}: {row:?}"
+                );
+                let painted = buffer.row_symbols(row.area.y).unwrap();
+                if row.label.is_some() {
+                    assert!(painted.contains(row.row.label()), "{area:?}: {painted}");
+                }
+                if row.row == ContrastRow::Minimum && row.control.width >= 24 {
+                    assert!(
+                        painted.contains("off   3.0   4.5   7.0"),
+                        "{area:?}: {painted}"
+                    );
+                }
+                if row.row == ContrastRow::Factor && row.control.width >= 16 {
+                    assert!(painted.contains("1.00×"), "{area:?}: {painted}");
+                }
+                // A press anywhere on the row focuses it; the wheel over it steps it.
+                for x in [row.area.x, row.area.right() - 1] {
+                    assert_eq!(
+                        appearance_picker_hit(&picker, press(x, row.area.y), area, theme),
+                        Some(AppearanceHit::Contrast(row.row))
+                    );
+                    assert_eq!(
+                        appearance_picker_contrast_wheel(
+                            &picker,
+                            MouseEvent::new(MouseEventKind::ScrollUp, Point::new(x, row.area.y)),
+                            area,
+                            theme
+                        ),
+                        Some((row.row, true))
+                    );
+                }
+                // Column hits never reach into the contrast rows.
+                for column in layout.columns() {
+                    assert!(column.area().intersection(row.area).is_empty());
+                }
+            }
+            // The focus marker sits on the focused row only.
+            if let Some([factor, minimum]) = layout.contrast
+                && factor.label.is_some()
+            {
+                let marker = |row: ContrastRowLayout| {
+                    region_text(&buffer, row.label.expect("label"))[0]
+                        .starts_with(CONTRAST_FOCUS_MARKER.trim_end())
+                };
+                assert!(marker(minimum) && !marker(factor), "{area:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_slider_shows_the_presented_factor() {
+        let mut picker = picker(AppearanceAxis::Palette);
+        picker.focus_contrast(ContrastRow::Factor);
+        for _ in 0..4 {
+            picker.step_contrast(ContrastRow::Factor, true);
+        }
+        let (_, text) = render_into(&mut picker, Rect::new(0, 0, 130, 44));
+        assert!(text.contains("1.20×"), "{text}");
+        assert!(!text.contains("1.00×"), "{text}");
     }
 
     #[test]

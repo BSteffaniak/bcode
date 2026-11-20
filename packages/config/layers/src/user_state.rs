@@ -223,6 +223,91 @@ pub fn save_tui_appearance(
     })
 }
 
+/// Per-theme values the appearance picker saved (`[theme.overrides.<theme-id>]`), read as `T`.
+///
+/// The values mirror `[tui.theme.overrides.<theme-id>]` in configuration and replace the
+/// configured ones they set. A missing file or section saves nothing.
+///
+/// # Errors
+///
+/// * [`LayersError::Io`] when the file exists but cannot be read.
+/// * [`LayersError::Composition`] when it is not TOML or an override does not parse as `T`.
+pub fn load_saved_theme_overrides<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<std::collections::BTreeMap<String, T>, LayersError> {
+    let Some(text) = read_state(path)? else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let document = text
+        .parse::<toml::Table>()
+        .map_err(|error| LayersError::Composition {
+            message: format!("{}: failed to parse TUI state: {error}", path.display()),
+        })?;
+    let Some(overrides) = document
+        .get("theme")
+        .and_then(|theme| theme.get("overrides"))
+    else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    overrides
+        .clone()
+        .try_into()
+        .map_err(|error: toml::de::Error| LayersError::Composition {
+            message: format!(
+                "{}: [theme.overrides]: {}",
+                path.display(),
+                error.message().trim()
+            ),
+        })
+}
+
+/// Replace the values saved for `theme_id` (`[theme.overrides.<theme-id>]`) in the state file at
+/// `path`; `None` removes them. Every other section and key stays as it is, and the file is
+/// replaced atomically.
+///
+/// # Errors
+///
+/// * [`LayersError::Io`] when the file cannot be read or written.
+/// * [`LayersError::Composition`] when `theme_id` is empty, the existing file is not TOML, a
+///   section on the way is not a table, or `values` is not a table.
+pub fn save_theme_override<T: serde::Serialize>(
+    path: &Path,
+    theme_id: &str,
+    values: Option<&T>,
+) -> Result<(), LayersError> {
+    if theme_id.trim().is_empty() {
+        return Err(LayersError::Composition {
+            message: "theme id must not be empty".to_owned(),
+        });
+    }
+    let values = values
+        .map(|values| match toml::Value::try_from(values) {
+            Ok(toml::Value::Table(table)) => Ok(table),
+            Ok(_) => Err("saved theme values are not a table".to_owned()),
+            Err(error) => Err(error.to_string()),
+        })
+        .transpose()
+        .map_err(|message| LayersError::Composition { message })?;
+    edit_state(path, |document| {
+        let theme =
+            table_entry(document, "theme").ok_or_else(|| "[theme] is not a table".to_owned())?;
+        let overrides = table_entry(theme, "overrides")
+            .ok_or_else(|| "[theme.overrides] is not a table".to_owned())?;
+        match values {
+            Some(values) if !values.is_empty() => {
+                overrides.insert(theme_id.to_owned(), toml::Value::Table(values));
+            }
+            _ => {
+                overrides.remove(theme_id);
+            }
+        }
+        if overrides.is_empty() {
+            theme.remove("overrides");
+        }
+        Ok(())
+    })
+}
+
 /// Replace the app's own theme choice (`[apps.<app>.theme]`) in the state file at `path`.
 ///
 /// Every other section and key stays as it is. `None` removes it, so the app follows Bcode's
@@ -402,6 +487,52 @@ mod tests {
         assert_eq!(
             default_tui_state_path_with_environment(&explicit_file),
             PathBuf::from("/elsewhere/ui.toml")
+        );
+    }
+
+    #[test]
+    fn saved_theme_overrides_round_trip_beside_the_saved_choices() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tui.toml");
+        save_tui_appearance(
+            &path,
+            &SavedTuiAppearance {
+                theme: Some("nord".to_owned()),
+                profile: None,
+            },
+        )
+        .expect("save choices");
+        let values = toml::Table::from_iter([("contrast".to_owned(), toml::Value::Float(1.2))]);
+        save_theme_override(&path, "nord", Some(&values)).expect("save override");
+        save_theme_override(&path, "dracula", Some(&values)).expect("save override");
+        save_theme_override(&path, "dracula", None::<&toml::Table>).expect("remove override");
+        let loaded = load_saved_theme_overrides::<toml::Table>(&path).expect("load");
+        assert_eq!(loaded.keys().collect::<Vec<_>>(), ["nord"]);
+        assert_eq!(loaded["nord"], values);
+        // Saving a choice keeps the overrides, and the overrides keep the choice.
+        save_tui_appearance(
+            &path,
+            &SavedTuiAppearance {
+                theme: Some("dracula".to_owned()),
+                profile: None,
+            },
+        )
+        .expect("save choices again");
+        assert_eq!(
+            load_saved_theme_overrides::<toml::Table>(&path).expect("load")["nord"],
+            values
+        );
+        assert_eq!(
+            SavedTuiAppearance::load(&path)
+                .expect("choices")
+                .theme
+                .as_deref(),
+            Some("dracula")
+        );
+        assert!(
+            load_saved_theme_overrides::<toml::Table>(&dir.path().join("missing.toml"))
+                .expect("missing")
+                .is_empty()
         );
     }
 

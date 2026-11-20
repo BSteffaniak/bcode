@@ -896,6 +896,12 @@ pub enum TuiEffect {
         /// Profile id, or none to clear.
         name: Option<String>,
     },
+    /// Persist per-theme contrast values edited in the appearance picker; each value replaces
+    /// the one saved for that theme.
+    PersistThemeContrast {
+        /// Edited values keyed by theme id.
+        values: std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>,
+    },
     /// Persist one interactive streaming-presentation policy to user state.
     PersistStreamingPresentation {
         /// Normalized renderer-neutral presentation policy.
@@ -1345,6 +1351,18 @@ pub enum TuiEffectResult {
         /// Global interactive streaming-presentation override load result.
         streaming_presentation:
             Result<Option<bcode_session_view_models::StreamingPresentationPolicy>, String>,
+        /// Per-theme contrast values saved in user state, load result.
+        contrast_overrides: Result<
+            std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>,
+            String,
+        >,
+    },
+    /// Durable per-theme contrast state update completed.
+    ThemeContrastPersisted {
+        /// Theme ids whose values were saved.
+        themes: Vec<String>,
+        /// State write result.
+        result: Result<std::path::PathBuf, String>,
     },
     /// Durable TUI profile state update completed.
     ProfileSelectionPersisted {
@@ -1775,6 +1793,7 @@ impl TuiEffectResult {
                 DaemonObservation::from_client_result(result)
             }
             Self::ConfigLoaded { .. }
+            | Self::ThemeContrastPersisted { .. }
             | Self::ThemeSelectionPersisted { .. }
             | Self::ProfileSelectionPersisted { .. }
             | Self::StreamingPresentationPersisted { .. }
@@ -1914,6 +1933,7 @@ enum EffectKey {
     Config,
     ThemeSelection,
     ProfileSelection,
+    ThemeContrast,
     StreamingPresentation,
     PresentationRules,
     AuthSecurity,
@@ -2161,6 +2181,11 @@ impl TuiEffect {
                 theme_selection: Err(client_error.to_string()),
                 profile_selection: Err(client_error.to_string()),
                 streaming_presentation: Err(client_error.to_string()),
+                contrast_overrides: Err(client_error.to_string()),
+            },
+            Self::PersistThemeContrast { values } => TuiEffectResult::ThemeContrastPersisted {
+                themes: values.into_keys().collect(),
+                result: Err(client_error.to_string()),
             },
             Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
                 name: Some(name),
@@ -2351,6 +2376,7 @@ impl TuiEffect {
             | Self::PersistThemeSelection { .. }
             | Self::ClearThemeSelection
             | Self::PersistProfileSelection { .. }
+            | Self::PersistThemeContrast { .. }
             | Self::PersistStreamingPresentation { .. }
             | Self::ClearStreamingPresentation
             | Self::PersistPresentationRules { .. }
@@ -2721,6 +2747,7 @@ impl TuiEffect {
                 EffectKey::ThemeSelection
             }
             Self::PersistProfileSelection { .. } => EffectKey::ProfileSelection,
+            Self::PersistThemeContrast { .. } => EffectKey::ThemeContrast,
             Self::PersistStreamingPresentation { .. } | Self::ClearStreamingPresentation => {
                 EffectKey::StreamingPresentation
             }
@@ -2843,6 +2870,18 @@ impl TuiEffect {
                     .map_err(|error| error.to_string()),
                 streaming_presentation: bcode_config::load_tui_streaming_presentation_override()
                     .map_err(|error| error.to_string()),
+                contrast_overrides: bcode_config::load_tui_contrast_overrides()
+                    .map_err(|error| error.to_string()),
+            },
+            Self::PersistThemeContrast { values } => TuiEffectResult::ThemeContrastPersisted {
+                result: values
+                    .iter()
+                    .try_fold(None, |_, (theme, values)| {
+                        bcode_config::update_tui_contrast_override(theme, values).map(Some)
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|path| path.ok_or_else(|| "nothing to save".to_owned())),
+                themes: values.into_keys().collect(),
             },
             Self::PersistThemeSelection { name } => TuiEffectResult::ThemeSelectionPersisted {
                 result: bcode_config::set_tui_theme_selection(&name)
@@ -3207,6 +3246,7 @@ impl TuiEffect {
             | Self::PersistThemeSelection { .. }
             | Self::ClearThemeSelection
             | Self::PersistProfileSelection { .. }
+            | Self::PersistThemeContrast { .. }
             | Self::PersistStreamingPresentation { .. }
             | Self::ClearStreamingPresentation
             | Self::PersistPresentationRules { .. }

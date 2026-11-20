@@ -203,10 +203,14 @@ pub struct PreparedPresentation {
     appearance: SavedAppearance,
 }
 
-/// Theme and profile chosen interactively and saved in user state.
+/// Theme, profile and per-theme contrast chosen interactively and saved in user state.
 struct SavedAppearance {
     theme: Result<Option<String>, String>,
     profile: Result<Option<String>, String>,
+    contrast: Result<
+        std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>,
+        String,
+    >,
 }
 
 impl SavedAppearance {
@@ -214,6 +218,8 @@ impl SavedAppearance {
         Self {
             theme: bcode_config::load_tui_theme_selection().map_err(|error| error.to_string()),
             profile: bcode_config::load_tui_profile_selection().map_err(|error| error.to_string()),
+            contrast: bcode_config::load_tui_contrast_overrides()
+                .map_err(|error| error.to_string()),
         }
     }
 }
@@ -477,7 +483,12 @@ fn apply_initial_config(
     settings.set_completion_settings(config.presentation.completion);
     settings.set_permissions(config.permissions);
     chat.app.apply_tui_config(config.tui.clone());
-    chat_loop::apply_saved_appearance(chat, appearance.theme, appearance.profile);
+    chat_loop::apply_saved_appearance(
+        chat,
+        appearance.theme,
+        appearance.profile,
+        appearance.contrast,
+    );
     chat.app
         .apply_configured_structure_rules(config.presentation.rules.clone());
     let declarative = config.presentation.streaming.policy();
@@ -1996,10 +2007,12 @@ mod saved_appearance_tests {
         let configured = start(SavedAppearance {
             theme: Ok(None),
             profile: Ok(None),
+            contrast: Ok(std::collections::BTreeMap::new()),
         });
         let chat = start(SavedAppearance {
             theme: Ok(Some("bcode-light".to_owned())),
             profile: Ok(Some("zen".to_owned())),
+            contrast: Ok(std::collections::BTreeMap::new()),
         });
         assert_eq!(chat.app.tui_config().theme.name, "bcode-light");
         assert_eq!(chat.app.tui_config().theme.profile.as_deref(), Some("zen"));
@@ -2010,14 +2023,50 @@ mod saved_appearance_tests {
     }
 
     #[tokio::test]
+    async fn startup_applies_contrast_saved_for_the_presented_theme() {
+        let exact = start(SavedAppearance {
+            theme: Ok(Some("bcode-light".to_owned())),
+            profile: Ok(None),
+            contrast: Ok(std::collections::BTreeMap::new()),
+        });
+        let raised = start(SavedAppearance {
+            theme: Ok(Some("bcode-light".to_owned())),
+            profile: Ok(None),
+            contrast: Ok(std::collections::BTreeMap::from([(
+                "bcode-light".to_owned(),
+                bcode_tui_theme::adjustment::ContrastOverride {
+                    contrast: Some(
+                        bcode_tui_theme::adjustment::ContrastFactor::new(1.6).expect("factor"),
+                    ),
+                    ..Default::default()
+                },
+            )])),
+        });
+        assert_eq!(
+            raised
+                .app
+                .theme_contrast_settings("bcode-light")
+                .factor
+                .get(),
+            1.6
+        );
+        assert_ne!(
+            raised.app.presented_theme().muted,
+            exact.app.presented_theme().muted
+        );
+    }
+
+    #[tokio::test]
     async fn startup_keeps_the_configured_theme_when_the_saved_one_is_unavailable() {
         let configured = start(SavedAppearance {
             theme: Ok(None),
             profile: Ok(None),
+            contrast: Ok(std::collections::BTreeMap::new()),
         });
         let chat = start(SavedAppearance {
             theme: Ok(Some("no-such-theme".to_owned())),
             profile: Ok(None),
+            contrast: Ok(std::collections::BTreeMap::new()),
         });
         assert_eq!(
             chat.app.tui_config().theme.name,
@@ -2049,6 +2098,7 @@ mod saved_appearance_tests {
                 SavedAppearance {
                     theme: Ok(theme.map(str::to_owned)),
                     profile: Ok(profile.map(str::to_owned)),
+                    contrast: Ok(std::collections::BTreeMap::new()),
                 },
             );
             let configured = ThemePreferences {

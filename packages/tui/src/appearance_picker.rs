@@ -8,16 +8,60 @@
 //! the caller applies it live; cancelling restores both selections the
 //! picker opened with. The column lists ([`PaletteAxisState`],
 //! [`ProfileAxisState`]) follow the selection for scrolling and hit testing.
+//!
+//! Below the columns, a contrast slider and a minimum-contrast row adjust the
+//! selected palette's contrast ([`ContrastControls`]). The focus keys cycle
+//! palettes, profiles, contrast and minimum; on a contrast row the horizontal
+//! keys change its value and `0` resets it.
 
 use bcode_tui_theme::picker::AppearanceSelection;
 use bmux_keyboard::KeyStroke;
 
 use super::appearance_picker_axes::{PaletteAxisState, ProfileAxisState};
+pub use super::appearance_picker_contrast::{ContrastControls, ContrastRow};
 use super::theme::{ProfileCatalogEntry, ThemeCatalogEntry};
 
 pub use bcode_tui_theme::picker::AppearanceAxis;
+use bcode_tui_theme::picker::AppearanceOutcome;
+
 /// Appearance picker outcome for one input event.
-pub use bcode_tui_theme::picker::AppearanceOutcome as AppearancePickerOutcome;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppearancePickerOutcome {
+    /// The palette selection moved; preview it without persisting.
+    PreviewPalette(String),
+    /// The profile selection moved; preview it (`None` clears the profile overlay).
+    PreviewProfile(Option<String>),
+    /// The active axis changed; nothing needs to be applied.
+    AxisChanged(AppearanceAxis),
+    /// A contrast row gained focus.
+    ContrastFocused(ContrastRow),
+    /// The contrast of the palette changed; preview it without persisting.
+    ContrastChanged(String),
+    /// Persist both selections and the contrast edits.
+    Apply {
+        /// Selected palette (theme) id.
+        palette: String,
+        /// Selected profile id (`None` for the theme's own presentation).
+        profile: Option<String>,
+    },
+    /// Close and restore what the picker opened with.
+    Cancel,
+    /// The input changed nothing.
+    Ignored,
+}
+
+impl From<AppearanceOutcome> for AppearancePickerOutcome {
+    fn from(outcome: AppearanceOutcome) -> Self {
+        match outcome {
+            AppearanceOutcome::PreviewPalette(id) => Self::PreviewPalette(id),
+            AppearanceOutcome::PreviewProfile(id) => Self::PreviewProfile(id),
+            AppearanceOutcome::AxisChanged(axis) => Self::AxisChanged(axis),
+            AppearanceOutcome::Apply { palette, profile } => Self::Apply { palette, profile },
+            AppearanceOutcome::Cancel => Self::Cancel,
+            AppearanceOutcome::Ignored => Self::Ignored,
+        }
+    }
+}
 
 /// Keymap scope of the appearance picker.
 pub const APPEARANCE_PICKER_SCOPE: &str = "appearance_picker";
@@ -57,6 +101,7 @@ pub struct AppearancePickerState {
     palettes: PaletteAxisState,
     profiles: ProfileAxisState,
     preview: super::appearance_picker_sample::SamplePreview,
+    contrast: ContrastControls,
 }
 
 impl AppearancePickerState {
@@ -80,6 +125,7 @@ impl AppearancePickerState {
             profiles: ProfileAxisState::new(selection.profiles()),
             selection,
             preview: super::appearance_picker_sample::SamplePreview::default(),
+            contrast: ContrastControls::default(),
         };
         state.sync_lists();
         state
@@ -89,11 +135,6 @@ impl AppearancePickerState {
     #[must_use]
     pub const fn axis(&self) -> AppearanceAxis {
         self.selection.axis()
-    }
-
-    /// Make `axis` active; returns whether it changed.
-    pub fn set_axis(&mut self, axis: AppearanceAxis) -> bool {
-        self.selection.set_axis(axis)
     }
 
     /// Return the palette list state.
@@ -116,6 +157,56 @@ impl AppearancePickerState {
     /// Return the profile list state mutably (list rendering).
     pub const fn profiles_mut(&mut self) -> &mut ProfileAxisState {
         &mut self.profiles
+    }
+
+    /// Return the contrast rows' state.
+    #[must_use]
+    pub const fn contrast(&self) -> &ContrastControls {
+        &self.contrast
+    }
+
+    /// Return the contrast rows' state mutably.
+    pub const fn contrast_mut(&mut self) -> &mut ContrastControls {
+        &mut self.contrast
+    }
+
+    /// Focus contrast `row`.
+    pub fn focus_contrast(&mut self, row: ContrastRow) -> AppearancePickerOutcome {
+        if self.contrast.set_focus(Some(row)) {
+            AppearancePickerOutcome::ContrastFocused(row)
+        } else {
+            AppearancePickerOutcome::Ignored
+        }
+    }
+
+    /// Change the focused-or-given contrast `row` of the selected palette one step.
+    pub fn step_contrast(&mut self, row: ContrastRow, forward: bool) -> AppearancePickerOutcome {
+        let Some(palette) = self.selection.selected_palette().map(str::to_owned) else {
+            return AppearancePickerOutcome::Ignored;
+        };
+        if self.contrast.step(&palette, row, forward) {
+            AppearancePickerOutcome::ContrastChanged(palette)
+        } else {
+            AppearancePickerOutcome::Ignored
+        }
+    }
+
+    fn reset_contrast(&mut self, row: ContrastRow) -> AppearancePickerOutcome {
+        let Some(palette) = self.selection.selected_palette().map(str::to_owned) else {
+            return AppearancePickerOutcome::Ignored;
+        };
+        if self.contrast.reset(&palette, row) {
+            AppearancePickerOutcome::ContrastChanged(palette)
+        } else {
+            AppearancePickerOutcome::Ignored
+        }
+    }
+
+    /// Return focus from the contrast rows to `axis`.
+    fn focus_axis(&mut self, axis: AppearanceAxis) -> AppearancePickerOutcome {
+        self.contrast.set_focus(None);
+        self.selection.set_axis(axis);
+        AppearancePickerOutcome::AxisChanged(axis)
     }
 
     /// Return the sample preview rendered in the preview pane.
@@ -191,15 +282,28 @@ impl AppearancePickerState {
 
     /// Make `axis` active and select one absolute row on it.
     pub fn select_row(&mut self, axis: AppearanceAxis, row: usize) -> AppearancePickerOutcome {
-        let outcome = self.selection.select_row(axis, row);
+        let outcome = self.selection.select_row(axis, row).into();
+        if outcome != AppearancePickerOutcome::Ignored {
+            self.contrast.set_focus(None);
+        }
         self.sync_lists();
         outcome
+    }
+
+    /// Make `axis` active (returning focus from the contrast rows); returns whether the focus
+    /// changed.
+    pub fn set_axis_focus(&mut self, axis: AppearanceAxis) -> bool {
+        let left_contrast = self.contrast.set_focus(None);
+        self.selection.set_axis(axis) || left_contrast
     }
 
     /// Make `axis` active and move its selection one row, as one mouse
     /// wheel notch over its column does (`forward` is down).
     pub fn scroll(&mut self, axis: AppearanceAxis, forward: bool) -> AppearancePickerOutcome {
-        let outcome = self.selection.scroll(axis, forward);
+        let outcome = self.selection.scroll(axis, forward).into();
+        if outcome != AppearancePickerOutcome::Ignored {
+            self.contrast.set_focus(None);
+        }
         self.sync_lists();
         outcome
     }
@@ -207,7 +311,7 @@ impl AppearancePickerState {
     /// Request persistence of both current selections.
     #[must_use]
     pub fn apply(&self) -> AppearancePickerOutcome {
-        self.selection.apply()
+        self.selection.apply().into()
     }
 
     /// Handle one picker key.
@@ -225,20 +329,66 @@ impl AppearancePickerState {
         stroke: KeyStroke,
         keymap: &super::keymap::BmuxKeyMap,
     ) -> AppearancePickerOutcome {
-        let outcome = match keymap.action(APPEARANCE_PICKER_SCOPE, stroke) {
-            Some("tui.control.cancel") => AppearancePickerOutcome::Cancel,
-            Some("tui.control.submit") => self.apply(),
-            Some("tui.control.up") => self.selection.step(false),
-            Some("tui.control.down") => self.selection.step(true),
-            Some("tui.control.left") => self.selection.switch_to(AppearanceAxis::Palette),
-            Some("tui.control.right") => self.selection.switch_to(AppearanceAxis::Profile),
-            Some("tui.control.focus_next" | "tui.control.focus_previous") => {
-                self.selection.toggle_axis()
+        let action = keymap.action(APPEARANCE_PICKER_SCOPE, stroke);
+        let outcome = match (self.contrast.focus(), action) {
+            (_, Some("tui.control.cancel")) => AppearancePickerOutcome::Cancel,
+            (_, Some("tui.control.submit")) => self.apply(),
+            (Some(row), _) => self.handle_contrast_key(row, action, stroke),
+            (None, Some("tui.control.up")) => self.selection.step(false).into(),
+            (None, Some("tui.control.down")) => self.selection.step(true).into(),
+            (None, Some("tui.control.left")) => {
+                self.selection.switch_to(AppearanceAxis::Palette).into()
             }
-            _ => AppearancePickerOutcome::Ignored,
+            (None, Some("tui.control.right")) => {
+                self.selection.switch_to(AppearanceAxis::Profile).into()
+            }
+            (None, Some("tui.control.focus_next")) => match self.axis() {
+                AppearanceAxis::Palette => self.selection.switch_to(AppearanceAxis::Profile).into(),
+                AppearanceAxis::Profile => self.focus_contrast(ContrastRow::Factor),
+            },
+            (None, Some("tui.control.focus_previous")) => match self.axis() {
+                AppearanceAxis::Palette => self.focus_contrast(ContrastRow::Minimum),
+                AppearanceAxis::Profile => self.selection.switch_to(AppearanceAxis::Palette).into(),
+            },
+            (None, _) => AppearancePickerOutcome::Ignored,
         };
         self.sync_lists();
         outcome
+    }
+
+    /// Handle a key while contrast `row` has focus: the horizontal keys change its value, `0`
+    /// resets it, the vertical keys move between the rows, and the focus keys continue the
+    /// cycle through the columns.
+    fn handle_contrast_key(
+        &mut self,
+        row: ContrastRow,
+        action: Option<&str>,
+        stroke: KeyStroke,
+    ) -> AppearancePickerOutcome {
+        match action {
+            Some("tui.control.left") => self.step_contrast(row, false),
+            Some("tui.control.right") => self.step_contrast(row, true),
+            Some("tui.control.up") => match row {
+                ContrastRow::Factor => self.focus_axis(self.axis()),
+                ContrastRow::Minimum => self.focus_contrast(ContrastRow::Factor),
+            },
+            Some("tui.control.down") => match row {
+                ContrastRow::Factor => self.focus_contrast(ContrastRow::Minimum),
+                ContrastRow::Minimum => AppearancePickerOutcome::Ignored,
+            },
+            Some("tui.control.focus_next") => match row {
+                ContrastRow::Factor => self.focus_contrast(ContrastRow::Minimum),
+                ContrastRow::Minimum => self.focus_axis(AppearanceAxis::Palette),
+            },
+            Some("tui.control.focus_previous") => match row {
+                ContrastRow::Factor => self.focus_axis(AppearanceAxis::Profile),
+                ContrastRow::Minimum => self.focus_contrast(ContrastRow::Factor),
+            },
+            None if stroke == KeyStroke::simple(bmux_keyboard::KeyCode::Char('0')) => {
+                self.reset_contrast(row)
+            }
+            _ => AppearancePickerOutcome::Ignored,
+        }
     }
 
     /// Move each column's list cursor to the selection's row.
@@ -349,12 +499,94 @@ pub mod tests {
             AppearancePickerOutcome::AxisChanged(AppearanceAxis::Profile)
         );
         assert_eq!(
-            picker.handle_key(KeyStroke::simple(KeyCode::Tab)),
+            picker.handle_key(KeyStroke::simple(KeyCode::Char('h'))),
             AppearancePickerOutcome::AxisChanged(AppearanceAxis::Palette)
         );
         assert_eq!(
             picker.handle_key(KeyStroke::simple(KeyCode::Char('h'))),
             AppearancePickerOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn focus_keys_cycle_through_the_columns_and_the_contrast_rows() {
+        let mut picker = picker(AppearanceAxis::Palette);
+        let tab =
+            |picker: &mut AppearancePickerState| picker.handle_key(KeyStroke::simple(KeyCode::Tab));
+        assert_eq!(
+            tab(&mut picker),
+            AppearancePickerOutcome::AxisChanged(AppearanceAxis::Profile)
+        );
+        assert_eq!(
+            tab(&mut picker),
+            AppearancePickerOutcome::ContrastFocused(ContrastRow::Factor)
+        );
+        assert_eq!(
+            tab(&mut picker),
+            AppearancePickerOutcome::ContrastFocused(ContrastRow::Minimum)
+        );
+        assert_eq!(
+            tab(&mut picker),
+            AppearancePickerOutcome::AxisChanged(AppearanceAxis::Palette)
+        );
+        assert_eq!(picker.contrast().focus(), None);
+        assert_eq!(
+            picker.handle_key(parse_key_stroke("shift+tab").unwrap()),
+            AppearancePickerOutcome::ContrastFocused(ContrastRow::Minimum)
+        );
+    }
+
+    #[test]
+    fn contrast_keys_step_reset_and_leave_the_palette_selection_alone() {
+        let mut picker = picker(AppearanceAxis::Profile);
+        picker.handle_key(KeyStroke::simple(KeyCode::Tab));
+        assert_eq!(picker.contrast().focus(), Some(ContrastRow::Factor));
+        for _ in 0..3 {
+            assert_eq!(
+                picker.handle_key(KeyStroke::simple(KeyCode::Right)),
+                AppearancePickerOutcome::ContrastChanged("dusk".to_owned())
+            );
+        }
+        assert_eq!(picker.contrast().shown().factor.get(), 1.15);
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Left)),
+            AppearancePickerOutcome::ContrastChanged("dusk".to_owned())
+        );
+        assert_eq!(picker.contrast().shown().factor.get(), 1.1);
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Char('0'))),
+            AppearancePickerOutcome::ContrastChanged("dusk".to_owned())
+        );
+        assert!(picker.contrast().shown().factor.is_exact());
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Char('0'))),
+            AppearancePickerOutcome::Ignored
+        );
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Down)),
+            AppearancePickerOutcome::ContrastFocused(ContrastRow::Minimum)
+        );
+        let mut floors = Vec::new();
+        for _ in 0..4 {
+            picker.handle_key(KeyStroke::simple(KeyCode::Right));
+            floors.push(picker.contrast().shown().minimum.to_string());
+        }
+        assert_eq!(floors, ["3.0", "4.5", "7.0", "off"]);
+        assert_eq!(picker.selected_palette(), Some("dusk"));
+        assert_eq!(picker.selected_profile(), Some("zen"));
+        // Up from the contrast slider returns to the active column.
+        picker.handle_key(KeyStroke::simple(KeyCode::Up));
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Up)),
+            AppearancePickerOutcome::AxisChanged(AppearanceAxis::Profile)
+        );
+        assert_eq!(picker.contrast().focus(), None);
+        assert_eq!(
+            picker.handle_key(KeyStroke::simple(KeyCode::Enter)),
+            AppearancePickerOutcome::Apply {
+                palette: "dusk".to_owned(),
+                profile: Some("zen".to_owned()),
+            }
         );
     }
 

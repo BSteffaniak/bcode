@@ -199,6 +199,13 @@ pub fn load_in(start: &Path, environment: &impl ConfigEnvironment) -> LoadedConf
             .diagnostics
             .push(format!("saved appearance not loaded: {error}")),
     }
+    // Contrast saved per theme by Bcode's appearance picker refines the configured values.
+    match bcode_config_layers::user_state::load_saved_theme_overrides(&state) {
+        Ok(saved) => loaded.theme.contrast.apply_saved(&saved),
+        Err(error) => loaded
+            .diagnostics
+            .push(format!("saved theme contrast not loaded: {error}")),
+    }
     let mut files = candidates;
     files.extend(loaded.files.iter().cloned());
     files.push(state.clone());

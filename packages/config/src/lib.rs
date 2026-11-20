@@ -2824,6 +2824,34 @@ pub struct TuiThemeConfig {
     /// all; `terminal` always keeps the terminal's own ANSI colors.
     #[serde(default)]
     pub terminal_palette: TuiTerminalPalette,
+    /// Contrast factor applied on top of the theme's exact colors, from 0.5 to 2.0: each
+    /// adjusted color's lightness moves away from (above 1) or toward (below 1) the background
+    /// it is painted on. `1.0` keeps the theme's colors exactly.
+    #[config_doc(values(), value_type = "number")]
+    #[serde(default)]
+    pub contrast: bcode_tui_theme_models::ContrastFactor,
+    /// Minimum WCAG contrast ratio (1 to 21) of every adjusted color against its background,
+    /// reached by the smallest lightness change after `contrast`; `"off"` (default) sets none.
+    #[config_doc(values(), value_type = "number | \"off\"")]
+    #[serde(default)]
+    pub minimum_contrast: bcode_tui_theme_models::MinimumContrast,
+    /// Which colors `contrast` and `minimum_contrast` adjust, as a table of booleans that each
+    /// default to `true`: `text` (text, state, accent, link, Markdown and border roles),
+    /// `syntax` (code colors), `fills` (surfaces, selection, diff rows and state surfaces) and
+    /// `ansi` (the theme's terminal colors).
+    #[config_doc(values(), value_type = "table")]
+    #[serde(default)]
+    pub contrast_parts: bcode_tui_theme_models::ContrastParts,
+    /// Per-theme contrast values keyed by theme id, each with any of `contrast`,
+    /// `minimum_contrast` and `contrast_parts`, replacing the global values for that theme.
+    #[config_doc(
+        map_key = "<theme-id>",
+        values(),
+        value_type = "table",
+        value_description = "Any of contrast, minimum_contrast and contrast_parts for this theme."
+    )]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, bcode_tui_theme_models::ContrastOverride>,
 }
 
 /// Colors that paint terminal output.
@@ -2847,6 +2875,17 @@ impl TuiThemeConfig {
             .chain(&self.overlays)
             .cloned()
             .collect()
+    }
+
+    /// The configured contrast values and per-theme overrides.
+    #[must_use]
+    pub fn contrast_preferences(&self) -> bcode_tui_theme_models::ContrastPreferences {
+        bcode_tui_theme_models::ContrastPreferences {
+            contrast: self.contrast,
+            minimum_contrast: self.minimum_contrast,
+            contrast_parts: self.contrast_parts,
+            overrides: self.overrides.clone(),
+        }
     }
 
     /// Return the user's explicit accent transition duration in milliseconds.
@@ -2877,6 +2916,10 @@ impl Default for TuiThemeConfig {
             accent_transition_ms: None,
             accent_transition_curve: TuiAccentTransitionCurve::EaseOut,
             terminal_palette: TuiTerminalPalette::Theme,
+            contrast: bcode_tui_theme_models::ContrastFactor::EXACT,
+            minimum_contrast: bcode_tui_theme_models::MinimumContrast::OFF,
+            contrast_parts: bcode_tui_theme_models::ContrastParts::ALL,
+            overrides: BTreeMap::new(),
         }
     }
 }
@@ -7224,6 +7267,67 @@ pub fn set_tui_profile_selection_at(
     update_saved_tui_appearance(path, |saved| saved.profile = name.map(str::to_owned))
 }
 
+/// Load the per-theme contrast values the appearance picker saved in user state
+/// (`[theme.overrides.<theme-id>]`).
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_contrast_overrides()
+-> Result<BTreeMap<String, bcode_tui_theme_models::ContrastOverride>, ConfigError> {
+    load_tui_contrast_overrides_from(&default_tui_state_path())
+}
+
+/// Load the saved per-theme contrast values from a specific state path.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or parsed.
+pub fn load_tui_contrast_overrides_from(
+    path: &Path,
+) -> Result<BTreeMap<String, bcode_tui_theme_models::ContrastOverride>, ConfigError> {
+    bcode_config_layers::user_state::load_saved_theme_overrides(path).map_err(ConfigError::from)
+}
+
+/// Save `values` for `theme_id` in user state: each value they set replaces the one saved for
+/// that theme, and the others stay.
+///
+/// # Errors
+///
+/// Returns an error when the theme id is empty or the state cannot be read or written.
+pub fn update_tui_contrast_override(
+    theme_id: &str,
+    values: &bcode_tui_theme_models::ContrastOverride,
+) -> Result<PathBuf, ConfigError> {
+    update_tui_contrast_override_at(&default_tui_state_path(), theme_id, values)
+}
+
+/// Save `values` for `theme_id` at a specific state path ([`update_tui_contrast_override`]).
+///
+/// # Errors
+///
+/// Returns an error when the theme id is empty or the state cannot be read or written.
+pub fn update_tui_contrast_override_at(
+    path: &Path,
+    theme_id: &str,
+    values: &bcode_tui_theme_models::ContrastOverride,
+) -> Result<PathBuf, ConfigError> {
+    let _guard = TUI_STATE_UPDATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let saved = load_tui_contrast_overrides_from(path)?
+        .remove(theme_id)
+        .unwrap_or_default()
+        .overlaid_with(*values);
+    bcode_config_layers::user_state::save_theme_override(
+        path,
+        theme_id,
+        Some(&saved).filter(|saved| !saved.is_empty()),
+    )
+    .map_err(ConfigError::from)?;
+    Ok(path.to_path_buf())
+}
+
 /// Clear the globally selected interactive TUI theme.
 ///
 /// # Errors
@@ -8780,7 +8884,56 @@ fn write_tui_theme_toml(output: &mut String, theme: &TuiThemeConfig) {
         })
     )
     .expect("writing to string should not fail");
+    if theme.terminal_palette == TuiTerminalPalette::Terminal {
+        writeln!(output, "terminal_palette = \"terminal\"")
+            .expect("writing to string should not fail");
+    }
+    write_tui_theme_contrast_toml(output, &theme.contrast_preferences());
     output.push('\n');
+}
+
+/// `value` as an inline TOML value.
+fn inline_toml(value: &impl Serialize) -> String {
+    toml::Value::try_from(value).map_or_else(|_| String::new(), |value| value.to_string())
+}
+
+/// Write the non-default contrast keys of `[tui.theme]`, with the per-theme overrides as
+/// inline tables so they stay inside the section.
+fn write_tui_theme_contrast_toml(
+    output: &mut String,
+    contrast: &bcode_tui_theme_models::ContrastPreferences,
+) {
+    if !contrast.contrast.is_exact() {
+        writeln!(output, "contrast = {}", contrast.contrast.get())
+            .expect("writing to string should not fail");
+    }
+    if contrast.minimum_contrast != bcode_tui_theme_models::MinimumContrast::OFF {
+        writeln!(
+            output,
+            "minimum_contrast = {}",
+            inline_toml(&contrast.minimum_contrast)
+        )
+        .expect("writing to string should not fail");
+    }
+    if contrast.contrast_parts != bcode_tui_theme_models::ContrastParts::ALL {
+        writeln!(
+            output,
+            "contrast_parts = {}",
+            inline_toml(&contrast.contrast_parts)
+        )
+        .expect("writing to string should not fail");
+    }
+    if !contrast.overrides.is_empty() {
+        write!(output, "overrides = {{ ").expect("writing to string should not fail");
+        for (index, (theme, values)) in contrast.overrides.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{} = {}", toml_string(theme), inline_toml(values))
+                .expect("writing to string should not fail");
+        }
+        output.push_str(" }\n");
+    }
 }
 
 const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
@@ -11981,6 +12134,82 @@ accent_transition_curve = "ease_in_out"
             BcodeConfig::default().tui.theme.accent_transition_curve,
             TuiAccentTransitionCurve::EaseOut
         );
+    }
+
+    #[test]
+    fn theme_contrast_keys_parse_default_round_trip_and_reject_invalid_values() {
+        let defaults = BcodeConfig::default();
+        assert_eq!(
+            defaults.tui.theme.contrast_preferences(),
+            bcode_tui_theme_models::ContrastPreferences::default()
+        );
+        let parsed: BcodeConfig = toml::from_str(
+            r#"
+            [tui.theme]
+            name = "solarized"
+            contrast = 1.25
+            minimum_contrast = 4.5
+            contrast_parts = { ansi = false }
+
+            [tui.theme.overrides.nord]
+            contrast = 0.8
+            minimum_contrast = "off"
+            "#,
+        )
+        .expect("contrast keys parse");
+        let preferences = parsed.tui.theme.contrast_preferences();
+        assert_eq!(preferences.settings_for("solarized").factor.get(), 1.25);
+        assert_eq!(
+            preferences.settings_for("solarized").minimum.ratio(),
+            Some(4.5)
+        );
+        assert!(!preferences.settings_for("solarized").parts.ansi);
+        let nord = preferences.settings_for("nord");
+        assert_eq!(nord.factor.get(), 0.8);
+        assert_eq!(nord.minimum.ratio(), None);
+
+        let rendered = super::config_to_toml(&parsed);
+        let round_trip: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(round_trip.tui.theme, parsed.tui.theme, "{rendered}");
+
+        for invalid in [
+            "[tui.theme]\ncontrast = 0",
+            "[tui.theme]\nminimum_contrast = 30",
+            "[tui.theme]\ncontrast_parts = { borders = false }",
+        ] {
+            assert!(toml::from_str::<BcodeConfig>(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn saved_theme_contrast_updates_only_the_values_it_sets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tui.toml");
+        let factor = bcode_tui_theme_models::ContrastFactor::new(1.3).expect("factor");
+        let floor = bcode_tui_theme_models::MinimumContrast::new(4.5).expect("floor");
+        super::update_tui_contrast_override_at(
+            &path,
+            "nord",
+            &bcode_tui_theme_models::ContrastOverride {
+                contrast: Some(factor),
+                ..Default::default()
+            },
+        )
+        .expect("save factor");
+        super::update_tui_contrast_override_at(
+            &path,
+            "nord",
+            &bcode_tui_theme_models::ContrastOverride {
+                minimum_contrast: Some(floor),
+                ..Default::default()
+            },
+        )
+        .expect("save floor");
+        let saved = super::load_tui_contrast_overrides_from(&path).expect("load");
+        assert_eq!(saved["nord"].contrast, Some(factor));
+        assert_eq!(saved["nord"].minimum_contrast, Some(floor));
+        std::fs::write(&path, "[theme.overrides.nord]\ncontrast = 9\n").expect("write");
+        assert!(super::load_tui_contrast_overrides_from(&path).is_err());
     }
 
     #[test]

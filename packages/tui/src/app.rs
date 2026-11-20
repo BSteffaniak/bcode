@@ -1770,12 +1770,18 @@ impl BmuxApp {
     ) -> Option<ResolvedThemeDefinition> {
         let overlays = self.tui_config.theme.effective_overlays();
         let variant = super::theme::resolve_variant_for_config(self.tui_config.theme.variant);
+        let contrast = self
+            .tui_config
+            .theme
+            .contrast_preferences()
+            .settings_for(theme_id);
         self.theme_catalog()?
             .catalog
             .resolve(
                 &super::theme::definition::ThemeSelection::new(theme_id)
                     .overlays(overlays)
-                    .variant(variant),
+                    .variant(variant)
+                    .contrast(contrast),
             )
             .ok()
     }
@@ -1929,6 +1935,67 @@ impl BmuxApp {
         }
         self.tui_config.theme.profile = profile.map(str::to_owned);
         self.sync_theme_target(Instant::now());
+    }
+
+    /// The contrast settings `theme_id` resolves with: configured values, per-theme overrides
+    /// and the values saved or previewed for it.
+    #[must_use]
+    pub fn theme_contrast_settings(
+        &self,
+        theme_id: &str,
+    ) -> bcode_tui_theme::adjustment::ContrastSettings {
+        self.tui_config
+            .theme
+            .contrast_preferences()
+            .settings_for(theme_id)
+    }
+
+    /// The per-theme contrast values in effect for `theme_id`, if any.
+    #[must_use]
+    pub fn theme_contrast_override(
+        &self,
+        theme_id: &str,
+    ) -> Option<bcode_tui_theme::adjustment::ContrastOverride> {
+        self.tui_config.theme.overrides.get(theme_id).copied()
+    }
+
+    /// Replace (or remove, with `None` or empty values) the per-theme contrast values of
+    /// `theme_id` and present the result. Durable persistence stays with the caller.
+    pub fn set_theme_contrast_override(
+        &mut self,
+        theme_id: &str,
+        values: Option<bcode_tui_theme::adjustment::ContrastOverride>,
+    ) {
+        let overrides = &mut self.tui_config.theme.overrides;
+        let before = overrides.get(theme_id).copied();
+        match values.filter(|values| !values.is_empty()) {
+            Some(values) => {
+                overrides.insert(theme_id.to_owned(), values);
+            }
+            None => {
+                overrides.remove(theme_id);
+            }
+        }
+        if self.tui_config.theme.overrides.get(theme_id).copied() != before {
+            self.sync_theme_target(Instant::now());
+        }
+    }
+
+    /// Overlay the per-theme contrast values saved in user state on the configured overrides.
+    pub fn apply_saved_contrast(
+        &mut self,
+        saved: &std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>,
+    ) {
+        if saved.is_empty() {
+            return;
+        }
+        let mut preferences = self.tui_config.theme.contrast_preferences();
+        preferences.apply_saved(saved);
+        if preferences.overrides != self.tui_config.theme.overrides {
+            self.tui_config.theme.overrides = preferences.overrides;
+            self.theme_preview_id = None;
+            self.sync_theme_target(Instant::now());
+        }
     }
 
     /// Select (or clear) the profile overlay; returns false for unknown profiles.

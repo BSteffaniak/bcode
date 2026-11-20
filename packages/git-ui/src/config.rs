@@ -1021,6 +1021,13 @@ fn load_appearance(
             .diagnostics
             .push(format!("saved appearance not loaded: {error}")),
     }
+    // Contrast saved per theme by Bcode's appearance picker refines the configured values.
+    match bcode_config_layers::user_state::load_saved_theme_overrides(&state) {
+        Ok(saved) => loaded.theme.contrast.apply_saved(&saved),
+        Err(error) => loaded
+            .diagnostics
+            .push(format!("saved theme contrast not loaded: {error}")),
+    }
     let mut files = bcode_candidates;
     files.extend(git_candidates);
     files.extend(loaded.files.iter().cloned());
@@ -1406,6 +1413,42 @@ mod tests {
 
     fn load(start: &Path) -> LoadedConfig {
         load_with(start, &ConfigOptions::default())
+    }
+
+    #[test]
+    fn bcode_contrast_settings_and_saved_theme_contrast_reach_the_git_ui() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).expect("repo");
+        let state = repo.join(".test-config-home/state/bcode/tui.toml");
+        std::fs::create_dir_all(state.parent().expect("state dir")).expect("state dir");
+        std::fs::write(&state, "[theme.overrides.nord]\nminimum_contrast = 7\n")
+            .expect("user state");
+        std::fs::write(
+            repo.join("bcode.toml"),
+            "[tui.theme]\nname = \"nord\"\ncontrast = 1.4\n\
+             [tui.theme.overrides.nord]\nminimum_contrast = 3\n",
+        )
+        .expect("config");
+        let loaded = load(repo);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        let settings = loaded.theme.contrast.settings_for("nord");
+        assert_eq!(settings.factor.get(), 1.4);
+        // The saved value replaces the configured override's.
+        assert_eq!(settings.minimum.ratio(), Some(7.0));
+        let resolution = appearance_sources(&loaded, repo)
+            .resolve(bmux_tui::capabilities::TerminalBackground::Dark);
+        let exact = resolution
+            .catalog
+            .resolve(
+                &bcode_tui_theme::definition::ThemeSelection::new("nord")
+                    .variant(resolution.variant),
+            )
+            .expect("exact nord");
+        assert_ne!(
+            resolution.resolved.expect("adjusted nord").fingerprint,
+            exact.fingerprint
+        );
     }
 
     #[test]

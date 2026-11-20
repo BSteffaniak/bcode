@@ -1017,15 +1017,19 @@ impl ChatLoopState {
             axis,
         ));
         if let Some(picker) = self.appearance_picker.as_mut() {
+            show_palette_contrast(picker, &chat.app);
             picker.refresh_preview(&mut chat.app);
         }
         chat.app.set_status("appearance picker opened".to_owned());
     }
 
-    /// Close the appearance picker, restoring the palette and profile it was
+    /// Close the appearance picker, restoring the palette, profile and contrast it was
     /// opened with.
     pub fn cancel_appearance_picker(&mut self, chat: &mut ActiveChat) {
         if let Some(picker) = self.appearance_picker.take() {
+            for (palette, original) in picker.contrast().originals() {
+                chat.app.set_theme_contrast_override(palette, *original);
+            }
             chat.app.restore_profile(picker.original_profile());
             chat.app.cancel_theme_preview();
         }
@@ -1057,6 +1061,15 @@ impl ChatLoopState {
             return false;
         };
         let theme = super::render::TuiTheme::for_app(&chat.app);
+        if let Some((row, raise)) =
+            super::appearance_picker_render::appearance_picker_contrast_wheel(
+                picker, mouse, frame_area, theme,
+            )
+        {
+            let outcome = picker.step_contrast(row, raise);
+            self.apply_appearance_picker_outcome(chat, outcome);
+            return true;
+        }
         if let Some((axis, forward)) = super::appearance_picker_render::appearance_picker_wheel(
             picker, mouse, frame_area, theme,
         ) {
@@ -1069,12 +1082,13 @@ impl ChatLoopState {
         ) {
             Some(AppearanceHit::Row(axis, row)) => picker.select_row(axis, row),
             Some(AppearanceHit::Axis(axis)) => {
-                if picker.set_axis(axis) {
+                if picker.set_axis_focus(axis) {
                     AppearancePickerOutcome::AxisChanged(axis)
                 } else {
                     AppearancePickerOutcome::Ignored
                 }
             }
+            Some(AppearanceHit::Contrast(row)) => picker.focus_contrast(row),
             None => AppearancePickerOutcome::Ignored,
         };
         self.apply_appearance_picker_outcome(chat, outcome);
@@ -1112,6 +1126,27 @@ impl ChatLoopState {
         }
     }
 
+    /// Present the contrast the picker edited for `palette` live, remembering the values it
+    /// had before so cancelling restores them.
+    fn preview_appearance_contrast(&mut self, chat: &mut ActiveChat, palette: &str) {
+        let Some(picker) = self.appearance_picker.as_mut() else {
+            return;
+        };
+        picker
+            .contrast_mut()
+            .remember_original(palette, chat.app.theme_contrast_override(palette));
+        let values = picker.contrast().edited_values(palette);
+        let shown = picker.contrast().shown();
+        // Contrast changes the resolved colors, so cached previews no longer apply.
+        picker.palettes_mut().clear_resolved_previews();
+        chat.app.set_theme_contrast_override(palette, values);
+        self.preview_appearance_palette(chat);
+        chat.app.set_status(format!(
+            "previewing {palette} at contrast {}×, minimum contrast {}",
+            shown.factor, shown.minimum
+        ));
+    }
+
     fn apply_appearance_picker_outcome(
         &mut self,
         chat: &mut ActiveChat,
@@ -1121,8 +1156,20 @@ impl ChatLoopState {
         let label = |id: Option<&str>| id.unwrap_or("theme default").to_owned();
         match outcome {
             AppearancePickerOutcome::PreviewPalette(id) => {
+                if let Some(picker) = self.appearance_picker.as_mut() {
+                    show_palette_contrast(picker, &chat.app);
+                }
                 self.preview_appearance_palette(chat);
                 chat.app.set_status(format!("previewing palette {id}"));
+            }
+            AppearancePickerOutcome::ContrastFocused(row) => {
+                chat.app.set_status(format!(
+                    "adjusting {}: left/right change it, 0 resets it",
+                    row.label().to_lowercase()
+                ));
+            }
+            AppearancePickerOutcome::ContrastChanged(palette) => {
+                self.preview_appearance_contrast(chat, &palette);
             }
             AppearancePickerOutcome::PreviewProfile(id) => {
                 if chat.app.apply_profile(id.as_deref()) {
@@ -1146,6 +1193,11 @@ impl ChatLoopState {
                 };
                 let palette_changed = picker.palette_changed();
                 let profile_changed = picker.profile_changed();
+                let contrast = picker.contrast().edits().clone();
+                let contrast_changed = !contrast.is_empty();
+                if contrast_changed {
+                    chat.replace_effect(TuiEffect::PersistThemeContrast { values: contrast });
+                }
                 if profile_changed && !chat.app.apply_profile(profile.as_deref()) {
                     chat.app.restore_profile(picker.original_profile());
                     chat.app.cancel_theme_preview();
@@ -1184,7 +1236,11 @@ impl ChatLoopState {
                     }
                     (false, false) => {
                         chat.app.cancel_theme_preview();
-                        chat.app.set_status("appearance unchanged".to_owned());
+                        chat.app.set_status(if contrast_changed {
+                            "saving contrast to user state…".to_owned()
+                        } else {
+                            "appearance unchanged".to_owned()
+                        });
                     }
                 }
             }
@@ -3766,17 +3822,31 @@ pub fn apply_effect_result_with_frontend(
             theme_selection,
             profile_selection,
             streaming_presentation,
+            contrast_overrides,
         } => {
             apply_config_result(
                 settings,
                 chat,
                 loop_state,
                 *config,
-                theme_selection,
-                profile_selection,
+                SavedChoices {
+                    theme: theme_selection,
+                    profile: profile_selection,
+                    contrast: contrast_overrides,
+                },
                 streaming_presentation,
             );
         }
+        TuiEffectResult::ThemeContrastPersisted { themes, result } => match result {
+            Ok(path) => chat.app.set_status(format!(
+                "contrast for {} saved to user state at {}",
+                themes.join(", "),
+                bcode_plugin_sdk::path::display_from_current_dir(&path)
+            )),
+            Err(error) => chat
+                .app
+                .set_status(format!("contrast could not be saved: {error}")),
+        },
         TuiEffectResult::ProfileSelectionPersisted { name, result } => match result {
             Ok(path) => chat.app.set_status(name.map_or_else(
                 || {
@@ -4502,8 +4572,7 @@ pub fn apply_config_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     config: Result<bcode_config::BcodeConfig, String>,
-    theme_selection: Result<Option<String>, String>,
-    profile_selection: Result<Option<String>, String>,
+    saved: SavedChoices,
     streaming_presentation: Result<
         Option<bcode_session_view_models::StreamingPresentationPolicy>,
         String,
@@ -4570,7 +4639,7 @@ pub fn apply_config_result(
                 loop_state.pinned_interaction_viewport = None;
                 loop_state.interactive_surface_geometry = None;
             }
-            apply_saved_appearance(chat, theme_selection, profile_selection);
+            apply_saved_appearance(chat, saved.theme, saved.profile, saved.contrast);
             if let Some(surface) = loop_state.interactive_surface.as_mut() {
                 surface.update_keymap(&settings.keymap);
             }
@@ -4591,14 +4660,51 @@ pub fn apply_config_result(
     }
 }
 
-/// Apply the theme and profile saved in user state over the configured ones, theme first
-/// (a profile layers over the theme). An unavailable saved choice keeps the configured one and
-/// says so.
+/// Show the contrast the picker's selected palette presents (the configured theme when the
+/// catalog lists none).
+fn show_palette_contrast(
+    picker: &mut super::appearance_picker::AppearancePickerState,
+    app: &super::app::BmuxApp,
+) {
+    let palette = picker
+        .selected_palette()
+        .map_or_else(|| app.tui_config().theme.name.clone(), str::to_owned);
+    picker
+        .contrast_mut()
+        .show(app.theme_contrast_settings(&palette));
+}
+
+/// Interactive choices loaded from user state with a configuration reload.
+pub struct SavedChoices {
+    /// Saved theme.
+    pub theme: Result<Option<String>, String>,
+    /// Saved profile.
+    pub profile: Result<Option<String>, String>,
+    /// Saved per-theme contrast values.
+    pub contrast: Result<
+        std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>,
+        String,
+    >,
+}
+
+/// Apply the theme, profile and per-theme contrast saved in user state over the configured
+/// ones, theme first (a profile layers over the theme). An unavailable saved choice keeps the
+/// configured one and says so.
 pub fn apply_saved_appearance(
     chat: &mut ActiveChat,
     theme_selection: Result<Option<String>, String>,
     profile_selection: Result<Option<String>, String>,
+    contrast: Result<
+        std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>,
+        String,
+    >,
 ) {
+    match contrast {
+        Ok(contrast) => chat.app.apply_saved_contrast(&contrast),
+        Err(error) => chat
+            .app
+            .set_status(format!("TUI contrast state unavailable: {error}")),
+    }
     let saved = bcode_tui_theme::appearance::SavedAppearance {
         theme: theme_selection.as_ref().ok().cloned().flatten(),
         profile: profile_selection.as_ref().ok().cloned().flatten(),

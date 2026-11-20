@@ -299,3 +299,82 @@ async fn profile_route_opens_on_the_profile_axis_and_wheel_previews_live() {
     key(&mut loop_state, &mut chat, KeyCode::Escape);
     assert_eq!(queued_persistence(&mut chat), (Vec::new(), Vec::new()));
 }
+
+fn queued_contrast(
+    chat: &mut ActiveChat,
+) -> Vec<std::collections::BTreeMap<String, bcode_tui_theme::adjustment::ContrastOverride>> {
+    let (effects, _) = chat.pending_effects.drain_runtime();
+    effects
+        .into_iter()
+        .filter_map(
+            |crate::effects::ScheduledEffect { effect, .. }| match effect {
+                TuiEffect::PersistThemeContrast { values } => Some(values),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+#[tokio::test]
+async fn contrast_slider_previews_live_saves_on_apply_and_cancel_restores() {
+    let mut chat = test_chat();
+    let mut loop_state = test_loop_state();
+    loop_state.open_appearance_picker(&mut chat, AppearanceAxis::Palette);
+    choose(
+        &mut loop_state,
+        &mut chat,
+        AppearanceAxis::Palette,
+        "bcode-light",
+    );
+    let exact = chat.app.presented_theme();
+    // Tab twice reaches the contrast slider.
+    key(&mut loop_state, &mut chat, KeyCode::Tab);
+    key(&mut loop_state, &mut chat, KeyCode::Tab);
+    for _ in 0..6 {
+        key(&mut loop_state, &mut chat, KeyCode::Right);
+    }
+    assert_eq!(
+        chat.app.theme_contrast_settings("bcode-light").factor.get(),
+        1.3
+    );
+    let raised = chat.app.presented_theme();
+    assert_ne!(raised.muted, exact.muted, "contrast previews live");
+    assert_eq!(raised.canvas.bg, exact.canvas.bg, "the canvas never moves");
+
+    // Escape restores the contrast the palette had.
+    key(&mut loop_state, &mut chat, KeyCode::Escape);
+    assert!(chat.app.theme_contrast_override("bcode-light").is_none());
+    assert!(
+        queued_contrast(&mut chat).is_empty(),
+        "cancel saves nothing"
+    );
+
+    // Again, then apply: only the edited value is saved.
+    loop_state.open_appearance_picker(&mut chat, AppearanceAxis::Profile);
+    key(&mut loop_state, &mut chat, KeyCode::Tab);
+    key(&mut loop_state, &mut chat, KeyCode::Down);
+    key(&mut loop_state, &mut chat, KeyCode::Right);
+    key(&mut loop_state, &mut chat, KeyCode::Right);
+    let presented = chat.app.tui_config().theme.name.clone();
+    assert_eq!(
+        chat.app.theme_contrast_settings(&presented).minimum.ratio(),
+        Some(4.5)
+    );
+    key(&mut loop_state, &mut chat, KeyCode::Enter);
+    let saved = queued_contrast(&mut chat);
+    assert_eq!(saved.len(), 1);
+    let values = saved[0][&presented];
+    assert_eq!(
+        values
+            .minimum_contrast
+            .and_then(bcode_tui_theme::adjustment::MinimumContrast::ratio),
+        Some(4.5)
+    );
+    assert_eq!(values.contrast, None);
+    assert_eq!(
+        chat.app.theme_contrast_settings(&presented).minimum.ratio(),
+        Some(4.5),
+        "applied contrast stays presented"
+    );
+    drop(chat);
+}
