@@ -624,7 +624,8 @@ theme file. The report lists, per variant:
 
 Adjustments are informational and never count as warnings. `--json` prints a
 stable, versioned structure; a contrast row whose role color is a palette
-color kept exactly names that entry in `palette_slot`.
+color kept exactly names that entry in `palette_slot`. `--with-adjustments`
+measures the colors your contrast settings produce instead (see Contrast).
 
 ### Accepting findings
 
@@ -770,6 +771,88 @@ agent_accent = "agent_with_theme_fallback"
 
 `paths` may add explicitly authorized theme files or directories. Bcode canonicalizes discovered paths, confines candidates to authorized roots, and bounds candidate count and bytes.
 
+## Contrast
+
+Contrast can be raised or lowered on top of any theme's exact colors. The
+adjustment runs after the theme is resolved, so theme files, upstream palette
+fidelity, and `bcode theme check`'s default report are unchanged; the default
+settings change nothing at all.
+
+```toml
+[tui.theme]
+contrast = 1.2               # 0.5 to 2.0; 1.0 (default) keeps the theme's colors
+minimum_contrast = 4.5       # a WCAG ratio from 1 to 21, or "off" (default)
+contrast_parts = { ansi = false } # text, syntax, fills, ansi; each defaults to true
+
+[tui.theme.overrides.solarized]  # per theme id; replaces the global values it sets
+contrast = 1.4
+minimum_contrast = "off"
+```
+
+Every adjusted color is measured against the background it is painted on, in
+OKLCH:
+
+* `contrast` scales lightness away from (above 1) or toward (below 1) that
+  background: `L' = L_bg + (L − L_bg) × contrast`, clamped to 0–1. Hue is kept.
+  Chroma follows the factor by a quarter, `C' = C × (1 + (contrast − 1) / 4)`,
+  so colors pushed toward black or white keep some color and colors pulled
+  toward the background fade with it; a color outside the sRGB gamut loses
+  chroma, never lightness or hue.
+* `minimum_contrast` then lifts each color still below the ratio by the
+  smallest lightness change that reaches it; colors already at or above it
+  stay exactly as they are.
+
+`contrast_parts` selects what is adjusted:
+
+* `text`: every role foreground other than code (text, states, accents, links,
+  Markdown, borders, transcript and tool labels), against the role's own
+  background, else the surface `bcode theme check` pairs it with, else the
+  canvas. A fill whose text comes from another role (for example the
+  selection) gets its own foreground when that text fails `minimum_contrast`
+  on it.
+* `syntax`: `syntax.*` against the `source.text` background and
+  `markdown.code.*` against the `markdown.code_block_text` background (each
+  falling back to the canvas).
+* `fills`: role backgrounds other than the canvas — raised and overlay
+  surfaces, selection and line highlight, diff rows and emphasis, state
+  surfaces, inline code — move away from the canvas, so panels and selections
+  separate more. `minimum_contrast` does not apply to fills. Fills change
+  before foregrounds, so text is measured against the changed fill.
+* `ansi`: the palette's sixteen ANSI colors and `terminal_fg` for terminal
+  output, against `terminal_bg` (else the canvas). ANSI black and white get the
+  factor but not the floor, because programs use them as fills as often as text.
+
+The canvas itself never moves. Colors the terminal owns — the default colors
+and the terminal's sixteen-color palette — are never adjusted, so
+`terminal-native` stays transparent. A per-theme override's `contrast_parts`
+replaces the global table as a whole (its unset keys are `true`).
+
+The appearance picker has a contrast slider and a minimum-contrast row below
+its columns. Tab cycles palettes, profiles, contrast, and minimum (Shift+Tab in
+reverse); on a contrast row, Left and Right change the value (the factor in
+steps of 0.05, the floor through off, 3.0, 4.5, and 7.0), Up and Down move
+between the rows, and `0` resets the factor to 1.0 or the floor to off. A click
+focuses a row and the mouse wheel over it steps its value. Changes preview
+live for the selected palette; Enter saves the values you changed for each
+palette you changed in user state (`[theme.overrides.<theme-id>]` in the state
+file, mirroring the configuration keys), where they replace the configured
+values for that theme; Escape restores what the picker opened with. Narrow
+pickers drop the row labels first; pickers too short to keep three column rows
+above them do not show the rows (the keys still adjust them).
+
+The git client and the review app read the same `[tui.theme]` keys and the
+values saved by the picker, so their colors and terminal views match.
+
+`bcode theme check` measures the authored theme. `--with-adjustments` measures
+the colors your contrast settings produce for the checked theme instead (the
+report names the settings, and fails when they leave warnings). Accepted
+findings describe authored themes, so they are not compared, and
+`--with-adjustments` cannot be combined with `--bless`:
+
+```console
+bcode theme check solarized --with-adjustments
+```
+
 ## Discovery precedence
 
 Definitions are considered in this order, with later valid definitions taking precedence by theme id:
@@ -857,7 +940,8 @@ transcript; it never reads or mutates the live session event stream. Narrow or s
 the preview and keep the columns. The preview exposes the selected palette's id, source, any
 validation state other than `valid`, and dark/light variant availability. Moving the selection
 previews the complete live app, Enter persists through the existing user-state effect, and Escape
-restores the configured presentation.
+restores the configured presentation. Below the columns, the contrast rows adjust the selected
+palette's contrast (see Contrast).
 
 ## Authoring examples
 

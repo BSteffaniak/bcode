@@ -1310,7 +1310,9 @@ bcode's own (`--print-config-paths` lists them in order):
   `variant = "auto"` the app asks the terminal for its colors and presents the light variant on
   a light background (else `COLORFGBG`, else dark). Everything resolves through
   `bcode_tui_theme::appearance`, the code bcode and `bcode-git` use, and the visual system above
-  derives every color the app uses from the chosen theme.
+  derives every color the app uses from the chosen theme. `contrast`, `minimum_contrast`,
+  `contrast_parts` and `[tui.theme.overrides.<theme-id>]` (with the per-theme values bcode's
+  appearance picker saved) adjust the theme's contrast as in bcode (see `docs/tui-themes.md`).
 * `[plugins.config."bcode.code_review".theme]`: `name`, `profile`, `overlays` and `paths` for
   the review only; each set field replaces the `[tui.theme]` one.
 * `[tui.markdown] html`: how raw HTML in markdown (descriptions, comments, assistant answers,
