@@ -768,9 +768,8 @@ pub struct ReviewSurface {
     /// Questions on their way that create their own session, by exchange id.
     fresh_asks: std::collections::BTreeSet<String>,
     next_exchange: u64,
-    /// The annotations' and sessions' revisions the threads of earlier questions were last
-    /// recovered at.
-    exchange_threads_at: Option<(u64, u64)>,
+    /// Recovery of the threads earlier questions were asked from.
+    exchange_threads: annotate::ExchangeThreads,
     /// Whether the open document's annotations were requested.
     notes_requested: bool,
     /// Whether a transient review is being saved as a durable one.
@@ -928,7 +927,7 @@ impl ReviewSurface {
             asks: VecDeque::new(),
             fresh_asks: std::collections::BTreeSet::new(),
             next_exchange: 0,
-            exchange_threads_at: None,
+            exchange_threads: annotate::ExchangeThreads::default(),
             notes_requested: false,
             saving_as: false,
             viewed_sync: viewed_sync::Tracking::default(),
@@ -2177,6 +2176,12 @@ impl ReviewSurface {
             Message::GuideLifecycle(done) => self.apply_guide_lifecycle(*done),
             Message::GuideExported(result) => self.guide_exported(result),
             Message::GuideFanOut(done) => self.fan_out_done(*done, host),
+            Message::ExchangeHistory { found, searched } => {
+                self.exchange_threads.found.extend(found);
+                self.exchange_threads.asked.extend(searched);
+                // Recover with what was found at the next poll.
+                self.exchange_threads.at = None;
+            }
             Message::History(result) => {
                 self.apply_history(result);
                 // Baselines picked by time wait for the history.
@@ -6108,6 +6113,7 @@ impl View for ReviewSurface {
         self.pump_feed(host);
         changed |= self.agents.drain();
         changed |= self.recover_exchange_threads();
+        self.search_exchange_history(host);
         self.reflect_review_tools(host);
         self.follow_layer_guide();
         self.pump_fan_out(host);

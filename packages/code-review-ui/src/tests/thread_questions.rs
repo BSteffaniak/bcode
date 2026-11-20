@@ -719,6 +719,63 @@ fn a_card_saved_without_its_thread_recovers_it_from_its_session() {
     );
 }
 
+#[test]
+fn a_card_older_than_its_sessions_window_recovers_its_thread_from_earlier_messages() {
+    let fixture = interaction::fixture();
+    let mut setup = interaction::setup(&fixture, 170, 50);
+    let (thread_id, asked) = asked_from_local_thread(&mut setup);
+    let session = asked.session_id.clone().expect("linked");
+    let prompt = setup.backend.messages()[0].1.clone();
+    save_exchange(
+        &setup,
+        ReviewAiExchange {
+            thread_id: None,
+            ..asked
+        },
+    );
+    let mut setup = interaction::setup_with_backend(&fixture, &setup, 170, 50);
+    // The question's prompt is older than the turns its card observes: three history pages
+    // back.
+    let host = setup.scenario.host();
+    host.record_message(&session, &prompt);
+    for turn in 0..2 * crate::testing::harness::HISTORY_PAGE_MESSAGES {
+        host.record_message(&session, &format!("Later question {turn}"));
+    }
+    assert!(
+        host.history_reads().is_empty(),
+        "nothing is read before the card observes"
+    );
+    let newer = || snapshot_with_prompt("Later question 3");
+    setup
+        .scenario
+        .host()
+        .session_view(&session)
+        .expect("followed")
+        .try_send(SessionViewFollowUpdate::Snapshot(Box::new(newer())))
+        .expect("delivered");
+    stable(&mut setup.scenario);
+    let recovered = local_exchanges(&setup);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].thread_id.as_deref(), Some(thread_id.as_str()));
+    let reads = setup.scenario.host().history_reads();
+    assert_eq!(
+        reads,
+        vec![session.clone(); 3],
+        "pages newest first, up to the prompt"
+    );
+
+    // Found once: later snapshots read nothing more.
+    setup
+        .scenario
+        .host()
+        .session_view(&session)
+        .expect("followed")
+        .try_send(SessionViewFollowUpdate::Snapshot(Box::new(newer())))
+        .expect("delivered");
+    stable(&mut setup.scenario);
+    assert_eq!(setup.scenario.host().history_reads().len(), 3);
+}
+
 /// Move the app's cursor to item `index` with counted `j`/`k`.
 fn app_move_to(scenario: &mut Scenario<ReviewApp>, index: usize) {
     let doc = document(scenario);

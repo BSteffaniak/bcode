@@ -319,6 +319,15 @@ pub struct PendingPermission {
     pub tool: String,
 }
 
+/// User messages of one bounded history page of a session, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserMessagePage {
+    /// The page's user messages, newest first.
+    pub texts: Vec<String>,
+    /// Where the next older page starts, when there is one.
+    pub older: Option<bcode_session_models::SessionHistoryCursor>,
+}
+
 /// User messages counted in a session's newest history page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnCount {
@@ -591,6 +600,18 @@ pub trait ReviewHost: Send + Sync {
     /// User messages in the newest history page of `session_id`.
     fn count_turns(&self, session_id: String) -> HostFuture<TurnCount> {
         let _ = session_id;
+        Box::pin(async { Err(HostError::failed("this host cannot read history")) })
+    }
+
+    /// The user messages of one bounded history page of `session_id`: the newest page, or the
+    /// page before `older` (a cursor an earlier page returned). Reading never changes the
+    /// session.
+    fn user_messages(
+        &self,
+        session_id: String,
+        older: Option<bcode_session_models::SessionHistoryCursor>,
+    ) -> HostFuture<UserMessagePage> {
+        let _ = (session_id, older);
         Box::pin(async { Err(HostError::failed("this host cannot read history")) })
     }
 
@@ -1386,6 +1407,34 @@ impl ReviewHost for StandaloneHost {
         })
     }
 
+    fn user_messages(
+        &self,
+        session_id: String,
+        older: Option<bcode_session_models::SessionHistoryCursor>,
+    ) -> HostFuture<UserMessagePage> {
+        let bcode = Arc::clone(&self.bcode);
+        Box::pin(async move {
+            let id = parse_session(&session_id)?;
+            let page = bcode
+                .client()
+                .await?
+                .session_history_page(
+                    id,
+                    bcode_session_models::SessionHistoryQuery {
+                        cursor: older,
+                        limit: TURN_COUNT_EVENTS,
+                        direction: bcode_session_models::SessionHistoryDirection::Backward,
+                    },
+                )
+                .await
+                .map_err(|error| bcode.failure(&error))?;
+            Ok(UserMessagePage {
+                texts: user_texts(&page.events),
+                older: page.next_cursor.filter(|_| page.has_more),
+            })
+        })
+    }
+
     fn resolve_permission(
         &self,
         permission_id: String,
@@ -1822,6 +1871,22 @@ fn user_turns(events: &[bcode_session_models::SessionEvent]) -> usize {
             )
         })
         .count()
+}
+
+/// The texts of the user messages among `events`, newest first.
+fn user_texts(events: &[bcode_session_models::SessionEvent]) -> Vec<String> {
+    let mut texts: Vec<(u64, String)> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            bcode_session_models::SessionEventKind::SubmissionActivated { text, .. }
+            | bcode_session_models::SessionEventKind::UserMessage { text, .. } => {
+                Some((event.sequence, text.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    texts.sort_by_key(|(sequence, _)| std::cmp::Reverse(*sequence));
+    texts.into_iter().map(|(_, text)| text).collect()
 }
 
 #[cfg(test)]

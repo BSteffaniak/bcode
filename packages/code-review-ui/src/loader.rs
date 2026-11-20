@@ -68,6 +68,15 @@ pub enum Message {
     GuideExported(Result<String, String>),
     /// Fan-out work finished.
     GuideFanOut(Box<super::surface::FanOutDone>),
+    /// A session's earlier user messages were searched for the threads questions were asked
+    /// from: each exchange id with the review tools' id of its thread, and every exchange id
+    /// searched for.
+    ExchangeHistory {
+        /// Exchanges whose thread was found, with that thread's tool id.
+        found: Vec<(String, String)>,
+        /// Every exchange searched for.
+        searched: Vec<String>,
+    },
     /// Every source arrived: the change token taken after them.
     Filled {
         /// Change token, when it could be taken.

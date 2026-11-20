@@ -51,6 +51,9 @@ const TASK_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Updates buffered per followed session.
 const FOLLOW_BUFFER: usize = 16;
 
+/// Sent messages one fake history page holds.
+pub const HISTORY_PAGE_MESSAGES: usize = 2;
+
 /// A [`ReviewHost`] whose effects are captured for assertions.
 pub struct ScriptedHost {
     keymap: Arc<KeymapRegistry>,
@@ -64,6 +67,8 @@ pub struct ScriptedHost {
     sessions: Mutex<Vec<(String, String)>>,
     session_origins: Mutex<Vec<bcode_session_models::SessionOrigin>>,
     messages: Mutex<Vec<(String, String)>>,
+    /// Sessions whose history pages were read, one entry per page.
+    history_reads: Mutex<Vec<String>>,
     session_failure: Mutex<Option<String>>,
     permissions: Mutex<Vec<(String, bool, bool)>>,
     cancels: Mutex<Vec<String>>,
@@ -178,6 +183,7 @@ impl ScriptedHost {
             sessions: Mutex::default(),
             session_origins: Mutex::default(),
             messages: Mutex::default(),
+            history_reads: Mutex::default(),
             session_failure: Mutex::default(),
             permissions: Mutex::default(),
             cancels: Mutex::default(),
@@ -678,6 +684,28 @@ impl ScriptedHost {
     #[must_use]
     pub fn messages(&self) -> Vec<(String, String)> {
         self.messages.lock().expect("messages lock").clone()
+    }
+
+    /// Record `text` as a message `session_id` was sent earlier (part of its history).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    pub fn record_message(&self, session_id: &str, text: &str) {
+        self.messages
+            .lock()
+            .expect("messages lock")
+            .push((session_id.to_owned(), text.to_owned()));
+    }
+
+    /// Sessions whose history pages were read so far, one entry per page.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned.
+    #[must_use]
+    pub fn history_reads(&self) -> Vec<String> {
+        self.history_reads.lock().expect("history lock").clone()
     }
 
     /// Permission answers sent so far: `(permission id, approved, remember)`.
@@ -1190,6 +1218,39 @@ impl ReviewHost for ScriptedHost {
             .filter(|(session, _)| *session == session_id)
             .count();
         Box::pin(async move { Ok(crate::host::TurnCount { turns, more: false }) })
+    }
+
+    /// Pages of [`HISTORY_PAGE_MESSAGES`] sent messages, newest first; a cursor is the index of
+    /// the newest message of the page it starts.
+    fn user_messages(
+        &self,
+        session_id: String,
+        older: Option<bcode_session_models::SessionHistoryCursor>,
+    ) -> HostFuture<crate::host::UserMessagePage> {
+        self.history_reads
+            .lock()
+            .expect("history lock")
+            .push(session_id.clone());
+        let texts: Vec<String> = self
+            .messages
+            .lock()
+            .expect("messages lock")
+            .iter()
+            .filter(|(session, _)| *session == session_id)
+            .map(|(_, text)| text.clone())
+            .rev()
+            .collect();
+        let start = older.map_or(0, |cursor| {
+            usize::try_from(cursor.sequence).unwrap_or(usize::MAX)
+        });
+        let end = start.saturating_add(HISTORY_PAGE_MESSAGES).min(texts.len());
+        let page = crate::host::UserMessagePage {
+            texts: texts.get(start..end).unwrap_or_default().to_vec(),
+            older: (end < texts.len()).then(|| bcode_session_models::SessionHistoryCursor {
+                sequence: u64::try_from(end).unwrap_or(u64::MAX),
+            }),
+        };
+        Box::pin(async move { Ok(page) })
     }
 
     fn resolve_permission(

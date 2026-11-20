@@ -38,6 +38,56 @@ const ASKING_STATUS: &str = "asking Bcode…";
 /// Keymap scope of the composer.
 pub const COMPOSER_SCOPE: &str = "code-review-composer";
 
+/// Recovery of the threads questions saved without one were asked from.
+#[derive(Debug, Default)]
+pub(super) struct ExchangeThreads {
+    /// The annotations' and sessions' revisions the threads were last recovered at.
+    pub(super) at: Option<(u64, u64)>,
+    /// Threads (as the review tools name them) found in the sessions' earlier messages, by
+    /// exchange id, until the exchanges are saved with them.
+    pub(super) found: std::collections::BTreeMap<String, String>,
+    /// Exchanges whose sessions' earlier messages were searched, or are being searched.
+    pub(super) asked: std::collections::BTreeSet<String>,
+}
+
+/// History pages of a session searched for the threads of its earlier questions.
+const EXCHANGE_HISTORY_PAGES: usize = 8;
+
+/// The threads (as the review tools name them) `questions` — `(exchange id, asked question)`
+/// — were asked from, found in the review prompts among `session`'s user messages: newest
+/// first, at most [`EXCHANGE_HISTORY_PAGES`] history pages, stopping once every question is
+/// found. A failed read ends the search with what was found.
+async fn exchange_threads_in_history(
+    host: &dyn crate::host::ReviewHost,
+    session: String,
+    mut questions: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut older = None;
+    for _ in 0..EXCHANGE_HISTORY_PAGES {
+        let Ok(page) = host.user_messages(session.clone(), older.take()).await else {
+            break;
+        };
+        for text in &page.texts {
+            let Some(thread) = agent::feed::thread_of(text) else {
+                continue;
+            };
+            let question = agent::feed::question_of(text);
+            // Messages are read newest first, so each one goes to the newest question asking
+            // it that is still unmatched (questions are in the order they were asked).
+            if let Some(at) = questions.iter().rposition(|(_, asked)| *asked == question) {
+                let (exchange_id, _) = questions.remove(at);
+                found.push((exchange_id, thread));
+            }
+        }
+        if questions.is_empty() || page.older.is_none() {
+            break;
+        }
+        older = page.older;
+    }
+    found
+}
+
 /// Milliseconds since the Unix epoch.
 pub(super) fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -883,16 +933,17 @@ impl ReviewSurface {
 
     /// Recover the thread questions saved without one were asked from, and save it with them:
     /// from the review prompt of each question's turn in what its card already observes of its
-    /// session (a bounded window; nothing more is read), mapped to the thread the review holds
-    /// under that id; and a question without a thread of its own, in the same session and on
-    /// the same anchor as one asked from a thread, goes with that thread (a follow-up asked from
-    /// its card). Returns whether any changed.
+    /// session (a bounded window), else in the session's earlier messages
+    /// ([`Self::search_exchange_history`]), mapped to the thread the review holds under that id;
+    /// and a question without a thread of its own, in the same session and on the same anchor
+    /// as one asked from a thread, goes with that thread (a follow-up asked from its card).
+    /// Returns whether any changed.
     pub(super) fn recover_exchange_threads(&mut self) -> bool {
         let at = (self.notes.revision(), self.agents.revision());
-        if self.exchange_threads_at == Some(at) {
+        if self.exchange_threads.at == Some(at) {
             return false;
         }
-        self.exchange_threads_at = Some(at);
+        self.exchange_threads.at = Some(at);
         let unowned = |exchange: &&ReviewAiExchange| {
             exchange.thread_id.is_none() && exchange.status != ReviewAiExchangeStatus::Pending
         };
@@ -902,9 +953,18 @@ impl ReviewSurface {
             .iter()
             .filter(unowned)
             .filter_map(|exchange| {
-                let state = self.agents.state(exchange.session_id.as_deref()?)?;
-                let (_, turn) = state.feed.turn_for(&exchange.question)?;
-                let thread = self.notes.thread_for_tool_id(turn.thread.as_deref()?)?;
+                let observed = self
+                    .agents
+                    .state(exchange.session_id.as_deref()?)
+                    .and_then(|state| state.feed.turn_for(&exchange.question))
+                    .and_then(|(_, turn)| turn.thread.as_deref());
+                let tool_id = observed.or_else(|| {
+                    self.exchange_threads
+                        .found
+                        .get(&exchange.exchange_id)
+                        .map(String::as_str)
+                })?;
+                let thread = self.notes.thread_for_tool_id(tool_id)?;
                 Some((exchange.exchange_id.clone(), thread))
             })
             .collect();
@@ -935,8 +995,65 @@ impl ReviewSurface {
         let mut changed = false;
         for (exchange_id, thread) in found {
             changed |= self.notes.record_exchange_thread(&exchange_id, &thread);
+            self.exchange_threads.found.remove(&exchange_id);
         }
         changed
+    }
+
+    /// Search the earlier messages of the sessions of questions still saved without the thread
+    /// they were asked from, once per question and only after the card observed its session
+    /// without finding it: a bounded number of history pages, newest first, read without
+    /// changing the session; what is found is saved by [`Self::recover_exchange_threads`].
+    pub(super) fn search_exchange_history(&mut self, host: &UiContext) {
+        let mut wanted: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for exchange in self.notes.exchanges() {
+            if exchange.thread_id.is_some()
+                || exchange.status == ReviewAiExchangeStatus::Pending
+                || self.exchange_threads.asked.contains(&exchange.exchange_id)
+            {
+                continue;
+            }
+            let Some(session) = exchange.session_id.clone() else {
+                continue;
+            };
+            // Only once the card observes its session, and the question is not in that
+            // window (which recovers it without a read).
+            let Some(state) = self
+                .agents
+                .state(&session)
+                .filter(|state| state.phase != crate::agent::AgentPhase::Waiting)
+            else {
+                continue;
+            };
+            if state.feed.turn_for(&exchange.question).is_some() {
+                continue;
+            }
+            wanted.entry(session).or_default().push((
+                exchange.exchange_id.clone(),
+                crate::agent::feed::asked_question(&exchange.question),
+            ));
+        }
+        for (session, mut questions) in wanted {
+            questions.sort_by_cached_key(|(id, _)| {
+                self.notes
+                    .exchanges()
+                    .iter()
+                    .find(|exchange| exchange.exchange_id == *id)
+                    .map(|exchange| exchange.created_at_ms)
+            });
+            self.exchange_threads
+                .asked
+                .extend(questions.iter().map(|(id, _)| id.clone()));
+            let services = std::sync::Arc::clone(host.host());
+            let inbox = self.inbox.clone();
+            host.spawn(Box::pin(async move {
+                let searched = questions.iter().map(|(id, _)| id.clone()).collect();
+                let found =
+                    exchange_threads_in_history(services.as_ref(), session, questions).await;
+                inbox.push(Message::ExchangeHistory { found, searched });
+            }));
+        }
     }
 
     /// The session the question being written goes to, when it is a follow-up.

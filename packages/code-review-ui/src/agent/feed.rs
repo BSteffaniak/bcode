@@ -253,13 +253,20 @@ impl Feed {
     /// The newest turn asking `question` (trimmed), with its index.
     #[must_use]
     pub fn turn_for(&self, question: &str) -> Option<(usize, &Turn)> {
-        let question = bounded(question.trim(), MAX_QUESTION_BYTES);
+        let question = asked_question(question);
         self.turns
             .iter()
             .enumerate()
             .rev()
             .find(|(_, turn)| turn.question == question)
     }
+}
+
+/// A question as a turn records it ([`question_of`] of the message that sent it): trimmed and
+/// bounded.
+#[must_use]
+pub fn asked_question(question: &str) -> String {
+    bounded(question.trim(), MAX_QUESTION_BYTES)
 }
 
 /// The question of a user message: the text after the review prompt's `Question:` marker, else
