@@ -1248,15 +1248,6 @@ ratio = 4.05
 slot = "error"
 
 [[accepted]]
-theme = "glacier"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 4.19
-slot = "orange"
-
-[[accepted]]
 theme = "gruvbox"
 variant = "dark"
 kind = "contrast"
@@ -1923,15 +1914,6 @@ ratio = 2.95
 slot = "comment"
 
 [[accepted]]
-theme = "newsroom"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 3.93
-slot = "orange"
-
-[[accepted]]
 theme = "night-owl"
 variant = "dark"
 kind = "contrast"
@@ -1947,96 +1929,6 @@ kind = "contrast"
 foreground = "transcript.assistant.label"
 background = "canvas"
 ratio = 3.49
-slot = "violet"
-
-[[accepted]]
-theme = "night-shift"
-variant = "dark"
-kind = "contrast"
-foreground = "diff.removed"
-background = "canvas"
-ratio = 2.33
-slot = "diff_remove"
-
-[[accepted]]
-theme = "night-shift"
-variant = "dark"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 3.54
-slot = "markup_code"
-
-[[accepted]]
-theme = "night-shift"
-variant = "dark"
-kind = "contrast"
-foreground = "state.error"
-background = "canvas"
-ratio = 3.55
-slot = "error"
-
-[[accepted]]
-theme = "night-shift"
-variant = "dark"
-kind = "contrast"
-foreground = "syntax.comment"
-background = "canvas"
-ratio = 2.35
-slot = "comment"
-
-[[accepted]]
-theme = "night-shift"
-variant = "dark"
-kind = "contrast"
-foreground = "transcript.assistant.label"
-background = "canvas"
-ratio = 4.37
-slot = "violet"
-
-[[accepted]]
-theme = "night-shift"
-variant = "light"
-kind = "contrast"
-foreground = "diff.removed"
-background = "canvas"
-ratio = 2.33
-slot = "diff_remove"
-
-[[accepted]]
-theme = "night-shift"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 3.54
-slot = "markup_code"
-
-[[accepted]]
-theme = "night-shift"
-variant = "light"
-kind = "contrast"
-foreground = "state.error"
-background = "canvas"
-ratio = 3.55
-slot = "error"
-
-[[accepted]]
-theme = "night-shift"
-variant = "light"
-kind = "contrast"
-foreground = "syntax.comment"
-background = "canvas"
-ratio = 2.35
-slot = "comment"
-
-[[accepted]]
-theme = "night-shift"
-variant = "light"
-kind = "contrast"
-foreground = "transcript.assistant.label"
-background = "canvas"
-ratio = 4.37
 slot = "violet"
 
 [[accepted]]
@@ -2355,15 +2247,6 @@ ratio = 2.31
 slot = "comment"
 
 [[accepted]]
-theme = "paper"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 3.93
-slot = "orange"
-
-[[accepted]]
 theme = "poimandres"
 variant = "dark"
 kind = "contrast"
@@ -2416,141 +2299,6 @@ foreground = "markdown.inline_code"
 background = "canvas"
 ratio = 3.5
 slot = "markup_code"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "diff.added"
-background = "canvas"
-ratio = 2.95
-slot = "diff_add"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "diff.hunk"
-background = "canvas"
-ratio = 2.46
-slot = "info"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "link"
-background = "canvas"
-ratio = 2.81
-slot = "markup_link"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.heading"
-background = "canvas"
-ratio = 4.34
-slot = "markup_heading"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 2.65
-slot = "markup_code"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.link"
-background = "canvas"
-ratio = 2.81
-slot = "markup_link"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "selection.active"
-background = "selection.active"
-ratio = 4.39
-slot = "text"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "state.info"
-background = "canvas"
-ratio = 2.46
-slot = "info"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "state.info.surface"
-background = "state.info.surface"
-ratio = 2.16
-slot = "info"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "state.success"
-background = "canvas"
-ratio = 2.95
-slot = "success"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "state.success.surface"
-background = "state.success.surface"
-ratio = 2.54
-slot = "success"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "state.warning"
-background = "canvas"
-ratio = 2.31
-slot = "warning"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "state.warning.surface"
-background = "state.warning.surface"
-ratio = 2.05
-slot = "warning"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "tool.running.title"
-background = "canvas"
-ratio = 2.46
-slot = "info"
-
-[[accepted]]
-theme = "rice-mocha"
-variant = "light"
-kind = "contrast"
-foreground = "tool.succeeded.title"
-background = "canvas"
-ratio = 2.95
-slot = "success"
 
 [[accepted]]
 theme = "rose-pine"
@@ -3631,15 +3379,6 @@ foreground = "selection.active"
 background = "selection.active"
 ratio = 3.62
 slot = "text"
-
-[[accepted]]
-theme = "zen-paper"
-variant = "light"
-kind = "contrast"
-foreground = "markdown.inline_code"
-background = "canvas"
-ratio = 3.93
-slot = "orange"
 
 [[accepted]]
 theme = "zenburn"

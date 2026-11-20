@@ -2,4 +2,7 @@
 display_name   = "Night Shift"
 extends        = ["tokyonight-storm", "soft"]
 id             = "night-shift"
+# The palette's colors stay upstream-exact; in this combination resolution raises the
+# ones that read below their contrast minimum, by lightness only.
+contrast       = "enforce"
 schema_version = 2
