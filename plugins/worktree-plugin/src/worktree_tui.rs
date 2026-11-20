@@ -820,6 +820,7 @@ mod tests {
         let syntax = PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default);
         PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal: None,
             canvas: style.bg(bmux_tui::style::Color::Blue),
             text: style.fg(bmux_tui::style::Color::White),
             muted: style.fg(bmux_tui::style::Color::Yellow),
@@ -861,6 +862,12 @@ mod tests {
                 heading: syntax,
                 link: syntax,
                 raw: syntax,
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
             },
             component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }

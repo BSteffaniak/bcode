@@ -431,7 +431,7 @@ fn spans_match(tokens: &[SyntaxSpan], content: &str) -> bool {
 }
 
 const fn syntax_style(theme: &GitTheme, token: &SyntaxSpan) -> Style {
-    let mut style = theme.syntax(token.style.base_role);
+    let mut style = theme.token_syntax(token.style.role, token.style.base_role);
     if token.style.bold {
         style = style.add_modifier(Modifier::BOLD);
     }

@@ -130,14 +130,34 @@ slot is optional; an omitted slot keeps the derivation for its roles.
 | `diff_add_bg`, `diff_remove_bg` | `diff.added_row`, `diff.removed_row` |
 | `diff_add_emphasis_bg`, `diff_remove_emphasis_bg` | `diff.added_emphasis`, `diff.removed_emphasis` |
 | `syntax_keyword`, `syntax_function`, `syntax_variable`, `syntax_string`, `syntax_number`, `syntax_type`, `syntax_operator`, `syntax_punctuation` | the `syntax.*` role of the same name |
+| `syntax_constant`, `syntax_parameter`, `syntax_property`, `syntax_builtin`, `syntax_tag`, `syntax_attribute` | the `syntax.*` role of the same name; unset, those tokens keep their base color |
 | `markup_heading` | `markdown.heading`, `syntax.heading` |
 | `markup_link` | `link`, `markdown.link`, `syntax.link` |
 | `markup_raw` | `syntax.raw` |
 | `markup_code`, `markup_code_bg` | `markdown.inline_code` text and fill |
 | `markup_list` | `markdown.list_marker` |
+| `ansi_black` … `ansi_white`, `ansi_bright_black` … `ansi_bright_white` | terminal output's ANSI colors 0–15, only when all sixteen are declared |
+| `terminal_fg`, `terminal_bg` | terminal output's default foreground and background (with the sixteen ANSI slots) |
 
 The `syntax_*` slots cover every token kind the syntax highlighter
 distinguishes; the `markdown.code.*` roles follow the matching `syntax.*` role.
+The refined kinds — constants, parameters, properties, builtins, markup tags
+and attributes — have no derivation: without their slot (or an explicit
+`syntax.constant` … style) the highlighter paints those tokens with their base
+color (number, variable, function, keyword, string, or plain text), exactly as
+a palette without them always rendered.
+
+Terminal output — shell tool runs in the transcript and terminal views in the
+git client — paints ANSI colors 0–15 with the palette's `ansi_*` slots when it
+declares all sixteen; a palette without a complete set leaves them to the
+terminal. Colors programs write as 256-color indices or RGB keep their values.
+`[tui.theme] terminal_palette = "terminal"` always keeps the terminal's own
+ANSI colors (the default, `"theme"`, uses the palette's when it has them):
+
+```toml
+[tui.theme]
+terminal_palette = "terminal"
+```
 
 A color a palette declares is used exactly as written: a role that takes a
 palette color unchanged — a slot, or a seed such as `$blue` for

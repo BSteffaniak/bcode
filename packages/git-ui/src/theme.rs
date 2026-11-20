@@ -71,6 +71,12 @@ pub struct GitTheme {
     /// Named theme colors, for configuration that refers to them.
     pub palette: std::collections::BTreeMap<String, Color>,
     syntax: [Style; 13],
+    /// Declared colors for refined roles (constant, parameter, property, builtin, tag,
+    /// attribute); `None` paints those tokens with their base role.
+    refined_syntax: [Option<Style>; 6],
+    /// Colors for terminal output, when the theme declares all sixteen ANSI colors and
+    /// configuration does not keep the terminal's own.
+    pub terminal: Option<bmux_tui_components::terminal_view::TerminalPalette>,
 }
 
 impl GitTheme {
@@ -104,6 +110,16 @@ impl GitTheme {
                         |resolved| Self::from_definition(&resolved),
                     )
             }
+        };
+        let theme = if resolution.preferences.terminal_palette
+            == bcode_tui_theme::appearance::TerminalPalettePreference::Terminal
+        {
+            Self {
+                terminal: None,
+                ..theme
+            }
+        } else {
+            theme
         };
         (theme, diagnostics)
     }
@@ -305,6 +321,16 @@ impl GitTheme {
                 role("markdown.link", Style::new().fg(Color::Cyan)),
                 role("markdown.inline_code", Style::new().fg(Color::Yellow)),
             ],
+            refined_syntax: [
+                "syntax.constant",
+                "syntax.parameter",
+                "syntax.property",
+                "syntax.builtin",
+                "syntax.tag",
+                "syntax.attribute",
+            ]
+            .map(|name| theme.style(name)),
+            terminal: bcode_tui_theme::components::terminal_palette(theme),
         }
     }
 
@@ -329,6 +355,25 @@ impl GitTheme {
             SyntaxRole::Link => 11,
             SyntaxRole::Raw => 12,
         }]
+    }
+
+    /// Style for a highlighted token: its refined `role` when the theme declares a color for
+    /// it, otherwise its `base_role`.
+    #[must_use]
+    pub const fn token_syntax(&self, role: SyntaxRole, base_role: SyntaxRole) -> Style {
+        let refined = match role {
+            SyntaxRole::Constant => self.refined_syntax[0],
+            SyntaxRole::Parameter => self.refined_syntax[1],
+            SyntaxRole::Property => self.refined_syntax[2],
+            SyntaxRole::Builtin => self.refined_syntax[3],
+            SyntaxRole::Tag => self.refined_syntax[4],
+            SyntaxRole::Attribute => self.refined_syntax[5],
+            _ => None,
+        };
+        match refined {
+            Some(style) => style,
+            None => self.syntax(base_role),
+        }
     }
 
     /// Stable color for a graph lane.
@@ -383,6 +428,38 @@ mod tests {
             project_root: dir.to_path_buf(),
             ..AppearanceSources::default()
         }
+    }
+
+    #[test]
+    fn refined_tokens_use_declared_colors_and_otherwise_their_base_role() {
+        let catalog = bcode_tui_theme::definition::ThemeCatalog::bundled().expect("catalog");
+        let resolve = |id: &str| {
+            catalog
+                .resolve(&ThemeSelection::new(id))
+                .unwrap_or_else(|error| panic!("{id}: {error}"))
+        };
+        let declared = resolve("tokyonight");
+        let theme = GitTheme::from_definition(&declared);
+        assert_eq!(
+            Some(theme.token_syntax(SyntaxRole::Constant, SyntaxRole::String)),
+            declared.style("syntax.constant")
+        );
+        assert_eq!(
+            Some(theme.token_syntax(SyntaxRole::Parameter, SyntaxRole::Variable)),
+            declared.style("syntax.parameter")
+        );
+
+        let undeclared = resolve("nord");
+        assert_eq!(undeclared.style("syntax.constant"), None);
+        let theme = GitTheme::from_definition(&undeclared);
+        assert_eq!(
+            theme.token_syntax(SyntaxRole::Constant, SyntaxRole::String),
+            theme.syntax(SyntaxRole::String)
+        );
+        assert_eq!(
+            theme.token_syntax(SyntaxRole::Builtin, SyntaxRole::Variable),
+            theme.syntax(SyntaxRole::Variable)
+        );
     }
 
     #[test]

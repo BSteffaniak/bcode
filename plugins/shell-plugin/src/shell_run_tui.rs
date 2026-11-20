@@ -36,8 +36,8 @@ use crate::contracts::{
     TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
 use bcode_tui_components::terminal_viewer::{
-    MAX_INLINE_TERMINAL_ROWS, TerminalViewerInput, TerminalViewerLiveState, TerminalViewerSizing,
-    terminal_viewer_rows,
+    MAX_INLINE_TERMINAL_ROWS, TerminalPalette, TerminalViewerInput, TerminalViewerLiveState,
+    TerminalViewerSizing, terminal_viewer_rows, terminal_viewer_rows_with_palette,
 };
 use bmux_terminal_grid::GridMode;
 use bmux_tui::prelude::{Color, Line, Span, Style};
@@ -1186,7 +1186,9 @@ impl ShellRunTuiVisualAdapter {
         lines.extend(self.typing_rows(key));
         let retained_rows = self.live_grid_rows(key, input, width, lines.len(), projection);
         let used_retained_grid = retained_rows.is_some();
-        let terminal_rows = retained_rows.unwrap_or_else(|| terminal_viewer_rows(input, width));
+        let terminal_rows = retained_rows.unwrap_or_else(|| {
+            terminal_viewer_rows_with_palette(input, width, active_terminal_palette().as_ref())
+        });
         if !used_retained_grid {
             if let Ok(mut diagnostics) = self.diagnostics.lock() {
                 diagnostics.resets = diagnostics.resets.saturating_add(1);
@@ -1652,6 +1654,26 @@ fn syntax_style(
     )
 }
 
+/// The host theme's terminal-output palette, when it supplies one; `None` keeps the
+/// terminal's own ANSI colors.
+fn active_terminal_palette() -> Option<TerminalPalette> {
+    ACTIVE_THEME.with(|theme| {
+        theme
+            .get()
+            .and_then(|theme| theme.terminal)
+            .map(|terminal| {
+                let mut palette = TerminalPalette::new(terminal.ansi);
+                if let Some(foreground) = terminal.foreground {
+                    palette = palette.with_foreground(foreground);
+                }
+                if let Some(background) = terminal.background {
+                    palette = palette.with_background(background);
+                }
+                palette
+            })
+    })
+}
+
 fn muted_style() -> Style {
     theme_style(|theme| theme.muted, Style::new().fg(Color::BrightBlack))
 }
@@ -1682,7 +1704,11 @@ fn append_terminal_replay_rows(
     if let Some(frames) = replay.frames.as_deref() {
         lines.extend(shell_terminal_frame_rows(input, frames, width));
     } else {
-        lines.extend(terminal_viewer_rows(input, width));
+        lines.extend(terminal_viewer_rows_with_palette(
+            input,
+            width,
+            active_terminal_palette().as_ref(),
+        ));
     }
 }
 
@@ -1806,6 +1832,10 @@ impl ShellTerminalView {
             }
         } else {
             terminal.window(width, following)?
+        };
+        let window = match active_terminal_palette() {
+            Some(palette) => window.with_palette(&palette),
+            None => window,
         };
         self.selection = window
             .selection
@@ -3699,6 +3729,7 @@ mod tests {
         let style = Style::new();
         let theme = PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal: None,
             canvas: style,
             text: style.fg(Color::White),
             muted: style.fg(Color::Yellow),
@@ -3738,6 +3769,12 @@ mod tests {
                 heading: PluginTuiSyntaxColor::from_tui(Color::Magenta),
                 link: PluginTuiSyntaxColor::from_tui(Color::BrightBlue),
                 raw: PluginTuiSyntaxColor::from_tui(Color::BrightGreen),
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
             },
             component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }
@@ -4599,6 +4636,107 @@ mod tests {
 
         assert!(rendered.contains("hello"), "{rendered}");
         assert!(rendered.contains("world"), "{rendered}");
+    }
+
+    fn theme_with_terminal(
+        terminal: Option<bcode_plugin_sdk::tui::PluginTuiTerminalPalette>,
+    ) -> bcode_plugin_sdk::tui::PluginTuiTheme {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffTheme, PluginTuiSourceTheme, PluginTuiSyntaxColor, PluginTuiSyntaxTheme,
+            PluginTuiTheme,
+        };
+        let style = Style::new();
+        let color = PluginTuiSyntaxColor::from_tui(Color::Default);
+        PluginTuiTheme {
+            component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal,
+            canvas: style,
+            text: style,
+            muted: style,
+            border: style,
+            focused: style,
+            selection: style,
+            source: PluginTuiSourceTheme {
+                source: style,
+                border: style,
+                gutter: style,
+                truncated: style,
+            },
+            diff: PluginTuiDiffTheme {
+                text: style,
+                muted: style,
+                title: style,
+                label: style,
+                added: style,
+                removed: style,
+                hunk: style,
+                added_row: style,
+                removed_row: style,
+                added_emphasis: style,
+                removed_emphasis: style,
+            },
+            syntax: PluginTuiSyntaxTheme {
+                text: color,
+                comment: color,
+                keyword: color,
+                function: color,
+                variable: color,
+                string: color,
+                number: color,
+                type_name: color,
+                operator: color,
+                punctuation: color,
+                heading: color,
+                link: color,
+                raw: color,
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
+            },
+            component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
+        }
+        .with_legacy_component()
+    }
+
+    #[test]
+    fn terminal_output_uses_the_host_terminal_palette_when_supplied() {
+        let payload = serde_json::json!({
+            "mode": "terminal",
+            "output_tail": "\u{1b}[31mhello\u{1b}[0m world\n",
+            "columns": 80,
+            "rows": 24
+        });
+        let red_of = |terminal| {
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                100,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            )
+            .with_theme(theme_with_terminal(terminal));
+            let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
+                &ShellRunTuiVisualAdapter::default(),
+                SHELL_RUN_SCHEMA,
+                &payload,
+                &context,
+            );
+            rows.iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains("hello"))
+                .and_then(|span| span.style.fg)
+        };
+        let mut ansi = [Color::Rgb(0, 0, 0); 16];
+        ansi[1] = Color::Rgb(1, 2, 3);
+        let palette = bcode_plugin_sdk::tui::PluginTuiTerminalPalette {
+            ansi,
+            foreground: None,
+            background: None,
+        };
+
+        assert_eq!(red_of(Some(palette)), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(red_of(None), Some(Color::Red));
     }
 
     fn render_rows(payload: &serde_json::Value) -> Vec<Line> {

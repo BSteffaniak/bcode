@@ -61,13 +61,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bcode_markdown_render::{
-    MarkdownCodeBlockFrame, MarkdownContributionKind, MarkdownDestination, MarkdownDocumentContext,
-    MarkdownPresentation, MarkdownRenderOptions, MarkdownRenderResult, MarkdownSelectionKind,
-    MarkdownTableHeaderAlignment, MarkdownTheme, MermaidContributionRendering, render_markdown,
+    MarkdownCodeBlockFrame, MarkdownColorScheme, MarkdownContributionKind, MarkdownDestination,
+    MarkdownDocumentContext, MarkdownPresentation, MarkdownRenderOptions, MarkdownRenderResult,
+    MarkdownSelectionKind, MarkdownTableHeaderAlignment, MarkdownTheme,
+    MermaidContributionRendering, render_markdown,
 };
 use bcode_syntax_render::{SyntaxColor, SyntaxPalette};
 use bcode_tui_theme::chrome::{CodeBlockFrame, TableHeaders};
-use bcode_tui_theme::definition::ResolvedThemeDefinition;
+use bcode_tui_theme::definition::{ResolvedThemeDefinition, ResolvedThemeVariant};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutNode, LogicalRect,
 };
@@ -544,12 +545,13 @@ pub fn syntax_palette(theme: &ResolvedThemeDefinition) -> SyntaxPalette {
     let success = state("state.success");
     let warning = state("state.warning");
     // Code blocks use `markdown.code.<token>`, falling back to the shared `syntax.<token>`.
-    let color = |token: &str, fallback: SyntaxColor| {
+    let declared = |token: &str| {
         [format!("markdown.code.{token}"), format!("syntax.{token}")]
             .iter()
             .find_map(|name| theme.style(name).and_then(|style| style.fg))
-            .map_or(fallback, SyntaxColor::from_tui)
+            .map(SyntaxColor::from_tui)
     };
+    let color = |token: &str, fallback: SyntaxColor| declared(token).unwrap_or(fallback);
     SyntaxPalette {
         text: color("text", text),
         comment: color("comment", muted),
@@ -564,7 +566,13 @@ pub fn syntax_palette(theme: &ResolvedThemeDefinition) -> SyntaxPalette {
         heading: color("heading", info),
         link: color("link", info),
         raw: color("raw", success),
-        ..SyntaxPalette::default()
+        // Unset refined colors paint those tokens with their base role color.
+        constant: declared("constant"),
+        parameter: declared("parameter"),
+        property: declared("property"),
+        builtin: declared("builtin"),
+        tag: declared("tag"),
+        attribute: declared("attribute"),
     }
 }
 
@@ -618,6 +626,16 @@ pub fn render_options(
         .with_link_destination_fallbacks(true)
         .with_rich_reserved_rows(image_rows, MERMAID_RESERVED_ROWS)
         .with_html(cx.markdown.html);
+    // `<picture>` sources follow the theme's light/dark appearance.
+    match cx.theme.appearance() {
+        ResolvedThemeVariant::Light => {
+            options = options.with_color_scheme(MarkdownColorScheme::Light);
+        }
+        ResolvedThemeVariant::Dark => {
+            options = options.with_color_scheme(MarkdownColorScheme::Dark);
+        }
+        ResolvedThemeVariant::Unspecified => {}
+    }
     if cx.markdown.mermaid {
         options = options.with_mermaid_contributions(MERMAID_PIXELS.0, MERMAID_PIXELS.1);
     }

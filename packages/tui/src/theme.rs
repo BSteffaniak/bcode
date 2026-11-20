@@ -241,6 +241,8 @@ pub struct ResolvedTheme {
     pub effects: effects::ChromeEffects,
     /// Complete generic component theme, including v2 roles and chrome.
     pub component: ComponentTheme,
+    /// The theme's terminal-output palette, when its palette declares all sixteen ANSI colors.
+    pub terminal: Option<bcode_tui_theme::components::TerminalPalette>,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -270,6 +272,7 @@ impl ResolvedTheme {
             unit_chrome: self.unit_chrome,
             effects: self.effects,
             component: self.component,
+            terminal: self.terminal,
             fingerprint: self.fingerprint,
         }
     }
@@ -322,6 +325,8 @@ pub struct PresentedTheme {
     pub effects: effects::ChromeEffects,
     /// Complete generic component theme, including v2 roles and chrome.
     pub component: ComponentTheme,
+    /// The theme's terminal-output palette, when its palette declares all sixteen ANSI colors.
+    pub terminal: Option<bcode_tui_theme::components::TerminalPalette>,
     /// Stable resolved presentation fingerprint.
     pub fingerprint: u64,
 }
@@ -507,6 +512,14 @@ pub fn theme_preferences(
         overlays: theme.overlays.clone(),
         variant: variant_preference(theme.variant),
         paths: theme.paths.clone(),
+        terminal_palette: match theme.terminal_palette {
+            bcode_config::TuiTerminalPalette::Theme => {
+                bcode_tui_theme::appearance::TerminalPalettePreference::Theme
+            }
+            bcode_config::TuiTerminalPalette::Terminal => {
+                bcode_tui_theme::appearance::TerminalPalettePreference::Terminal
+            }
+        },
     }
 }
 
@@ -703,6 +716,7 @@ pub(crate) fn resolved_definition_theme(
         unit_chrome,
         effects,
         component: component_theme,
+        terminal: theme.and_then(bcode_tui_theme::components::terminal_palette),
         fingerprint: theme.map_or(0, |theme| theme.fingerprint),
     }
 }
@@ -1016,6 +1030,7 @@ mod capability_tests {
             "bcode-light",
             "nord",
             "monochrome",
+            "tokyonight",
         ] {
             let resolved = catalog
                 .resolve(&definition::ThemeSelection::new(theme_id))
@@ -1043,6 +1058,22 @@ mod capability_tests {
                     .style(role)
                     .and_then(|style| style.fg)
                     .map_or(actual, SyntaxColor::from_tui);
+                assert_eq!(actual, expected, "{theme_id} {role}");
+            }
+            // Refined token colors are exactly the declared role color, and unset otherwise so
+            // the highlighter keeps those tokens' base color.
+            for (role, actual) in [
+                ("syntax.constant", presented.syntax.constant),
+                ("syntax.parameter", presented.syntax.parameter),
+                ("syntax.property", presented.syntax.property),
+                ("syntax.builtin", presented.syntax.builtin),
+                ("syntax.tag", presented.syntax.tag),
+                ("syntax.attribute", presented.syntax.attribute),
+            ] {
+                let expected = resolved
+                    .style(role)
+                    .and_then(|style| style.fg)
+                    .map(SyntaxColor::from_tui);
                 assert_eq!(actual, expected, "{theme_id} {role}");
             }
         }

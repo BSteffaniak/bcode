@@ -83,7 +83,12 @@ pub fn semantic_state_theme() -> super::theme::PresentedTheme {
 /// Build renderer-owned plugin presentation from the active app theme.
 #[must_use]
 pub fn plugin_theme_for_app(app: &BmuxApp) -> bcode_plugin_sdk::tui::PluginTuiTheme {
-    plugin_tui_theme(&app.presented_theme())
+    let mut theme = plugin_tui_theme(&app.presented_theme());
+    // `[tui.theme] terminal_palette = "terminal"` keeps the terminal's own ANSI colors.
+    if app.tui_config().theme.terminal_palette == bcode_config::TuiTerminalPalette::Terminal {
+        theme.terminal = None;
+    }
+    theme
 }
 
 fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::tui::PluginTuiTheme {
@@ -94,6 +99,13 @@ fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::t
     let syntax = theme.syntax;
     bcode_plugin_sdk::tui::PluginTuiTheme {
         component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+        terminal: theme
+            .terminal
+            .map(|palette| bcode_plugin_sdk::tui::PluginTuiTerminalPalette {
+                ansi: palette.ansi,
+                foreground: palette.foreground,
+                background: palette.background,
+            }),
         canvas: components.canvas,
         text: components.text,
         muted: components.muted,
@@ -133,6 +145,12 @@ fn plugin_tui_theme(theme: &super::theme::PresentedTheme) -> bcode_plugin_sdk::t
             heading: syntax_color(syntax.heading),
             link: syntax_color(syntax.link),
             raw: syntax_color(syntax.raw),
+            constant: syntax.constant.map(syntax_color),
+            parameter: syntax.parameter.map(syntax_color),
+            property: syntax.property.map(syntax_color),
+            builtin: syntax.builtin.map(syntax_color),
+            tag: syntax.tag.map(syntax_color),
+            attribute: syntax.attribute.map(syntax_color),
         },
         component: components,
     }

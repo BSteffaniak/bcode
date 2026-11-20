@@ -2819,6 +2819,22 @@ pub struct TuiThemeConfig {
     /// Easing curve used for accent color transitions.
     #[serde(default)]
     pub accent_transition_curve: TuiAccentTransitionCurve,
+    /// Colors that paint terminal output (shell tool runs and other embedded terminal views):
+    /// `theme` (default) uses the theme's sixteen ANSI colors when its palette declares them
+    /// all; `terminal` always keeps the terminal's own ANSI colors.
+    #[serde(default)]
+    pub terminal_palette: TuiTerminalPalette,
+}
+
+/// Colors that paint terminal output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTerminalPalette {
+    /// The theme's ANSI colors when its palette declares all sixteen, else the terminal's.
+    #[default]
+    Theme,
+    /// Always the terminal's own ANSI colors.
+    Terminal,
 }
 
 impl TuiThemeConfig {
@@ -2860,6 +2876,7 @@ impl Default for TuiThemeConfig {
             accent_transition: TuiAccentTransitionMode::Transition,
             accent_transition_ms: None,
             accent_transition_curve: TuiAccentTransitionCurve::EaseOut,
+            terminal_palette: TuiTerminalPalette::Theme,
         }
     }
 }

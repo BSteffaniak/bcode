@@ -197,9 +197,11 @@ pub struct ThemeWarning {
 }
 
 /// Light/dark branch selected while resolving a theme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolvedThemeVariant {
     /// Do not apply a variant patch.
+    #[default]
     Unspecified,
     /// Apply the dark variant patch when present.
     Dark,
@@ -440,7 +442,9 @@ impl ThemeCatalog {
                 &mut applied,
             )?;
         }
-        resolve_merged(&selection.base, merged, applied, &self.role_namespaces)
+        let mut resolved = resolve_merged(&selection.base, merged, applied, &self.role_namespaces)?;
+        resolved.variant = selection.variant;
+        Ok(resolved)
     }
 
     fn merge_theme(
@@ -541,6 +545,9 @@ pub struct ResolvedThemeDefinition {
     pub applied_layers: Vec<String>,
     /// Stable fingerprint of all resolved presentation fields.
     pub fingerprint: u64,
+    /// The light/dark branch this theme was resolved for: the presented appearance.
+    #[serde(default)]
+    pub variant: ResolvedThemeVariant,
 }
 
 impl ResolvedThemeDefinition {
@@ -565,6 +572,28 @@ impl ResolvedThemeDefinition {
             warnings: Vec::new(),
             applied_layers: Vec::new(),
             fingerprint: 0,
+            variant: ResolvedThemeVariant::Unspecified,
+        }
+    }
+
+    /// Whether the theme presents light or dark: the variant it was resolved for, else the
+    /// lightness of its RGB `background`; [`ResolvedThemeVariant::Unspecified`] when neither
+    /// says.
+    #[must_use]
+    pub fn appearance(&self) -> ResolvedThemeVariant {
+        match self.variant {
+            ResolvedThemeVariant::Unspecified => match self.color("background") {
+                Some(Color::Rgb(r, g, b)) => {
+                    let luma = 299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b);
+                    if luma >= 128_000 {
+                        ResolvedThemeVariant::Light
+                    } else {
+                        ResolvedThemeVariant::Dark
+                    }
+                }
+                _ => ResolvedThemeVariant::Unspecified,
+            },
+            variant => variant,
         }
     }
 
@@ -1015,6 +1044,7 @@ fn resolve_merged(
         warnings,
         applied_layers,
         fingerprint,
+        variant: ResolvedThemeVariant::Unspecified,
     })
 }
 

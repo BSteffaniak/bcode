@@ -4206,6 +4206,7 @@ impl ReviewSurface {
         self.theme = self.config.theme(theme);
         if let Some(theme) = theme {
             self.syntax.set_palette(theme.syntax);
+            crate::rows::set_markdown_color_scheme(theme.markdown_color_scheme);
         }
         self.threads_empty = vec![Line::from_spans(vec![Span::styled(
             "Comment threads and AI answers appear here.",

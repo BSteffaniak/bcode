@@ -18,7 +18,7 @@ bcode_git_daemon = { workspace = true }
 bcode_git_live = { workspace = true }
 bcode_keymap = { workspace = true }
 bcode_syntax_render = { workspace = true }
-bcode_tui_theme = { workspace = true }
+bcode_tui_theme = { workspace = true, features = ["components"] }
 bmux_config_composition = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_pty = { workspace = true }

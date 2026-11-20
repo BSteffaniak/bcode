@@ -1491,12 +1491,13 @@ fn command_log(app: &App) -> Element<'_> {
             .filter(|output| !output.terminal.is_empty());
         if let Some(output) = output {
             entries = entries.child(
-                Surface::new(
+                Surface::new(themed_terminal(
                     TerminalViewComponent::new(format!("log-{}", record.id), &output.terminal)
                         .mode(TerminalViewMode::Reflow)
                         .max_rows(LOG_OUTPUT_ROWS)
                         .cursor(false),
-                )
+                    theme,
+                ))
                 .padding(Insets::new(0, 0, 0, 2)),
             );
             if record.output_truncated {
@@ -1531,6 +1532,17 @@ pub const TERMINAL_POPUP_WIDTH: u16 = 140;
 /// scrollbar).
 pub fn terminal_popup_view(terminal: &TerminalState) -> TerminalViewComponent<'_> {
     TerminalViewComponent::new(crate::scroll::TERMINAL_LIST, terminal).scrollbar(POPUP_SCROLLBAR)
+}
+
+/// `view` painted with the theme's terminal palette, when it has one.
+const fn themed_terminal<'a>(
+    view: TerminalViewComponent<'a>,
+    theme: &GitTheme,
+) -> TerminalViewComponent<'a> {
+    match theme.terminal {
+        Some(palette) => view.palette(palette),
+        None => view,
+    }
 }
 
 fn key(app: &App, action: Action) -> String {
@@ -1883,7 +1895,7 @@ fn popup<'a>(app: &'a App, frame: &'a Frame) -> Option<Element<'a>> {
                 &format!("$ {} · {status}", run.command),
                 TERMINAL_POPUP_WIDTH,
                 height,
-                terminal_popup_view(&run.terminal),
+                themed_terminal(terminal_popup_view(&run.terminal), &app.theme),
             ))
         }
         Popup::Confirm(confirm) => Some(modal(

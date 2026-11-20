@@ -19,6 +19,7 @@ bmux_tui                         = { workspace = true, features = ["serde"] }
 bmux_tui_components = { workspace = true, optional = true, features = [
     "diff-viewer",
     "source-viewer",
+    "terminal-viewer",
 ] }
 serde                            = { workspace = true, features = ["derive", "std"] }
 thiserror                        = { workspace = true }

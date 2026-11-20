@@ -42,6 +42,8 @@ pub struct ComponentStyles {
     pub syntax: SyntaxPalette,
     /// Border glyphs and focus effects for dialogs and modals.
     pub dialog_chrome: ComponentChrome,
+    /// Which `<picture>` sources Markdown shows: the theme's light/dark appearance.
+    pub markdown_color_scheme: Option<bcode_markdown_render::MarkdownColorScheme>,
 }
 
 /// The `source.file.*` roles a theme sets; the review derives the rest.
@@ -172,6 +174,7 @@ pub fn component_styles(theme: Option<&ResolvedThemeDefinition>, accent: Color) 
         markdown: markdown_theme(theme, text, muted),
         syntax: syntax_palette(theme, text, muted, info, success, warning),
         dialog_chrome: theme.map_or(ComponentChrome::DEFAULT, dialog_chrome),
+        markdown_color_scheme: theme.and_then(markdown_color_scheme),
     }
 }
 
@@ -226,6 +229,64 @@ pub fn dialog_chrome(theme: &ResolvedThemeDefinition) -> ComponentChrome {
     surface_chrome(theme.chrome.borders.dialog, &theme.chrome)
 }
 
+pub use bmux_tui_components::terminal_viewer::TerminalPalette;
+
+/// Palette slots for ANSI colors 0-15, in index order.
+pub const ANSI_SLOTS: [&str; 16] = [
+    "ansi_black",
+    "ansi_red",
+    "ansi_green",
+    "ansi_yellow",
+    "ansi_blue",
+    "ansi_magenta",
+    "ansi_cyan",
+    "ansi_white",
+    "ansi_bright_black",
+    "ansi_bright_red",
+    "ansi_bright_green",
+    "ansi_bright_yellow",
+    "ansi_bright_blue",
+    "ansi_bright_magenta",
+    "ansi_bright_cyan",
+    "ansi_bright_white",
+];
+
+/// The terminal-output palette a theme declares: its sixteen `ansi_*` slots, with the
+/// optional `terminal_fg` / `terminal_bg` defaults.
+///
+/// `None` unless every ANSI slot is declared, so terminal output keeps the terminal's own
+/// colors for themes that do not define a complete set.
+#[must_use]
+pub fn terminal_palette(theme: &ResolvedThemeDefinition) -> Option<TerminalPalette> {
+    let mut ansi = [Color::Default; 16];
+    for (color, slot) in ansi.iter_mut().zip(ANSI_SLOTS) {
+        *color = theme.color(slot)?;
+    }
+    let mut palette = TerminalPalette::new(ansi);
+    if let Some(foreground) = theme.color("terminal_fg") {
+        palette = palette.with_foreground(foreground);
+    }
+    if let Some(background) = theme.color("terminal_bg") {
+        palette = palette.with_background(background);
+    }
+    Some(palette)
+}
+
+/// The `<picture>` color scheme for Markdown rendered under `theme` (its
+/// [`ResolvedThemeDefinition::appearance`]); `None` when the appearance is unknown.
+#[must_use]
+pub fn markdown_color_scheme(
+    theme: &ResolvedThemeDefinition,
+) -> Option<bcode_markdown_render::MarkdownColorScheme> {
+    use crate::definition::ResolvedThemeVariant;
+    use bcode_markdown_render::MarkdownColorScheme;
+    match theme.appearance() {
+        ResolvedThemeVariant::Light => Some(MarkdownColorScheme::Light),
+        ResolvedThemeVariant::Dark => Some(MarkdownColorScheme::Dark),
+        ResolvedThemeVariant::Unspecified => None,
+    }
+}
+
 fn syntax_palette(
     theme: Option<&ResolvedThemeDefinition>,
     text: Style,
@@ -246,6 +307,13 @@ fn syntax_palette(
             .and_then(|theme| theme.style(role).and_then(|style| style.fg))
             .map_or(fallback, SyntaxColor::from_tui)
     };
+    // Refined token colors stay unset unless the theme declares them, so those tokens keep
+    // their base role color.
+    let refined = |role: &str| {
+        theme
+            .and_then(|theme| theme.style(role).and_then(|style| style.fg))
+            .map(SyntaxColor::from_tui)
+    };
     SyntaxPalette {
         text: color("syntax.text", text_color),
         comment: color("syntax.comment", muted_color),
@@ -260,7 +328,12 @@ fn syntax_palette(
         heading: color("syntax.heading", info_color),
         link: color("syntax.link", info_color),
         raw: color("syntax.raw", success_color),
-        ..SyntaxPalette::default()
+        constant: refined("syntax.constant"),
+        parameter: refined("syntax.parameter"),
+        property: refined("syntax.property"),
+        builtin: refined("syntax.builtin"),
+        tag: refined("syntax.tag"),
+        attribute: refined("syntax.attribute"),
     }
 }
 
@@ -305,6 +378,68 @@ fn markdown_theme(
 mod tests {
     use super::*;
     use crate::definition::ThemeCatalog;
+
+    fn bundled(
+        id: &str,
+        variant: crate::definition::ResolvedThemeVariant,
+    ) -> ResolvedThemeDefinition {
+        ThemeCatalog::bundled()
+            .expect("catalog")
+            .resolve(&crate::definition::ThemeSelection::new(id).variant(variant))
+            .unwrap_or_else(|error| panic!("{id}: {error}"))
+    }
+
+    #[test]
+    fn terminal_palette_is_the_declared_ansi_slots_or_none() {
+        use crate::definition::ResolvedThemeVariant;
+        let theme = bundled("tokyonight", ResolvedThemeVariant::Dark);
+        let palette = terminal_palette(&theme).expect("tokyonight declares all sixteen");
+        for (color, slot) in palette.ansi.iter().zip(ANSI_SLOTS) {
+            assert_eq!(Some(*color), theme.color(slot), "{slot}");
+        }
+        assert_eq!(palette.foreground, theme.color("terminal_fg"));
+        assert_eq!(palette.background, theme.color("terminal_bg"));
+
+        // Without a complete set terminal output keeps the terminal's own colors.
+        assert_eq!(
+            terminal_palette(&bundled("nord", ResolvedThemeVariant::Dark)),
+            None
+        );
+        assert_eq!(
+            terminal_palette(&bundled("catppuccin-mocha", ResolvedThemeVariant::Dark)),
+            None
+        );
+    }
+
+    #[test]
+    fn markdown_color_scheme_follows_the_presented_appearance() {
+        use crate::definition::ResolvedThemeVariant;
+        use bcode_markdown_render::MarkdownColorScheme;
+        assert_eq!(
+            markdown_color_scheme(&bundled("tokyonight", ResolvedThemeVariant::Light)),
+            Some(MarkdownColorScheme::Light)
+        );
+        assert_eq!(
+            markdown_color_scheme(&bundled("tokyonight", ResolvedThemeVariant::Dark)),
+            Some(MarkdownColorScheme::Dark)
+        );
+        // Without a variant, the background's lightness decides; terminal colors say nothing.
+        assert_eq!(
+            markdown_color_scheme(&bundled("bcode-light", ResolvedThemeVariant::Unspecified)),
+            Some(MarkdownColorScheme::Light)
+        );
+        assert_eq!(
+            markdown_color_scheme(&bundled("bcode-dark", ResolvedThemeVariant::Unspecified)),
+            Some(MarkdownColorScheme::Dark)
+        );
+        assert_eq!(
+            markdown_color_scheme(&bundled(
+                "terminal-native",
+                ResolvedThemeVariant::Unspecified
+            )),
+            None
+        );
+    }
 
     #[test]
     fn gradients_need_two_rgb_colors_and_an_effect() {

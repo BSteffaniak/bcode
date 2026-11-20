@@ -3862,6 +3862,7 @@ library = "libcomposer_fixture.dylib"
         );
         bcode_plugin_sdk::tui::PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal: None,
             canvas: style,
             text: style.fg(Color::White),
             muted: style.fg(Color::BrightBlack),
@@ -3901,6 +3902,12 @@ library = "libcomposer_fixture.dylib"
                 heading: syntax,
                 link: syntax,
                 raw: syntax,
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
             },
             component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }

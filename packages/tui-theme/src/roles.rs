@@ -197,6 +197,30 @@ pub const EXACT_PALETTE: &[(&str, &str)] = &[
     ("syntax_operator", "operators: syntax.operator"),
     ("syntax_punctuation", "punctuation: syntax.punctuation"),
     (
+        "syntax_constant",
+        "named constants: `true`, `null`, constant identifiers, escapes: syntax.constant (unset uses the token's base color)",
+    ),
+    (
+        "syntax_parameter",
+        "function parameters: syntax.parameter (unset uses the token's base color)",
+    ),
+    (
+        "syntax_property",
+        "properties, fields, and mapping keys: syntax.property (unset uses the token's base color)",
+    ),
+    (
+        "syntax_builtin",
+        "builtin functions, classes, and language variables such as `self`: syntax.builtin (unset uses the token's base color)",
+    ),
+    (
+        "syntax_tag",
+        "markup tag names: syntax.tag (unset uses the token's base color)",
+    ),
+    (
+        "syntax_attribute",
+        "markup attribute names: syntax.attribute (unset uses the token's base color)",
+    ),
+    (
         "markup_heading",
         "headings: markdown.heading, syntax.heading",
     ),
@@ -205,6 +229,54 @@ pub const EXACT_PALETTE: &[(&str, &str)] = &[
     ("markup_code", "inline code text: markdown.inline_code"),
     ("markup_code_bg", "inline code fill: markdown.inline_code"),
     ("markup_list", "list markers: markdown.list_marker"),
+    ("ansi_black", "terminal output ANSI color 0 (black)"),
+    ("ansi_red", "terminal output ANSI color 1 (red)"),
+    ("ansi_green", "terminal output ANSI color 2 (green)"),
+    ("ansi_yellow", "terminal output ANSI color 3 (yellow)"),
+    ("ansi_blue", "terminal output ANSI color 4 (blue)"),
+    ("ansi_magenta", "terminal output ANSI color 5 (magenta)"),
+    ("ansi_cyan", "terminal output ANSI color 6 (cyan)"),
+    ("ansi_white", "terminal output ANSI color 7 (white)"),
+    (
+        "ansi_bright_black",
+        "terminal output ANSI color 8 (bright black)",
+    ),
+    (
+        "ansi_bright_red",
+        "terminal output ANSI color 9 (bright red)",
+    ),
+    (
+        "ansi_bright_green",
+        "terminal output ANSI color 10 (bright green)",
+    ),
+    (
+        "ansi_bright_yellow",
+        "terminal output ANSI color 11 (bright yellow)",
+    ),
+    (
+        "ansi_bright_blue",
+        "terminal output ANSI color 12 (bright blue)",
+    ),
+    (
+        "ansi_bright_magenta",
+        "terminal output ANSI color 13 (bright magenta)",
+    ),
+    (
+        "ansi_bright_cyan",
+        "terminal output ANSI color 14 (bright cyan)",
+    ),
+    (
+        "ansi_bright_white",
+        "terminal output ANSI color 15 (bright white)",
+    ),
+    (
+        "terminal_fg",
+        "terminal output default foreground (with all 16 ANSI slots)",
+    ),
+    (
+        "terminal_bg",
+        "terminal output default background (with all 16 ANSI slots)",
+    ),
 ];
 
 // Derivation building blocks. Every expression resolves only from the
@@ -240,6 +312,14 @@ const STRING: &str = "readable(or($syntax_string, $green, $success, $accent), $b
 const NUMBER: &str = "readable(or($syntax_number, $orange, $yellow, $accent), $background, 4.5)";
 const TYPE: &str = "readable(or($syntax_type, $cyan, $blue, $accent), $background, 4.5)";
 const OPERATOR: &str = "readable(or($syntax_operator, $cyan, $blue, $accent), $background, 4.5)";
+// Refined token colors come only from their exact slot: unset leaves the role
+// unset, so the highlighter paints those tokens with their base role color.
+const CONSTANT: &str = "readable($syntax_constant, $background, 4.5)";
+const PARAMETER: &str = "readable($syntax_parameter, $background, 4.5)";
+const PROPERTY: &str = "readable($syntax_property, $background, 4.5)";
+const BUILTIN: &str = "readable($syntax_builtin, $background, 4.5)";
+const TAG: &str = "readable($syntax_tag, $background, 4.5)";
+const ATTRIBUTE: &str = "readable($syntax_attribute, $background, 4.5)";
 const RAW: &str = "readable(or($markup_raw, $green, $success, $accent), $background, 4.5)";
 const INLINE_CODE: &str = "readable(or($markup_code, $orange, $yellow, $accent), $background, 4.5)";
 const LIST_MARKER: &str = "readable(or($markup_list, $accent), $background, 4.5)";
@@ -859,6 +939,42 @@ pub const ROLES: &[RoleSpec] = &[
         "raw text in code in Markdown code blocks; unset uses syntax.raw",
         None,
     ),
+    role(
+        "markdown.code.constant",
+        RoleCategory::Markdown,
+        "constants in Markdown code blocks; unset uses syntax.constant",
+        None,
+    ),
+    role(
+        "markdown.code.parameter",
+        RoleCategory::Markdown,
+        "parameters in Markdown code blocks; unset uses syntax.parameter",
+        None,
+    ),
+    role(
+        "markdown.code.property",
+        RoleCategory::Markdown,
+        "properties in Markdown code blocks; unset uses syntax.property",
+        None,
+    ),
+    role(
+        "markdown.code.builtin",
+        RoleCategory::Markdown,
+        "builtins in Markdown code blocks; unset uses syntax.builtin",
+        None,
+    ),
+    role(
+        "markdown.code.tag",
+        RoleCategory::Markdown,
+        "markup tags in Markdown code blocks; unset uses syntax.tag",
+        None,
+    ),
+    role(
+        "markdown.code.attribute",
+        RoleCategory::Markdown,
+        "markup attributes in Markdown code blocks; unset uses syntax.attribute",
+        None,
+    ),
     // Syntax
     role(
         "syntax.text",
@@ -937,6 +1053,42 @@ pub const ROLES: &[RoleSpec] = &[
         RoleCategory::Syntax,
         "markup literals",
         Some(DerivedStyle::fg(RAW)),
+    ),
+    role(
+        "syntax.constant",
+        RoleCategory::Syntax,
+        "constants; unset paints them with their base token color",
+        Some(DerivedStyle::fg(CONSTANT)),
+    ),
+    role(
+        "syntax.parameter",
+        RoleCategory::Syntax,
+        "parameters; unset paints them with their base token color",
+        Some(DerivedStyle::fg(PARAMETER)),
+    ),
+    role(
+        "syntax.property",
+        RoleCategory::Syntax,
+        "properties; unset paints them with their base token color",
+        Some(DerivedStyle::fg(PROPERTY)),
+    ),
+    role(
+        "syntax.builtin",
+        RoleCategory::Syntax,
+        "builtins; unset paints them with their base token color",
+        Some(DerivedStyle::fg(BUILTIN)),
+    ),
+    role(
+        "syntax.tag",
+        RoleCategory::Syntax,
+        "markup tags; unset paints them with their base token color",
+        Some(DerivedStyle::fg(TAG)),
+    ),
+    role(
+        "syntax.attribute",
+        RoleCategory::Syntax,
+        "markup attributes; unset paints them with their base token color",
+        Some(DerivedStyle::fg(ATTRIBUTE)),
     ),
     // Source and diff
     role(

@@ -1149,6 +1149,7 @@ mod tests {
         let style = Style::new();
         PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal: None,
             canvas: style,
             text: style,
             muted: style.fg(Color::BrightBlack),
@@ -1190,6 +1191,12 @@ mod tests {
                 heading: PluginTuiSyntaxColor::from_tui(Color::Magenta),
                 link: PluginTuiSyntaxColor::from_tui(Color::BrightBlue),
                 raw: PluginTuiSyntaxColor::from_tui(Color::BrightGreen),
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
             },
             component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }

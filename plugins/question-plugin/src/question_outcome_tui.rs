@@ -86,6 +86,7 @@ mod tests {
     fn adapter_uses_renderer_owned_component_theme() {
         let theme = bcode_plugin_sdk::tui::PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal: None,
             canvas: Style::new(),
             text: Style::new().fg(Color::Green),
             muted: Style::new().fg(Color::BrightBlack),
@@ -125,6 +126,12 @@ mod tests {
                 heading: PluginTuiSyntaxColor::from_tui(Color::Default),
                 link: PluginTuiSyntaxColor::from_tui(Color::Default),
                 raw: PluginTuiSyntaxColor::from_tui(Color::Default),
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
             },
             component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }

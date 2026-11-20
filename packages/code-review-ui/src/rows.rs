@@ -2021,9 +2021,36 @@ fn markdown_html() -> bcode_markdown_render::MarkdownHtmlMode {
         .unwrap_or_default()
 }
 
-/// Markdown render options for `width` cells under the review's configuration.
+/// Which `<picture>` sources markdown shows: 0 unknown, 1 light, 2 dark; follows the theme.
+static MARKDOWN_COLOR_SCHEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Choose `<picture>` sources in every markdown text of the review for `scheme` (the theme's
+/// light/dark appearance); `None` leaves the choice to the renderer.
+pub fn set_markdown_color_scheme(scheme: Option<bcode_markdown_render::MarkdownColorScheme>) {
+    let index = match scheme {
+        None => 0,
+        Some(bcode_markdown_render::MarkdownColorScheme::Light) => 1,
+        Some(bcode_markdown_render::MarkdownColorScheme::Dark) => 2,
+    };
+    MARKDOWN_COLOR_SCHEME.store(index, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn markdown_color_scheme() -> Option<bcode_markdown_render::MarkdownColorScheme> {
+    match MARKDOWN_COLOR_SCHEME.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(bcode_markdown_render::MarkdownColorScheme::Light),
+        2 => Some(bcode_markdown_render::MarkdownColorScheme::Dark),
+        _ => None,
+    }
+}
+
+/// Markdown render options for `width` cells under the review's configuration and theme.
 pub(crate) fn markdown_options(width: u16) -> bcode_markdown_render::MarkdownRenderOptions {
-    bcode_markdown_render::MarkdownRenderOptions::new(width).with_html(markdown_html())
+    let options =
+        bcode_markdown_render::MarkdownRenderOptions::new(width).with_html(markdown_html());
+    match markdown_color_scheme() {
+        Some(scheme) => options.with_color_scheme(scheme),
+        None => options,
+    }
 }
 
 /// [`markdown`], and whether rows were elided.

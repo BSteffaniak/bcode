@@ -123,7 +123,30 @@ impl VisualContext for bcode_plugin_sdk::tui::PluginTuiVisualRenderContext {
                 heading: bcode_syntax_render::SyntaxColor::from_tui(theme.syntax.heading.into()),
                 link: bcode_syntax_render::SyntaxColor::from_tui(theme.syntax.link.into()),
                 raw: bcode_syntax_render::SyntaxColor::from_tui(theme.syntax.raw.into()),
-                ..bcode_syntax_render::SyntaxPalette::default()
+                constant: theme
+                    .syntax
+                    .constant
+                    .map(|color| bcode_syntax_render::SyntaxColor::from_tui(color.into())),
+                parameter: theme
+                    .syntax
+                    .parameter
+                    .map(|color| bcode_syntax_render::SyntaxColor::from_tui(color.into())),
+                property: theme
+                    .syntax
+                    .property
+                    .map(|color| bcode_syntax_render::SyntaxColor::from_tui(color.into())),
+                builtin: theme
+                    .syntax
+                    .builtin
+                    .map(|color| bcode_syntax_render::SyntaxColor::from_tui(color.into())),
+                tag: theme
+                    .syntax
+                    .tag
+                    .map(|color| bcode_syntax_render::SyntaxColor::from_tui(color.into())),
+                attribute: theme
+                    .syntax
+                    .attribute
+                    .map(|color| bcode_syntax_render::SyntaxColor::from_tui(color.into())),
             },
         })
     }

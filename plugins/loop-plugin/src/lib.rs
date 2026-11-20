@@ -6272,6 +6272,7 @@ mod tests {
         let muted = Style::new().fg(Color::BrightBlack).bg(Color::Blue);
         let theme = PluginTuiTheme {
             component_theme_version: bcode_plugin_sdk::tui::PLUGIN_TUI_COMPONENT_THEME_VERSION,
+            terminal: None,
             canvas,
             text: Style::new().fg(Color::White),
             muted,
@@ -6311,6 +6312,12 @@ mod tests {
                 heading: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
                 link: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
                 raw: bcode_plugin_sdk::tui::PluginTuiSyntaxColor::from_tui(Color::Default),
+                constant: None,
+                parameter: None,
+                property: None,
+                builtin: None,
+                tag: None,
+                attribute: None,
             },
             component: bcode_plugin_sdk::tui::ComponentTheme::terminal_default(),
         }

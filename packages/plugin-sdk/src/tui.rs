@@ -1362,6 +1362,24 @@ pub struct PluginTuiSyntaxTheme {
     pub link: PluginTuiSyntaxColor,
     /// Markup literal spans such as inline code.
     pub raw: PluginTuiSyntaxColor,
+    /// Named constants; `None` paints them with their base role color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constant: Option<PluginTuiSyntaxColor>,
+    /// Function parameters; `None` paints them with their base role color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<PluginTuiSyntaxColor>,
+    /// Properties, fields, and mapping keys; `None` paints them with their base role color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<PluginTuiSyntaxColor>,
+    /// Language and runtime builtins; `None` paints them with their base role color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<PluginTuiSyntaxColor>,
+    /// Markup tag names; `None` paints them with their base role color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<PluginTuiSyntaxColor>,
+    /// Markup attribute names; `None` paints them with their base role color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<PluginTuiSyntaxColor>,
 }
 
 /// Semantic styles for source-code cards supplied by the TUI host.
@@ -1431,6 +1449,24 @@ pub struct PluginTuiTheme {
     /// [`Self::component_theme`].
     #[serde(with = "component_theme_wire")]
     pub component: bmux_tui_components::theme::ComponentTheme,
+    /// Colors for terminal output (ANSI 0-15 and optional defaults); `None` keeps the
+    /// terminal's own colors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<PluginTuiTerminalPalette>,
+}
+
+/// Terminal-output palette supplied by the TUI host: the theme's ANSI colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTuiTerminalPalette {
+    /// Colors for ANSI indices 0-15: black, red, green, yellow, blue, magenta, cyan, white,
+    /// then their bright variants.
+    pub ansi: [bmux_tui::style::Color; 16],
+    /// Foreground for text left in the default color; `None` keeps the host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground: Option<bmux_tui::style::Color>,
+    /// Background for cells left in the default color; `None` keeps the host default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bmux_tui::style::Color>,
 }
 
 impl PluginTuiTheme {
@@ -1734,9 +1770,16 @@ mod component_theme_tests {
             heading: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
             link: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
             raw: PluginTuiSyntaxColor::from_tui(bmux_tui::style::Color::Default),
+            constant: None,
+            parameter: None,
+            property: None,
+            builtin: None,
+            tag: None,
+            attribute: None,
         };
         PluginTuiTheme {
             component_theme_version: version,
+            terminal: None,
             canvas: style,
             text: style,
             muted: style,

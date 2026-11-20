@@ -65,6 +65,19 @@ impl VariantPreference {
     }
 }
 
+/// Which colors paint terminal output (`[tui.theme] terminal_palette`): shell tool runs and
+/// other embedded terminal views.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPalettePreference {
+    /// The theme's ANSI colors, when its palette declares all sixteen; otherwise the
+    /// terminal's own.
+    #[default]
+    Theme,
+    /// Always the terminal's own ANSI colors.
+    Terminal,
+}
+
 /// Configured theme selection: the `[tui.theme]` table.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -79,6 +92,8 @@ pub struct ThemePreferences {
     pub variant: VariantPreference,
     /// Extra theme files or directories.
     pub paths: Vec<PathBuf>,
+    /// Which colors paint terminal output.
+    pub terminal_palette: TerminalPalettePreference,
 }
 
 impl Default for ThemePreferences {
@@ -89,6 +104,7 @@ impl Default for ThemePreferences {
             overlays: Vec::new(),
             variant: VariantPreference::Auto,
             paths: Vec::new(),
+            terminal_palette: TerminalPalettePreference::Theme,
         }
     }
 }
