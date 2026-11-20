@@ -231,25 +231,7 @@ pub fn dialog_chrome(theme: &ResolvedThemeDefinition) -> ComponentChrome {
 
 pub use bmux_tui_components::terminal_viewer::TerminalPalette;
 
-/// Palette slots for ANSI colors 0-15, in index order.
-pub const ANSI_SLOTS: [&str; 16] = [
-    "ansi_black",
-    "ansi_red",
-    "ansi_green",
-    "ansi_yellow",
-    "ansi_blue",
-    "ansi_magenta",
-    "ansi_cyan",
-    "ansi_white",
-    "ansi_bright_black",
-    "ansi_bright_red",
-    "ansi_bright_green",
-    "ansi_bright_yellow",
-    "ansi_bright_blue",
-    "ansi_bright_magenta",
-    "ansi_bright_cyan",
-    "ansi_bright_white",
-];
+pub use crate::roles::ANSI_SLOTS;
 
 /// The terminal-output palette a theme declares: its sixteen `ansi_*` slots, with the
 /// optional `terminal_fg` / `terminal_bg` defaults.

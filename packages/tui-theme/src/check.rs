@@ -406,6 +406,40 @@ pub struct ThemeCheck {
     /// Comparison with the accepted findings, when one was made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<Acceptance>,
+    /// The user contrast adjustments the selection was measured with; absent when the authored
+    /// theme was measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjustments: Option<CheckedAdjustments>,
+}
+
+/// User contrast adjustments a check measured with ([`check_theme_adjusted`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CheckedAdjustments {
+    /// Lightness factor.
+    pub contrast: f64,
+    /// Contrast-ratio floor, when one is set.
+    pub minimum_contrast: Option<f64>,
+    /// Adjusted parts, in order: `text`, `syntax`, `fills`, `ansi`.
+    pub parts: Vec<&'static str>,
+}
+
+impl From<&crate::adjustment::ContrastSettings> for CheckedAdjustments {
+    fn from(settings: &crate::adjustment::ContrastSettings) -> Self {
+        let parts = settings.parts;
+        Self {
+            contrast: settings.factor.get(),
+            minimum_contrast: settings.minimum.ratio(),
+            parts: [
+                ("text", parts.text),
+                ("syntax", parts.syntax),
+                ("fills", parts.fills),
+                ("ansi", parts.ansi),
+            ]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect(),
+        }
+    }
 }
 
 impl ThemeCheck {
@@ -451,6 +485,23 @@ pub fn check_theme(
     base: &str,
     overlays: &[String],
     role_namespaces: &[String],
+    presentation: impl FnMut(&ResolvedThemeDefinition) -> Vec<CheckFinding>,
+) -> Result<ThemeCheck, ThemeError> {
+    check_theme_adjusted(catalog, base, overlays, role_namespaces, None, presentation)
+}
+
+/// [`check_theme`], measuring the colors `contrast` adjusts the theme to (what a user with
+/// those contrast settings sees) instead of the authored ones when it is set.
+///
+/// # Errors
+///
+/// Returns the resolver error when either variant fails to resolve.
+pub fn check_theme_adjusted(
+    catalog: &ThemeCatalog,
+    base: &str,
+    overlays: &[String],
+    role_namespaces: &[String],
+    contrast: Option<&crate::adjustment::ContrastSettings>,
     mut presentation: impl FnMut(&ResolvedThemeDefinition) -> Vec<CheckFinding>,
 ) -> Result<ThemeCheck, ThemeError> {
     let mut variants: Vec<(u64, VariantCheck)> = Vec::new();
@@ -458,7 +509,8 @@ pub fn check_theme(
         let resolved = catalog.resolve(
             &ThemeSelection::new(base)
                 .overlays(overlays.to_vec())
-                .variant(variant.resolved()),
+                .variant(variant.resolved())
+                .contrast(contrast.copied().unwrap_or_default()),
         )?;
         if let Some((_, existing)) = variants
             .iter_mut()
@@ -480,6 +532,7 @@ pub fn check_theme(
         findings: Vec::new(),
         summary: CheckSummary::default(),
         acceptance: None,
+        adjustments: contrast.map(CheckedAdjustments::from),
     };
     report.finish();
     Ok(report)

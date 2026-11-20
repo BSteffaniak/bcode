@@ -94,6 +94,10 @@ pub struct ThemePreferences {
     pub paths: Vec<PathBuf>,
     /// Which colors paint terminal output.
     pub terminal_palette: TerminalPalettePreference,
+    /// Contrast adjustments (`contrast`, `minimum_contrast`, `contrast_parts` and
+    /// `[overrides.<theme-id>]`), applied on top of the resolved theme's colors.
+    #[serde(flatten)]
+    pub contrast: crate::adjustment::ContrastPreferences,
 }
 
 impl Default for ThemePreferences {
@@ -105,6 +109,7 @@ impl Default for ThemePreferences {
             variant: VariantPreference::Auto,
             paths: Vec::new(),
             terminal_palette: TerminalPalettePreference::Theme,
+            contrast: crate::adjustment::ContrastPreferences::default(),
         }
     }
 }
@@ -135,12 +140,14 @@ impl ThemePreferences {
             .collect()
     }
 
-    /// The catalog selection these preferences resolve for `variant`.
+    /// The catalog selection these preferences resolve for `variant`, with the contrast
+    /// settings of the selected palette.
     #[must_use]
     pub fn selection(&self, variant: ResolvedThemeVariant) -> ThemeSelection {
         ThemeSelection::new(self.name.clone())
             .overlays(self.effective_overlays())
             .variant(variant)
+            .contrast(self.contrast.settings_for(&self.name))
     }
 }
 
@@ -703,6 +710,62 @@ mod tests {
         let again = following.with_saved(&following.saved, Some(&own));
         assert_eq!(again.preferences.name, "dracula");
         assert_eq!(again.preferences.profile.as_deref(), Some("bare"));
+    }
+
+    #[test]
+    fn configured_contrast_applies_to_the_presented_palette_and_its_override_wins() {
+        let preferences = configured(
+            r#"
+            name = "nord"
+            variant = "dark"
+            contrast = 1.3
+            minimum_contrast = "off"
+            contrast_parts = { ansi = false }
+
+            [overrides.dracula]
+            contrast = 0.8
+            "#,
+        );
+        let exact = bundled(&ThemeSelection::new("nord").variant(ResolvedThemeVariant::Dark));
+        let resolution = resolve(&preferences, &SavedAppearance::default());
+        let presented = resolution.resolved.expect("resolved");
+        assert_ne!(presented.fingerprint, exact.fingerprint);
+        assert_eq!(
+            presented.fingerprint,
+            bundled(
+                &ThemeSelection::new("nord")
+                    .variant(ResolvedThemeVariant::Dark)
+                    .contrast(preferences.contrast.settings_for("nord"))
+            )
+            .fingerprint
+        );
+        // A saved palette with an override presents its override.
+        let saved = SavedAppearance {
+            theme: Some("dracula".to_owned()),
+            profile: None,
+        };
+        let dracula = resolve(&preferences, &saved);
+        let settings = dracula.preferences.contrast.settings_for("dracula");
+        assert_eq!(settings.factor.get(), 0.8);
+        assert!(!settings.parts.ansi);
+        assert_eq!(
+            dracula.resolved.expect("resolved").fingerprint,
+            bundled(
+                &ThemeSelection::new("dracula")
+                    .variant(ResolvedThemeVariant::Dark)
+                    .contrast(settings)
+            )
+            .fingerprint
+        );
+    }
+
+    #[test]
+    fn invalid_contrast_values_are_reported() {
+        let error = ThemePreferences::from_toml(&toml::Value::Table(
+            toml::from_str("contrast = 3.0").expect("toml"),
+        ))
+        .expect_err("out of range");
+        assert!(error.contains("from 0.5 to 2"), "{error}");
     }
 
     #[test]

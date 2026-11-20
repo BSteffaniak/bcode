@@ -14,6 +14,7 @@ version     = { workspace = true }
 bcode_markdown_render            = { workspace = true, optional = true }
 bcode_syntax_render              = { workspace = true, optional = true }
 bcode_presentation_policy_models = { workspace = true }
+bcode_tui_theme_models           = { workspace = true }
 bmux_color                       = { workspace = true, features = ["serde"] }
 bmux_tui                         = { workspace = true, features = ["serde"] }
 bmux_tui_components = { workspace = true, optional = true, features = [
@@ -39,5 +40,6 @@ components = [
 default = []
 fail-on-warnings = [
     "bcode_presentation_policy_models/fail-on-warnings",
+    "bcode_tui_theme_models/fail-on-warnings",
     "bmux_color/fail-on-warnings",
 ]

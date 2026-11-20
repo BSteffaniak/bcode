@@ -311,16 +311,20 @@ pub struct ThemeSelection {
     pub overlays: Vec<String>,
     /// Already-resolved light/dark variant.
     pub variant: ResolvedThemeVariant,
+    /// User contrast adjustments applied after resolution
+    /// ([`crate::adjustment::apply_contrast`]); exact by default.
+    pub contrast: crate::adjustment::ContrastSettings,
 }
 
 impl ThemeSelection {
-    /// Select one base theme without overlays or a variant patch.
+    /// Select one base theme without overlays, a variant patch, or contrast adjustments.
     #[must_use]
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
             overlays: Vec::new(),
             variant: ResolvedThemeVariant::Unspecified,
+            contrast: crate::adjustment::ContrastSettings::EXACT,
         }
     }
 
@@ -335,6 +339,13 @@ impl ThemeSelection {
     #[must_use]
     pub const fn variant(mut self, variant: ResolvedThemeVariant) -> Self {
         self.variant = variant;
+        self
+    }
+
+    /// Return this selection with user contrast adjustments.
+    #[must_use]
+    pub const fn contrast(mut self, contrast: crate::adjustment::ContrastSettings) -> Self {
+        self.contrast = contrast;
         self
     }
 }
@@ -444,6 +455,7 @@ impl ThemeCatalog {
         }
         let mut resolved = resolve_merged(&selection.base, merged, applied, &self.role_namespaces)?;
         resolved.variant = selection.variant;
+        crate::adjustment::apply_contrast(&mut resolved, &selection.contrast);
         Ok(resolved)
     }
 
@@ -1418,6 +1430,16 @@ fn deep_merge_table(target: &mut toml::Table, source: &toml::Table) {
             }
         }
     }
+}
+
+/// Fingerprint of `theme` after its colors were adjusted: the resolution's fingerprint combined
+/// with the adjusted palette and styles.
+pub(crate) fn adjusted_fingerprint(theme: &ResolvedThemeDefinition) -> u64 {
+    theme_fingerprint(&[
+        &theme.fingerprint.to_string(),
+        &format!("{:?}", theme.palette),
+        &format!("{:?}", theme.styles),
+    ])
 }
 
 fn theme_fingerprint(parts: &[&str]) -> u64 {

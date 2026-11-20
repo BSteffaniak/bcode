@@ -279,6 +279,26 @@ pub const EXACT_PALETTE: &[(&str, &str)] = &[
     ),
 ];
 
+/// Palette slots for ANSI colors 0-15, in index order.
+pub const ANSI_SLOTS: [&str; 16] = [
+    "ansi_black",
+    "ansi_red",
+    "ansi_green",
+    "ansi_yellow",
+    "ansi_blue",
+    "ansi_magenta",
+    "ansi_cyan",
+    "ansi_white",
+    "ansi_bright_black",
+    "ansi_bright_red",
+    "ansi_bright_green",
+    "ansi_bright_yellow",
+    "ansi_bright_blue",
+    "ansi_bright_magenta",
+    "ansi_bright_cyan",
+    "ansi_bright_white",
+];
+
 // Derivation building blocks. Every expression resolves only from the
 // palette, so a v2 theme with RGB seeds derives a complete presentation.
 // `readable(…)` keeps a color taken directly from the palette exactly and

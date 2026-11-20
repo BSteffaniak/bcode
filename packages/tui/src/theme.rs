@@ -520,6 +520,7 @@ pub fn theme_preferences(
                 bcode_tui_theme::appearance::TerminalPalettePreference::Terminal
             }
         },
+        contrast: bcode_tui_theme::adjustment::ContrastPreferences::default(),
     }
 }
 

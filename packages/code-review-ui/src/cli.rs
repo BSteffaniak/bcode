@@ -208,14 +208,15 @@ pub async fn run_with(
                     "code review is disabled by configuration ([plugins] disabled)".to_owned(),
                 ));
             }
-            crate::run(crate::RunOptions {
+            // Boxed: the app's run future is large enough to burden this one's stack.
+            Box::pin(crate::run(crate::RunOptions {
                 path: repo,
                 config,
                 host: None,
                 entry,
                 bcode_program,
                 launch,
-            })
+            }))
             .await?;
             Ok(())
         }
