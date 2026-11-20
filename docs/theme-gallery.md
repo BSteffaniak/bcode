@@ -1100,14 +1100,14 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `moss` | `#141a14` | `#dbe4d0` | `#838c7d` | `#9ccf6e` | `#3f463c` | `#1c221c` | `#384a2e` | `#7fa8b8` | `#9ccf6e` | `#d9c46a` | `#e57c6a` |
 | `neon` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
 | `neon-noir` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
-| `newsroom` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
+| `newsroom` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#44de71` | `#efc03f` | `#ff8a7a` |
 | `night-owl` | `#021727` | `#d6deeb` | `#798797` | `#5f7e97` | `#262a39` | `#021727` | `#1d3b53` | `#82aaff` | `#c5e478` | `#ffd602` | `#ef5350` |
 | `night-shift` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#f05f5c` |
 | `nightfox` | `#192330` | `#cdcecf` | `#aeafb0` | `#71839b` | `#131a24` | `#131a24` | `#2b3b51` | `#719cd6` | `#81b29a` | `#dbc074` | `#c94f6d` |
 | `nord` | `#2e3440` | `#d8dee9` | `#8f95a1` | `#3b4252` | `#3b4252` | `#3b4252` | `#434c5e` | `#88c0d0` | `#a3be8c` | `#ebcb8b` | `#bf616a` |
 | `one` | `#282c34` | `#abb2bf` | `#848b98` | `#5c6370` | `#3b3f4c` | `#31353f` | `#3b3f4c` | `#56b6c2` | `#98c379` | `#e5c07b` | `#e86671` |
 | `oxocarbon` | `#161616` | `#d0d0d0` | `#7e7e7e` | `#131313` | `#262626` | `#131313` | `#393939` | `#78a9ff` | `#42be65` | `#be95ff` | `#ee5396` |
-| `paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
+| `paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#44de71` | `#efc03f` | `#ff8a7a` |
 | `phosphor` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
 | `poimandres` | `#1b1e28` | `#e4f0fb` | `#a6accd` | `#171922` | `#171922` | `#171922` | `#506477` | `#91b4d5` | `#5de4c7` | `#fffac2` | `#d0679d` |
 | `quiet` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
@@ -1121,7 +1121,7 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `tokyonight-moon` | `#222436` | `#c8d3f5` | `#828bb8` | `#589ed7` | `#1b1d2b` | `#1e2030` | `#2d3f76` | `#0db9d7` | `#c3e88d` | `#ffc777` | `#c53b53` |
 | `tokyonight-storm` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
 | `vesper` | `#101010` | `#cccccc` | `#65737e` | `#65737e` | `#505050` | `#282828` | `#656565` | `#99ffe4` | `#82d9c2` | `#ffc799` | `#ff8080` |
-| `zen-paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#8fcf9a` | `#e6c26a` | `#ff8a7a` |
+| `zen-paper` | `#262420` | `#ece6da` | `#969289` | `#8fa6ff` | `#524f49` | `#2e2c28` | `#43485c` | `#8fa6ff` | `#44de71` | `#efc03f` | `#ff8a7a` |
 | `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#2e3330` | `#2c2e2e` | `#2f2f2f` | `#8cb0d3` | `#5f7f5f` | `#ffd7a7` | `#cc9393` |
 
 ## Light variant swatches
@@ -1166,14 +1166,14 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `moss` | `#141a14` | `#dbe4d0` | `#838c7d` | `#9ccf6e` | `#3f463c` | `#1c221c` | `#384a2e` | `#7fa8b8` | `#9ccf6e` | `#d9c46a` | `#e57c6a` |
 | `neon` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
 | `neon-noir` | `#0a0614` | `#e9e4ff` | `#858197` | `#ff2fd6` | `#383446` | `#120e1d` | `#491647` | `#4d9dff` | `#39ffb6` | `#ffe14d` | `#ff3864` |
-| `newsroom` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
+| `newsroom` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2a3eec` | `#bebab3` | `#ebe6dc` | `#b1c2ef` | `#2a3eec` | `#1d6e31` | `#8a6100` | `#b4241c` |
 | `night-owl` | `#021727` | `#d6deeb` | `#798797` | `#5f7e97` | `#262a39` | `#021727` | `#1d3b53` | `#82aaff` | `#c5e478` | `#ffd602` | `#ef5350` |
 | `night-shift` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#f05f5c` |
 | `nightfox` | `#faf4ed` | `#575279` | `#625c87` | `#a8a3b3` | `#ebe5df` | `#ebe5df` | `#d0d8d8` | `#286983` | `#618774` | `#ea9d34` | `#b4637a` |
 | `nord` | `#2e3440` | `#d8dee9` | `#8f95a1` | `#3b4252` | `#3b4252` | `#3b4252` | `#434c5e` | `#88c0d0` | `#a3be8c` | `#ebcb8b` | `#bf616a` |
 | `one` | `#fafafa` | `#383a42` | `#818387` | `#a0a1a7` | `#dcdcdc` | `#f0f0f0` | `#dcdcdc` | `#0184bc` | `#50a14f` | `#986801` | `#e45649` |
 | `oxocarbon` | `#161616` | `#d0d0d0` | `#7e7e7e` | `#131313` | `#262626` | `#131313` | `#393939` | `#78a9ff` | `#42be65` | `#be95ff` | `#ee5396` |
-| `paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
+| `paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2a3eec` | `#bebab3` | `#ebe6dc` | `#b1c2ef` | `#2a3eec` | `#1d6e31` | `#8a6100` | `#b4241c` |
 | `phosphor` | `#050a05` | `#9dff9d` | `#599159` | `#39ff7a` | `#243d24` | `#0a130a` | `#184823` | `#5cffc8` | `#39ff7a` | `#c8ff5c` | `#ff7a5c` |
 | `poimandres` | `#1b1e28` | `#e4f0fb` | `#a6accd` | `#171922` | `#171922` | `#171922` | `#506477` | `#91b4d5` | `#5de4c7` | `#fffac2` | `#d0679d` |
 | `quiet` | — | *default* | *bright black* | *cyan* | *bright black* | — | — | *cyan* | *green* | *yellow* | *red* |
@@ -1187,5 +1187,5 @@ Bcode     The offset is recomputed before layout, so hit rows lag one frame.
 | `tokyonight-moon` | `#222436` | `#c8d3f5` | `#828bb8` | `#589ed7` | `#1b1d2b` | `#1e2030` | `#2d3f76` | `#0db9d7` | `#c3e88d` | `#ffc777` | `#c53b53` |
 | `tokyonight-storm` | `#24283b` | `#c0caf5` | `#a9b1d6` | `#29a4bd` | `#1d202f` | `#1f2335` | `#2e3c64` | `#0db9d7` | `#9ece6a` | `#e0af68` | `#db4b4b` |
 | `vesper` | `#101010` | `#cccccc` | `#65737e` | `#65737e` | `#505050` | `#282828` | `#656565` | `#99ffe4` | `#82d9c2` | `#ffc799` | `#ff8080` |
-| `zen-paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2f4bd6` | `#bebab3` | `#ebe6dc` | `#b5c3e7` | `#2f4bd6` | `#2e6b3a` | `#8a6100` | `#b3261e` |
+| `zen-paper` | `#f6f1e7` | `#2b2a28` | `#75736e` | `#2a3eec` | `#bebab3` | `#ebe6dc` | `#b1c2ef` | `#2a3eec` | `#1d6e31` | `#8a6100` | `#b4241c` |
 | `zenburn` | `#3f3f3f` | `#dcdccc` | `#999990` | `#f0dfaf` | `#2e3330` | `#2c2e2e` | `#2f2f2f` | `#8cb0d3` | `#5f7f5f` | `#ffd7a7` | `#cc9393` |
