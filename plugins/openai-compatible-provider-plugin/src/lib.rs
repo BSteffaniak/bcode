@@ -236,6 +236,7 @@ struct TurnState {
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
     structured_output: Arc<Mutex<Option<bcode_model_provider_runtime::StructuredOutputCapture>>>,
+    tool_calls: Arc<Mutex<Option<bcode_model_provider_runtime::ToolCallDecoder>>>,
 }
 
 #[derive(Debug)]
@@ -296,6 +297,29 @@ impl TurnState {
         );
     }
 
+    /// Decode tool calls for `request`'s strict tool schemas before publishing them.
+    fn install_tool_schemas(&self, request: &ModelTurnRequest) {
+        if let Some(schemas) = strict_tool_wire_schemas(request)
+            && schemas.is_adapted()
+        {
+            *self.tool_calls.lock().expect("tool call decoding lock") =
+                Some(bcode_model_provider_runtime::ToolCallDecoder::new(schemas));
+        }
+    }
+
+    /// Withhold wire-form argument deltas of adapted tools and decode their finished calls.
+    fn decode_tool_call(&self, event: ProviderTurnEvent) -> Option<ProviderTurnEvent> {
+        match self
+            .tool_calls
+            .lock()
+            .expect("tool call decoding lock")
+            .as_mut()
+        {
+            Some(decoder) => decoder.filter(event),
+            None => Some(event),
+        }
+    }
+
     /// Route `event` through an installed structured-output capture, returning the events to
     /// publish instead.
     fn captured(&self, event: &ProviderTurnEvent) -> Option<Vec<ProviderTurnEvent>> {
@@ -322,6 +346,9 @@ impl TurnState {
             }
             return;
         }
+        let Some(event) = self.decode_tool_call(event) else {
+            return;
+        };
         diagnostics::event(&event);
         if matches!(
             &event,
@@ -3429,6 +3456,7 @@ fn usage_window_refs(
 }
 
 fn start_chat_completion(runtime: &ProviderRuntime, request: ModelTurnRequest, turn: &TurnState) {
+    turn.install_tool_schemas(&request);
     let worker_turn = turn.clone();
     if let Err(error) = runtime.try_spawn(diagnostics::scope(async move {
         stream_chat_completion(&request, &worker_turn).await;
@@ -7129,12 +7157,12 @@ fn model_tools_to_responses_tools(
             name: tool.provider_name,
             description: tool.description,
             parameters: tool.parameters,
-            strict: if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict)
+            strict: if tool.strict
                 || dialect
                     .responses_request_capabilities()
                     .requires_explicit_tool_strictness
             {
-                Some(request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict))
+                Some(tool.strict)
             } else {
                 None
             },
@@ -7155,8 +7183,7 @@ fn model_tools_to_chat_tools(
                 name: tool.provider_name,
                 description: tool.description,
                 parameters: tool.parameters,
-                strict: (request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict))
-                    .then_some(true),
+                strict: tool.strict.then_some(true),
             },
         })
         .collect())
@@ -7167,6 +7194,19 @@ struct ProjectedTool {
     provider_name: String,
     description: String,
     parameters: serde_json::Value,
+    strict: bool,
+}
+
+/// Strict wire schemas for `request`'s tools, when the request asks for strict tool schemas.
+fn strict_tool_wire_schemas(
+    request: &ModelTurnRequest,
+) -> Option<bcode_model_provider_runtime::ToolWireSchemas> {
+    (request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict)).then(|| {
+        bcode_model_provider_runtime::ToolWireSchemas::compile(
+            &request.tools,
+            bcode_openai_responses::strict_schema,
+        )
+    })
 }
 
 fn project_model_tools(
@@ -7175,6 +7215,7 @@ fn project_model_tools(
 ) -> Result<Vec<ProjectedTool>, ProviderError> {
     let mut projected = Vec::with_capacity(request.tools.len());
     let mut names = BTreeMap::new();
+    let wire_schemas = strict_tool_wire_schemas(request);
     for tool in &request.tools {
         let provider_name = provider_tool_name(&tool.name, dialect);
         if let Some(existing) = names.insert(provider_name.clone(), tool.name.clone()) {
@@ -7187,14 +7228,15 @@ fn project_model_tools(
                 ),
             ));
         }
+        let wire = wire_schemas
+            .as_ref()
+            .and_then(|schemas| schemas.get(&tool.name));
         projected.push(ProjectedTool {
             provider_name,
             description: tool.description.clone(),
-            parameters: if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
-                strict_openai_schema(&tool.input_schema)?
-            } else {
-                tool.input_schema.clone()
-            },
+            parameters: wire
+                .map_or_else(|| tool.input_schema.clone(), |wire| wire.schema().clone()),
+            strict: wire.is_some_and(bcode_model_provider_runtime::ToolWireSchema::strict),
         });
     }
     Ok(projected)
@@ -12795,6 +12837,113 @@ mod tests {
             jsonschema::validator_for(parameters)
                 .unwrap()
                 .is_valid(&serde_json::json!({"name":"x","branch":null,"detach":null}))
+        );
+    }
+
+    fn map_tool_request() -> ModelTurnRequest {
+        let mut request = test_request(Vec::new());
+        request.tool_schema_mode = Some(bcode_model::ToolSchemaMode::Strict);
+        request.tools = vec![
+            bcode_model::ToolDefinition {
+                name: "feedback.record".to_string(),
+                description: "Record feedback".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": {
+                        "text": {"type": "string"},
+                        "facets": {"type": "object", "additionalProperties": {"type": "string"}}
+                    },
+                    "additionalProperties": false
+                }),
+            },
+            bcode_model::ToolDefinition {
+                name: "mixed.map".to_string(),
+                description: "Fixed and dynamic properties".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"fixed": {"type": "string"}},
+                    "additionalProperties": {"type": "string"}
+                }),
+            },
+        ];
+        request
+    }
+
+    #[test]
+    fn strict_tools_with_maps_are_encoded_and_inexpressible_tools_sent_non_strict() {
+        let request = map_tool_request();
+        for dialect in [
+            OpenAiCompatibleDialect::ResponsesApi,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        ] {
+            let tools = model_tools_to_responses_tools(&request, dialect).expect("tools project");
+            let facets = &tools[0].parameters["properties"]["facets"];
+            assert_eq!(facets["anyOf"][0]["type"], "array");
+            assert!(
+                jsonschema::validator_for(&tools[0].parameters)
+                    .unwrap()
+                    .is_valid(&serde_json::json!({
+                        "text": "x",
+                        "facets": [{"key": "bcode.model", "value": "luna"}]
+                    }))
+            );
+            assert_eq!(tools[1].parameters, request.tools[1].input_schema);
+            assert_ne!(tools[1].strict, Some(true));
+        }
+        let tools = model_tools_to_chat_tools(&request, OpenAiCompatibleDialect::ChatCompletions)
+            .expect("chat tools project");
+        assert_eq!(tools[0].function.strict, Some(true));
+        assert_eq!(tools[1].function.strict, None);
+    }
+
+    #[test]
+    fn map_encoded_tool_calls_publish_canonical_arguments_without_wire_deltas() {
+        let request = map_tool_request();
+        let turn = TurnState::default();
+        turn.install_tool_schemas(&request);
+        let wire = r#"{"text":"x","facets":[{"key":"bcode.model","value":"luna"}]}"#;
+        turn.push(ProviderTurnEvent::ToolCallStarted {
+            call_id: "call-1".into(),
+            name: "feedback.record".into(),
+        });
+        turn.push(ProviderTurnEvent::ToolCallDelta {
+            call_id: "call-1".into(),
+            delta: wire.into(),
+        });
+        let calls = BTreeMap::from([(
+            0,
+            ToolCallAccumulator {
+                id: Some("call-1".to_owned()),
+                name: Some("feedback.record".to_owned()),
+                arguments: wire.to_owned(),
+                emitted_argument_bytes: 0,
+                started: true,
+            },
+        )]);
+        finish_tool_calls(
+            &TurnEventSink(&turn),
+            &calls,
+            &BTreeMap::new(),
+            OpenAiCompatibleDialect::ResponsesApi,
+        )
+        .expect("tool call finishes");
+        let events = turn.drain();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallDelta { .. }))
+        );
+        let finished = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderTurnEvent::ToolCallFinished { call } => Some(call),
+                _ => None,
+            })
+            .expect("finished call");
+        assert_eq!(
+            finished.arguments,
+            serde_json::json!({"text": "x", "facets": {"bcode.model": "luna"}})
         );
     }
 

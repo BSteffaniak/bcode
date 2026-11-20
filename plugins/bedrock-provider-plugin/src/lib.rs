@@ -873,6 +873,9 @@ async fn stream_bedrock_converse_turn(
             model_id.clone(),
             settings.region.as_deref(),
         )?;
+        turn.decode_tool_calls(
+            bedrock_tool_wire_schemas(&request_for_model.tools, model_id).unwrap_or_default(),
+        );
         let mut builder = client
             .converse_stream()
             .model_id(bedrock_request.model_id)
@@ -3249,27 +3252,19 @@ fn bedrock_strict_tool_schema_dialect() -> bcode_model_schema::SchemaDialect {
     }
 }
 
-fn bedrock_tool_input_schema_for_model(
-    tool: &ToolDefinition,
+/// Strict-dialect wire schemas for `OpenAI` models on Bedrock.
+///
+/// Dynamic maps are encoded as key/value records and decoded again by the turn; a tool the
+/// dialect cannot express is sent non-strict with its canonical schema.
+fn bedrock_tool_wire_schemas(
+    tools: &[ToolDefinition],
     model_id: &str,
-) -> Result<serde_json::Value, ProviderError> {
-    let schema = bedrock_tool_input_schema(tool)?;
-    if model_id.contains(".openai.") {
-        bcode_model_schema::normalize(schema, &bedrock_strict_tool_schema_dialect()).map_err(
-            |error| {
-                provider_error(
-                    "bedrock_tool_schema_unsupported",
-                    ProviderErrorCategory::InvalidRequest,
-                    format!(
-                        "Bedrock tool '{}' input schema cannot be made strict: {error}",
-                        tool.name
-                    ),
-                )
-            },
-        )
-    } else {
-        Ok(schema.clone())
-    }
+) -> Option<bcode_model_provider_runtime::ToolWireSchemas> {
+    model_id.contains(".openai.").then(|| {
+        bcode_model_provider_runtime::ToolWireSchemas::compile(tools, |schema| {
+            bcode_model_schema::normalize(schema, &bedrock_strict_tool_schema_dialect())
+        })
+    })
 }
 
 /// Resolve the `max_tokens` value the Anthropic Messages surface requires.
@@ -4130,16 +4125,26 @@ fn model_tools_to_bedrock_tool_config(
         };
     }
     let tool_choice = bedrock_tool_choice(request)?;
+    let wire_schemas = bedrock_tool_wire_schemas(&request.tools, model_id);
     let mut tools = request
         .tools
         .iter()
         .map(|tool| {
-            let schema = bedrock_tool_input_schema_for_model(tool, model_id)?;
+            let canonical = bedrock_tool_input_schema(tool)?;
+            let wire = wire_schemas
+                .as_ref()
+                .and_then(|schemas| schemas.get(&tool.name));
+            let schema = wire.map_or(
+                canonical,
+                bcode_model_provider_runtime::ToolWireSchema::schema,
+            );
             let mut specification = ToolSpecification::builder()
                 .name(bedrock_tool_name(&tool.name))
                 .description(tool.description.clone())
-                .input_schema(ToolInputSchema::Json(json_value_to_document(&schema)));
-            if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict) {
+                .input_schema(ToolInputSchema::Json(json_value_to_document(schema)));
+            if request.tool_schema_mode == Some(bcode_model::ToolSchemaMode::Strict)
+                && wire.is_none_or(bcode_model_provider_runtime::ToolWireSchema::strict)
+            {
                 specification = specification.strict(true);
             }
             specification
@@ -7337,8 +7342,12 @@ mod tests {
             }),
         };
 
-        let strict = bedrock_tool_input_schema_for_model(&tool, "us.openai.gpt-oss-120b-1:0")
-            .expect("strict schema");
+        let schemas =
+            bedrock_tool_wire_schemas(std::slice::from_ref(&tool), "us.openai.gpt-oss-120b-1:0")
+                .expect("openai model schemas");
+        let wire = schemas.get(&tool.name).expect("tool schema");
+        assert!(wire.strict());
+        let strict = wire.schema();
 
         assert_eq!(strict["additionalProperties"], false);
         assert_eq!(
@@ -7364,9 +7373,56 @@ mod tests {
             strict["properties"]["next"]["anyOf"][1],
             serde_json::json!({"type": "null"})
         );
+        assert!(bedrock_tool_wire_schemas(&[tool], "anthropic.claude-model").is_none());
+    }
+
+    #[test]
+    fn openai_model_map_tools_are_encoded_and_calls_decoded() {
+        let tool = ToolDefinition {
+            name: "feedback.record".to_string(),
+            description: "Record feedback".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "facets": {"type": "object", "additionalProperties": {"type": "string"}}
+                },
+                "additionalProperties": false
+            }),
+        };
+        let mut request = test_model_turn_request();
+        request.tool_schema_mode = Some(bcode_model::ToolSchemaMode::Strict);
+        request.tools = vec![tool];
+        let model_id = "us.openai.gpt-oss-120b-1:0";
+        model_tools_to_bedrock_tool_config(&request, model_id)
+            .expect("map tools are accepted")
+            .expect("tool config");
+        let turn = TurnState::default();
+        turn.decode_tool_calls(
+            bedrock_tool_wire_schemas(&request.tools, model_id).unwrap_or_default(),
+        );
+        turn.push(ProviderTurnEvent::ToolCallFinished {
+            call: ToolCall {
+                id: "call".into(),
+                name: "feedback.record".into(),
+                arguments: serde_json::json!({
+                    "text": "x",
+                    "facets": [{"key": "bcode.model", "value": "luna"}]
+                }),
+            },
+        });
+        let finished = turn
+            .drain()
+            .into_iter()
+            .find_map(|event| match event {
+                ProviderTurnEvent::ToolCallFinished { call } => Some(call),
+                _ => None,
+            })
+            .expect("finished call");
         assert_eq!(
-            bedrock_tool_input_schema_for_model(&tool, "anthropic.claude-model").expect("schema"),
-            tool.input_schema
+            finished.arguments,
+            serde_json::json!({"text": "x", "facets": {"bcode.model": "luna"}})
         );
     }
     #[tokio::test]

@@ -317,6 +317,14 @@ canonical schema accepts are never changed by this restoration.
   against the tool's input schema before preparation, so permission checks, presentation and
   invocation see canonical arguments. Providers may report either form; the conversation history
   keeps the arguments as the model produced them.
+* **Tool schemas with dynamic maps** are adapted per tool by the provider adapter. Adapters compile
+  `bcode_model_provider_runtime::ToolWireSchemas` from the request's tools with their strict dialect
+  normalization. A schema the dialect accepts is sent strict as normalized; a schema with dynamic
+  maps is sent strict with each map encoded as key/value records; a schema the dialect cannot
+  express even with map encoding is sent non-strict in its canonical form, so one tool cannot make
+  every request fail. Adapters install the schemas on the turn (`TurnState::decode_tool_calls`, or
+  a `ToolCallDecoder` in an adapter-owned turn state), which withholds wire-form argument deltas of
+  map-encoded tools and publishes their finished calls with map arguments restored.
 
 Empty strings are not normalized: `""` can be a real value. A tool that treats blank optional
 strings as omitted opts in with `bcode_tool::arguments::without_blank_values`, naming any fields

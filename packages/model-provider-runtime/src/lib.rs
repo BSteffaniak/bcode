@@ -89,6 +89,8 @@ pub use structured_output::{
     MAX_STRUCTURED_OUTPUT_WIRE_BYTES, STRUCTURED_OUTPUT_WIRE_INSTRUCTION, StructuredOutputCapture,
     StructuredOutputWireEncoding,
 };
+mod tool_schema;
+pub use tool_schema::{ToolCallDecoder, ToolWireSchema, ToolWireSchemas};
 
 use bcode_model::{
     ProviderError, ProviderErrorCategory, ProviderOutputEvent, ProviderRetryHint,
@@ -685,9 +687,21 @@ pub struct TurnState {
     cancel_notify: Arc<Notify>,
     diagnostics: ProviderDiagnostics,
     structured_output: Arc<Mutex<Option<StructuredOutputCapture>>>,
+    tool_calls: Arc<Mutex<Option<ToolCallDecoder>>>,
 }
 
 impl TurnState {
+    /// Publish tool calls decoded through `schemas`.
+    ///
+    /// Install this before the provider streams output for a request whose tool schemas were
+    /// replaced by `schemas`' wire schemas. See [`ToolCallDecoder`] for what is published.
+    /// Installing schemas without adapted tools removes any earlier decoder.
+    pub fn decode_tool_calls(&self, schemas: ToolWireSchemas) {
+        if let Ok(mut decoder) = self.tool_calls.lock() {
+            *decoder = schemas.is_adapted().then(|| ToolCallDecoder::new(schemas));
+        }
+    }
+
     /// Hold text deltas until the turn ends and publish them decoded through `encoding`.
     ///
     /// Install this before the provider streams output for a request whose structured-output
@@ -739,6 +753,13 @@ impl TurnState {
             }
             return;
         }
+        let event = match self.tool_calls.lock().ok().as_deref_mut() {
+            Some(Some(decoder)) => match decoder.filter(event) {
+                Some(event) => event,
+                None => return,
+            },
+            _ => event,
+        };
         if matches!(event, ProviderTurnEvent::AttemptTiming { .. })
             && !self.attempt_timing_enabled.load(Ordering::Acquire)
         {
