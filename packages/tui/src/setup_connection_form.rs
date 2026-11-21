@@ -773,7 +773,24 @@ impl ConnectionForm {
             if render_auth_prompt(device, frame, area, theme, &self.keymap) {
                 return;
             }
-            render_login_text(frame, area, &device.lines, theme.text);
+            if let Some(bcode_provider_auth_models::AuthFlowEffect::PasteInput {
+                message, ..
+            }) = &device.paste
+            {
+                let mut lines = device.lines.clone();
+                lines.push(String::new());
+                lines.push(message.clone());
+                render_login_text(frame, area, &lines, theme.text);
+                write(
+                    frame,
+                    area,
+                    area.height.saturating_sub(3),
+                    &paste_status_line(device.paste_value.chars().count()),
+                    theme.muted,
+                );
+            } else {
+                render_login_text(frame, area, &device.lines, theme.text);
+            }
             write(
                 frame,
                 area,
@@ -934,7 +951,31 @@ fn render_auth_prompt(
     false
 }
 
+/// Hidden paste status; the pasted value itself is never painted.
+fn paste_status_line(characters: usize) -> String {
+    match characters {
+        0 => "Paste: (nothing yet) · Enter submits".to_owned(),
+        count => format!("Paste: {count} characters, hidden · Enter submits"),
+    }
+}
+
 fn handle_auth_prompt(device: &mut super::setup_device_login::DeviceLogin, event: &Event) {
+    if device.prompt.is_none() && device.paste.is_some() && !device.terminal {
+        match event {
+            Event::Key(key) if key.modifiers.ctrl || key.modifiers.alt => {}
+            Event::Key(key) => match key.key {
+                KeyCode::Enter => device.submit_paste(),
+                KeyCode::Char(character) => device.extend_paste(&character.to_string()),
+                KeyCode::Backspace => {
+                    device.paste_value.pop();
+                }
+                _ => {}
+            },
+            Event::Paste(text) => device.extend_paste(text),
+            _ => {}
+        }
+        return;
+    }
     if device.prompt.is_some() {
         match event {
             Event::Key(key) => match key.key {

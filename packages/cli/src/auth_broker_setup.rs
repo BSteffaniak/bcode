@@ -350,6 +350,10 @@ async fn drive_enrollment(
             owner, bcode_provider_auth_models::AUTH_INTERFACE_ID, operation, request,
         ).map_err(|_| setup_error("Provider enrollment outcome is unresolved; do not reissue the exchange. Explicit reconnect is required."))
     }, |effect| {
+        // Broker enrollment answers only blocking prompts; an optional paste offer is not shown.
+        if matches!(effect, bcode_provider_auth_models::AuthFlowEffect::PasteInput { .. }) {
+            return Ok(None);
+        }
         crate::write_auth_effect(&mut std::io::stdout(), effect)?;
         if matches!(effect, bcode_provider_auth_models::AuthFlowEffect::Prompt { .. }) {
             Ok(Some(crate::read_stdin_line()?))

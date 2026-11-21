@@ -907,7 +907,11 @@ mod tests {
         let observing = "{\"frame\":\"event\",\"event\":{\"event\":\"observation\",\"observation_id\":\"o\",\"sequence\":0,\"view\":{\"session_id\":\"s\",\"items\":[{\"id\":\"1\",\"kind\":\"hologram\",\"text\":\"3D\"}]}}}\n{\"frame\":\"event\",\"event\":{\"event\":\"teleport\"}}\n{\"frame\":\"response\",\"id\":ID,\"ok\":{\"kind\":\"observing\",\"observation_id\":\"o\",\"added_later\":true}}";
         let (connected, bridge) = scripted(vec![hello, observing]).await;
         let (client, mut events) = connected.expect("connected");
-        assert_eq!(client.hello().version, 1, "the version the bridge negotiated");
+        assert_eq!(
+            client.hello().version,
+            1,
+            "the version the bridge negotiated"
+        );
         assert_eq!(client.observe("s", 10).await.expect("observe"), "o");
         let Some(BridgeEvent::Observation { view, .. }) = events.recv().await else {
             panic!("expected an observation");

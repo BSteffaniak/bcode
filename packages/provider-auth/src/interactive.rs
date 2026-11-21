@@ -104,14 +104,14 @@ impl InteractiveEnrollment {
         if self.terminal {
             return Err("Authentication is already terminal");
         }
-        let AuthFlowEffect::Prompt { prompt_id, .. } = prompt else {
+        let Some(prompt_id) = prompt.answer_prompt_id() else {
             return Err("Not an authentication prompt");
         };
         prompt
             .validate_answer(&value)
             .map_err(|_| "Invalid authentication answer")?;
         self.request.input = Some(AuthFlowInput {
-            prompt_id: prompt_id.clone(),
+            prompt_id: prompt_id.to_owned(),
             value,
         });
         Ok(())

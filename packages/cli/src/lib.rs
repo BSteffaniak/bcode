@@ -13945,13 +13945,26 @@ async fn run_auth_interactive_flow(
         revoke,
     };
     let mut status: Option<bcode_tui::auth_inline::AuthStatus> = None;
+    let mut session = AuthFlowSession::new(
+        bcode_config::load_config()?
+            .onboarding
+            .browser_opening_enabled(&bcode_config::ProcessConfigEnvironment),
+    );
     loop {
-        if let Some(surface) = status.as_mut()
-            && surface.cancelled()?
-        {
-            drop(status.take());
-            cancel_auth_flow(host, provider, operation, &request)?;
-            return Err(CliError::AuthFlowCancelled);
+        if let Some(surface) = status.as_mut() {
+            match surface.poll_input()? {
+                bcode_tui::auth_inline::AuthStatusInput::Cancelled => {
+                    drop(status.take());
+                    cancel_auth_flow(host, provider, operation, &request)?;
+                    return Err(CliError::AuthFlowCancelled);
+                }
+                bcode_tui::auth_inline::AuthStatusInput::Submitted(value) => {
+                    if request.input.is_none() {
+                        request.input = session.accept_paste(&value);
+                    }
+                }
+                bcode_tui::auth_inline::AuthStatusInput::Idle => {}
+            }
         }
         request
             .validate()
@@ -13979,44 +13992,68 @@ async fn run_auth_interactive_flow(
             drop(status.take());
         }
         let terminal = prepare_auth_flow_response(&mut std::io::stderr().lock(), &response)?;
-        if !terminal && status.is_none() && bcode_tui::auth_inline::supported() {
-            status = Some(bcode_tui::auth_inline::AuthStatus::enter(
-                &bcode_config::load_config()?.tui,
-            )?);
+        let inline = !terminal && bcode_tui::auth_inline::supported();
+        if inline {
+            // Links go to ordinary scrollback before the inline surface takes the screen, so
+            // the terminal soft-wraps them and they copy intact for use on another device.
+            let links = session.unprinted_links(&response.effects);
+            if !links.is_empty() {
+                drop(status.take());
+                let mut writer = std::io::stderr().lock();
+                for line in links {
+                    writeln!(writer, "{line}")?;
+                }
+                writer.flush()?;
+            }
+            if status.is_none() {
+                status = Some(bcode_tui::auth_inline::AuthStatus::enter(
+                    &bcode_config::load_config()?.tui,
+                )?);
+            }
         }
+        session.paste = None;
         let mut input = None;
         for effect in &response.effects {
+            use bcode_provider_auth_models::AuthFlowEffect;
+            let opened = match effect {
+                AuthFlowEffect::OpenBrowser { url } => session.open(url),
+                AuthFlowEffect::DisplayDeviceCode {
+                    verification_url, ..
+                } => session.open(verification_url),
+                _ => false,
+            };
             if let Some(surface) = status.as_mut() {
-                use bcode_provider_auth_models::AuthFlowEffect;
                 let detail = match effect {
-                    AuthFlowEffect::OpenBrowser { url } => {
-                        format!("Opening browser. If it does not open, visit:\n{url}")
+                    AuthFlowEffect::OpenBrowser { .. } if opened => {
+                        "Opened your browser. Signing in on another device? Open the link printed above there.".to_owned()
                     }
-                    AuthFlowEffect::DisplayDeviceCode {
-                        verification_url,
-                        user_code,
-                        ..
-                    } => format!("Visit {verification_url}\nDevice code: {user_code}"),
+                    AuthFlowEffect::OpenBrowser { .. } => {
+                        "Open the link printed above in a browser on any device.".to_owned()
+                    }
+                    AuthFlowEffect::DisplayDeviceCode { user_code, .. } => format!(
+                        "Open the link printed above on any device and enter code {user_code}"
+                    ),
                     AuthFlowEffect::Message { message } => message.clone(),
-                    AuthFlowEffect::Wait { .. } | AuthFlowEffect::Prompt { .. } => String::new(),
+                    AuthFlowEffect::Wait { .. }
+                    | AuthFlowEffect::Prompt { .. }
+                    | AuthFlowEffect::PasteInput { .. } => String::new(),
                 };
                 if !detail.is_empty() {
                     surface.show(&provider.contribution.display_name, &detail)?;
                 }
-            } else {
+            } else if !matches!(effect, AuthFlowEffect::PasteInput { .. }) {
                 write_auth_effect(&mut std::io::stdout().lock(), effect)?;
             }
             match effect {
-                bcode_provider_auth_models::AuthFlowEffect::OpenBrowser { url } => {
-                    open_browser(url);
+                AuthFlowEffect::PasteInput { message, .. } => {
+                    if let Some(surface) = status.as_mut() {
+                        surface.offer_paste(message)?;
+                    } else if session.offer_line_paste(effect) {
+                        write_auth_effect(&mut std::io::stdout().lock(), effect)?;
+                    }
+                    session.paste = Some(effect.clone());
                 }
-                bcode_provider_auth_models::AuthFlowEffect::DisplayDeviceCode {
-                    verification_url,
-                    ..
-                } => {
-                    open_browser(verification_url);
-                }
-                bcode_provider_auth_models::AuthFlowEffect::Prompt {
+                AuthFlowEffect::Prompt {
                     prompt_id,
                     message,
                     choices,
@@ -14025,7 +14062,7 @@ async fn run_auth_interactive_flow(
                     drop(status.take());
                     let value = if choices.is_empty() {
                         write_auth_effect(&mut std::io::stdout().lock(), effect)?;
-                        read_stdin_line()?
+                        session.read_line()?
                     } else {
                         let mut prompt = auth_login::terminal();
                         let index = prompt.choose(
@@ -14043,27 +14080,37 @@ async fn run_auth_interactive_flow(
                         value,
                     });
                 }
-                bcode_provider_auth_models::AuthFlowEffect::Wait { millis } => {
+                AuthFlowEffect::Wait { millis } => {
                     let deadline = tokio::time::Instant::now() + Duration::from_millis(*millis);
-                    while tokio::time::Instant::now() < deadline {
+                    while input.is_none() && tokio::time::Instant::now() < deadline {
                         tokio::time::sleep(
                             Duration::from_millis(50).min(
                                 deadline.saturating_duration_since(tokio::time::Instant::now()),
                             ),
                         )
                         .await;
-                        if let Some(surface) = status.as_mut()
-                            && surface.cancelled()?
-                        {
-                            drop(status.take());
-                            let mut cancellation = request.clone();
-                            cancellation.state.clone_from(&response.state);
-                            cancel_auth_flow(host, provider, operation, &cancellation)?;
-                            return Err(CliError::AuthFlowCancelled);
+                        if let Some(surface) = status.as_mut() {
+                            match surface.poll_input()? {
+                                bcode_tui::auth_inline::AuthStatusInput::Cancelled => {
+                                    drop(status.take());
+                                    let mut cancellation = request.clone();
+                                    cancellation.state.clone_from(&response.state);
+                                    cancel_auth_flow(host, provider, operation, &cancellation)?;
+                                    return Err(CliError::AuthFlowCancelled);
+                                }
+                                bcode_tui::auth_inline::AuthStatusInput::Submitted(value) => {
+                                    input = session.accept_paste(&value);
+                                }
+                                bcode_tui::auth_inline::AuthStatusInput::Idle => {}
+                            }
+                        } else {
+                            input = session.take_line_paste();
                         }
                     }
                 }
-                bcode_provider_auth_models::AuthFlowEffect::Message { .. } => {}
+                AuthFlowEffect::OpenBrowser { .. }
+                | AuthFlowEffect::DisplayDeviceCode { .. }
+                | AuthFlowEffect::Message { .. } => {}
             }
         }
         if terminal {
@@ -14084,6 +14131,127 @@ async fn run_auth_interactive_flow(
         request.operation = bcode_provider_auth_models::AuthFlowOperation::Continue;
         request.state = response.state;
         request.input = input;
+    }
+}
+
+/// Per-flow CLI presentation state: browser attempts, printed links, and paste input.
+struct AuthFlowSession {
+    browser_enabled: bool,
+    attempted: BTreeSet<String>,
+    printed: BTreeSet<String>,
+    /// Paste offer from the current response, if any.
+    paste: Option<bcode_provider_auth_models::AuthFlowEffect>,
+    /// Paste offers already announced in line mode.
+    announced: BTreeSet<String>,
+    /// Line-mode stdin reader, started on the first paste offer and shared with prompts.
+    lines: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+}
+
+impl AuthFlowSession {
+    const fn new(browser_enabled: bool) -> Self {
+        Self {
+            browser_enabled,
+            attempted: BTreeSet::new(),
+            printed: BTreeSet::new(),
+            paste: None,
+            announced: BTreeSet::new(),
+            lines: None,
+        }
+    }
+
+    /// Open a URL once per flow when policy allows; reports whether a launch was attempted.
+    fn open(&mut self, url: &str) -> bool {
+        if !self.browser_enabled {
+            return false;
+        }
+        if !self.attempted.insert(url.to_owned()) {
+            return true;
+        }
+        open_browser(url)
+    }
+
+    /// Plain-text link lines not yet printed during this flow.
+    fn unprinted_links(
+        &mut self,
+        effects: &[bcode_provider_auth_models::AuthFlowEffect],
+    ) -> Vec<String> {
+        use bcode_provider_auth_models::AuthFlowEffect;
+        let mut lines = Vec::new();
+        for effect in effects {
+            let (url, code) = match effect {
+                AuthFlowEffect::OpenBrowser { url } => (url, None),
+                AuthFlowEffect::DisplayDeviceCode {
+                    verification_url,
+                    user_code,
+                    ..
+                } => (verification_url, Some(user_code)),
+                _ => continue,
+            };
+            if !self.printed.insert(url.clone()) {
+                continue;
+            }
+            lines.push("Sign-in link (works from any device):".to_owned());
+            lines.push(url.clone());
+            if let Some(code) = code {
+                lines.push(format!("Code: {code}"));
+            }
+        }
+        lines
+    }
+
+    /// Validate a pasted value against the current offer, dropping blank or stale input.
+    fn accept_paste(&self, value: &str) -> Option<bcode_provider_auth_models::AuthFlowInput> {
+        let paste = self.paste.as_ref()?;
+        paste.validate_answer(value).ok()?;
+        Some(bcode_provider_auth_models::AuthFlowInput {
+            prompt_id: paste.answer_prompt_id()?.to_owned(),
+            value: value.trim().to_owned(),
+        })
+    }
+
+    /// Start line-mode paste input; true when this offer has not been announced yet.
+    fn offer_line_paste(&mut self, effect: &bcode_provider_auth_models::AuthFlowEffect) -> bool {
+        self.ensure_line_reader();
+        effect
+            .answer_prompt_id()
+            .is_some_and(|prompt_id| self.announced.insert(prompt_id.to_owned()))
+    }
+
+    fn take_line_paste(&self) -> Option<bcode_provider_auth_models::AuthFlowInput> {
+        let line = self.lines.as_ref()?.try_recv().ok()?.ok()?;
+        self.accept_paste(&line)
+    }
+
+    /// Read one answer line, through the shared reader once one has been started.
+    fn read_line(&self) -> Result<String, CliError> {
+        let Some(lines) = &self.lines else {
+            return read_stdin_line();
+        };
+        lines
+            .recv()
+            .map_err(|_| {
+                CliError::InvalidArguments(
+                    "authentication input ended before a response".to_owned(),
+                )
+            })?
+            .map_err(CliError::InvalidArguments)
+    }
+
+    fn ensure_line_reader(&mut self) {
+        if self.lines.is_some() {
+            return;
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            loop {
+                let line = read_stdin_line().map_err(|error| error.to_string());
+                let ended = line.is_err();
+                if send.send(line).is_err() || ended {
+                    break;
+                }
+            }
+        });
+        self.lines = Some(receive);
     }
 }
 
@@ -14139,6 +14307,10 @@ fn write_auth_effect(
             }
         }
         AuthFlowEffect::Message { message } => writeln!(writer, "{message}")?,
+        AuthFlowEffect::PasteInput { message, .. } => {
+            writeln!(writer, "{message}")?;
+            writeln!(writer, "Paste it and press Enter (or just wait):")?;
+        }
         AuthFlowEffect::Wait { .. } => return Ok(()),
     }
     writer.flush()?;
@@ -15117,19 +15289,21 @@ fn plugin_selection_for_config(
     bcode_config::plugin_selection_with_default_plugin_ids(config, &default_plugin_ids)
 }
 
-fn open_browser(url: &str) {
+/// Launch the platform browser; reports whether the launcher started.
+fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
     #[cfg(target_os = "windows")]
     let command = ("cmd", vec!["/C", "start", url]);
     #[cfg(all(unix, not(target_os = "macos")))]
     let command = ("xdg-open", vec![url]);
-    let _ = Command::new(command.0)
+    Command::new(command.0)
         .args(command.1)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
 fn list_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliError> {
@@ -25272,6 +25446,44 @@ auth_profile = "openai"
     }
 
     #[test]
+    fn auth_flow_links_print_once_unwrapped_for_cross_device_copy() {
+        use bcode_provider_auth_models::AuthFlowEffect;
+        let url = format!("https://auth.example.com/authorize?{}", "x=1&".repeat(80));
+        let effects = [
+            AuthFlowEffect::OpenBrowser { url: url.clone() },
+            AuthFlowEffect::DisplayDeviceCode {
+                verification_url: "https://example.com/device".to_owned(),
+                user_code: "ABCD-1234".to_owned(),
+                expires_in_seconds: None,
+            },
+            AuthFlowEffect::Wait { millis: 1 },
+        ];
+        let mut session = AuthFlowSession::new(false);
+        let lines = session.unprinted_links(&effects);
+        assert!(lines.contains(&url), "URL must be a whole line: {lines:?}");
+        assert!(lines.iter().any(|line| line == "Code: ABCD-1234"));
+        assert_eq!(session.unprinted_links(&effects), Vec::<String>::new());
+        assert!(!session.open(&url), "disabled policy never launches");
+    }
+
+    #[test]
+    fn auth_flow_paste_requires_a_current_offer_and_nonblank_value() {
+        use bcode_provider_auth_models::AuthFlowEffect;
+        let mut session = AuthFlowSession::new(false);
+        assert!(session.accept_paste("http://localhost/cb").is_none());
+        session.paste = Some(AuthFlowEffect::PasteInput {
+            prompt_id: "callback_url".to_owned(),
+            message: "Paste".to_owned(),
+        });
+        assert!(session.accept_paste("   ").is_none());
+        let input = session
+            .accept_paste("  http://localhost/cb?code=c&state=s \n")
+            .expect("accepted paste");
+        assert_eq!(input.prompt_id, "callback_url");
+        assert_eq!(input.value, "http://localhost/cb?code=c&state=s");
+    }
+
+    #[test]
     fn auth_effect_output_is_fallible_and_preserves_prompt_choices() {
         use bcode_provider_auth_models::AuthFlowEffect;
         let effects = [
@@ -25291,6 +25503,10 @@ auth_profile = "openai"
             AuthFlowEffect::Message {
                 message: "Done".to_owned(),
             },
+            AuthFlowEffect::PasteInput {
+                prompt_id: "callback_url".to_owned(),
+                message: "Paste the address".to_owned(),
+            },
         ];
         let mut output = Vec::new();
         for effect in &effects {
@@ -25300,7 +25516,7 @@ auth_profile = "openai"
         }
         assert_eq!(
             output,
-            b"Open in browser: https://example.com\nConfirm\nChoices: yes, no\nOpen https://example.com/device and enter code ABCD\nDone\n"
+            b"Open in browser: https://example.com\nConfirm\nChoices: yes, no\nOpen https://example.com/device and enter code ABCD\nDone\nPaste the address\nPaste it and press Enter (or just wait):\n"
         );
         let mut empty = &mut [][..];
         write_auth_effect(&mut empty, &AuthFlowEffect::Wait { millis: 1 }).unwrap();

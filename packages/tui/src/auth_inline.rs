@@ -21,7 +21,7 @@ use bmux_tui_components::{
 mod many;
 mod status;
 pub use many::{AuthMultiChoiceOutcome, choose_many};
-pub use status::AuthStatus;
+pub use status::{AuthStatus, AuthStatusInput};
 
 use std::{
     cell::Cell,

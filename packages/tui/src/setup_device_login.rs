@@ -10,6 +10,10 @@ use std::sync::{
     mpsc,
 };
 use std::time::Duration;
+use zeroize::Zeroizing;
+
+/// Upper bound on hidden pasted input, matching the auth contract's text bound.
+const MAX_PASTE_BYTES: usize = 4096;
 
 pub fn pool_compatibility(
     host: &bcode_plugin::PluginHost,
@@ -82,17 +86,25 @@ pub enum LoginUpdate {
     Progress(Vec<String>, bool),
     Succeeded,
     Prompt(AuthFlowEffect),
+    /// Offer (or withdraw) an optional hidden paste while sign-in keeps polling.
+    Paste(Option<AuthFlowEffect>),
 }
 
 struct LoginChannel {
     updates: mpsc::SyncSender<LoginUpdate>,
     answers: mpsc::Receiver<String>,
+    pastes: mpsc::Receiver<Zeroizing<String>>,
 }
 
 pub struct DeviceLogin {
     pub prompt: Option<AuthFlowEffect>,
     pub answer: String,
     answers: mpsc::SyncSender<String>,
+    /// Optional cross-device paste offer; never blocks sign-in.
+    pub paste: Option<AuthFlowEffect>,
+    /// Hidden pasted value; presentation shows only its length.
+    pub paste_value: Zeroizing<String>,
+    pastes: mpsc::SyncSender<Zeroizing<String>>,
     pub lines: Vec<String>,
     pub terminal: bool,
     pub succeeded: bool,
@@ -106,10 +118,12 @@ impl DeviceLogin {
         let worker_cancel = cancel.clone();
         let (send, updates) = mpsc::sync_channel(8);
         let (answers, receive_answers) = mpsc::sync_channel(1);
+        let (pastes, receive_pastes) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let channel = LoginChannel {
                 updates: send,
                 answers: receive_answers,
+                pastes: receive_pastes,
             };
             let result = run(
                 &provider,
@@ -129,6 +143,9 @@ impl DeviceLogin {
             prompt: None,
             answer: String::new(),
             answers,
+            paste: None,
+            paste_value: Zeroizing::default(),
+            pastes,
             lines: vec!["Starting sign-in… Cancel stops sign-in.".to_owned()],
             terminal: false,
             succeeded: false,
@@ -151,6 +168,7 @@ impl DeviceLogin {
                         self.terminal = true;
                         self.prompt = None;
                         self.answer.clear();
+                        self.withdraw_paste();
                     }
                     break;
                 }
@@ -166,6 +184,7 @@ impl DeviceLogin {
                     self.succeeded = true;
                     self.prompt = None;
                     self.answer.clear();
+                    self.withdraw_paste();
                 }
                 LoginUpdate::Progress(lines, terminal) => {
                     self.lines = lines;
@@ -173,12 +192,15 @@ impl DeviceLogin {
                     if terminal {
                         self.prompt = None;
                         self.answer.clear();
+                        self.withdraw_paste();
                     }
                 }
                 LoginUpdate::Prompt(prompt) => {
                     self.prompt = Some(prompt);
                     self.answer.clear();
                 }
+                LoginUpdate::Paste(Some(paste)) => self.paste = Some(paste),
+                LoginUpdate::Paste(None) => self.withdraw_paste(),
             }
         }
     }
@@ -187,6 +209,7 @@ impl DeviceLogin {
     pub fn failed_for_test() -> Self {
         let (send, updates) = mpsc::channel();
         let (answers, _) = mpsc::sync_channel(1);
+        let (pastes, _) = mpsc::sync_channel(1);
         send.send(LoginUpdate::Progress(
             vec!["Sign-in request failed".to_owned()],
             true,
@@ -196,6 +219,9 @@ impl DeviceLogin {
             prompt: None,
             answer: String::new(),
             answers,
+            paste: None,
+            paste_value: Zeroizing::default(),
+            pastes,
             lines: Vec::new(),
             terminal: false,
             succeeded: false,
@@ -213,6 +239,35 @@ impl DeviceLogin {
                 self.answer.clear();
             }
         }
+    }
+
+    /// Append typed or pasted characters to the hidden paste field, bounded by bytes.
+    pub fn extend_paste(&mut self, text: &str) {
+        for character in text.chars().filter(|character| !character.is_control()) {
+            if self.paste_value.len() + character.len_utf8() > MAX_PASTE_BYTES {
+                break;
+            }
+            self.paste_value.push(character);
+        }
+    }
+
+    /// Hand the hidden paste to the sign-in worker; it is submitted on the next poll.
+    pub fn submit_paste(&mut self) {
+        let Some(paste) = &self.paste else {
+            return;
+        };
+        if paste.validate_answer(&self.paste_value).is_err() {
+            return;
+        }
+        let value = std::mem::take(&mut self.paste_value);
+        if self.pastes.try_send(value).is_ok() {
+            self.lines.push("Checking the pasted address…".to_owned());
+        }
+    }
+
+    fn withdraw_paste(&mut self) {
+        self.paste = None;
+        self.paste_value.clear();
     }
 
     pub fn cancel(&self) {
@@ -300,6 +355,7 @@ fn flow(
         prepared.resolved.profile_name.clone(),
     );
     let mut display = vec!["Waiting for sign-in… Cancel stops sign-in.".to_owned()];
+    let mut offered_paste: Option<AuthFlowEffect> = None;
     loop {
         if cancel.load(Ordering::Acquire) {
             request.operation = AuthFlowOperation::Cancel;
@@ -338,7 +394,13 @@ fn flow(
             AuthFlowStatus::Pending => {}
         }
         answer_prompts(&progress.effects, &mut domain_flow, send, cancel)?;
-        present_progress(progress.effects, &mut display, &mut browser, send, cancel);
+        let paste = offer_paste(&progress.effects, &mut offered_paste, send);
+        let wait = present_progress(progress.effects, &mut display, &mut browser, send);
+        if let Some(value) = wait_for_paste_or_cancel(wait, paste.is_some(), send, cancel)
+            && let Some(paste) = &paste
+        {
+            domain_flow.answer(paste, value.to_string())?;
+        }
         request = domain_flow.request()?.clone();
     }
 }
@@ -381,18 +443,58 @@ fn exchange_flow_request(
     Ok(response)
 }
 
+/// Present the effects and return the provider-requested wait in milliseconds.
 fn present_progress(
     effects: Vec<AuthFlowEffect>,
     display: &mut Vec<String>,
     browser: &mut super::auth_browser::AuthBrowser,
     send: &LoginChannel,
-    cancel: &AtomicBool,
-) {
+) -> u64 {
     let wait = adapt_effects(effects, display, browser);
     let _ = send
         .updates
         .try_send(LoginUpdate::Progress(display.clone(), false));
-    wait_or_cancel(wait, cancel);
+    wait
+}
+
+/// Track the provider's optional paste offer, notifying the view only when it changes.
+fn offer_paste(
+    effects: &[AuthFlowEffect],
+    offered: &mut Option<AuthFlowEffect>,
+    send: &LoginChannel,
+) -> Option<AuthFlowEffect> {
+    let current = effects
+        .iter()
+        .find(|effect| matches!(effect, AuthFlowEffect::PasteInput { .. }))
+        .cloned();
+    if current != *offered {
+        let _ = send.updates.send(LoginUpdate::Paste(current.clone()));
+        offered.clone_from(&current);
+    }
+    current
+}
+
+/// Wait out the provider poll interval, ending early on cancellation or a submitted paste.
+fn wait_for_paste_or_cancel(
+    wait: u64,
+    accepting: bool,
+    send: &LoginChannel,
+    cancel: &AtomicBool,
+) -> Option<Zeroizing<String>> {
+    for _ in 0..wait.div_ceil(100) {
+        if cancel.load(Ordering::Acquire) {
+            return None;
+        }
+        if accepting {
+            match send.pastes.recv_timeout(Duration::from_millis(100)) {
+                Ok(value) => return Some(value),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
 }
 
 fn answer_prompts(
@@ -522,19 +624,10 @@ fn present_effects(effects: Vec<AuthFlowEffect>, display: &mut Vec<String>) -> u
                     display.push(message);
                 }
             }
-            AuthFlowEffect::Prompt { .. } => {}
+            AuthFlowEffect::Prompt { .. } | AuthFlowEffect::PasteInput { .. } => {}
         }
     }
     wait
-}
-
-fn wait_or_cancel(wait: u64, cancel: &AtomicBool) {
-    for _ in 0..wait.div_ceil(100) {
-        if cancel.load(Ordering::Acquire) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 fn adapt_effects(
@@ -645,10 +738,14 @@ mod tests {
     fn terminal_progress_cannot_be_reopened_by_late_updates() {
         let (send, updates) = mpsc::channel();
         let (answers, _) = mpsc::sync_channel(1);
+        let (pastes, _) = mpsc::sync_channel(1);
         let mut login = DeviceLogin {
             prompt: None,
             answer: String::new(),
             answers,
+            paste: None,
+            paste_value: Zeroizing::default(),
+            pastes,
             lines: Vec::new(),
             terminal: false,
             succeeded: false,
@@ -707,10 +804,14 @@ mod tests {
     fn prompt_answer_is_validated_and_delivered_without_stdin() {
         let (send, updates) = mpsc::channel();
         let (answers, received) = mpsc::sync_channel(1);
+        let (pastes, _) = mpsc::sync_channel(1);
         let mut login = DeviceLogin {
             prompt: None,
             answer: String::new(),
             answers,
+            paste: None,
+            paste_value: Zeroizing::default(),
+            pastes,
             lines: Vec::new(),
             terminal: false,
             succeeded: false,
@@ -734,11 +835,114 @@ mod tests {
         assert!(login.prompt.is_none());
     }
 
+    fn test_channel() -> (
+        LoginChannel,
+        mpsc::Receiver<LoginUpdate>,
+        mpsc::SyncSender<Zeroizing<String>>,
+    ) {
+        let (updates, received_updates) = mpsc::sync_channel(8);
+        let (_, answers) = mpsc::sync_channel(1);
+        let (pastes, received_pastes) = mpsc::sync_channel(1);
+        (
+            LoginChannel {
+                updates,
+                answers,
+                pastes: received_pastes,
+            },
+            received_updates,
+            pastes,
+        )
+    }
+
     #[test]
     fn cancellation_interrupts_provider_wait() {
+        let (channel, _updates, _pastes) = test_channel();
         let cancel = AtomicBool::new(true);
         let start = std::time::Instant::now();
-        wait_or_cancel(300_000, &cancel);
+        assert!(wait_for_paste_or_cancel(300_000, true, &channel, &cancel).is_none());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn submitted_paste_ends_the_provider_wait_early() {
+        let (channel, _updates, pastes) = test_channel();
+        pastes
+            .send(Zeroizing::new("http://localhost/cb".to_owned()))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let value = wait_for_paste_or_cancel(300_000, true, &channel, &AtomicBool::new(false));
+        assert_eq!(
+            value.as_deref().map(String::as_str),
+            Some("http://localhost/cb")
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn paste_offer_is_announced_once_and_withdrawn_when_absent() {
+        let (channel, updates, _pastes) = test_channel();
+        let paste = AuthFlowEffect::PasteInput {
+            prompt_id: "callback_url".to_owned(),
+            message: "Paste the redirected address".to_owned(),
+        };
+        let mut offered = None;
+        let effects = [paste.clone(), AuthFlowEffect::Wait { millis: 1 }];
+        assert_eq!(
+            offer_paste(&effects, &mut offered, &channel),
+            Some(paste.clone())
+        );
+        assert_eq!(offer_paste(&effects, &mut offered, &channel), Some(paste));
+        assert_eq!(offer_paste(&[], &mut offered, &channel), None);
+        let announced = updates.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            announced.as_slice(),
+            [LoginUpdate::Paste(Some(_)), LoginUpdate::Paste(None)]
+        ));
+    }
+
+    #[test]
+    fn hidden_paste_is_bounded_validated_and_delivered_once() {
+        let (send, updates) = mpsc::channel();
+        let (answers, _) = mpsc::sync_channel(1);
+        let (pastes, received) = mpsc::sync_channel(1);
+        let mut login = DeviceLogin {
+            prompt: None,
+            answer: String::new(),
+            answers,
+            paste: None,
+            paste_value: Zeroizing::default(),
+            pastes,
+            lines: Vec::new(),
+            terminal: false,
+            succeeded: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            updates,
+        };
+        login.extend_paste("ignored without an offer");
+        login.paste_value.clear();
+        login.submit_paste();
+        assert!(received.try_recv().is_err());
+        send.send(LoginUpdate::Paste(Some(AuthFlowEffect::PasteInput {
+            prompt_id: "callback_url".to_owned(),
+            message: "Paste".to_owned(),
+        })))
+        .unwrap();
+        login.refresh();
+        login.submit_paste();
+        assert!(received.try_recv().is_err(), "blank paste must not submit");
+        login.extend_paste(&"é".repeat(MAX_PASTE_BYTES));
+        assert!(login.paste_value.len() <= MAX_PASTE_BYTES);
+        login.paste_value.clear();
+        login.extend_paste("http://localhost/cb?code=c\n");
+        login.submit_paste();
+        assert_eq!(
+            received.try_recv().unwrap().as_str(),
+            "http://localhost/cb?code=c"
+        );
+        assert!(login.paste_value.is_empty());
+        send.send(LoginUpdate::Progress(vec!["done".to_owned()], true))
+            .unwrap();
+        login.refresh();
+        assert!(login.paste.is_none());
     }
 }

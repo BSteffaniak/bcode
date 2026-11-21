@@ -1133,6 +1133,29 @@ pub fn bedrock_environment_is_configured_with_environment(
         .is_some_and(|spec| first_env_value_from_slice(environment, spec.signal_env_vars).is_some())
 }
 
+/// Whether this process likely has no browser the user can see.
+///
+/// True for SSH sessions without a forwarded display, and on Linux/BSD for sessions with
+/// neither X11 nor Wayland. macOS and Windows local sessions always have a desktop.
+#[must_use]
+pub fn headless_session(environment: &impl ConfigEnvironment) -> bool {
+    headless_session_for(
+        environment,
+        cfg!(all(unix, not(target_os = "macos"), not(target_os = "ios"))),
+    )
+}
+
+fn headless_session_for(environment: &impl ConfigEnvironment, desktop_needs_display: bool) -> bool {
+    let present = |key: &str| {
+        environment
+            .var_os(key)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let display = present("DISPLAY") || present("WAYLAND_DISPLAY");
+    let remote = present("SSH_CONNECTION") || present("SSH_CLIENT") || present("SSH_TTY");
+    !display && (remote || desktop_needs_display)
+}
+
 /// First-run setup preferences, also respected when reopening Settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "onboarding")]
@@ -1141,6 +1164,9 @@ pub struct OnboardingConfig {
     #[serde(default = "default_true")]
     pub credential_discovery: bool,
     /// Open authentication URLs automatically. Disable to copy URLs manually.
+    ///
+    /// Sessions without a local browser (SSH without a forwarded display, or a Linux/BSD
+    /// console without X11/Wayland) never open one; set `BCODE_NO_BROWSER=0` to override.
     #[serde(default = "default_true")]
     pub open_browser: bool,
 }
@@ -1155,13 +1181,21 @@ impl Default for OnboardingConfig {
 }
 
 impl OnboardingConfig {
-    /// Resolve browser launch policy. Environment opt-out wins over configuration.
+    /// Resolve browser launch policy.
+    ///
+    /// Configuration opt-out always wins. `BCODE_NO_BROWSER` set to anything other than
+    /// `0`/`false` disables opening; set to `0`/`false` it forces opening even in a session
+    /// detected as headless. Otherwise a headless session (see [`headless_session`]) never
+    /// opens a browser, so the URL is shown for use on another device instead.
     #[must_use]
     pub fn browser_opening_enabled(&self, environment: &impl ConfigEnvironment) -> bool {
-        self.open_browser
-            && environment
-                .var_os("BCODE_NO_BROWSER")
-                .is_none_or(|value| value == "0" || value == "false")
+        if !self.open_browser {
+            return false;
+        }
+        environment.var_os("BCODE_NO_BROWSER").map_or_else(
+            || !headless_session(environment),
+            |value| value == "0" || value == "false",
+        )
     }
 
     /// Resolve automatic discovery before accessing any credential source.
@@ -10130,9 +10164,39 @@ command_policy = { version = 1, layers = [{ command = { z = "deny" } }, { comman
     }
 
     #[test]
+    fn headless_sessions_are_ssh_without_display_or_displayless_desktops() {
+        let mut environment = super::ConfigEnvironmentSnapshot::isolated("/tmp/headless-policy");
+        assert!(!super::headless_session_for(&environment, false));
+        assert!(super::headless_session_for(&environment, true));
+        environment.set_var("SSH_CONNECTION", "10.0.0.2 50000 10.0.0.1 22");
+        assert!(super::headless_session_for(&environment, false));
+        environment.set_var("DISPLAY", "localhost:10.0");
+        assert!(!super::headless_session_for(&environment, false));
+        assert!(!super::headless_session_for(&environment, true));
+        environment.set_var("DISPLAY", "");
+        assert!(super::headless_session_for(&environment, false));
+        environment.set_var("WAYLAND_DISPLAY", "wayland-0");
+        assert!(!super::headless_session_for(&environment, true));
+    }
+
+    #[test]
+    fn headless_sessions_skip_the_browser_unless_explicitly_forced() {
+        let mut config = super::BcodeConfig::default();
+        let mut environment = super::ConfigEnvironmentSnapshot::isolated("/tmp/browser-ssh");
+        environment.set_var("SSH_TTY", "/dev/pts/3");
+        assert!(!config.onboarding.browser_opening_enabled(&environment));
+        environment.set_var("BCODE_NO_BROWSER", "0");
+        assert!(config.onboarding.browser_opening_enabled(&environment));
+        config.onboarding.open_browser = false;
+        assert!(!config.onboarding.browser_opening_enabled(&environment));
+    }
+
+    #[test]
     fn browser_opt_out_survives_config_serialization() {
         let mut config = super::BcodeConfig::default();
         let mut environment = super::ConfigEnvironmentSnapshot::isolated("/tmp/browser-policy");
+        // A local graphical session on every platform.
+        environment.set_var("DISPLAY", ":0");
         assert!(config.onboarding.browser_opening_enabled(&environment));
         environment.set_var("BCODE_NO_BROWSER", "1");
         assert!(!config.onboarding.browser_opening_enabled(&environment));

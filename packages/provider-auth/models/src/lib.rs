@@ -840,7 +840,7 @@ impl AuthFlowResponse {
         if self
             .effects
             .iter()
-            .filter(|effect| matches!(effect, AuthFlowEffect::Prompt { .. }))
+            .filter(|effect| effect.answer_prompt_id().is_some())
             .count()
             > 1
         {
@@ -857,9 +857,7 @@ impl AuthFlowResponse {
                     "terminal responses cannot request continuation waits",
                 ));
             }
-            if self.status != AuthFlowStatus::Pending
-                && matches!(effect, AuthFlowEffect::Prompt { .. })
-            {
+            if self.status != AuthFlowStatus::Pending && effect.answer_prompt_id().is_some() {
                 return Err(AuthContractError::InvalidFlowShape(
                     "terminal responses cannot request input",
                 ));
@@ -937,6 +935,16 @@ pub enum AuthFlowEffect {
     Wait { millis: u64 },
     /// Display non-secret informational text.
     Message { message: String },
+    /// Offer an optional hidden paste while the flow keeps polling.
+    ///
+    /// Unlike [`AuthFlowEffect::Prompt`], this never blocks: frontends keep honoring the
+    /// following [`AuthFlowEffect::Wait`] and continuing the flow. When the user submits a
+    /// value, the next continuation carries it as [`AuthFlowInput`] with this `prompt_id`.
+    /// Providers use it to complete a browser sign-in finished on another device, for
+    /// example by accepting the redirected callback URL. The value is sensitive: frontends
+    /// must not echo, log, or retain it. Providers may repeat the effect on every pending
+    /// response; frontends present it once per `prompt_id`.
+    PasteInput { prompt_id: String, message: String },
 }
 
 impl AuthFlowEffect {
@@ -944,14 +952,24 @@ impl AuthFlowEffect {
     ///
     /// # Errors
     ///
-    /// Rejects non-prompt effects, invalid prompt definitions, oversized answers,
-    /// and answers outside a non-empty choice list. Errors never include the supplied answer.
+    /// Rejects effects other than prompts and paste inputs, invalid prompt definitions,
+    /// oversized answers, empty pastes, and answers outside a non-empty choice list.
+    /// Errors never include the supplied answer.
     pub fn validate_answer(&self, value: &str) -> Result<(), AuthContractError> {
         self.validate()?;
-        let Self::Prompt { choices, .. } = self else {
-            return Err(AuthContractError::InvalidFlowShape(
-                "only prompts accept answers",
-            ));
+        let choices = match self {
+            Self::Prompt { choices, .. } => choices.as_slice(),
+            Self::PasteInput { .. } if value.trim().is_empty() => {
+                return Err(AuthContractError::InvalidFlowShape(
+                    "pasted authentication input is empty",
+                ));
+            }
+            Self::PasteInput { .. } => &[],
+            _ => {
+                return Err(AuthContractError::InvalidFlowShape(
+                    "only prompts accept answers",
+                ));
+            }
         };
         validate_optional_text("input.value", value, MAX_AUTH_TEXT_BYTES)?;
         if !choices.is_empty() && !choices.iter().any(|choice| choice == value) {
@@ -996,6 +1014,19 @@ impl AuthFlowEffect {
             Self::Message { message } => {
                 validate_text("effect.message", message, MAX_AUTH_TEXT_BYTES)
             }
+            Self::PasteInput { prompt_id, message } => {
+                validate_id("prompt_id", prompt_id)?;
+                validate_text("paste.message", message, MAX_AUTH_TEXT_BYTES)
+            }
+        }
+    }
+
+    /// Prompt identity for effects that accept an answer.
+    #[must_use]
+    pub fn answer_prompt_id(&self) -> Option<&str> {
+        match self {
+            Self::Prompt { prompt_id, .. } | Self::PasteInput { prompt_id, .. } => Some(prompt_id),
+            _ => None,
         }
     }
 }
@@ -1576,6 +1607,54 @@ mod tests {
                 .validate_answer("yes")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn paste_input_accepts_any_bounded_nonempty_value_and_only_while_pending() {
+        let paste = AuthFlowEffect::PasteInput {
+            prompt_id: "callback_url".to_owned(),
+            message: "Paste the redirected address".to_owned(),
+        };
+        paste
+            .validate_answer("http://localhost:1455/auth/callback?code=c&state=s")
+            .unwrap();
+        for blank in ["", "   "] {
+            assert!(paste.validate_answer(blank).is_err());
+        }
+        assert!(
+            paste
+                .validate_answer(&"x".repeat(MAX_AUTH_TEXT_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(paste.answer_prompt_id(), Some("callback_url"));
+
+        let mut response = AuthFlowResponse {
+            schema_version: AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Pending,
+            state: Some("state".to_owned()),
+            effects: vec![paste.clone(), AuthFlowEffect::Wait { millis: 1 }],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        response.validate().unwrap();
+        response.effects.push(AuthFlowEffect::Prompt {
+            prompt_id: "code".to_owned(),
+            message: "Enter code".to_owned(),
+            choices: Vec::new(),
+        });
+        assert!(matches!(
+            response.validate(),
+            Err(AuthContractError::InvalidFlowShape(_))
+        ));
+        response.effects = vec![paste];
+        response.state = None;
+        response.status = AuthFlowStatus::Failed;
+        assert!(matches!(
+            response.validate(),
+            Err(AuthContractError::InvalidFlowShape(
+                "terminal responses cannot request input"
+            ))
+        ));
     }
 
     #[test]

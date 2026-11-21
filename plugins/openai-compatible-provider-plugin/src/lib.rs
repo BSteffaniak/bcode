@@ -248,7 +248,6 @@ enum OpenAiAuthFlowState {
         redirect_uri: String,
         listeners: Vec<TcpListener>,
         polls: u16,
-        prompt_shown: bool,
     },
     Device {
         profile: String,
@@ -700,6 +699,30 @@ const fn cancelled_auth_flow_response() -> AuthFlowResponse {
         status: AuthFlowStatus::Cancelled,
         state: None,
         effects: Vec::new(),
+        credentials: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Pending browser sign-in: leading effects, then the cross-device paste offer and a poll wait.
+fn browser_pending_response(
+    state_id: String,
+    mut effects: Vec<AuthFlowEffect>,
+) -> AuthFlowResponse {
+    effects.push(AuthFlowEffect::PasteInput {
+        prompt_id: OPENAI_BROWSER_PROMPT_ID.to_owned(),
+        message: format!(
+            "Signing in from another computer? Approve there, then copy the address of the page it lands on (it starts with http://localhost:{OPENAI_CODEX_OAUTH_PORT}/auth/callback and will not load) and paste it here. Or retry with `bcode auth login openai --method device`."
+        ),
+    });
+    effects.push(AuthFlowEffect::Wait {
+        millis: OPENAI_BROWSER_WAIT_MILLIS,
+    });
+    AuthFlowResponse {
+        schema_version: AUTH_FLOW_SCHEMA_VERSION,
+        status: AuthFlowStatus::Pending,
+        state: Some(state_id),
+        effects,
         credentials: BTreeMap::new(),
         diagnostics: Vec::new(),
     }
@@ -1258,7 +1281,22 @@ impl OpenAiCompatibleProviderPlugin {
         state: &Arc<Mutex<OpenAiCompatibleProviderState>>,
         profile: String,
     ) -> Result<AuthFlowResponse, String> {
-        let listeners = open_oauth_listeners(OPENAI_CODEX_OAUTH_PORT)?;
+        // The pasted callback still completes sign-in when the local port is unavailable,
+        // so a busy port degrades to paste-only rather than failing.
+        let (listeners, listener_notice) = open_oauth_listeners(OPENAI_CODEX_OAUTH_PORT)
+            .map_or_else(
+                |_| {
+                    (
+                        Vec::new(),
+                        Some(AuthFlowEffect::Message {
+                            message: format!(
+                                "Port {OPENAI_CODEX_OAUTH_PORT} is busy, so this computer cannot receive the browser redirect itself. Paste the redirected address below to finish."
+                            ),
+                        }),
+                    )
+                },
+                |listeners| (listeners, None),
+            );
         let redirect_uri = format!("http://localhost:{OPENAI_CODEX_OAUTH_PORT}/auth/callback");
         let oauth_state = random_urlsafe(32)?;
         let verifier = random_urlsafe(32)?;
@@ -1278,22 +1316,11 @@ impl OpenAiCompatibleProviderPlugin {
                     redirect_uri,
                     listeners,
                     polls: 0,
-                    prompt_shown: false,
                 },
             );
-        Ok(AuthFlowResponse {
-            schema_version: AUTH_FLOW_SCHEMA_VERSION,
-            status: AuthFlowStatus::Pending,
-            state: Some(state_id),
-            effects: vec![
-                AuthFlowEffect::OpenBrowser { url: authorize_url },
-                AuthFlowEffect::Wait {
-                    millis: OPENAI_BROWSER_WAIT_MILLIS,
-                },
-            ],
-            credentials: BTreeMap::new(),
-            diagnostics: Vec::new(),
-        })
+        let mut effects = vec![AuthFlowEffect::OpenBrowser { url: authorize_url }];
+        effects.extend(listener_notice);
+        Ok(browser_pending_response(state_id, effects))
     }
 
     async fn continue_openai_browser_auth(
@@ -1313,7 +1340,6 @@ impl OpenAiCompatibleProviderPlugin {
                 redirect_uri,
                 listeners,
                 polls,
-                prompt_shown,
                 ..
             }) = auth_state.auth_flows.get_mut(&state_id)
             else {
@@ -1328,10 +1354,18 @@ impl OpenAiCompatibleProviderPlugin {
                 .filter(|input| input.prompt_id == OPENAI_BROWSER_PROMPT_ID)
                 .map(|input| input.value.trim())
                 .filter(|value| !value.is_empty());
-            let code = manual
-                .map(|value| parse_oauth_callback(value, oauth_state))
-                .transpose()?
-                .or(poll_oauth_listeners(listeners, oauth_state)?);
+            // A mistaken paste must not end a sign-in that can still complete; report it and
+            // keep waiting. Parse errors describe the problem without echoing the input.
+            let (pasted, rejected_paste) =
+                match manual.map(|value| parse_oauth_callback(value, oauth_state)) {
+                    Some(Ok(code)) => (Some(code), None),
+                    Some(Err(error)) => (None, Some(error)),
+                    None => (None, None),
+                };
+            let code = match pasted {
+                Some(code) => Some(code),
+                None => poll_oauth_listeners(listeners, oauth_state)?,
+            };
             let result = code.map(|code| {
                 (
                     code,
@@ -1340,10 +1374,19 @@ impl OpenAiCompatibleProviderPlugin {
                     profile.clone(),
                 )
             });
-            if result.is_none() {
-                *prompt_shown = true;
-            }
             drop(auth_state);
+            if result.is_none()
+                && let Some(error) = rejected_paste
+            {
+                return Ok(browser_pending_response(
+                    state_id,
+                    vec![AuthFlowEffect::Message {
+                        message: format!(
+                            "That address did not complete sign-in ({error}). Paste the full address from the browser's address bar after approving."
+                        ),
+                    }],
+                ));
+            }
             result
         };
         if let Some((code, verifier, redirect_uri, profile)) = completion {
@@ -1352,16 +1395,7 @@ impl OpenAiCompatibleProviderPlugin {
             Self::remove_auth_flow(&state, &state_id)?;
             return Ok(auth_flow_success(token, &profile));
         }
-        Ok(AuthFlowResponse {
-            schema_version: AUTH_FLOW_SCHEMA_VERSION,
-            status: AuthFlowStatus::Pending,
-            state: Some(state_id),
-            effects: vec![AuthFlowEffect::Wait {
-                millis: OPENAI_BROWSER_WAIT_MILLIS,
-            }],
-            credentials: BTreeMap::new(),
-            diagnostics: Vec::new(),
-        })
+        Ok(browser_pending_response(state_id, Vec::new()))
     }
 
     async fn openai_device_auth_flow(
@@ -10753,7 +10787,6 @@ mod tests {
                     redirect_uri: "http://localhost".to_owned(),
                     listeners: vec![listener],
                     polls: 0,
-                    prompt_shown: false,
                 },
             );
         }
@@ -10922,10 +10955,72 @@ mod tests {
                 redirect_uri: "http://localhost:1455/auth/callback".to_owned(),
                 listeners,
                 polls: 0,
-                prompt_shown: false,
             },
         );
         state
+    }
+
+    #[test]
+    fn browser_auth_mistaken_paste_keeps_flow_pending_and_reoffers_paste() {
+        let state = browser_auth_state(Vec::new(), "expected-state");
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let pasted = "http://localhost:1455/auth/callback?code=secret-code&state=other";
+        let response = runtime
+            .block_on(
+                OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                    Arc::clone(&state),
+                    "browser-state".to_owned(),
+                    Some(bcode_provider_auth_models::AuthFlowInput {
+                        prompt_id: OPENAI_BROWSER_PROMPT_ID.to_owned(),
+                        value: pasted.to_owned(),
+                    }),
+                    "http://127.0.0.1:9/unused".to_owned(),
+                ),
+            )
+            .expect("browser runtime")
+            .expect("pending after mistaken paste");
+        response.validate().expect("valid pending response");
+        assert_eq!(response.status, AuthFlowStatus::Pending);
+        assert_eq!(response.state.as_deref(), Some("browser-state"));
+        assert!(matches!(
+            response.effects.as_slice(),
+            [
+                AuthFlowEffect::Message { message },
+                AuthFlowEffect::PasteInput { prompt_id, .. },
+                AuthFlowEffect::Wait { .. },
+            ] if prompt_id == OPENAI_BROWSER_PROMPT_ID
+                && !message.contains("secret-code")
+        ));
+        assert!(
+            state
+                .lock()
+                .expect("auth state")
+                .auth_flows
+                .contains_key("browser-state")
+        );
+    }
+
+    #[test]
+    fn browser_auth_waiting_response_offers_cross_device_paste() {
+        let state = browser_auth_state(Vec::new(), "expected-state");
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let response = runtime
+            .block_on(
+                OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                    Arc::clone(&state),
+                    "browser-state".to_owned(),
+                    None,
+                    "http://127.0.0.1:9/unused".to_owned(),
+                ),
+            )
+            .expect("browser runtime")
+            .expect("pending");
+        response.validate().expect("valid pending response");
+        assert!(matches!(
+            response.effects.as_slice(),
+            [AuthFlowEffect::PasteInput { prompt_id, .. }, AuthFlowEffect::Wait { .. }]
+                if prompt_id == OPENAI_BROWSER_PROMPT_ID
+        ));
     }
 
     #[test]
@@ -11034,11 +11129,18 @@ mod tests {
                 .expect("pending callback");
             pending.validate().expect("valid pending response");
             assert_eq!(pending.status, AuthFlowStatus::Pending);
+            // Only the optional, non-blocking paste offer; never a blocking prompt.
+            assert!(
+                !pending
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, AuthFlowEffect::Prompt { .. }))
+            );
             assert_eq!(
-                pending.effects,
-                vec![AuthFlowEffect::Wait {
+                pending.effects.last(),
+                Some(&AuthFlowEffect::Wait {
                     millis: OPENAI_BROWSER_WAIT_MILLIS,
-                }]
+                })
             );
         }
         // Queue the request only after several empty polls, matching a user who takes
