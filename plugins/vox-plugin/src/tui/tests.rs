@@ -190,7 +190,7 @@ fn keymap_declarations_select_registered_commands_without_surprise_defaults() {
     assert_eq!(registry.keymap_actions().len(), 5);
     for definition in registry.keymap_actions() {
         assert_eq!(definition.scope, "chat");
-        assert!(definition.defaults.is_empty());
+        assert_eq!(definition.defaults, Vec::<String>::new());
         assert!(registry.frontend_command(&definition.id).is_some());
     }
 }

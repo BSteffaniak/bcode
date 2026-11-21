@@ -137,8 +137,6 @@ impl Runtime {
                 host_kernel_bridge: None,
                 host_service_port: None,
                 capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-                auxiliary_executables: std::collections::BTreeMap::default(),
-                auxiliary_executable_errors: std::collections::BTreeMap::default(),
             },
             services: bmux_plugin_sdk::definition::PluginHostServices::new(|_| {
                 Err(bmux_plugin_sdk::PluginError::ServiceProtocol {

@@ -118,8 +118,6 @@ pub(super) fn config(plugin_id: &str) -> bcode_plugin::ResolvedPluginConfig {
                 host_kernel_bridge: None,
                 host_service_port: None,
                 capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-                auxiliary_executables: std::collections::BTreeMap::new(),
-                auxiliary_executable_errors: std::collections::BTreeMap::new(),
             },
             services: bmux_plugin_sdk::definition::PluginHostServices::new(|_| {
                 Err(bmux_plugin_sdk::PluginError::ServiceProtocol {

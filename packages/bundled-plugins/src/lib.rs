@@ -715,9 +715,9 @@ mod tests {
         let selected =
             bcode_plugin::filter_selected_static_registrations(&bundles, &disabled).unwrap();
         let mut host = super::test_host::load_selected(&selected).unwrap();
-        assert!(
-            host.registered_command_contributions(&bcode_command::CommandSurface::Slash)
-                .is_empty()
+        assert_eq!(
+            host.registered_command_contributions(&bcode_command::CommandSurface::Slash),
+            Vec::<bcode_command::CommandContribution>::new()
         );
         host.deactivate_all().unwrap();
     }

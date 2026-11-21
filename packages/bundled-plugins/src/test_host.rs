@@ -108,8 +108,6 @@ pub fn load_selected(
                 host_kernel_bridge: None,
                 host_service_port: None,
                 capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-                auxiliary_executables: BTreeMap::new(),
-                auxiliary_executable_errors: BTreeMap::new(),
             },
             services: bmux_plugin_sdk::definition::PluginHostServices::new(|request| {
                 invocation_settings(&request)
