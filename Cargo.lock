@@ -3575,7 +3575,6 @@ dependencies = [
 name = "bcode_session_bridge_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_agent_runtime",
  "bcode_bundled_plugins",
  "bcode_client",
  "bcode_daemon_lifecycle",
