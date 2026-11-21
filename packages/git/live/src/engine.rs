@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::counts::{CountsMode, LineCounts, Modes};
 use crate::scan::{ScannerKind, StatusScanner, scanner};
-use crate::source::{WatchKind, WatchTarget};
+use crate::source::{WatchHealth, WatchKind, WatchTarget};
 use crate::worktree::{HeadMove, UntrackedLimits, WorktreeState, canonical};
 
 /// Untracked files counted in a worktree a client shows.
@@ -98,6 +98,9 @@ pub struct LiveUpdate {
     pub files: bool,
     /// Failures, as messages.
     pub errors: Vec<String>,
+    /// How changes are watched, when that changed (a new client is told unless native).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchHealth>,
     /// Work done so far by the engine serving the client.
     pub stats: EngineStats,
 }
@@ -112,6 +115,7 @@ impl LiveUpdate {
             && !self.metadata
             && !self.files
             && self.errors.is_empty()
+            && self.watch.is_none()
     }
 }
 
@@ -242,6 +246,8 @@ pub struct Engine {
     owed: BTreeSet<PathBuf>,
     /// Listing the other worktrees waits for [`Self::prepare_owed`].
     list_owed: bool,
+    /// How changes are watched.
+    watch_health: WatchHealth,
 }
 
 impl Engine {
@@ -267,6 +273,7 @@ impl Engine {
             carried: Applied::default(),
             owed: BTreeSet::new(),
             list_owed: false,
+            watch_health: WatchHealth::Native,
         }
     }
 
@@ -294,6 +301,17 @@ impl Engine {
     pub const fn note_watching(&mut self, counters: crate::source::WatchCounters) {
         self.stats.watch_events = counters.events;
         self.stats.watch_walks = counters.walks;
+    }
+
+    /// Record how changes are watched, to report to clients.
+    pub fn note_health(&mut self, health: WatchHealth) {
+        self.watch_health = health;
+    }
+
+    /// How changes are watched.
+    #[must_use]
+    pub const fn watch_health(&self) -> &WatchHealth {
+        &self.watch_health
     }
 
     /// Keep what `interests` ask for (all clients' interests together). Worktrees newly

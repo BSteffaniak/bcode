@@ -410,6 +410,8 @@ pub struct App {
     pub(crate) last_poll: Instant,
     pub(crate) last_fetch: Instant,
     pub(crate) watching: bool,
+    /// How the live state's changes are watched.
+    pub(crate) watch_health: bcode_git_live::source::WatchHealth,
 
     pub(crate) size: Cell<(u16, u16)>,
     pub(crate) hits: RefCell<HitMap>,
@@ -551,6 +553,7 @@ impl App {
             last_poll: Instant::now(),
             last_fetch: Instant::now(),
             watching: false,
+            watch_health: bcode_git_live::source::WatchHealth::Native,
             size: Cell::new((80, 24)),
             hits: RefCell::new(HitMap::new()),
             external: None,
@@ -2508,6 +2511,14 @@ impl App {
     fn install_live(&mut self, live: bcode_git_live::LiveUpdate) -> Update<Msg> {
         if let Some(error) = live.errors.first() {
             self.toast(error.clone(), true);
+        }
+        if let Some(health) = live.watch {
+            if health.is_polling() {
+                self.toast(health.to_string(), true);
+            } else if self.watch_health.is_polling() {
+                self.toast("File events are delivered again", false);
+            }
+            self.watch_health = health;
         }
         let mut update = Update::redraw();
         if let Some(primary) = live.primary {

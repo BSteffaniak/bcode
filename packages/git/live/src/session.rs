@@ -241,6 +241,7 @@ impl Loop {
                 self.engine.rescan(path.as_deref(), &mut round.pending);
             }
             Input::Source(SourceEvent::Degraded(message)) => self.errors.push(message),
+            Input::Source(SourceEvent::Health(health)) => self.engine.note_health(health),
             Input::Subscribe(id, repo, config, sink) => {
                 let root = Engine::root_of(&repo);
                 self.retained.remove(&root);

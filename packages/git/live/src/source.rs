@@ -7,17 +7,27 @@
 //!   `ReadDirectoryChangesW` on Windows), filtering ignored paths as events arrive.
 //! * [`PrunedSource`]: one watch per directory that git does not ignore (inotify on Linux,
 //!   where recursive watching would watch ignored trees such as `target/` and exhaust the
-//!   per-user watch limit), following directories as they appear.
+//!   per-user watch limit), following directories as they appear. [`PrunedSource::polling`]
+//!   compares those directories' entries on an interval instead, for when native events fail.
+//! * [`GuardedSource`]: a native source checked for liveness, falling back to polling while
+//!   the operating system delivers no events and returning to native events once they flow
+//!   again. On macOS recursive watching goes through it: `fseventsd` can stop delivering
+//!   events without any error.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher};
 
 use crate::filter::IgnoreFilter;
+
+mod guard;
+
+pub use guard::{GuardTiming, GuardedSource, NativeFactory};
 
 /// What a watched location is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +59,48 @@ pub enum SourceEvent {
     Rescan(Option<PathBuf>),
     /// Watching is incomplete (for example a system watch limit was reached).
     Degraded(String),
+    /// Whether native events are being delivered changed.
+    Health(WatchHealth),
+}
+
+/// Whether changes are seen through the operating system's native events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WatchHealth {
+    /// Native events are delivered.
+    #[default]
+    Native,
+    /// Native events stopped arriving; changes are found by polling until they flow again.
+    Polling {
+        /// The native mechanism that stopped, such as `FSEvents`.
+        native: String,
+        /// How often directories are compared.
+        interval_ms: u64,
+    },
+}
+
+impl WatchHealth {
+    /// Whether changes are found by polling instead of native events.
+    #[must_use]
+    pub const fn is_polling(&self) -> bool {
+        matches!(self, Self::Polling { .. })
+    }
+}
+
+impl std::fmt::Display for WatchHealth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native => formatter.write_str("watching native file events"),
+            Self::Polling {
+                native,
+                interval_ms,
+            } => write!(
+                formatter,
+                "{native} is not delivering file events; polling every {}",
+                guard::format_interval(Duration::from_millis(*interval_ms))
+            ),
+        }
+    }
 }
 
 /// Receives a change source's events, from any thread.
@@ -131,7 +183,16 @@ pub fn open(kind: SourceKind, sink: EventSink) -> Result<Box<dyn ChangeSource>, 
         SourceKind::Recursive => true,
         SourceKind::Pruned => false,
     };
-    Ok(if recursive {
+    Ok(if recursive && cfg!(target_os = "macos") {
+        Box::new(GuardedSource::new(
+            "FSEvents",
+            std::sync::Arc::new(|sink| {
+                Ok(Box::new(RecursiveSource::new(sink)?) as Box<dyn ChangeSource>)
+            }),
+            sink,
+            GuardTiming::default(),
+        )?)
+    } else if recursive {
         Box::new(RecursiveSource::new(sink)?)
     } else {
         Box::new(PrunedSource::new(sink)?)
@@ -253,17 +314,43 @@ pub struct PrunedSource {
     counters: Arc<Counters>,
 }
 
+/// A notify watcher of any backend.
+type AnyWatcher = Box<dyn Watcher + Send>;
+
 impl PrunedSource {
-    /// A source reporting to `sink`.
+    /// A source reporting to `sink`, using the operating system's native events.
     ///
     /// # Errors
     /// * [`SourceError`] when the operating system's watcher cannot start.
     pub fn new(sink: EventSink) -> Result<Self, SourceError> {
+        Self::start(sink, |handler| {
+            Ok(Box::new(notify::recommended_watcher(handler)?) as AnyWatcher)
+        })
+    }
+
+    /// A source reporting to `sink` that compares watched directories' entries (names,
+    /// sizes and modification times) every `interval` instead of using native events.
+    ///
+    /// # Errors
+    /// * [`SourceError`] when its polling thread cannot start.
+    pub fn polling(sink: EventSink, interval: Duration) -> Result<Self, SourceError> {
+        Self::start(sink, move |handler| {
+            let config = notify::Config::default().with_poll_interval(interval);
+            Ok(Box::new(notify::PollWatcher::new(handler, config)?) as AnyWatcher)
+        })
+    }
+
+    fn start(
+        sink: EventSink,
+        make: impl FnOnce(
+            Box<dyn FnMut(notify::Result<notify::Event>) + Send>,
+        ) -> notify::Result<AnyWatcher>,
+    ) -> Result<Self, SourceError> {
         let (commands, receiver) = mpsc::channel();
         let native = commands.clone();
-        let watcher = notify::recommended_watcher(move |result| {
+        let watcher = make(Box::new(move |result| {
             let _ = native.send(Command::Native(result));
-        })?;
+        }))?;
         let counters = Arc::new(Counters::default());
         let counting = counters.clone();
         std::thread::Builder::new()
@@ -316,7 +403,7 @@ impl ChangeSource for PrunedSource {
 }
 
 struct Pruner {
-    watcher: notify::RecommendedWatcher,
+    watcher: AnyWatcher,
     sink: EventSink,
     targets: Vec<(WatchTarget, Option<IgnoreFilter>)>,
     watched: BTreeSet<PathBuf>,

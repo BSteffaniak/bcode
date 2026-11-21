@@ -61,6 +61,15 @@ appear. How full scans run is pluggable too (`refresh.scanner`): plain `git stat
 filesystem monitor and untracked cache, which git saves in the index and serves from its monitor
 daemon (macOS and Windows; plain elsewhere).
 
+On macOS, native events can stop without any error: a wedged `fseventsd` accepts new streams
+and never reports a change. Recursive watching therefore also watches a private probe directory.
+After 10 seconds without events it writes a probe file. If two probes in a row go unseen for 2
+seconds each, every watched location is polled each second instead (one poll per directory git
+does not ignore), and the status bar shows `⚠ FSEvents stalled · polling` until native events
+return. While polling, a fresh native watcher is tried every 10 seconds. Once one sees its probe
+(for example after `sudo killall fseventsd`), watching goes native again. Each switch is followed
+by a full scan, since changes made during the switch may have been missed.
+
 The repository's other worktrees are watched the same way when branch flashes or branch line
 counts need them (at most 16).
 

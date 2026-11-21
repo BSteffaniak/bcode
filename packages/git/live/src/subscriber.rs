@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::engine::{Applied, Engine, EngineConfig, LiveUpdate, WorktreeSnapshot, WorktreeTotalAt};
+use crate::source::WatchHealth;
 
 /// One client of an [`Engine`], remembering what it was last told so each update carries
 /// only changes.
@@ -13,6 +14,8 @@ pub struct Subscriber {
     config: EngineConfig,
     last_primary: Option<WorktreeSnapshot>,
     last_totals: BTreeMap<PathBuf, WorktreeTotalAt>,
+    /// How changes are watched, as last told.
+    last_watch: WatchHealth,
 }
 
 impl Subscriber {
@@ -24,6 +27,7 @@ impl Subscriber {
             config,
             last_primary: None,
             last_totals: BTreeMap::new(),
+            last_watch: WatchHealth::Native,
         }
     }
 
@@ -53,6 +57,10 @@ impl Subscriber {
             stats: engine.stats(),
             ..LiveUpdate::default()
         };
+        if *engine.watch_health() != self.last_watch {
+            self.last_watch = engine.watch_health().clone();
+            update.watch = Some(self.last_watch.clone());
+        }
         if let Some(snapshot) = engine.snapshot(&self.root, self.config.counts)
             && self.last_primary.as_ref() != Some(&snapshot)
         {

@@ -1645,6 +1645,13 @@ fn status_bar(app: &App) -> Element<'_> {
             theme.warning,
         ));
     }
+    // Changes found by polling stay visible for as long as native file events fail.
+    if let bcode_git_live::source::WatchHealth::Polling { native, .. } = &app.watch_health {
+        right.push(Span::styled(
+            format!("⚠ {native} stalled · polling "),
+            theme.warning.add_modifier(Modifier::BOLD),
+        ));
+    }
     // Running work shows over messages; clicking it opens the command log, which shows its
     // live output.
     let activity = app.activity.status_spans(theme);
