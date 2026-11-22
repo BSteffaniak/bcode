@@ -3563,6 +3563,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_session_bridge_embedded"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_bundled_plugins",
+ "bcode_client",
+ "bcode_daemon_lifecycle",
+ "bcode_server",
+ "bcode_session_bridge",
+ "bcode_session_bridge_runtime",
+ "bcode_session_bridge_server",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bcode_session_bridge_models"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -3575,12 +3590,7 @@ dependencies = [
 name = "bcode_session_bridge_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_bundled_plugins",
- "bcode_client",
- "bcode_daemon_lifecycle",
- "bcode_server",
  "bcode_session_bridge",
- "bcode_session_bridge_server",
  "serde",
  "thiserror 2.0.21",
  "tokio",

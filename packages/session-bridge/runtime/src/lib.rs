@@ -6,8 +6,10 @@
 //!
 //! Applications built outside Bcode (bdata, BMUX) reach Bcode only through the session
 //! bridge. The bridge is served either by an **installed** Bcode (`bcode session-bridge
-//! --stdio`, a child process) or by a Bcode **embedded** in the application's own process
-//! (the `embedded` feature). Everything above [`Attached`] is the same either way.
+//! --stdio`, a child process) or by a Bcode **embedded** in the application's own process,
+//! which an application offers through [`RuntimeOptions::embedded`] (the
+//! `bcode_session_bridge_embedded` crate provides one). Everything above [`Attached`] is the
+//! same either way, and an application that never embeds Bcode links none of it.
 //!
 //! Selection is deterministic and never falls back after a failure:
 //!
@@ -23,16 +25,11 @@
 mod installed;
 mod resolve;
 
-#[cfg(feature = "embedded")]
-mod embedded;
-
-#[cfg(feature = "embedded")]
-pub use embedded::DAEMON_THREAD_PREFIX;
-
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
-#[cfg_attr(not(feature = "embedded"), allow(unused_imports))]
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use bcode_session_bridge::models::VersionRange;
 use bcode_session_bridge::{BridgeClient, BridgeEvents};
@@ -91,8 +88,21 @@ impl ActiveRuntime {
     }
 }
 
+/// A Bcode an application hosts in its own process, serving the session bridge in-process.
+pub trait EmbeddedBcode: Send + Sync {
+    /// Start (or find) the embedded Bcode and connect to its bridge.
+    ///
+    /// # Errors
+    /// [`AttachError::Failed`] when it cannot start or its bridge does not answer, or
+    /// [`AttachError::VersionMismatch`] when the bridge shares no version with the application.
+    fn attach<'a>(
+        &'a self,
+        options: &'a RuntimeOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Attached, AttachError>> + Send + 'a>>;
+}
+
 /// How to start the session bridge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeOptions {
     /// Bridge client name and the application's name in messages, such as `bmux`.
     pub app: String,
@@ -114,6 +124,24 @@ pub struct RuntimeOptions {
     pub directory: Option<PathBuf>,
     /// Bridge protocol versions to offer.
     pub versions: VersionRange,
+    /// The Bcode this application can embed, if it links one.
+    pub embedded: Option<Arc<dyn EmbeddedBcode>>,
+}
+
+impl std::fmt::Debug for RuntimeOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeOptions")
+            .field("app", &self.app)
+            .field("mode", &self.mode)
+            .field("auto_preference", &self.auto_preference)
+            .field("named", &self.named)
+            .field("private_env", &self.private_env)
+            .field("directory", &self.directory)
+            .field("versions", &self.versions)
+            .field("embedded", &self.embedded.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuntimeOptions {
@@ -130,6 +158,7 @@ impl RuntimeOptions {
             env: BTreeMap::new(),
             directory: None,
             versions: VersionRange::supported(),
+            embedded: None,
         }
     }
 }
@@ -210,7 +239,7 @@ impl Attached {
 ///
 /// # Errors
 /// * [`AttachError::Unavailable`] when the chosen runtime does not exist: no installed Bcode,
-///   a named executable that is not one, or an embedded Bcode this build lacks.
+///   a named executable that is not one, or no [`RuntimeOptions::embedded`].
 /// * [`AttachError::VersionMismatch`] when the bridge shares no version with the application.
 /// * [`AttachError::Failed`] when the bridge cannot start or answer.
 pub async fn attach(options: &RuntimeOptions) -> Result<Attached, AttachError> {
@@ -218,7 +247,7 @@ pub async fn attach(options: &RuntimeOptions) -> Result<Attached, AttachError> {
         options.mode,
         options.auto_preference,
         &options.named,
-        embedded_available(),
+        options.embedded.is_some(),
         &options.naming_hint,
     )?;
     match selection {
@@ -227,55 +256,14 @@ pub async fn attach(options: &RuntimeOptions) -> Result<Attached, AttachError> {
             Ok(attached.served_by(ActiveRuntime::Installed { executable }, reason))
         }
         Selection::Embedded { reason } => {
-            let attached = attach_embedded(options).await?;
+            let embedded = options.embedded.as_ref().ok_or_else(|| {
+                AttachError::Unavailable(format!(
+                    "This {} has no embedded Bcode: install Bcode, or use the installed runtime.",
+                    options.app
+                ))
+            })?;
+            let attached = embedded.attach(options).await?;
             Ok(attached.served_by(ActiveRuntime::Embedded, reason))
         }
     }
-}
-
-/// Whether this build can embed Bcode (the `embedded` feature).
-#[must_use]
-pub const fn embedded_available() -> bool {
-    cfg!(feature = "embedded")
-}
-
-/// Stop the embedded Bcode, if this process hosts one, waiting up to `wait` for it to release
-/// its sessions and plugins.
-#[cfg(feature = "embedded")]
-pub async fn shutdown_embedded(wait: Duration) {
-    embedded::shutdown(wait).await;
-}
-
-/// Stop the embedded Bcode; this build has none, so there is nothing to stop.
-#[cfg(not(feature = "embedded"))]
-#[allow(clippy::unused_async)] // Same shape as the embedded build's.
-pub async fn shutdown_embedded(_wait: Duration) {}
-
-/// Whether this process hosts an embedded Bcode.
-#[cfg(feature = "embedded")]
-#[must_use]
-pub fn embedded_running() -> bool {
-    embedded::running()
-}
-
-/// Whether this process hosts an embedded Bcode; never, in a build without one.
-#[cfg(not(feature = "embedded"))]
-#[must_use]
-pub const fn embedded_running() -> bool {
-    false
-}
-
-#[cfg(feature = "embedded")]
-async fn attach_embedded(options: &RuntimeOptions) -> Result<Attached, AttachError> {
-    embedded::attach(options).await
-}
-
-#[cfg(not(feature = "embedded"))]
-#[allow(clippy::unused_async)] // Same shape as the embedded build's.
-async fn attach_embedded(options: &RuntimeOptions) -> Result<Attached, AttachError> {
-    Err(AttachError::Unavailable(format!(
-        "This {} was built without the embedded Bcode: install Bcode, or use the installed \
-         runtime.",
-        options.app
-    )))
 }

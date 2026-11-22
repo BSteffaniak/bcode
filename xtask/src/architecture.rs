@@ -440,8 +440,8 @@ const FEATURE_PROFILES: &[FeatureProfile] = &[
         ],
     ),
     (
-        // Applications outside Bcode link the bridge runtime; without its `embedded` feature it
-        // only starts an installed Bcode's bridge, so none of Bcode's daemon stack comes along.
+        // Applications outside Bcode link the bridge runtime to start an installed Bcode's
+        // bridge; embedding Bcode is a separate crate, so none of the daemon stack comes along.
         "bcode_session_bridge_runtime",
         "packages/session-bridge/runtime",
         "",

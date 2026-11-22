@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Host Bcode inside an application's process and serve its session bridge in-process"
+edition     = { workspace = true }
+keywords    = ["bcode", "bridge", "embedded", "runtime"]
+license     = { workspace = true }
+name        = "bcode_session_bridge_embedded"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_bundled_plugins        = { workspace = true }
+bcode_client                 = { workspace = true }
+bcode_daemon_lifecycle       = { workspace = true }
+bcode_server                 = { workspace = true }
+bcode_session_bridge         = { workspace = true }
+bcode_session_bridge_runtime = { workspace = true }
+bcode_session_bridge_server  = { workspace = true }
+tokio                        = { workspace = true, features = ["io-util", "rt"] }
+tracing                      = { workspace = true }
+
+[features]
+default = []
+fail-on-warnings = []

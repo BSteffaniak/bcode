@@ -126,6 +126,9 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   serde_json only) holds the wire protocol; `bcode_session_bridge` (`packages/session-bridge`,
   serde, thiserror and tokio only) is the thin client applications link; `bcode_session_bridge_server`
   (`packages/session-bridge/server`) is the Bcode side, run by `bcode session-bridge --stdio`.
+  `bcode_session_bridge_runtime` chooses which Bcode serves an application (installed or
+  embedded) and starts an installed one's bridge; `bcode_session_bridge_embedded` is the
+  embedded tier, linked only by applications that host Bcode in-process.
 * Transport: JSON lines on the bridge's stdin and stdout. The application writes `ClientFrame`s
   (`{"id": n, "request": {"op": ...}}`); the bridge writes `BridgeFrame`s: `response` frames
   carrying `ok` (a `kind`-tagged response) or `error` (`code`, `message`), and `event` frames.
@@ -222,8 +225,9 @@ Related contracts: [session persistence](session-persistence-architecture.md),
   common case: it builds the daemon's runtime (threads named by the application, 8 MiB stacks),
   registers the in-process host, keeps the daemons it starts, and stops them gracefully with
   `EmbeddedDaemonHost::shutdown` when the application exits.
-* bdata hosts its daemon this way when its assistant runs embedded, and speaks to it through the
-  session bridge over an in-memory transport (`bcode_session_bridge_server::serve`).
+* bdata hosts its daemon this way when its assistant runs embedded (through
+  `bcode_session_bridge_embedded`), and speaks to it through the session bridge over an
+  in-memory transport (`bcode_session_bridge_server::serve`).
 * The standalone review app (`bcode-review`) hosts its daemon this way by default and reaches it
   as a client of its own artifact; it needs no bridge, being built from the same revision.
   `--bcode <path>` or `BCODE_BIN` select an installed Bcode instead (the option wins), whose
