@@ -208,8 +208,8 @@ impl ProductExtensions {
         #[cfg(feature = "tui")]
         let expected_version = if contract == crate::tui::portable::TUI_FRONTEND_CONTRACT {
             crate::tui::portable::TUI_FRONTEND_VERSION
-        } else if contract == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID {
-            bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION
+        } else if contract == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID {
+            bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION
         } else {
             1
         };
@@ -248,8 +248,8 @@ impl ProductExtensions {
         #[cfg(feature = "tui")]
         let expected = if contract == crate::tui::portable::TUI_FRONTEND_CONTRACT {
             crate::tui::portable::TUI_FRONTEND_VERSION
-        } else if contract == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID {
-            bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION
+        } else if contract == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID {
+            bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION
         } else {
             1
         };
@@ -333,7 +333,7 @@ impl ProductExtensions {
             .map_err(|_| PluginCommandError::failed("invalid CLI outcome"))
     }
     /// Construct a fresh selected frontend registry and retain its owner. Dynamic
-    /// components must supply B3's negotiated M7 adapter; absence is an error.
+    /// components must supply B3's negotiated embedded surface adapter; absence is an error.
     ///
     /// # Errors
     /// Returns owner, role, compatibility or adapter failures. Never substitutes
@@ -373,13 +373,13 @@ impl ProductExtensions {
     }
 }
 
-/// B3's native adapter around M7 resource/ack/input/retained-replay/local-hit
+/// B3's native adapter around embedded surface resource/ack/input/replay/local-hit
 ///
 /// operations. Each constructed surface/controller must retain `owner`; this
 /// trait transports no `PaintCx`, frame or native registry layout across the ABI.
 #[cfg(feature = "tui")]
 pub trait PortableFrontendAdapter: Send + Sync {
-    /// Negotiate required M7/product contracts and build fresh local proxies.
+    /// Negotiate required embedded surface/product contracts and build fresh local proxies.
     ///
     /// # Errors
     /// Reject unsupported contracts; do not omit unsupported rich resources.

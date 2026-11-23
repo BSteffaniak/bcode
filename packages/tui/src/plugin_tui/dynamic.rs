@@ -1,5 +1,5 @@
 //! Thin selected-execution frontend proxies. All author work runs on a bounded worker;
-//! the terminal frame loop only replays an M7 projection prepared by that worker.
+//! the terminal frame loop only replays an embedded surface prepared by that worker.
 use super::retained::RetainedFrontend;
 use bcode_plugin_sdk::{
     definition::{PortableFrontendAdapter, ProductExtensionDescriptor, ProductExtensions},
@@ -13,9 +13,8 @@ use bcode_plugin_sdk::{
         PluginTuiVisualAdapter, PluginTuiVisualRenderContext, portable as wire,
     },
 };
-use bmux_plugin::component_viewport::portable::{
-    FrontendPresentationRequest, FrontendPresentationResponse, FrontendResourceId,
-    PortablePresentationLimits,
+use bmux_plugin::surface::embedded::{
+    EmbeddedResourceId, EmbeddedSurfaceLimits, EmbeddedSurfaceRequest, EmbeddedSurfaceResponse,
 };
 use bmux_tui::{
     event::{Event, EventOutcome},
@@ -229,7 +228,7 @@ impl PortableFrontendAdapter for DynamicFrontendAdapter {
             let view = RetainedFrontend::from_active_descriptor(
                 owner.clone(),
                 descriptor,
-                PortablePresentationLimits::default(),
+                EmbeddedSurfaceLimits::default(),
             )?;
             let wire::Response::Descriptor(declaration) =
                 blocking_invoke(&self.runtime, &owner, wire::Request::Describe)?
@@ -388,9 +387,9 @@ impl PluginTuiSurfaceFactory for Factory {
             else {
                 return Err(std::io::Error::other("frontend open response mismatch").into());
             };
-            let created = view.apply(FrontendPresentationRequest::Create { generation: 1 });
+            let created = view.apply(EmbeddedSurfaceRequest::Create { generation: 1 });
             let local = match created {
-                Ok(FrontendPresentationResponse::Created { resource }) => resource,
+                Ok(EmbeddedSurfaceResponse::Created { resource }) => resource,
                 result => {
                     // The remote open already succeeded. Explicitly release it once; never
                     // replay an open after a local admission/response failure.
@@ -470,7 +469,7 @@ struct SurfaceProxy {
     id: String,
     title: String,
     remote: uuid::Uuid,
-    local: FrontendResourceId,
+    local: EmbeddedResourceId,
     view: Arc<RetainedFrontend>,
     send: mpsc::Sender<Work>,
     completions: mpsc::Receiver<Completion>,
@@ -1180,7 +1179,7 @@ struct SurfaceExecution {
     owner: ProductExtensions,
     correlated: Option<Arc<CorrelatedFrontend>>,
     remote: uuid::Uuid,
-    local: FrontendResourceId,
+    local: EmbeddedResourceId,
     view: Arc<RetainedFrontend>,
     stopped: Arc<AtomicBool>,
 }
@@ -1260,11 +1259,11 @@ async fn worker(
         let (mut result, effects) = execute(&owner, correlated.as_deref(), request).await;
         if let Ok(wire::Response::Projection(projection)) = &result {
             result = view
-                .apply(FrontendPresentationRequest::Publish {
+                .apply(EmbeddedSurfaceRequest::Publish {
                     resource: local,
                     generation: 1,
                     revision: projection.revision,
-                    presentation: Box::new(projection.scene.clone()),
+                    surface: Box::new(projection.scene.clone()),
                 })
                 .map(|_| wire::Response::Projection(projection.clone()));
         }
@@ -1275,7 +1274,7 @@ async fn worker(
         } // ambiguous mutations are never silently replayed
     }
     stopped.store(true, Ordering::Release);
-    let _ = view.apply(FrontendPresentationRequest::Destroy { resource: local });
+    let _ = view.apply(EmbeddedSurfaceRequest::Destroy { resource: local });
     close_surface(&owner, correlated, remote).await;
 }
 
@@ -1328,7 +1327,7 @@ impl InputExecutor for WorkerExecutor<'_> {
 
 struct ViewDisplay<'a> {
     view: &'a RetainedFrontend,
-    local: FrontendResourceId,
+    local: EmbeddedResourceId,
 }
 impl InputDisplay for ViewDisplay<'_> {
     fn admits(&self, revision: u64) -> bool {
@@ -1816,8 +1815,7 @@ impl PluginTuiSurface for SurfaceProxy {
         self.prepare(area, offset, None);
         if let Some(revision) = self.revision
             && self.projection.as_ref().is_some_and(|projection| {
-                projection.scene.cells.area().width == area.width
-                    && projection.scene.cells.area().height == area.height
+                projection.scene.width == area.width && projection.scene.height == area.height
             })
         {
             let _ = self.view.paint((self.local, 1, revision), area, 0, cx);
@@ -3100,8 +3098,8 @@ mod input_replay_tests {
                         contracts: vec![
                             contract(wire::TUI_FRONTEND_CONTRACT, wire::TUI_FRONTEND_VERSION),
                             contract(
-                                bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID,
-                                bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION,
+                                bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID,
+                                bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION,
                             ),
                         ],
                         native_frontend: false,
@@ -3172,7 +3170,7 @@ mod input_replay_tests {
             let view = RetainedFrontend::for_component(
                 owner.clone(),
                 1,
-                bmux_plugin::component_viewport::portable::PortablePresentationLimits::default(),
+                bmux_plugin::surface::embedded::EmbeddedSurfaceLimits::default(),
             )
             .await
             .unwrap();

@@ -509,7 +509,7 @@ fn frontend_factory_automatically_installs_scoped_portable_extension() {
         .unwrap();
     assert!(!backend_contracts.iter().any(|entry| entry.interface
         == crate::tui::portable::TUI_FRONTEND_CONTRACT
-        || entry.interface == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID));
+        || entry.interface == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID));
     let mut frontend = backend;
     frontend.role = ComponentRole::Frontend;
     let a = registrations.instance_extensions(&frontend);
@@ -536,8 +536,8 @@ fn frontend_factory_automatically_installs_scoped_portable_extension() {
         == crate::tui::portable::TUI_FRONTEND_CONTRACT
         && entry.version == crate::tui::portable::TUI_FRONTEND_VERSION));
     assert!(contracts.iter().any(|entry| entry.interface
-        == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID
-        && entry.version == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION));
+        == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
+        && entry.version == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION));
 }
 
 #[cfg(feature = "tui")]
@@ -581,8 +581,8 @@ fn selected_descriptor_advertises_frontend_contract_from_declared_factory() {
         == crate::tui::portable::TUI_FRONTEND_CONTRACT
         && entry.version == crate::tui::portable::TUI_FRONTEND_VERSION));
     assert!(reply.contracts.iter().any(|entry| entry.interface
-        == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID
-        && entry.version == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION));
+        == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
+        && entry.version == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION));
 }
 
 #[test]

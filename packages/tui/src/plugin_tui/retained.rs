@@ -1,6 +1,6 @@
-//! Renderer-local replay and successful-output admission for M7 retained resources.
+//! Renderer-local replay and successful-output admission for embedded plugin surfaces.
 //!
-//! No scene format lives here. The selected owner is retained beside M7's resource store;
+//! No scene format lives here. The selected owner is retained beside BMUX's embedded surface host;
 //! producer updates cannot acknowledge a display or choose their own owner namespace.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,10 +10,9 @@ use std::sync::{Arc, Mutex};
 static NEXT_FRONTEND: AtomicU64 = AtomicU64::new(1);
 
 use bcode_plugin_sdk::definition::{ProductExtensions, SelectedProductFrontend};
-use bmux_plugin::component_viewport::portable::{
-    FrontendPresentationRequest, FrontendPresentationResponse, FrontendResourceId,
-    PortablePresentationError, PortablePresentationLimits, PreparedFrontendPresentation,
-    RetainedFrontendHost,
+use bmux_plugin::surface::embedded::{
+    EmbeddedResourceId, EmbeddedSurfaceError, EmbeddedSurfaceHost, EmbeddedSurfaceLimits,
+    EmbeddedSurfaceRequest, EmbeddedSurfaceResponse, PreparedEmbeddedSurface,
 };
 use bmux_tui::geometry::Rect;
 use bmux_tui::hit::{HitId, HitMap};
@@ -36,14 +35,14 @@ pub struct RetainedProducer {
 }
 
 impl RetainedProducer {
-    /// Publish through the exact selected frontend's bounded M7 resource contract.
+    /// Publish through the exact selected frontend's bounded embedded surface contract.
     ///
     /// # Errors
     /// Rejects retired/closing owners, incompatible versions and invalid resource updates.
     pub fn apply(
         &self,
-        request: FrontendPresentationRequest,
-    ) -> Result<FrontendPresentationResponse, String> {
+        request: EmbeddedSurfaceRequest,
+    ) -> Result<EmbeddedSurfaceResponse, String> {
         self.view
             .upgrade()
             .ok_or_else(|| "frontend channel retired".to_owned())?
@@ -60,9 +59,9 @@ impl RetainedProducer {
         &self,
         contract: &str,
         payload: &[u8],
-    ) -> Result<FrontendPresentationResponse, String> {
-        use bmux_plugin::component_viewport::portable::PORTABLE_PRESENTATION_CONTRACT_ID;
-        if contract != PORTABLE_PRESENTATION_CONTRACT_ID {
+    ) -> Result<EmbeddedSurfaceResponse, String> {
+        use bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID;
+        if contract != EMBEDDED_SURFACE_CONTRACT_ID {
             return Err("unsupported retained frontend contract".to_owned());
         }
         let view = self
@@ -75,7 +74,7 @@ impl RetainedProducer {
         if payload.len() > view.max_request_bytes {
             return Err("retained frontend request exceeds bound".to_owned());
         }
-        let request = serde_json::from_slice::<FrontendPresentationRequest>(payload)
+        let request = serde_json::from_slice::<EmbeddedSurfaceRequest>(payload)
             .map_err(|_| "invalid retained frontend request".to_owned())?;
         view.apply(request)
     }
@@ -105,16 +104,16 @@ impl bcode_plugin_sdk::definition::ActivationResource for RegisteredState {
 }
 
 struct State {
-    resources: Option<RetainedFrontendHost>,
-    prepared: BTreeMap<(FrontendResourceId, u64), PreparedFrontendPresentation>,
-    generations: BTreeMap<FrontendResourceId, u64>,
+    resources: Option<EmbeddedSurfaceHost>,
+    prepared: BTreeMap<(EmbeddedResourceId, u64), PreparedEmbeddedSurface>,
+    generations: BTreeMap<EmbeddedResourceId, u64>,
     closed: bool,
     displayed_hits: BTreeSet<HitId>,
     displayed_content: BTreeSet<SelectionContentId>,
     // Only revisions actually replayed in the current output attempt may be acknowledged.
-    painted: BTreeMap<FrontendResourceId, (u64, u64, Rect, u16)>,
-    paint_order: Vec<FrontendResourceId>,
-    displayed: BTreeMap<FrontendResourceId, (u64, u64, Rect, u16)>,
+    painted: BTreeMap<EmbeddedResourceId, (u64, u64, Rect, u16)>,
+    paint_order: Vec<EmbeddedResourceId>,
+    displayed: BTreeMap<EmbeddedResourceId, (u64, u64, Rect, u16)>,
 }
 
 impl RetainedFrontend {
@@ -125,7 +124,7 @@ impl RetainedFrontend {
     pub fn new(
         selected: &SelectedProductFrontend,
         activation: u64,
-        limits: PortablePresentationLimits,
+        limits: EmbeddedSurfaceLimits,
     ) -> Result<Arc<Self>, String> {
         Self::from_owner(
             selected.owner().clone(),
@@ -140,11 +139,11 @@ impl RetainedFrontend {
     /// `SelectedProductFrontend` exists; it never trusts producer-supplied owner IDs.
     ///
     /// # Errors
-    /// Rejects inactive/backend components and missing or incompatible rich v2 contracts.
+    /// Rejects inactive/backend components and missing or incompatible embedded surface contracts.
     pub async fn for_component(
         owner: ProductExtensions,
         activation: u64,
-        limits: PortablePresentationLimits,
+        limits: EmbeddedSurfaceLimits,
     ) -> Result<Arc<Self>, String> {
         let descriptor = owner
             .descriptor()
@@ -152,12 +151,11 @@ impl RetainedFrontend {
             .map_err(|_| "frontend descriptor unavailable".to_owned())?;
         if descriptor.role != bcode_plugin_sdk::definition::ComponentRole::Frontend
             || !descriptor.contracts.iter().any(|contract| {
-                contract.interface
-                    == bmux_plugin::component_viewport::portable::PORTABLE_PRESENTATION_CONTRACT_ID
-                    && contract.version == 2
+                contract.interface == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
+                    && contract.version == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION
             })
         {
-            return Err("selected frontend does not implement rich retained v2".to_owned());
+            return Err("selected frontend does not implement embedded surfaces".to_owned());
         }
         Self::from_owner(owner, &descriptor.plugin_id, activation, limits)
     }
@@ -165,21 +163,20 @@ impl RetainedFrontend {
     /// Admit a descriptor already verified by `ProductExtensions::resolve_frontend`.
     ///
     /// # Errors
-    /// Rejects backend roles, absent rich-v2 contracts and unavailable selected owners.
+    /// Rejects backend roles, absent embedded surface contracts and unavailable selected owners.
     pub fn from_descriptor(
         owner: ProductExtensions,
         descriptor: &bcode_plugin_sdk::definition::ProductExtensionDescriptor,
         activation: u64,
-        limits: PortablePresentationLimits,
+        limits: EmbeddedSurfaceLimits,
     ) -> Result<Arc<Self>, String> {
         if descriptor.role != bcode_plugin_sdk::definition::ComponentRole::Frontend
             || !descriptor.contracts.iter().any(|contract| {
-                contract.interface
-                    == bmux_plugin::component_viewport::portable::PORTABLE_PRESENTATION_CONTRACT_ID
-                    && contract.version == 2
+                contract.interface == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
+                    && contract.version == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION
             })
         {
-            return Err("selected frontend lacks rich-v2 contract".to_owned());
+            return Err("selected frontend lacks the embedded surface contract".to_owned());
         }
         Self::from_owner(owner, &descriptor.plugin_id, activation, limits)
     }
@@ -191,7 +188,7 @@ impl RetainedFrontend {
     pub fn from_active_descriptor(
         owner: ProductExtensions,
         descriptor: &bcode_plugin_sdk::definition::ProductExtensionDescriptor,
-        limits: PortablePresentationLimits,
+        limits: EmbeddedSurfaceLimits,
     ) -> Result<Arc<Self>, String> {
         let resources = owner
             .activation_resources()
@@ -205,12 +202,11 @@ impl RetainedFrontend {
         let namespace = format!("{}:{}", scope.instance_id(), scope.id());
         if descriptor.role != bcode_plugin_sdk::definition::ComponentRole::Frontend
             || !descriptor.contracts.iter().any(|contract| {
-                contract.interface
-                    == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID
-                    && contract.version == 2
+                contract.interface == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
+                    && contract.version == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION
             })
         {
-            return Err("selected frontend lacks rich-v2 contract".to_owned());
+            return Err("selected frontend lacks the embedded surface contract".to_owned());
         }
         let mut view = Self::from_owner(owner, &namespace, 1, limits)?;
         let resource = resources
@@ -232,7 +228,7 @@ impl RetainedFrontend {
     /// Rejects hidden, retired, stale or display-suspended revisions.
     pub fn validate_displayed(
         &self,
-        resource: FrontendResourceId,
+        resource: EmbeddedResourceId,
         generation: u64,
         revision: u64,
     ) -> Result<(), String> {
@@ -263,7 +259,7 @@ impl RetainedFrontend {
     /// Returns `None` for hidden, retired, display-suspended or foreign-generation
     /// resources. Like [`Self::validate_displayed`], this issues no queued authority.
     #[must_use]
-    pub fn displayed_revision(&self, resource: FrontendResourceId, generation: u64) -> Option<u64> {
+    pub fn displayed_revision(&self, resource: EmbeddedResourceId, generation: u64) -> Option<u64> {
         self.owner.ensure_active().ok()?;
         let state = self.state.lock().ok()?;
         let (displayed_generation, revision, _, _) = *state.displayed.get(&resource)?;
@@ -284,7 +280,7 @@ impl RetainedFrontend {
         owner: ProductExtensions,
         namespace: &str,
         activation: u64,
-        limits: PortablePresentationLimits,
+        limits: EmbeddedSurfaceLimits,
     ) -> Result<Arc<Self>, String> {
         owner
             .ensure_active()
@@ -295,7 +291,7 @@ impl RetainedFrontend {
             })
             .map_err(|_| "frontend identity exhausted".to_owned())?;
         let namespace = format!("bcode.frontend.{instance}:{namespace}");
-        let resources = RetainedFrontendHost::new(namespace, activation, limits)
+        let resources = EmbeddedSurfaceHost::new(namespace, activation, limits)
             .map_err(|error| error.to_string())?;
         Ok(Arc::new(Self {
             owner,
@@ -323,14 +319,14 @@ impl RetainedFrontend {
         }
     }
 
-    /// Apply an already bounded, typed M7 producer update off the terminal frame loop.
+    /// Apply an already bounded, typed producer update off the terminal frame loop.
     ///
     /// # Errors
     /// Rejects closed owners, invalid updates and poisoned local state. Never retries mutations.
     pub fn apply(
         &self,
-        request: FrontendPresentationRequest,
-    ) -> Result<FrontendPresentationResponse, String> {
+        request: EmbeddedSurfaceRequest,
+    ) -> Result<EmbeddedSurfaceResponse, String> {
         self.owner
             .ensure_active()
             .map_err(|_| "frontend owner unavailable".to_owned())?;
@@ -342,17 +338,17 @@ impl RetainedFrontend {
             return Err("frontend resources closed".to_owned());
         }
         let published = match &request {
-            FrontendPresentationRequest::Publish {
+            EmbeddedSurfaceRequest::Publish {
                 resource, revision, ..
             } => Some((*resource, *revision)),
             _ => None,
         };
         let created_generation = match &request {
-            FrontendPresentationRequest::Create { generation } => Some(*generation),
+            EmbeddedSurfaceRequest::Create { generation } => Some(*generation),
             _ => None,
         };
         let destroyed = match &request {
-            FrontendPresentationRequest::Destroy { resource } => Some(*resource),
+            EmbeddedSurfaceRequest::Destroy { resource } => Some(*resource),
             _ => None,
         };
         let response = state
@@ -362,7 +358,7 @@ impl RetainedFrontend {
             .producer()
             .apply(request)
             .map_err(|error| error.to_string())?;
-        if let (Some(generation), FrontendPresentationResponse::Created { resource }) =
+        if let (Some(generation), EmbeddedSurfaceResponse::Created { resource }) =
             (created_generation, &response)
         {
             state.generations.insert(*resource, generation);
@@ -394,7 +390,7 @@ impl RetainedFrontend {
     /// Rejects unavailable owners/resources or unprepared revisions.
     pub fn paint(
         &self,
-        observed: (FrontendResourceId, u64, u64),
+        observed: (EmbeddedResourceId, u64, u64),
         destination: Rect,
         logical_row_offset: u16,
         cx: &mut PaintCx<'_, '_>,
@@ -461,7 +457,7 @@ impl RetainedFrontend {
     }
 
     /// Merge only replayed source text and modal declarations before the compositor writes output.
-    /// This uses M7's complete prepared projection, never a reconstruction from cells.
+    /// This uses the complete prepared surface, never a reconstruction from cells.
     ///
     /// # Errors
     /// Rejects revoked owners, conflicting text identities and missing prepared resources.
@@ -589,7 +585,8 @@ impl RetainedFrontend {
         Ok(())
     }
 
-    /// Permanently revoke this view and destroy every M7 resource, invalidating prepared handles.
+    /// Permanently revoke this view and destroy every surface resource, invalidating prepared
+    /// handles.
     pub fn close(&self) {
         Self::retire_state(&self.state);
         let registration = self
@@ -621,7 +618,7 @@ impl RetainedFrontend {
                 if let Some(resources) = &state.resources {
                     let _ = resources
                         .producer()
-                        .apply(FrontendPresentationRequest::Destroy { resource: *id });
+                        .apply(EmbeddedSurfaceRequest::Destroy { resource: *id });
                 }
             }
             state.resources.take();
@@ -654,7 +651,7 @@ impl RetainedFrontend {
     /// Rejects stale/hidden resources, unknown hits and closed selected owners before dispatch.
     pub fn local_hit(
         &self,
-        resource: FrontendResourceId,
+        resource: EmbeddedResourceId,
         generation: u64,
         revision: u64,
         hit: &HitId,
@@ -672,7 +669,7 @@ impl RetainedFrontend {
         let (_, _, area, offset) = *state
             .displayed
             .get(&resource)
-            .ok_or_else(|| PortablePresentationError::NotCommitted.to_string())?;
+            .ok_or_else(|| EmbeddedSurfaceError::NotCommitted.to_string())?;
         let prepared = state
             .resources
             .as_ref()
@@ -683,7 +680,7 @@ impl RetainedFrontend {
         let local = prepared
             .local_hit(hit)
             .ok_or_else(|| "unknown frontend hit".to_owned())?;
-        Ok((local.id.as_str().to_owned(), area, offset))
+        Ok((local.local_id.clone(), area, offset))
     }
 
     /// Dispatch immediately under a revocable committed lease, using only authoritative hit IDs.
@@ -694,7 +691,7 @@ impl RetainedFrontend {
     /// Rejects hidden, occluded, foreign, stale or retired input targets before callback admission.
     pub fn with_input<T>(
         &self,
-        observed: (FrontendResourceId, u64, u64),
+        observed: (EmbeddedResourceId, u64, u64),
         hit: &HitId,
         dispatch: impl FnOnce(&str, Rect, u16) -> Result<T, String>,
     ) -> Result<T, String> {
@@ -726,7 +723,7 @@ impl RetainedFrontend {
         let local = prepared
             .local_hit(hit)
             .ok_or_else(|| "frontend input lease revoked or foreign hit".to_owned())?;
-        dispatch(local.id.as_str(), area, offset)
+        dispatch(&local.local_id, area, offset)
     }
 
     /// Read logical source text only from resources admitted by the displayed revision.

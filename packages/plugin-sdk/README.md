@@ -188,8 +188,8 @@ B3 consumes `resolve_frontend(Some(portable_adapter)).await`, retaining the retu
 `SelectedProductFrontend` alongside all surfaces/controllers. Native resolution
 uses the selected provider's factory. Dynamic resolution requires B3's
 `PortableFrontendAdapter`, receiving the same retained owner and actual contract
-descriptor; it builds M7 resource/ack/input/full-replay/local-hit proxies, each
-retaining that owner. Missing portable adapters fail explicitly rather than
+descriptor; it builds embedded surface resource/ack/input/full-replay/local-hit
+proxies, each retaining that owner. Missing portable adapters fail explicitly rather than
 falling back to bundled discovery or silently dropping rich resources. Reading
 `SelectedProductFrontend::registry()` checks owner admission. This lease is not an
 execution fence by itself: B3 must use owner admission for subsequent native input
@@ -199,7 +199,7 @@ B4 uses `cli_descriptor`, `classify_cli`, `invoke_cli` on the same registry (or 
 selected native CLI registration). These paths do not depend on SDK TLS.
 
 The SDK implements these ports/contracts, not B2's host-side execution adapter or
-B3's M7 rich frontend proxies. Those remain explicit integration requirements;
+B3's embedded surface frontend proxies. Those remain explicit integration requirements;
 merely supplying an empty adapter is not rich frontend support.
 
 ## Frontend wire compatibility
@@ -207,9 +207,9 @@ merely supplying an empty adapter is not rich frontend support.
 `with_frontend(factory)` automatically installs exactly one B3 portable adapter
 per selected frontend instance using that same factory and `PluginCreateContext`.
 Both serial and concurrent definitions take this path; backend components do not
-install or advertise it. The current contract is **`bcode.tui.frontend/v3`, version
-3**. Frontend-v1's flattened response discriminator collided with event outcomes;
-there is no fallback/reinterpretation as v1 or v2. Registration and both shared
+install or advertise it. The current contract is **`bcode.tui.frontend/v4`, version
+4**. Frontend-v1's flattened response discriminator collided with event outcomes;
+there is no fallback/reinterpretation as an earlier version. Registration and both shared
 invocation paths use B3's `TUI_FRONTEND_CONTRACT` / `TUI_FRONTEND_VERSION` constants.
 
 Plain input carries the revision the host displayed. Version 3 answers input that
@@ -220,10 +220,12 @@ exhaustion closes the surface with a typed `InputDeliveryFailure` outcome rather
 than dropping the input. Fenced operations that reference a displayed snapshot,
 such as focused text field edits, still reject as stale and are never re-delivered.
 
-The paired `bmux.presentation.retained.v2` advertisement identifies the scene
-schema embedded in frontend-v2 render responses, not a second product RPC handler.
-B3 produces those scenes through M7's `PortablePresentation::from_prepared` and
-validates the retained envelope. Native factory access and portable author dispatch
+Version 4 carries each projection as a BMUX embedded plugin surface
+(`bmux_plugin::surface::embedded::EmbeddedSurface`): a `PluginSurface` targeting the
+host's box, plus the frame state beyond its cells, regions and selection. The paired
+`bmux.surface.embedded.v1` advertisement identifies that schema, not a second product
+RPC handler. B3 captures projections through `EmbeddedSurface::from_prepared` and
+validates them against the embedded surface limits. Native factory access and portable author dispatch
 therefore start from the same declared factory; no `bcode_tui` dependency is required
 in the producer. This source wiring is not proof of rich-resource parity: parent
 serial validation still owns actual selection, cancellation, display commit,

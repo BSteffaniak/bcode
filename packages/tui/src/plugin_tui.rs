@@ -3267,8 +3267,8 @@ library = "libcomposer_fixture.dylib"
     #[tokio::test(flavor = "current_thread")]
     async fn retained_registration_obeys_selected_activation_resource_capacity() {
         use super::retained::RetainedFrontend;
+        use bmux_plugin::surface::embedded::EmbeddedSurfaceLimits;
         use bmux_plugin_runtime::ScopeError;
-        use bmux_tui::presentation::portable::PortablePresentationLimits;
 
         let instance = tokio::task::spawn_blocking(selected_fixture_instance)
             .await
@@ -3289,7 +3289,7 @@ library = "libcomposer_fixture.dylib"
             RetainedFrontend::from_active_descriptor(
                 owner.clone(),
                 &descriptor,
-                PortablePresentationLimits::default(),
+                EmbeddedSurfaceLimits::default(),
             )
             .is_err()
         );
@@ -3297,7 +3297,7 @@ library = "libcomposer_fixture.dylib"
         let view = RetainedFrontend::from_active_descriptor(
             owner,
             &descriptor,
-            PortablePresentationLimits::default(),
+            EmbeddedSurfaceLimits::default(),
         )
         .unwrap();
         assert!(matches!(
@@ -3617,16 +3617,22 @@ library = "libcomposer_fixture.dylib"
                         contract,
                         bcode_plugin_sdk::definition::extensions::PRODUCT_EXTENSIONS_CONTRACT
                     );
-                    Ok(serde_json::to_vec(&bcode_plugin_sdk::definition::ProductExtensionDescriptor {
-                        plugin_id: "test.dynamic-visual".to_owned(),
-                        role: bcode_plugin_sdk::definition::ComponentRole::Frontend,
-                        contracts: vec![bmux_plugin_sdk::RegistrationContract {
-                            kind: bmux_plugin_sdk::RegistrationKind::Extension,
-                            interface: bmux_plugin::component_viewport::portable::PORTABLE_PRESENTATION_CONTRACT_ID.to_owned(),
-                            version: 2, name: "retained".to_owned(),
-                        }],
-                        native_frontend: false,
-                    }).unwrap())
+                    Ok(serde_json::to_vec(
+                        &bcode_plugin_sdk::definition::ProductExtensionDescriptor {
+                            plugin_id: "test.dynamic-visual".to_owned(),
+                            role: bcode_plugin_sdk::definition::ComponentRole::Frontend,
+                            contracts: vec![bmux_plugin_sdk::RegistrationContract {
+                                kind: bmux_plugin_sdk::RegistrationKind::Extension,
+                                interface:
+                                    bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
+                                        .to_owned(),
+                                version: 2,
+                                name: "retained".to_owned(),
+                            }],
+                            native_frontend: false,
+                        },
+                    )
+                    .unwrap())
                 })
             }
         }
@@ -4170,7 +4176,8 @@ library = "libcomposer_fixture.dylib"
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn selected_native_frontend_uses_author_codec_and_retained_v2_without_static_fallback() {
+    async fn selected_native_frontend_uses_author_codec_and_embedded_surfaces_without_static_fallback()
+     {
         use bcode_plugin_sdk::tui::portable::{
             Bindings, Request, Response, TUI_FRONTEND_CONTRACT, Viewport,
         };
@@ -4245,7 +4252,10 @@ library = "libcomposer_fixture.dylib"
         else {
             panic!("native retained projection")
         };
-        assert_eq!(projection.scene.version, 2);
+        assert!(matches!(
+            projection.scene.surface.target,
+            bmux_plugin::surface::PluginSurfaceTarget::Embedded
+        ));
         assert!(
             matches!(invoke(Request::Input { resource, expected_revision: projection.revision,
             event: bmux_tui::event::Event::Tick, bindings: Bindings::default(), focused: false }).await,

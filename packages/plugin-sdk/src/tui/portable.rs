@@ -1,5 +1,6 @@
 //! Terminal-only author codec. Static and dynamic frontends use the same surface factories.
-//! Scene data is exclusively M7's retained v2 envelope; product actions retain their owned sum.
+//! Scene data is exclusively BMUX's embedded plugin surface; product actions retain their owned
+//! sum.
 
 use super::{
     BoxedPluginTuiSurface, FocusedTextFieldEdit, FocusedTextFieldSnapshot, PluginTuiAction,
@@ -14,9 +15,9 @@ use crate::definition::{
 use crate::keymap;
 use bcode_session_models::SessionId;
 use bmux_keyboard::KeyStroke;
+use bmux_plugin::surface::embedded::{EmbeddedSurface, EmbeddedSurfaceLimits};
 use bmux_plugin_sdk::PluginCommandError;
 use bmux_text_edit::{TextEditCommand, TextMotion};
-use bmux_tui::presentation::portable::{PortablePresentation, PortablePresentationLimits};
 use bmux_tui::{damage::Damage, presentation::PresentationState};
 use bmux_tui::{event::Event, geometry::Rect};
 use serde::{Deserialize, Serialize};
@@ -46,9 +47,16 @@ mod tests;
 /// reported as not applied, distinctly from handled input, so the host can
 /// re-deliver it against the current revision. Version 2 silently consumed such
 /// input and is not accepted.
-pub const TUI_FRONTEND_CONTRACT: &str = "bcode.tui.frontend/v3";
+///
+/// Version 4 carries each projection as a BMUX embedded plugin surface
+/// (`bmux.surface.embedded.v1`) instead of the removed portable presentation.
+/// Version 3 is not accepted.
+pub const TUI_FRONTEND_CONTRACT: &str = "bcode.tui.frontend/v4";
 /// Negotiated schema version for terminal surface operations.
-pub const TUI_FRONTEND_VERSION: u32 = 3;
+pub const TUI_FRONTEND_VERSION: u32 = 4;
+/// Owner named by the plugin surfaces a frontend projects. Hosts scope every
+/// identity to the activation they trust, never to this producer-supplied name.
+const FRONTEND_SURFACE_OWNER: &str = "bcode.frontend";
 const MAX_SURFACES: usize = 128;
 const MAX_BYTES: usize = crate::SERVICE_BRIDGE_MAX_RESPONSE_BYTES;
 
@@ -183,7 +191,7 @@ pub struct Projection {
     pub action: PluginTuiAction,
     pub resource: uuid::Uuid,
     pub revision: u64,
-    pub scene: PortablePresentation,
+    pub scene: EmbeddedSurface,
     pub logical_height: u16,
     pub focused_rows: Option<std::ops::Range<u16>>,
     pub field: Option<FocusedTextFieldSnapshot>,
@@ -1069,20 +1077,29 @@ impl AuthorFrontend {
         if !prepared.set_modal_scopes(&surface.implementation.retained_modal_scopes()) {
             return Err(failure("invalid frontend modal declarations"));
         }
-        let scene = PortablePresentation::from_prepared(&prepared);
+        let revision = surface
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| failure("frontend revision exhausted"))?;
+        let scene = EmbeddedSurface::from_prepared(
+            bmux_plugin::surface::PluginSurfaceId::new(
+                FRONTEND_SURFACE_OWNER,
+                resource.to_string(),
+                resource,
+            ),
+            revision,
+            &prepared,
+        );
         scene
-            .validate(PortablePresentationLimits::default())
+            .validate(EmbeddedSurfaceLimits::default())
             .map_err(|error| failure(&format!("invalid rich frontend projection: {error}")))?;
         // This commit is producer-local only. Receiving input is still fenced by the frontend's
-        // successful displayed M7 lease, not this offscreen preparation.
+        // successful displayed embedded surface lease, not this offscreen preparation.
         surface
             .scene
             .present_prepared(Some(prepared), |_, _| Ok::<(), ()>(()))
             .map_err(|()| failure("frontend preparation commit failed"))?;
-        surface.revision = surface
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| failure("frontend revision exhausted"))?;
+        surface.revision = revision;
         surface.dirty = false;
         surface.viewport = Some(viewport);
         surface.bindings = Some(bindings);

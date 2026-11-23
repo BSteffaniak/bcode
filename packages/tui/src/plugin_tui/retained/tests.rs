@@ -1,6 +1,6 @@
 use super::*;
 use bcode_plugin_sdk::definition::{PluginFuture, PluginResult, ProductExtensionPort};
-use bmux_plugin::component_viewport::portable::PortablePresentation;
+use bmux_plugin::surface::embedded::EmbeddedSurface;
 use bmux_tui::{
     buffer::Buffer,
     frame::Frame,
@@ -13,6 +13,15 @@ use bmux_tui::{
     semantic::SemanticRegion,
     style::Style,
 };
+
+/// Capture what a producer prepared, as a frontend projects it.
+fn capture(prepared: &bmux_tui::presentation::PreparedPresentation) -> EmbeddedSurface {
+    EmbeddedSurface::from_prepared(
+        bmux_plugin::surface::PluginSurfaceId::new("bcode.frontend", "view", uuid::Uuid::nil()),
+        1,
+        prepared,
+    )
+}
 
 struct Owner;
 impl ProductExtensionPort for Owner {
@@ -35,15 +44,15 @@ fn frontend() -> (Arc<RetainedFrontend>, Arc<Owner>) {
         selected,
         "test.frontend",
         7,
-        PortablePresentationLimits::default(),
+        EmbeddedSurfaceLimits::default(),
     )
     .unwrap();
     (view, owner)
 }
 
-fn publish(view: &RetainedFrontend) -> FrontendResourceId {
-    let FrontendPresentationResponse::Created { resource } = view
-        .apply(FrontendPresentationRequest::Create { generation: 4 })
+fn publish(view: &RetainedFrontend) -> EmbeddedResourceId {
+    let EmbeddedSurfaceResponse::Created { resource } = view
+        .apply(EmbeddedSurfaceRequest::Create { generation: 4 })
         .unwrap()
     else {
         panic!("create")
@@ -88,12 +97,12 @@ fn publish(view: &RetainedFrontend) -> FrontendResourceId {
         )]))
         .unwrap();
     assert!(prepared.set_modal_scopes(&[HitId::new("modal")]));
-    let presentation = PortablePresentation::from_prepared(&prepared);
-    view.apply(FrontendPresentationRequest::Publish {
+    let presentation = capture(&prepared);
+    view.apply(EmbeddedSurfaceRequest::Publish {
         resource,
         generation: 4,
         revision: 1,
-        presentation: Box::new(presentation),
+        surface: Box::new(presentation),
     })
     .unwrap();
     resource
@@ -101,7 +110,7 @@ fn publish(view: &RetainedFrontend) -> FrontendResourceId {
 
 fn paint(
     view: &RetainedFrontend,
-    id: FrontendResourceId,
+    id: EmbeddedResourceId,
 ) -> (
     HitId,
     bmux_tui::hit::HitMap,
@@ -234,9 +243,8 @@ fn v2_prepared_capture_merges_modal_sources_and_revokes_old_input_lease() {
             .map(String::as_str),
         Some("界")
     );
-    let capture = PortablePresentation::from_prepared(&prepared);
-    assert_eq!(capture.version, 2);
-    assert_eq!(capture.modal_scopes.len(), 1);
+    let capture = capture(&prepared);
+    assert_eq!(capture.frame.modal_scopes.len(), 1);
     view.display_succeeded(prepared.hits(), prepared.selection())
         .unwrap();
     let lease = view
@@ -249,13 +257,12 @@ fn v2_prepared_capture_merges_modal_sources_and_revokes_old_input_lease() {
         .committed_for_input(id, 4, 1)
         .unwrap();
     assert!(!lease.selection_text().is_empty());
-    let mut newer = capture.clone();
-    newer.version = 2;
-    view.apply(FrontendPresentationRequest::Publish {
+    let newer = capture.clone();
+    view.apply(EmbeddedSurfaceRequest::Publish {
         resource: id,
         generation: 4,
         revision: 2,
-        presentation: Box::new(newer),
+        surface: Box::new(newer),
     })
     .unwrap();
     view.begin_display();
@@ -288,14 +295,17 @@ fn v2_prepared_capture_merges_modal_sources_and_revokes_old_input_lease() {
     assert!(current.selection_text().is_empty());
     assert!(lease.selection_text().is_empty());
     assert_eq!(lease.modal_scopes(), [] as [HitId; 0]);
+    // A surface aimed at the attach screen is not an embedded surface.
     let mut legacy = capture;
-    legacy.version = 1;
+    legacy.surface.target = bmux_plugin::surface::PluginSurfaceTarget::Explicit(
+        bmux_plugin::ExtensionRect::new(0, 0, 1, 1),
+    );
     assert!(
-        view.apply(FrontendPresentationRequest::Publish {
+        view.apply(EmbeddedSurfaceRequest::Publish {
             resource: id,
             generation: 4,
             revision: 2,
-            presentation: Box::new(legacy),
+            surface: Box::new(legacy),
         })
         .is_err()
     );
@@ -333,12 +343,10 @@ fn prepared_capture_keeps_persistent_images_and_host_occlusion() {
             cx.occlude(bmux_tui::paint::LocalRect::new(2, 0, 1, 1));
         })
         .unwrap();
-    let capture = PortablePresentation::from_prepared(&prepared);
-    assert_eq!(capture.images.len(), 1);
-    assert_eq!(capture.occlusions, vec![(0, Rect::new(2, 0, 1, 1))]);
-    capture
-        .validate(PortablePresentationLimits::default())
-        .unwrap();
+    let capture = capture(&prepared);
+    assert_eq!(capture.frame.images.len(), 1);
+    assert_eq!(capture.frame.occlusions, vec![(0, Rect::new(2, 0, 1, 1))]);
+    capture.validate(EmbeddedSurfaceLimits::default()).unwrap();
 }
 
 #[test]
@@ -362,12 +370,17 @@ fn retained_image_frame_uses_authoritative_configure_path() {
     assert_eq!(prepared.selection_text().len(), 1);
     assert_eq!(prepared.modal_scopes().count(), 1);
     assert_eq!(prepared.image_scene().placements().count(), 1);
-    let captured = PortablePresentation::from_prepared(&prepared);
-    captured
-        .validate(PortablePresentationLimits::default())
-        .unwrap();
-    assert_eq!(captured.text.len(), 1);
-    assert_eq!(captured.images.len(), 1);
+    let captured = capture(&prepared);
+    captured.validate(EmbeddedSurfaceLimits::default()).unwrap();
+    assert_eq!(
+        captured
+            .surface
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.text.len()),
+        Some(1)
+    );
+    assert_eq!(captured.frame.images.len(), 1);
     assert!(
         view.selection_text(&prepared.selection().fragments()[0].content_id)
             .is_none()
@@ -390,16 +403,16 @@ fn retained_image_frame_uses_authoritative_configure_path() {
 
 #[test]
 fn dynamic_wire_channel_publishes_same_rich_projection_without_commit_authority() {
-    use bmux_plugin::component_viewport::portable::PORTABLE_PRESENTATION_CONTRACT_ID;
+    use bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID;
     let (view, _) = frontend();
     let channel = view.producer();
     let created = channel
         .extension(
-            PORTABLE_PRESENTATION_CONTRACT_ID,
-            &serde_json::to_vec(&FrontendPresentationRequest::Create { generation: 9 }).unwrap(),
+            EMBEDDED_SURFACE_CONTRACT_ID,
+            &serde_json::to_vec(&EmbeddedSurfaceRequest::Create { generation: 9 }).unwrap(),
         )
         .unwrap();
-    let FrontendPresentationResponse::Created { resource } = created else {
+    let EmbeddedSurfaceResponse::Created { resource } = created else {
         panic!("resource")
     };
     let producer = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 4, 1));
@@ -423,21 +436,21 @@ fn dynamic_wire_channel_publishes_same_rich_projection_without_commit_authority(
             "界".to_owned(),
         )]))
         .unwrap();
-    let snapshot = PortablePresentation::from_prepared(&scene);
-    let publish = FrontendPresentationRequest::Publish {
+    let snapshot = capture(&scene);
+    let publish = EmbeddedSurfaceRequest::Publish {
         resource,
         generation: 9,
         revision: 1,
-        presentation: Box::new(snapshot),
+        surface: Box::new(snapshot),
     };
     assert_eq!(
         channel
             .extension(
-                PORTABLE_PRESENTATION_CONTRACT_ID,
+                EMBEDDED_SURFACE_CONTRACT_ID,
                 &serde_json::to_vec(&publish).unwrap()
             )
             .unwrap(),
-        FrontendPresentationResponse::Published
+        EmbeddedSurfaceResponse::Published
     );
     view.begin_display();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
@@ -463,7 +476,7 @@ fn dynamic_wire_channel_publishes_same_rich_projection_without_commit_authority(
     assert!(
         channel
             .extension(
-                PORTABLE_PRESENTATION_CONTRACT_ID,
+                EMBEDDED_SURFACE_CONTRACT_ID,
                 &serde_json::to_vec(&publish).unwrap()
             )
             .is_err()
@@ -477,19 +490,19 @@ fn producer_channel_retirement_is_not_extended_by_cloned_observers() {
     let observer = producer.clone();
     assert!(
         producer
-            .apply(FrontendPresentationRequest::Create { generation: 1 })
+            .apply(EmbeddedSurfaceRequest::Create { generation: 1 })
             .is_ok()
     );
     view.close();
     assert!(
         producer
-            .apply(FrontendPresentationRequest::Create { generation: 1 })
+            .apply(EmbeddedSurfaceRequest::Create { generation: 1 })
             .is_err()
     );
     drop(view);
     assert!(
         observer
-            .apply(FrontendPresentationRequest::Create { generation: 1 })
+            .apply(EmbeddedSurfaceRequest::Create { generation: 1 })
             .is_err()
     );
 }
@@ -519,13 +532,13 @@ fn hidden_destroyed_and_other_instance_hits_never_gain_authority() {
     let (hit, hits, selection) = paint(&first, id);
     first.display_succeeded(&hits, &selection).unwrap();
     first
-        .apply(FrontendPresentationRequest::Destroy { resource: id })
+        .apply(EmbeddedSurfaceRequest::Destroy { resource: id })
         .unwrap();
     assert!(first.local_hit(id, 4, 1, &hit).is_err());
     first.close();
     assert!(
         first
-            .apply(FrontendPresentationRequest::Create { generation: 4 })
+            .apply(EmbeddedSurfaceRequest::Create { generation: 4 })
             .is_err()
     );
 }

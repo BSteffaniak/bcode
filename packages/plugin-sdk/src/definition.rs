@@ -515,9 +515,9 @@ impl ProductRegistrations {
     /// Attach a fresh frontend registry factory independent of static packaging.
     ///
     /// Each frontend instance installs B3's portable adapter with this same factory
-    /// and creation context. The frontend-v2 operation contract carries M7 retained-v2
-    /// scenes; it is not wire-compatible with frontend-v1 responses. Backend instances
-    /// do not install or advertise either frontend presentation contract.
+    /// and creation context. The frontend operation contract carries BMUX embedded
+    /// plugin surfaces; it is not wire-compatible with earlier frontend versions.
+    /// Backend instances do not install or advertise either frontend contract.
     #[cfg(feature = "tui")]
     #[must_use]
     pub fn with_frontend(mut self, frontend: fn() -> crate::tui::PluginTuiRegistry) -> Self {
@@ -535,7 +535,7 @@ impl ProductRegistrations {
     ) -> PluginResult<()> {
         #[cfg(feature = "tui")]
         if contract == crate::tui::portable::TUI_FRONTEND_CONTRACT
-            || contract == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID
+            || contract == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
         {
             return Err(PluginCommandError::invalid_arguments(
                 "frontend contracts are installed by with_frontend",
@@ -1017,9 +1017,8 @@ impl<P: ProductImplementation> PluginInstance for ProductInstance<P> {
             #[cfg(feature = "tui")]
             if self.registrations.frontend.is_some() {
                 interfaces.push(crate::tui::portable::TUI_FRONTEND_CONTRACT.to_owned());
-                interfaces.push(
-                    bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID.to_owned(),
-                );
+                interfaces
+                    .push(bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID.to_owned());
             }
         }
         // The selected declaration is authoritative even before runtime extension
@@ -1036,9 +1035,9 @@ impl<P: ProductImplementation> PluginInstance for ProductInstance<P> {
                     if interface == crate::tui::portable::TUI_FRONTEND_CONTRACT {
                         crate::tui::portable::TUI_FRONTEND_VERSION
                     } else if interface
-                        == bmux_tui::presentation::portable::PORTABLE_PRESENTATION_CONTRACT_ID
+                        == bmux_plugin::surface::embedded::EMBEDDED_SURFACE_CONTRACT_ID
                     {
-                        bmux_tui::presentation::portable::PORTABLE_PRESENTATION_VERSION
+                        bmux_plugin::surface::embedded::EMBEDDED_SURFACE_VERSION
                     } else {
                         1
                     }

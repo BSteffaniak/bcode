@@ -613,7 +613,7 @@ async fn author_updates_use_attached_bounded_stream_without_replaying_overflow()
         panic!("updated projection")
     };
     assert_eq!(
-        projection.scene.text.values().next().map(String::as_str),
+        scene_text(&projection.scene).next().map(String::as_str),
         Some("0")
     );
     adapter.close().unwrap();
@@ -669,11 +669,14 @@ async fn verify_rich_scene_and_input_revision_fences(
     else {
         panic!("projection")
     };
-    assert_eq!(first.scene.version, 2);
-    assert_eq!(first.scene.images.len(), 1);
-    assert_eq!(first.scene.modal_scopes.len(), 1);
+    assert!(matches!(
+        first.scene.surface.target,
+        bmux_plugin::surface::PluginSurfaceTarget::Embedded
+    ));
+    assert_eq!(first.scene.frame.images.len(), 1);
+    assert_eq!(first.scene.frame.modal_scopes.len(), 1);
     assert_eq!(
-        first.scene.text.values().next().map(String::as_str),
+        scene_text(&first.scene).next().map(String::as_str),
         Some("界")
     );
     // Superseded input is reported as not applied, never silently consumed.
@@ -709,7 +712,7 @@ async fn verify_rich_scene_and_input_revision_fences(
     };
     assert!(second.revision > first.revision);
     assert_eq!(
-        second.scene.text.values().next().map(String::as_str),
+        scene_text(&second.scene).next().map(String::as_str),
         Some("ab")
     );
 }
@@ -746,7 +749,7 @@ async fn author_wire_factory_preserves_rich_scene_and_revision_fences() {
         panic!("updated projection")
     };
     assert_eq!(
-        third.scene.text.values().next().map(String::as_str),
+        scene_text(&third.scene).next().map(String::as_str),
         Some("更新")
     );
     let command = "plugin-owned-command".to_owned();
@@ -794,4 +797,15 @@ async fn author_wire_factory_preserves_rich_scene_and_revision_fences() {
             .await
             .is_err()
     );
+}
+
+/// Logical selection text a projected surface carries.
+fn scene_text(
+    scene: &bmux_plugin::surface::embedded::EmbeddedSurface,
+) -> impl Iterator<Item = &String> {
+    scene
+        .surface
+        .metadata
+        .iter()
+        .flat_map(|metadata| metadata.text.values())
 }
