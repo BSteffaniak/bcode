@@ -48,6 +48,36 @@ pub enum ReviewGroupKey {
 }
 
 impl ReviewGroupKey {
+    /// Identity of a resolved diff. `series` is whether its source currently resolves as a
+    /// multi-member series (the session's series state, not the number of requested revisions,
+    /// since aliases can pin to one commit). Outside a series every diff is standalone; inside
+    /// one, a diff with a part position is the member named by its head commit and a diff
+    /// without one is the combined aggregate.
+    #[must_use]
+    pub fn for_resolved(source: &crate::ResolvedSource, series: bool) -> Self {
+        let source_id = source.source_id.clone();
+        if !series {
+            return Self::Standalone { source_id };
+        }
+        match (&source.part, source.head.commit_oid()) {
+            (Some(_), Some(oid)) => Self::Member {
+                source_id,
+                member: oid.to_owned(),
+            },
+            _ => Self::Combined { source_id },
+        }
+    }
+
+    /// Canonical workspace source id this group belongs to.
+    #[must_use]
+    pub fn source_id(&self) -> &str {
+        match self {
+            Self::Standalone { source_id }
+            | Self::Member { source_id, .. }
+            | Self::Combined { source_id } => source_id,
+        }
+    }
+
     /// Stable selector for commands and keyed state. Standalone sources retain their id;
     /// `series:member:` and `series:combined:` are reserved selector namespaces. The member
     /// form length-prefixes the UTF-8 source id so delimiters in either id are unambiguous.
