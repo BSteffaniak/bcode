@@ -216,10 +216,12 @@ from it, is in [code review assistant](code-review-assistant.md).
   configured size. The palette's "Assistant: Reset the panel size to the configured default"
   forgets it. Below 24
   columns or 6 rows it shows its title row and input only, below 12 columns its title row only.
-* **What it knows.** Each message carries a stored `review app view` block (the screen, the
-  review's id, title, kind and sources, the stack layers and the current one, the comparison
-  with each layer's result, the file, cursor and selection, threads and loaded pull request
-  state) and, for that turn only, a `review app detail` block (the selected lines, threads on the
+* **What it knows.** Every message carries a stored `review app view` block naming the screen,
+  the repository and the review. With what is on screen attached (`ctrl+x`, or
+  `assistant.attach_context = true` in configuration; off by default), that block also
+  describes the review's id, title, kind and sources, the stack layers and the current one,
+  the comparison with each layer's result, the file, cursor and selection, threads and loaded
+  pull request state, and the message carries, for that turn only, a `review app detail` block (the selected lines, threads on the
   file, the focused thread, per-layer changes, files changed since the baseline, pull request
   state). Both are bounded, and every cut names the tool with the rest. A review without pull
   request layers whose sources are compared with their last completed pass lists each source's
@@ -230,8 +232,9 @@ from it, is in [code review assistant](code-review-assistant.md).
   what was left out.
 * **Conversation.** The title row names the active conversation and where it started (`✦
   Assistant · <title> · <review #layer or home>`) and carries `+ new`, `⟲` (history) and `↗`
-  (open in Bcode). The chips row names what is on screen (`⌖ src/retry.rs:42`, `⌖ home`, `⌖ new
-  review`); `ctrl+x` detaches it. The first message creates a Bcode session with the review app's
+  (open in Bcode). The chips row's context chip says `⌖ context off` until `ctrl+x` (or a
+  click) attaches what is on screen, then names it (`⌖ src/retry.rs:42`, `⌖ home`, `⌖ new
+  review`); `ctrl+x` detaches it again. The choice lasts while the app runs. The first message creates a Bcode session with the review app's
   origin, titled after the message and tagged with the review and stack layer on screen (or with
   none on home and in the wizard), on the app's tool connection, so its first turn already has
   the app's tools. Every message names the review assistant agent profile; while the app's tools

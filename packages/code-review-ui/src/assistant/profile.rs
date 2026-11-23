@@ -170,6 +170,10 @@ pub struct AssistantConfig {
     pub height: DockLength,
     /// Agent whose tools and permission rules the assistant narrows.
     pub base_agent: String,
+    /// Whether messages carry what is on screen (the cursor, selection and file) until the
+    /// chip is toggled (`assistant.attach_context`, off by default). Off, they still name the
+    /// screen and the review, and the assistant reads more with its tools.
+    pub attach_context: bool,
 }
 
 /// A docked panel's default size along its axis (`assistant.width` or `assistant.height`).
@@ -241,6 +245,7 @@ impl Default for AssistantConfig {
             width: DockLength::default(),
             height: DockLength::default(),
             base_agent: BASE_AGENT.to_owned(),
+            attach_context: false,
         }
     }
 }
@@ -267,6 +272,13 @@ impl AssistantConfig {
                 }
                 Some(_) => problems.push(format!("{prefix}.{key} must be a non-empty string")),
             }
+        }
+        match assistant.get("attach_context") {
+            None => {}
+            Some(toml::Value::Boolean(attach)) => config.attach_context = *attach,
+            Some(_) => problems.push(format!(
+                "{prefix}.attach_context must be true or false; using false"
+            )),
         }
         match assistant.get("base_agent") {
             None => {}

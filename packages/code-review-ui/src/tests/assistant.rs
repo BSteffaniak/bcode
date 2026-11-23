@@ -295,7 +295,13 @@ fn the_panel_opens_on_home_and_keeps_its_conversation_into_a_review_and_back() {
     assert!(setup.app().assistant().is_focused());
     let title = screen.find("Assistant").expect("panel title");
     assert!(title.x >= 60, "docked on the right: {title:?}");
+    // What is on screen is not attached until the chip is toggled.
+    assert!(screen.contains("⌖ context off"), "{}", screen.text());
+    setup.scenario.key("ctrl+x");
+    let screen = setup.settle();
     assert!(screen.contains("⌖ home"), "{}", screen.text());
+    setup.scenario.key("ctrl+x");
+    setup.settle();
 
     let session = setup.send("Create a review for my stack");
     let origin = setup
@@ -552,6 +558,9 @@ fn the_ask_ai_button_and_ctrl_k_open_the_panel_on_every_screen() {
     setup.scenario.key("ctrl+k");
     let screen = setup.settle();
     assert!(setup.app().assistant().is_focused());
+    assert!(screen.contains("⌖ context off"), "{}", screen.text());
+    setup.scenario.key("ctrl+x");
+    let screen = setup.settle();
     assert!(screen.contains("⌖ new review"), "{}", screen.text());
 
     // A review: the button sits after the publish button.

@@ -78,8 +78,8 @@ pub struct ViewContext {
     /// The review, on a review.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewView>,
-    /// Whether the user detached the context (only the screen, repository and review are
-    /// described).
+    /// Whether the context is not attached, by configuration or the user (only the screen,
+    /// repository and review are described).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
 }
@@ -541,7 +541,7 @@ impl ViewContext {
         if let Some(review) = &self.review {
             lines.push(review_line(review));
             if self.detached {
-                lines.push("context: detached by the user".to_owned());
+                lines.push("context: not attached".to_owned());
             } else {
                 review_lines(review, &mut lines);
             }
@@ -1847,7 +1847,7 @@ mod tests {
         let blocks = context.blocks();
         assert_eq!(blocks.len(), 1, "no detail block");
         let view = &blocks[0].text;
-        assert!(view.contains("context: detached"), "{view}");
+        assert!(view.contains("context: not attached"), "{view}");
         assert!(!view.contains("cursor:"), "{view}");
         assert!(!view.contains("comparison:"), "{view}");
     }

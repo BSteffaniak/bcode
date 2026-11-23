@@ -192,6 +192,15 @@ fn every_message_carries_a_stored_view_block_and_a_request_only_detail_block() {
     let review = setup.app().review().expect("review");
     assert!(review.selection().is_some(), "a range is selected");
     setup.scenario.key("ctrl+k");
+    // Off by default: the screen and review only, and no detail block.
+    setup.send("And in general?");
+    let (_, request) = setup.backend.host().turns().last().cloned().expect("turn");
+    assert_eq!(request.context.len(), 1);
+    assert!(request.context[0].text.contains("context: not attached"));
+    assert!(!request.context[0].text.contains("cursor:"));
+
+    // Attached: what is on screen goes with the message.
+    setup.scenario.key("ctrl+x");
     setup.send("What does this do?");
     let (_, request) = setup.backend.host().turns().last().cloned().expect("turn");
     assert_eq!(request.text, "What does this do?");
@@ -207,14 +216,33 @@ fn every_message_carries_a_stored_view_block_and_a_request_only_detail_block() {
     assert!(view.contains("selection="), "{view}");
     let detail = &request.context[1].text;
     assert!(detail.starts_with("selection: "), "{detail}");
+}
 
-    // Detached: the screen and review only, and no detail block.
+#[test]
+fn configuration_can_attach_what_is_on_screen_by_default() {
+    let (config, problems) = crate::assistant::profile::AssistantConfig::from_plugin_table(
+        &toml::from_str("[assistant]\nattach_context = true").expect("toml"),
+    );
+    assert_eq!(problems, Vec::<String>::new());
+    let mut setup = super::assistant::setup_with(
+        crate::testing::backend::TestBackend::default().with_assistant_config(config),
+        160,
+        40,
+        true,
+    );
+    setup.scenario.key("ctrl+k");
+    setup.send("What does this do?");
+    let (_, request) = setup.backend.host().turns().last().cloned().expect("turn");
+    assert!(
+        request.context[0].text.contains("cursor: "),
+        "{}",
+        request.context[0].text
+    );
+    // Toggling still detaches it for the rest of the session.
     setup.scenario.key("ctrl+x");
     setup.send("And in general?");
     let (_, request) = setup.backend.host().turns().last().cloned().expect("turn");
-    assert_eq!(request.context.len(), 1);
-    assert!(request.context[0].text.contains("context: detached"));
-    assert!(!request.context[0].text.contains("cursor:"));
+    assert!(request.context[0].text.contains("context: not attached"));
 }
 
 #[test]

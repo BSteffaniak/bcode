@@ -417,8 +417,9 @@ pub struct Assistant {
     failed: Vec<(u64, String)>,
     input: RefCell<TextInputState>,
     policy: TextInputPolicy,
-    /// Whether messages carry what is on screen.
-    context: bool,
+    /// Whether messages carry what is on screen, once toggled in this panel; until then
+    /// `assistant.attach_context` decides.
+    context: Option<bool>,
     agents: AgentStreams,
     folds: Folds,
     rows: RefCell<Option<Rows>>,
@@ -515,7 +516,7 @@ impl Assistant {
             failed: Vec::new(),
             input: RefCell::new(empty_input()),
             policy,
-            context: true,
+            context: None,
             agents: AgentStreams::default(),
             folds: Folds::default(),
             rows: RefCell::new(None),
@@ -681,10 +682,15 @@ impl Assistant {
         self.picker.as_ref()
     }
 
-    /// Whether the context chip is attached.
+    /// Whether the context chip is attached: as toggled in this panel, else as configured.
     #[must_use]
-    pub const fn context_attached(&self) -> bool {
+    pub fn context_attached(&self) -> bool {
         self.context
+            .unwrap_or_else(|| self.services.assistant_config().attach_context)
+    }
+
+    fn toggle_context(&mut self) {
+        self.context = Some(!self.context_attached());
     }
 
     /// The notice shown under the chips, if any.
@@ -1295,7 +1301,7 @@ impl Assistant {
                     repo: self.repo.display().to_string(),
                     ..super::context::ViewContext::default()
                 });
-        context.detached = !self.context;
+        context.detached = !self.context_attached();
         context.blocks()
     }
 
@@ -2672,7 +2678,7 @@ impl Assistant {
     fn chip_clicked(&mut self, chip: ChipId, place: &Place, ui: &UiContext) -> Outcome {
         match chip {
             ChipId::Context => {
-                self.context = !self.context;
+                self.toggle_context();
                 Outcome::Redraw
             }
             ChipId::Model => self.run_action("assistant_model", place, ui),
@@ -3642,7 +3648,7 @@ impl Assistant {
             }
             "assistant_back" => self.visibility = Shown::Open,
             "assistant_stop" => self.stop(ui),
-            "assistant_context" => self.context = !self.context,
+            "assistant_context" => self.toggle_context(),
             "assistant_new" => self.new_conversation(),
             "assistant_open" => return self.open_in_bcode(),
             "assistant_history" => self.open_history(ui),
@@ -4430,15 +4436,16 @@ impl Assistant {
     fn chips(&self, place: &Place, theme: &ReviewTheme) -> Vec<Chip> {
         let text = |text: String, style| Line::from_spans(vec![Span::styled(text, style)]);
         let mut chips = Vec::new();
-        let (context, context_style) = if self.context {
+        let attached = self.context_attached();
+        let (context, context_style) = if attached {
             (format!(" ⌖ {} ", place.chip()), theme.pill_accent)
         } else {
-            ("context detached".to_owned(), theme.tiers.dim)
+            ("⌖ context off".to_owned(), theme.tiers.dim)
         };
         chips.push(Chip {
             id: ChipId::Context,
             short: text(
-                if self.context {
+                if attached {
                     " ⌖ ".to_owned()
                 } else {
                     "⌖ off".to_owned()

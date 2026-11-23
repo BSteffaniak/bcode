@@ -209,8 +209,10 @@ Bottom dock (fewer than 100 columns):
 
 The title row names the active conversation: `✦ Assistant · <title> · <tag>` (the tag is the
 review title and `#layer`, or `home`), cut from the right; then `+ new`, `⟲` (history) and `↗`
-(open in `bcode tui`) as buttons, like bdata's. The chips row shows the context chip (`⌖ src/retry.rs:42`
-on a review, `⌖ home` on home; `ctrl+x` detaches it). The chip is computed from the route on
+(open in `bcode tui`) as buttons, like bdata's. The chips row shows the context chip: `⌖ context off` by
+default, and once `ctrl+x` attaches what is on screen `⌖ src/retry.rs:42` on a review, `⌖ home`
+on home (`ctrl+x` detaches it again; `assistant.attach_context = true` attaches it from the
+start). The chip is computed from the route on
 screen every frame, so it never names a place the user has left.
 
 Below 24 columns or 6 rows the panel shows its title row and input only; below 12 columns the
@@ -361,8 +363,10 @@ is cached across routes, so no field can survive from a previous screen.
   Bcode enforces by rejecting (never truncating); the renderer cuts each section to its own
   budget first, then the block to its total, and every cut says so: `… 7 more layers (code_review.summary)`.
   Lines are single-line `key: value` text; strings are quoted and control characters escaped.
-* **Detached context.** `ctrl+x` detaches the chip: the detail block is left out and the view
-  block shrinks to the `screen`, `repo` and `review` lines.
+* **Detached context.** Context is detached by default (`assistant.attach_context`, false) and
+  `ctrl+x` toggles it for the rest of the session: detached, the detail block is left out and
+  the view block shrinks to the `screen`, `repo` and `review` lines plus
+  `context: not attached`.
 * **Daemon restart.** A request-only block the daemon no longer holds fails the turn with
   `request_only_context_unavailable`; the panel resubmits once with a fresh snapshot.
 * **Movement during a turn.** Context describes the screen at send time. A running turn reads
