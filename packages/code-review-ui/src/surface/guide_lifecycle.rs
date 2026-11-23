@@ -111,12 +111,14 @@ impl ReviewSurface {
         self.guide.grant.as_ref()
     }
 
-    /// Guide revision pairs in document order, excluding hidden and alternate groups.
+    /// Guide revision pairs of every group the document holds, keyed by selector, in
+    /// document order. Groups the view hides or leaves out as alternates take part too, so a
+    /// guide pins every layer and representation whichever one is on screen, and switching
+    /// views changes neither its pins nor its freshness.
     pub(super) fn guide_sources(&self) -> Vec<ResolvedSource> {
         self.review
             .iter()
             .flat_map(|review| review.doc.groups())
-            .filter(|group| !group.hidden && !group.alternate)
             .map(|group| {
                 let mut source = group.source.clone();
                 source.source_id = group.key.selector();
@@ -125,11 +127,11 @@ impl ReviewSurface {
             .collect()
     }
 
+    /// Labels of the groups of [`Self::guide_sources`], by selector.
     fn source_labels(&self) -> BTreeMap<String, String> {
         self.review
             .iter()
             .flat_map(|review| review.doc.groups())
-            .filter(|group| !group.hidden && !group.alternate)
             .map(|group| (group.key.selector(), group.label.to_owned()))
             .collect()
     }

@@ -5,7 +5,9 @@ use super::stack::StackView;
 use bcode_code_review_models::{
     ReviewGroupKey, ReviewSeriesPresentation, ReviewSeriesView as View, ReviewSourceKind,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub(super) const fn from_stack(view: StackView) -> View {
     match view {
@@ -23,7 +25,20 @@ pub(super) const fn to_stack(view: View) -> StackView {
     }
 }
 
+/// What the cached series catalog was built for: the document generation, its group count,
+/// and [`CatalogCache::epoch`].
+pub(super) type CatalogStamp = (u64, usize, u64);
+
+/// The series catalog of the review's current state.
 #[derive(Default)]
+pub(super) struct CatalogCache {
+    /// Bumped whenever the groups, sources, or series descriptions the catalog is built from
+    /// change outside a document replacement.
+    epoch: u64,
+    built: RefCell<Option<(CatalogStamp, Arc<Vec<Series>>)>>,
+}
+
+#[derive(Clone, Default)]
 pub(super) struct Series {
     pub id: String,
     pub commits: bool,
@@ -61,32 +76,48 @@ impl Series {
         views
     }
 
-    pub fn view(&self, surface: &ReviewSurface) -> Option<View> {
-        if let Some(state) = surface.commit_series.get(&self.id) {
-            return Some(state.view);
-        }
-        let views = self.views();
+    /// The view the series is asked to show: the saved choice, else the default (the view a
+    /// commit series resolved with, the stack view for a stack), limited to [`Self::views`].
+    /// A combined diff that cannot be computed is never asked for. While a combined diff is
+    /// still being computed this is already the combined view, so choices made meanwhile build
+    /// on it.
+    pub fn requested_view(&self, surface: &ReviewSurface) -> Option<View> {
+        let state = surface.commit_series.get(&self.id);
         let wanted = surface.series_preference(&self.id).map_or_else(
             || {
                 if self.commits {
-                    if self.combined.is_some() {
-                        View::Combined
-                    } else {
-                        View::AllMembers
-                    }
+                    state.map_or(View::AllMembers, |state| state.view)
                 } else {
                     from_stack(surface.stack_view)
                 }
             },
-            |state| state.view,
+            |saved| saved.view,
         );
-        if wanted == View::Combined && self.combined.is_none() && self.members.len() > 1 {
+        let unavailable = state.is_some_and(|state| state.unavailable.is_some());
+        if self.commits && wanted == View::Combined && unavailable {
             return Some(View::AllMembers);
         }
+        let views = self.views();
         views
             .contains(&wanted)
             .then_some(wanted)
             .or_else(|| views.first().copied())
+    }
+
+    /// The view the document shows: [`Self::requested_view`], except that a commit series
+    /// keeps showing every member until its combined diff is in the document.
+    pub fn view(&self, surface: &ReviewSurface) -> Option<View> {
+        let wanted = self.requested_view(surface)?;
+        if wanted == View::Combined
+            && self.commits
+            && !self
+                .combined
+                .as_ref()
+                .is_some_and(|key| surface.has_group(key))
+        {
+            return Some(View::AllMembers);
+        }
+        Some(wanted)
     }
 
     pub fn selected(&self, surface: &ReviewSurface) -> Option<&ReviewGroupKey> {
@@ -128,7 +159,7 @@ impl ReviewSurface {
         if series.views().len() < 2 {
             return None;
         }
-        let view = series.view(self)?;
+        let view = series.requested_view(self)?;
         let empty_combined = view == View::Combined
             && self.review.as_ref()?.doc.groups().any(|g| {
                 Some(g.key) == series.combined.as_ref()
@@ -146,10 +177,6 @@ impl ReviewSurface {
                 .get(&series.id)
                 .and_then(|s| s.unavailable.clone()),
         })
-    }
-
-    pub(super) fn select_series_view(&mut self, view: View, _host: &super::UiContext) {
-        self.set_series_view(view);
     }
 
     pub(super) fn seed_stack_series_view(&mut self, view: View) {
@@ -221,16 +248,50 @@ impl ReviewSurface {
             .get(id)
     }
 
-    pub(super) fn series_catalog(&self) -> Vec<Series> {
+    /// Whether the document holds group `key` (loaded or still loading).
+    pub(super) fn has_group(&self, key: &ReviewGroupKey) -> bool {
+        self.review
+            .as_ref()
+            .is_some_and(|review| review.doc.groups().any(|group| group.key == key))
+    }
+
+    /// Note that the groups, sources, or series descriptions the catalog is built from
+    /// changed.
+    pub(super) const fn invalidate_series(&mut self) {
+        self.series_cache.epoch = self.series_cache.epoch.wrapping_add(1);
+    }
+
+    /// Identifies the document's groups and the series descriptions: changes when a
+    /// document replaces the previous one, a group arrives, or a description changes.
+    pub(super) fn catalog_stamp(&self) -> CatalogStamp {
+        (
+            self.generation,
+            self.review
+                .as_ref()
+                .map_or(0, |review| review.doc.groups().count()),
+            self.series_cache.epoch,
+        )
+    }
+
+    /// Every series of the review: each commit series and each stack of pull requests, with
+    /// its members and combined representation. Built once per document state (see
+    /// [`Self::invalidate_series`]); painting reads it several times per frame.
+    pub(super) fn series_catalog(&self) -> Arc<Vec<Series>> {
+        let stamp = self.catalog_stamp();
+        if let Some((built, catalog)) = self.series_cache.built.borrow().as_ref()
+            && *built == stamp
+        {
+            return Arc::clone(catalog);
+        }
+        let catalog = Arc::new(self.build_series_catalog());
+        *self.series_cache.built.borrow_mut() = Some((stamp, Arc::clone(&catalog)));
+        catalog
+    }
+
+    fn build_series_catalog(&self) -> Vec<Series> {
         let Some(review) = &self.review else {
             return Vec::new();
         };
-        let commits: BTreeSet<_> = self
-            .sources
-            .iter()
-            .filter(|s| matches!(&s.kind, ReviewSourceKind::Commits { revs } if revs.len() > 1))
-            .map(|s| s.id.as_str())
-            .collect();
         let mut sets = BTreeMap::new();
         // Match PR sources by provider/repository and the numbers in the resolved chain,
         // not merely by the presence of stack metadata in the document.
@@ -257,58 +318,50 @@ impl ReviewSurface {
         }
         for group in review.doc.groups() {
             let owner = &group.source.source_id;
-            let (id, commits, whole) = if commits.contains(owner.as_str()) {
-                if matches!(group.key, ReviewGroupKey::Standalone { .. }) {
-                    continue;
-                }
-                (owner, true, group.source.part.is_none())
-            } else if let Some((_, provider, repository, stack)) =
+            let Some((_, provider, repository, stack)) =
                 chains.iter().find(|(s, ..)| s.id == *owner)
-            {
-                let Some(top) = stack.stack.layers.last() else {
-                    continue;
-                };
-                let chain = chains
-                    .iter()
-                    .filter(|(_, p, r, candidate)| {
-                        p == provider
-                            && r == repository
-                            && candidate
-                                .stack
-                                .layers
-                                .iter()
-                                .any(|layer| layer.number == top.number)
-                    })
-                    .max_by_key(|(_, _, _, candidate)| {
-                        (candidate.whole, candidate.stack.layers.len())
-                    });
-                let id = if stack.whole {
-                    owner
-                } else {
-                    chain.map_or(owner, |(source, ..)| &source.id)
-                };
-                (id, false, stack.whole)
-            } else {
+            else {
                 continue;
+            };
+            let Some(top) = stack.stack.layers.last() else {
+                continue;
+            };
+            let chain = chains
+                .iter()
+                .filter(|(_, p, r, candidate)| {
+                    p == provider
+                        && r == repository
+                        && candidate
+                            .stack
+                            .layers
+                            .iter()
+                            .any(|layer| layer.number == top.number)
+                })
+                .max_by_key(|(_, _, _, candidate)| (candidate.whole, candidate.stack.layers.len()));
+            let id = if stack.whole {
+                owner
+            } else {
+                chain.map_or(owner, |(source, ..)| &source.id)
             };
             let series = sets.entry(id.clone()).or_insert_with(|| Series {
                 id: id.clone(),
-                commits,
                 ..Series::default()
             });
-            if whole {
+            if stack.whole {
                 series.combined = Some(group.key.clone());
             } else {
                 series.members.push(group.key.clone());
             }
         }
-        self.add_commit_series(&mut sets, &commits);
+        self.add_commit_series(&mut sets);
         sets.into_values().collect()
     }
 
-    fn add_commit_series(&self, sets: &mut BTreeMap<String, Series>, commits: &BTreeSet<&str>) {
+    /// Each selected-commits source that resolved as a series, with every member it
+    /// describes (listed or not) and its combined diff.
+    fn add_commit_series(&self, sets: &mut BTreeMap<String, Series>) {
         for (id, state) in &self.commit_series {
-            if !commits.contains(id.as_str()) || state.members.len() < 2 {
+            if state.members.len() < 2 || !self.sources.iter().any(|s| s.id == *id) {
                 continue;
             }
             sets.insert(
@@ -332,27 +385,32 @@ impl ReviewSurface {
         }
     }
 
+    /// The series the rail shows: the one the cursor is in, else the one last entered, else
+    /// the first. Reading another source of the review keeps the rail where it was.
     pub(super) fn active_series(&self) -> Option<Series> {
-        let mut series = self.series_catalog();
+        let catalog = self.series_catalog();
+        let holding = |id: &str| catalog.iter().position(|set| set.contains(id));
         let cursor = self
             .review
             .as_ref()
             .and_then(|r| r.doc.group_of_key(r.cursor.as_ref()?))
             .map(ReviewGroupKey::selector);
-        let index = if let Some(id) = cursor.as_deref() {
-            series.iter().position(|set| set.contains(id))?
-        } else {
-            self.rail_layer
-                .as_ref()
-                .and_then(|id| series.iter().position(|set| set.contains(id)))
-                .unwrap_or(0)
-        };
-        (!series.is_empty()).then(|| series.swap_remove(index))
+        let index = cursor
+            .as_deref()
+            .and_then(holding)
+            .or_else(|| self.rail_layer.as_deref().and_then(holding))
+            .unwrap_or(0);
+        catalog.get(index).cloned()
     }
 
     /// The effective grouping of the series at the cursor.
     pub fn shown_series_view(&self) -> Option<View> {
         self.active_series()?.view(self)
+    }
+
+    /// The grouping asked for the series at the cursor (see [`Series::requested_view`]).
+    pub(super) fn requested_series_view(&self) -> Option<View> {
+        self.active_series()?.requested_view(self)
     }
 
     pub(super) fn remember_series(
@@ -384,16 +442,15 @@ impl ReviewSurface {
         self.request_save();
     }
 
-    /// Land after a demand-driven reload, using only a position belonging to the selected group.
+    /// Land in [`ReviewSurface::pending_member`] once it is in the document and shown: stay
+    /// where the cursor is when it is already in that group (a view change keeps the file),
+    /// else return to the group's remembered position, else its header or first file.
     pub(super) fn finish_member_jump(&mut self) {
-        let Some(selector) = self.pending_member.as_ref() else {
+        let Some(selector) = self.pending_member.clone() else {
             return;
         };
-        let Some(series) = self
-            .series_catalog()
-            .into_iter()
-            .find(|s| s.contains(selector))
-        else {
+        let catalog = self.series_catalog();
+        let Some(series) = catalog.iter().find(|s| s.contains(&selector)) else {
             return;
         };
         let Some(review) = self.review.as_mut() else {
@@ -402,18 +459,18 @@ impl ReviewSurface {
         let target = review
             .doc
             .groups()
-            .find(|g| !g.hidden && !g.alternate && g.key.selector() == *selector)
+            .find(|g| !g.hidden && !g.alternate && g.key.selector() == selector)
             .and_then(|g| {
-                self.layer_positions
-                    .get(selector)
-                    .and_then(|p| review.doc.resolve_persisted(p))
+                review
+                    .cursor
+                    .as_ref()
                     .filter(|key| review.doc.group_of_key(key) == Some(g.key))
+                    .cloned()
                     .or_else(|| {
-                        review
-                            .cursor
-                            .as_ref()
+                        self.layer_positions
+                            .get(&selector)
+                            .and_then(|p| review.doc.resolve_persisted(p))
                             .filter(|key| review.doc.group_of_key(key) == Some(g.key))
-                            .cloned()
                     })
                     .or(g.header)
                     .or_else(|| {
@@ -428,18 +485,20 @@ impl ReviewSurface {
         if let Some(key) = target
             && let Some(jump) = review.doc.jump_to(&key)
         {
-            review.set_cursor(
-                jump.index,
-                bmux_tui_components::virtual_list::AnchorPolicy::ItemTopAtTop,
-            );
-            review.pending_jump = jump.needs_load.map(|_| key);
-            review.open_only_group(selector, &series);
+            if review.cursor.as_ref() != Some(&key) {
+                review.set_cursor(
+                    jump.index,
+                    bmux_tui_components::virtual_list::AnchorPolicy::ItemTopAtTop,
+                );
+                review.pending_jump = jump.needs_load.map(|_| key);
+            }
+            review.open_only_group(&selector, series);
             self.pending_member = None;
         } else if let Some(reason) = self.commit_series.values().find_map(|s| {
             let combined = ReviewGroupKey::Combined {
                 source_id: s.source_id.clone(),
             };
-            (combined.selector() == *selector)
+            (combined.selector() == selector)
                 .then(|| s.unavailable.clone())
                 .flatten()
         }) {
@@ -449,6 +508,13 @@ impl ReviewSurface {
                 bmux_tui_components::status_bar::StatusSeverity::Info,
             );
         }
+    }
+
+    /// The load that should have brought [`ReviewSurface::pending_member`] completed: stop
+    /// waiting for it, so a later refresh or arrival does not move the cursor.
+    pub(super) fn settle_member_jump(&mut self) {
+        self.finish_member_jump();
+        self.pending_member = None;
     }
 
     /// Select a loaded member of the active series by full commit OID, PR source id, or group selector.

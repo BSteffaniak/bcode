@@ -486,7 +486,7 @@ impl ReviewSurface {
             }
             CompareMenuOutcome::ApplyAndClose(MenuChoice::Group(view)) => {
                 self.close_compare_menu();
-                self.select_series_view(view, host);
+                self.set_series_view(view);
                 Action::Redraw
             }
             CompareMenuOutcome::ApplyAndClose(MenuChoice::Guide) => {

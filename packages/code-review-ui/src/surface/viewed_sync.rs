@@ -66,12 +66,7 @@ pub(super) fn set(
     file: &ViewedIdentity<'_>,
     value: bool,
 ) {
-    match (group, value) {
-        (ReviewGroupKey::Standalone { .. }, true) => viewed::mark_viewed(workspace, file),
-        (ReviewGroupKey::Standalone { .. }, false) => viewed::unmark_viewed(workspace, file),
-        (_, true) => viewed::mark_group_viewed(workspace, group, std::slice::from_ref(file)),
-        (_, false) => viewed::unmark_group_viewed(workspace, group, file),
-    }
+    viewed::set_in_group(workspace, group, std::slice::from_ref(file), value);
 }
 
 /// Update a batch together so marking a whole review sorts each group's marks just once.
@@ -88,14 +83,6 @@ pub(super) fn set_batch(
             .push(identity.with_patch(patch.as_deref()));
     }
     for (key, files) in groups {
-        if !value {
-            for file in files {
-                set(workspace, key, &file, false);
-            }
-        } else if matches!(key, ReviewGroupKey::Standalone { .. }) {
-            viewed::mark_all_viewed(workspace, &files);
-        } else {
-            viewed::mark_group_viewed(workspace, key, &files);
-        }
+        viewed::set_in_group(workspace, key, &files, value);
     }
 }

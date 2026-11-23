@@ -448,6 +448,18 @@ fn resolve_and_list(
                 if let Some(state) = state {
                     multi.insert(source.id.as_str());
                     send!(emit, OpenEvent::CommitSeries(state));
+                    // Every group of the series shows (as loading) before it is listed.
+                    for group in &groups {
+                        send!(
+                            emit,
+                            OpenEvent::Pending(OpenedSource {
+                                source: group.clone(),
+                                entries: Vec::new(),
+                                stack: None,
+                                untruncated_entries: None,
+                            })
+                        );
+                    }
                 }
                 resolved.sources.extend(groups);
             }

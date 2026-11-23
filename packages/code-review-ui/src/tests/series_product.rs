@@ -41,12 +41,15 @@ fn focus_file(app: &mut Scenario<ReviewApp>) {
     panic!("no current file in the displayed group");
 }
 
-fn assert_file(app: &mut Scenario<ReviewApp>, group: &ReviewGroupKey, viewed: usize) {
+/// The cursor is on the series file in `group`, and the review's progress is `files`
+/// (total, viewed): members shown one at a time all count, an alternate representation not.
+#[track_caller]
+fn assert_file(app: &mut Scenario<ReviewApp>, group: &ReviewGroupKey, files: (usize, usize)) {
     focus_file(app);
     let review = view(app);
     assert_eq!(review.kind, "commits");
     assert!(review.stack.is_none() && review.pull_request.is_none());
-    assert_eq!(review.files, (1, viewed));
+    assert_eq!(review.files, files);
     let file = review.file.unwrap();
     assert_eq!(file.path, PATH);
     // The assistant must have a usable selector in its current-file context. It may retain
@@ -105,34 +108,34 @@ fn same_path_marks_and_drafts_follow_the_member_across_views_and_reopen() {
         source_id: source_id.clone(),
     };
     let mut app = resume(&repo, &backend, id);
-    assert_file(&mut app, &combined, 0);
+    assert_file(&mut app, &combined, (1, 0));
     key(&mut app, "shift+o");
-    assert_file(&mut app, &member(first.clone()), 0);
+    assert_file(&mut app, &member(first.clone()), (2, 0));
     app.key("c");
     app.paste("Only the first edit needs a change.");
     key(&mut app, "ctrl+s");
     assert_threads(&app, 1);
     key(&mut app, "v");
     key(&mut app, ".");
-    assert_file(&mut app, &member(second.clone()), 0);
+    assert_file(&mut app, &member(second.clone()), (2, 1));
     assert_threads(&app, 0);
     key(&mut app, "shift+o");
     assert_eq!(view(&app).files, (2, 1));
     key(&mut app, "shift+o");
-    assert_file(&mut app, &combined, 0);
+    assert_file(&mut app, &combined, (1, 0));
     assert_threads(&app, 0);
     key(&mut app, "q");
     drop(app);
 
     let mut reopened = resume(&repo, &backend, id);
-    assert_file(&mut reopened, &combined, 0);
+    assert_file(&mut reopened, &combined, (1, 0));
     let saved = reopened.surface().review().unwrap().workspace().unwrap();
     assert_eq!(&saved.id, id);
     assert_eq!(saved.sources, workspace.sources);
     key(&mut reopened, "shift+o");
-    assert_file(&mut reopened, &member(second), 0);
+    assert_file(&mut reopened, &member(second), (2, 1));
     key(&mut reopened, ",");
-    assert_file(&mut reopened, &member(first), 1);
+    assert_file(&mut reopened, &member(first), (2, 1));
     // The viewed file reopens folded. Its thread is still on this member, but a
     // folded file correctly has no inline card. Open it before checking the card.
     assert_eq!(view(&reopened).threads.on_file.total, 1);
@@ -165,7 +168,7 @@ fn sparse_series_opens_as_members_and_combines_only_selected_changes() {
         &ReviewGroupKey::Combined {
             source_id: workspace.sources[0].id.clone(),
         },
-        0,
+        (1, 0),
     );
 }
 

@@ -229,6 +229,7 @@ impl ReviewSurface {
         };
         self.gone_layers.clear();
         self.sources.clone_from(&change.sources);
+        self.invalidate_series();
         self.workspace_mut().sources = change.sources;
         if change.layers_filled {
             // A review made of the whole-stack diff keeps showing it, now with layers to switch

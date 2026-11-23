@@ -128,21 +128,21 @@ impl ReviewSurface {
         self.generation.hash(&mut generation);
         self.guide.grant_epoch.hash(&mut generation);
         if let Some(review) = &self.review {
-            for group in review
-                .doc
-                .groups()
-                .filter(|g| !g.hidden && !g.alternate && !g.loading)
-            {
+            for group in review.doc.groups().filter(|g| !g.loading) {
                 group.key.hash(&mut generation);
                 group.source.head.commit_oid().hash(&mut generation);
                 group.source.base.commit_oid().hash(&mut generation);
+                // The saved view decides which groups the assistant treats as active.
+                (group.hidden || group.alternate).hash(&mut generation);
             }
         }
         generation.finish()
     }
 
     /// The binding of this review for `session_id`: its workspace and the revisions its open
-    /// document resolved to.
+    /// document resolved to. Every listed group is bound, shown or not, so the assistant can
+    /// address each stack layer, whole-stack diff and series group; the workspace's saved view
+    /// decides which are active.
     pub(super) fn assistant_binding(&mut self, session_id: String) -> ReviewAssistantBinding {
         let workspace = bcode_code_review::assistant::bound_workspace(self.workspace_mut());
         let (resolved, stacks) = self.review.as_ref().map_or_else(
@@ -151,11 +151,7 @@ impl ReviewSurface {
                 let mut resolved = Vec::new();
                 let mut stacks: Vec<&bcode_code_review_models::ResolvedReviewStack> = Vec::new();
                 let mut seen = BTreeSet::new();
-                for group in review
-                    .doc
-                    .groups()
-                    .filter(|g| !g.hidden && !g.alternate && !g.loading)
-                {
+                for group in review.doc.groups().filter(|g| !g.loading) {
                     resolved.push(group.source.clone());
                     if let Some(stack) = group.stack
                         && seen.insert(stack.stack.source_id.as_str())
@@ -496,42 +492,53 @@ impl ReviewSurface {
         side: Option<&str>,
         source: Option<&str>,
     ) -> Result<String, String> {
-        let file = self.find_file(path, source, None)?;
+        let file = self.find_file(path, source)?;
         Ok(self.show_file_location(&file, line, side))
     }
 
-    /// The file `path` (of `source` when given) names; with `within`, only one of that source
-    /// (the stack layer that will be shown alone).
-    pub(super) fn find_file(
-        &self,
-        path: &str,
-        source: Option<&str>,
-        within: Option<&str>,
-    ) -> Result<FileRef, String> {
+    /// The one file `path` names: in the group `selector` names (a group selector or a source
+    /// id, shown or hidden by focus) when given, else in the groups shown. Alternate
+    /// representations the view leaves out are never searched.
+    ///
+    /// # Errors
+    ///
+    /// * The review is still loading.
+    /// * No searched group has `path`.
+    /// * Several do; the message lists their group selectors.
+    pub(super) fn find_file(&self, path: &str, selector: Option<&str>) -> Result<FileRef, String> {
         let review = self.review.as_ref().ok_or("the review is still loading")?;
-        let path = path.trim().trim_start_matches("./").to_owned();
-        let named: Vec<&FileRef> = review
+        let path = path.trim().trim_start_matches("./");
+        let named: Vec<(String, &FileRef)> = review
             .doc
             .groups()
-            .filter(|group| !group.alternate && (!group.hidden || within.is_some()))
             .filter(|group| {
-                [source, within]
-                    .into_iter()
-                    .flatten()
-                    .all(|id| id == group.source.source_id || id == group.key.selector())
+                !group.alternate
+                    && selector.map_or(!group.hidden, |id| {
+                        id == group.source.source_id || id == group.key.selector()
+                    })
             })
-            .flat_map(|group| review.doc.group_files(group.index))
-            .filter(|file| file.path == path)
+            .flat_map(|group| {
+                review
+                    .doc
+                    .group_files(group.index)
+                    .filter(|file| file.path == path)
+                    .map(move |file| (group.key.selector(), file))
+            })
             .collect();
-        if named.is_empty() {
-            return Err(format!(
+        match named.as_slice() {
+            [] => Err(format!(
                 "{path} is not a file shown in the requested group (code_review.list_files lists them)"
-            ));
+            )),
+            [(_, file)] => Ok((*file).clone()),
+            several => Err(format!(
+                "{path} occurs in several groups; pass one of these group selectors as source: {}",
+                several
+                    .iter()
+                    .map(|(selector, _)| selector.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
-        named
-            .first()
-            .map(|file| (*file).clone())
-            .ok_or_else(|| format!("{path} is not in the layer shown; name its layer with `layer`"))
     }
 
     /// Move the cursor to `file` (at `line` on `side` when given, else its header) and say

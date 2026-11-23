@@ -699,15 +699,22 @@ impl ReviewSurface {
         let latest = comments.last().map(|comment| (*comment).clone());
         let first = first?;
         let anchor = self.doc_anchor(&first.anchor);
+        // A thread of a series group must reply in that group; without it loaded the reply
+        // could not record where it belongs. Other threads keep working when their file left
+        // the diff.
         if first.anchor.kind != ReviewAnchorKind::Review
             && anchor.file.is_none()
+            && self
+                .review
+                .as_ref()
+                .is_some_and(|review| review.doc.anchor_group(&first.anchor).is_some())
             && matches!(
                 action,
                 ThreadAction::Reply | ThreadAction::Edit | ThreadAction::Ask
             )
         {
             self.set_status(
-                "the original file or group is not loaded",
+                "the thread's commit group is not loaded",
                 StatusSeverity::Warning,
             );
             return None;
@@ -1166,27 +1173,22 @@ impl ReviewSurface {
         self.focus_card(&exchange_id);
     }
 
+    /// The series group a draft belongs to: its own, or the one a legacy draft without one
+    /// belongs to. `None` for drafts outside every series.
+    pub(super) fn draft_group(
+        &self,
+        anchor: &bcode_code_review_models::DraftAnchor,
+    ) -> Option<bcode_code_review_models::ReviewGroupKey> {
+        self.review.as_ref().map_or_else(
+            || anchor.group.clone(),
+            |review| review.doc.anchor_group(anchor),
+        )
+    }
+
     /// The other threads on `path` (or the review, for the review-level path) a question lists:
     /// the review's own and its pull requests', one line each, without `except`; and how many
     /// were left out past [`agent::MAX_PROMPT_THREADS`].
-    pub(super) fn other_threads(&self, path: &str, except: Option<&str>) -> (Vec<String>, usize) {
-        let group = self
-            .review
-            .as_ref()
-            .and_then(|review| {
-                let file = review.cursor_file()?;
-                review.doc.group_of_key(&ItemKey::FileHeader(file))
-            })
-            .filter(|g| {
-                !matches!(
-                    g,
-                    bcode_code_review_models::ReviewGroupKey::Standalone { .. }
-                )
-            });
-        self.other_threads_in_group(path, except, group)
-    }
-
-    fn other_threads_in_group(
+    pub(super) fn other_threads_in_group(
         &self,
         path: &str,
         except: Option<&str>,
@@ -1200,7 +1202,7 @@ impl ReviewSurface {
             .filter(|draft| draft.anchor.reply_to.is_none())
             .filter(|draft| {
                 draft.anchor.file_path == path
-                    && draft.anchor.group.as_ref() == group
+                    && self.draft_group(&draft.anchor).as_ref() == group
                     && seen.insert(&draft.thread_id)
             })
             .filter(|draft| Some(draft.thread_id.as_str()) != except)
@@ -1473,7 +1475,10 @@ impl ReviewSurface {
         self.set_status("returned from linked Bcode session", StatusSeverity::Info);
     }
 
-    fn persisted_anchor(&self, anchor: &DocAnchor) -> bcode_code_review_models::DraftAnchor {
+    pub(super) fn persisted_anchor(
+        &self,
+        anchor: &DocAnchor,
+    ) -> bcode_code_review_models::DraftAnchor {
         self.review.as_ref().map_or_else(
             || anchor.to_draft_anchor(),
             |review| review.doc.draft_anchor(anchor),
@@ -1481,43 +1486,48 @@ impl ReviewSurface {
     }
 
     /// The document anchor of a persisted anchor (at its file in this review).
+    ///
+    /// An anchor of a series group (its own, or the group a legacy anchor without one
+    /// belongs to, see [`ReviewDocument::anchor_group`]) only ever lands in that group. Any
+    /// other anchor lands on the path in its source, wherever that source shows it.
+    ///
+    /// [`ReviewDocument::anchor_group`]: bcode_code_review::document::ReviewDocument::anchor_group
     pub(super) fn doc_anchor(&self, anchor: &bcode_code_review_models::DraftAnchor) -> DocAnchor {
         let file = self.review.as_ref().and_then(|review| {
             if anchor.kind == ReviewAnchorKind::Review {
                 return None;
             }
-            let mut matches = review
+            let group = review.doc.anchor_group(anchor);
+            // A series anchor that names no member of it has no group to land in.
+            if group.is_none()
+                && anchor
+                    .source_id
+                    .as_ref()
+                    .is_some_and(|id| self.commit_series.contains_key(id))
+            {
+                return None;
+            }
+            review
                 .doc
-                .groups()
-                .filter(|group| {
-                    if let Some(key) = &anchor.group {
-                        return group.key == key;
-                    }
-                    if anchor
-                        .source_id
-                        .as_ref()
-                        .is_some_and(|id| id != &group.source.source_id)
-                    {
-                        return false;
-                    }
-                    // Before group identity was recorded, a commit part can only be recovered
-                    // from its pinned OID. Never place a legacy member on a combined diff.
-                    match group.key {
-                        bcode_code_review_models::ReviewGroupKey::Member { member, .. } => {
-                            anchor.head_oid.as_ref() == Some(member)
-                        }
-                        bcode_code_review_models::ReviewGroupKey::Combined { .. } => false,
-                        bcode_code_review_models::ReviewGroupKey::Standalone { .. } => true,
-                    }
+                .file_keys()
+                .filter(|file| file.path == anchor.file_path)
+                .find(|file| {
+                    group.as_ref().map_or_else(
+                        || {
+                            anchor
+                                .source_id
+                                .as_deref()
+                                .is_none_or(|id| id == file.source_id)
+                        },
+                        |group| {
+                            review
+                                .doc
+                                .group_of_key(&ItemKey::FileHeader((*file).clone()))
+                                == Some(group)
+                        },
+                    )
                 })
-                .filter_map(|group| {
-                    review
-                        .doc
-                        .group_files(group.index)
-                        .find(|f| f.path == anchor.file_path)
-                });
-            let file = matches.next()?;
-            matches.next().is_none().then(|| file.clone())
+                .cloned()
         });
         DocAnchor {
             file,

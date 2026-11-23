@@ -379,6 +379,10 @@ one identity rule. Workspace-wide viewed marks and ungrouped anchors saved befor
 series belong to the groups that representation became: a contiguous chain's to the combined
 group, a sparse selection's to each member (anchors by head commit), adopted once per series.
 Selecting a different representation does not retarget a comment made in the original one.
+Opening a review lists every member of a series and, when it needs no replay or the saved view
+asks for it, the combined diff; the review app then switches views by changing which groups
+show, as it does for a stack of pull requests. Only a sparse selection's combined diff, the
+first time it is asked for, opens the review again to compute it.
 
 #### Resolution by source kind
 

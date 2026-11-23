@@ -150,9 +150,10 @@ impl GuideMarks {
         }
     }
 
-    /// Bind row-local part positions to the displayed document's stable selectors.
+    /// Bind row-local part positions to the document's stable selectors. Every group binds,
+    /// shown or not, so changing which groups show needs no new binding.
     pub(crate) fn bind_document(&mut self, doc: &bcode_code_review::document::ReviewDocument) {
-        for group in doc.groups().filter(|g| !g.hidden && !g.alternate) {
+        for group in doc.groups() {
             self.selectors
                 .entry(group.source.source_id.clone())
                 .or_default()

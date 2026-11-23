@@ -161,7 +161,8 @@ impl ReviewSurface {
             review.totals = review.doc.totals();
             review.rebuild_files(&theme, file_view);
             // Stay on the cursor's item when it still shows, else on the same file in the
-            // sources now shown, else on the shown layer's home (or the document's start).
+            // sources now shown (with every layer shown, the topmost layer that touches it),
+            // else on the shown layer's home (or the document's start).
             let same_file = cursor
                 .as_ref()
                 .and_then(ItemKey::file)
@@ -173,6 +174,9 @@ impl ReviewSurface {
                     review
                         .doc
                         .groups()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
                         .filter(|g| {
                             !g.alternate
                                 && !g.hidden
@@ -209,7 +213,7 @@ impl ReviewSurface {
         let catalog = self.series_catalog();
         let mut alternates = BTreeSet::new();
         let mut hidden = BTreeSet::new();
-        for set in &catalog {
+        for set in catalog.iter() {
             match set.view(self) {
                 Some(View::Combined) => alternates.extend(set.members.iter().cloned()),
                 Some(mode) => {
@@ -233,10 +237,30 @@ impl ReviewSurface {
     /// Switch to the next way of showing the stack: one layer at a time, every layer, then the
     /// whole stack as one diff (skipping the ones the review cannot show).
     pub(super) fn toggle_stack_view(&mut self) {
-        let Some(series) = self.active_series() else {
-            self.set_status("this review has no series to switch", StatusSeverity::Info);
+        let series = self.active_series();
+        let views = series
+            .as_ref()
+            .map_or_else(Vec::new, |series| self.offered_views(series));
+        let Some(series) = series.filter(|_| views.len() >= 2) else {
+            self.set_status(
+                "only a stack review or several selected commits have other ways to show",
+                StatusSeverity::Info,
+            );
             return;
         };
+        // The view asked for, not the one still showing: a combined diff being computed
+        // counts as shown, so pressing again moves on from it.
+        let current = series.requested_view(self);
+        let next = views
+            .iter()
+            .position(|v| Some(*v) == current)
+            .map_or(0, |i| (i + 1) % views.len());
+        self.set_series_view(views[next]);
+    }
+
+    /// The views `shift+o` cycles through for `series`: [`Series::views`] without a combined
+    /// diff that cannot be computed.
+    fn offered_views(&self, series: &Series) -> Vec<View> {
         let mut views = series.views();
         if self
             .commit_series
@@ -245,18 +269,15 @@ impl ReviewSurface {
         {
             views.retain(|view| *view != View::Combined);
         }
-        if views.len() < 2 {
-            return;
-        }
-        let current = series.view(self);
-        let next = views
-            .iter()
-            .position(|v| Some(*v) == current)
-            .map_or(0, |i| (i + 1) % views.len());
-        self.set_series_view(views[next]);
+        views
     }
 
     /// Change grouping without changing a comparison baseline or workspace source.
+    ///
+    /// Every representation of a series is in the document, so this only changes which
+    /// shows, keeping the cursor on the same file when the new view has it. The one
+    /// exception is a sparse commit series' combined diff, computed the first time it is
+    /// asked for: the review is opened again, and lands in it once it is there.
     pub fn set_series_view(&mut self, view: View) {
         let Some(series) = self.active_series() else {
             return;
@@ -289,41 +310,29 @@ impl ReviewSurface {
         }
         let member = key.as_ref().filter(|key| series.members.contains(key));
         self.remember_series(&series, view, member);
-        self.pending_member = if view == View::Combined {
-            series.combined.as_ref()
-        } else {
-            member.or_else(|| series.selected(self))
-        }
-        .map(ReviewGroupKey::selector);
-        if series.commits && (series.view(self) != Some(view) || self.switching) {
+        let compute = series.commits
+            && view == View::Combined
+            && !series
+                .combined
+                .as_ref()
+                .is_some_and(|key| self.has_group(key));
+        if compute {
+            self.pending_member = series.combined.as_ref().map(ReviewGroupKey::selector);
             self.schedule_series_reload();
         } else {
+            // A combined diff still being computed is no longer wanted.
+            self.pending_member = None;
             self.apply_stack_view();
-            self.finish_member_jump();
             self.apply_compare_filter();
         }
-        let status = if series.commits {
-            match view {
-                View::Combined => "combined diff",
-                View::AllMembers => "every member separately",
-                View::OneMember => "one member at a time",
-            }
-            .to_owned()
-        } else {
-            let description = |mode| match mode {
-                View::OneMember => "one pull request at a time",
-                View::AllMembers => "every pull request of the stack",
-                View::Combined => "the whole stack as one diff",
-            };
-            let views = series.views();
-            match views.iter().position(|mode| *mode == view) {
-                Some(i) if views.len() > 1 => format!(
-                    "{} (shift+o: {})",
-                    description(view),
-                    description(views[(i + 1) % views.len()])
-                ),
-                _ => description(view).to_owned(),
-            }
+        let views = self.offered_views(&series);
+        let status = match views.iter().position(|mode| *mode == view) {
+            Some(i) if views.len() > 1 => format!(
+                "{} (shift+o: {})",
+                describe(series.commits, view),
+                describe(series.commits, views[(i + 1) % views.len()])
+            ),
+            _ => describe(series.commits, view).to_owned(),
         };
         self.set_status(status, StatusSeverity::Info);
         self.persist_presentation(true);
@@ -579,7 +588,8 @@ impl ReviewSurface {
                     .and_then(|id| entries.iter().position(|entry| &entry.source_id == id))
             });
         // Layers do not show with the whole stack: a layer found is only the one last entered.
-        if self.shown_series_view() == Some(View::Combined)
+        // A combined diff still being computed is already the selected tab.
+        if self.requested_series_view() == Some(View::Combined)
             && found.is_none_or(|index| !entries[index].whole)
             && let Some(whole) = entries.iter().position(|entry| entry.whole)
         {
@@ -670,25 +680,17 @@ impl ReviewSurface {
         else {
             return;
         };
-        let prior = series.view(self);
-        let view = if prior == Some(View::AllMembers) {
+        // From the whole stack (shown, or still being computed) a layer shows alone.
+        let view = if series.requested_view(self) == Some(View::AllMembers) {
             View::AllMembers
         } else {
             View::OneMember
         };
         self.remember_series(&series, view, Some(key));
-        if series.commits
-            && (prior != Some(view)
-                || !self
-                    .review
-                    .as_ref()
-                    .is_some_and(|r| r.doc.groups().any(|g| g.key == key)))
-        {
-            self.pending_member = Some(key.selector());
-            self.rail_layer = self.pending_member.clone();
-            self.schedule_series_reload();
-            return;
-        }
+        // A member that is not listed yet is landed in when it arrives; with nothing loading
+        // it will not arrive, and nothing waits for it.
+        let loading = self.open_progress.filling || self.refreshing || self.reopen_pending;
+        self.pending_member = (loading && !self.has_group(key)).then(|| key.selector());
         self.apply_compare_filter();
         self.rail_layer = Some(target.source_id.clone());
         // Show the entered layer (alone, or with only its file group open).
@@ -752,10 +754,10 @@ impl ReviewSurface {
             return;
         };
         let Some(layers) = group.stack.map(|stack| &stack.stack.layers) else {
-            cx.paint_component(
-                &TextBlock::new(Text::from_lines(vec![entries[index].labels[0].clone()])),
-                area,
-            );
+            let line = entries[index].labels[0]
+                .clone()
+                .truncate(usize::from(area.width));
+            cx.paint_component(&TextBlock::new(Text::from_lines(vec![line])), area);
             return;
         };
         let Some(top) = layers.last() else {
@@ -1004,6 +1006,18 @@ impl ReviewSurface {
             return true;
         }
         outcome != EventOutcome::Ignored
+    }
+}
+
+/// What `shift+o` names `view`, for a stack of pull requests or a commit series.
+const fn describe(commits: bool, view: View) -> &'static str {
+    match (commits, view) {
+        (false, View::OneMember) => "one pull request at a time",
+        (false, View::AllMembers) => "every pull request of the stack",
+        (false, View::Combined) => "the whole stack as one diff",
+        (true, View::OneMember) => "one commit at a time",
+        (true, View::AllMembers) => "every selected commit separately",
+        (true, View::Combined) => "the selected commits as one diff",
     }
 }
 

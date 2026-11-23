@@ -58,9 +58,9 @@ impl ReviewSurface {
             .take(MAX_SOURCES)
             .map(|group| group.key.selector())
             .collect();
-        view.files = doc.groups().fold((0, 0), |(files, viewed), group| {
-            (files + group.file_count, viewed + group.viewed)
-        });
+        // The review's progress: every group but the alternate representations not shown.
+        let progress = doc.viewed_progress();
+        view.files = (progress.total, progress.viewed);
         if self.steps_through_stack() {
             view.stack = Some(StackView {
                 layers: self.stack_layer_numbers(),
@@ -120,8 +120,6 @@ impl ReviewSurface {
                 .and_then(|_| doc.file_since(file))
                 .map(since_text),
         });
-        let (threads, omitted) = self.other_threads(&file.path, None);
-        let total = threads.len() + omitted;
         let group = doc.group_of_key(&ItemKey::FileHeader(file.clone()));
         let anchor_group = group.filter(|key| {
             !matches!(
@@ -129,6 +127,8 @@ impl ReviewSurface {
                 bcode_code_review_models::ReviewGroupKey::Standalone { .. }
             )
         });
+        let (threads, omitted) = self.other_threads_in_group(&file.path, None, anchor_group);
+        let total = threads.len() + omitted;
         let (open, resolved) = self.thread_counts(&file.path, anchor_group);
         view.threads = ThreadsView {
             open,
@@ -263,7 +263,7 @@ impl ReviewSurface {
         for draft in self.notes.drafts() {
             if draft.anchor.reply_to.is_none()
                 && draft.anchor.file_path == path
-                && draft.anchor.group.as_ref() == group
+                && self.draft_group(&draft.anchor).as_ref() == group
                 && seen.insert(draft.thread_id.as_str())
             {
                 resolved += usize::from(self.notes.thread_resolved(&draft.thread_id));

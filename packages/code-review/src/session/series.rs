@@ -260,6 +260,10 @@ pub fn resolve_commit_series(
     })
 }
 
+/// Resolve a commits source for opening: its series description and every group it can show
+/// without further work ([`ResolvedCommitSeries::all`]), so switching between members, every
+/// member, and an already computed combined diff needs no further resolution. A sparse
+/// selection's combined diff is only computed when the saved view asks for it.
 pub(super) fn resolve(
     data: &ReviewData,
     request: &OpenRequest,
@@ -271,6 +275,6 @@ pub(super) fn resolve(
         source,
         request.series_views.get(&source.id),
     )?;
-    let visible = resolved.visible();
-    Ok((resolved.state, visible))
+    let groups = resolved.all();
+    Ok((resolved.state, groups))
 }

@@ -48,3 +48,20 @@ fn relisting_or_failing_one_part_does_not_remove_its_siblings() {
     known.forget(&selector);
     assert_eq!(known.sources, vec![(b, false)]);
 }
+
+#[test]
+fn a_listed_part_does_not_stand_for_its_siblings() {
+    let a = member(0, "a");
+    let b = member(1, "b");
+    let mut known = Known::default();
+    known.put(a.clone(), true);
+    known.put(b.clone(), true);
+    known.put(a.clone(), false);
+    assert!(known.listed(&a.source));
+    // The sibling is still only pending: its placeholder is not taken for a listing.
+    assert!(!known.listed(&b.source));
+    let labels = vec![("commits".into(), "Selected commits".into(), false)];
+    let inputs = known.inputs(&labels);
+    assert_eq!(inputs.len(), 2);
+    assert!(inputs[1].loading);
+}

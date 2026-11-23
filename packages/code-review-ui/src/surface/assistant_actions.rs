@@ -196,8 +196,9 @@ pub struct ComparisonChange {
     /// Every pull request of the stack at once (`false`: one at a time).
     pub all_layers: Option<bool>,
     /// How a stack shows: `one_pr`, `all_prs`, or `whole` (the whole stack as one diff).
-    #[serde(alias = "series_view")]
     pub stack_view: Option<String>,
+    /// Grouping of the active series: `one_member`, `all_members`, or `combined`.
+    pub series_view: Option<String>,
     /// Stable member id or selector of the active series.
     pub member: Option<String>,
     /// Compare one pull request between two of its versions (1-based: v1 is the first).
@@ -397,30 +398,7 @@ impl ReviewSurface {
         path: &str,
         selector: Option<&str>,
     ) -> Result<bcode_code_review::document::FileRef, String> {
-        let doc = &self
-            .review
-            .as_ref()
-            .ok_or("the review is still loading")?
-            .doc;
-        let mut matches = doc
-            .groups()
-            .filter(|group| {
-                !group.alternate
-                    && selector.map_or(!group.hidden, |id| {
-                        group.key.selector() == id || group.source.source_id == id
-                    })
-            })
-            .flat_map(|group| doc.group_files(group.index))
-            .filter(|file| file.path == path.trim_start_matches("./"));
-        let file = matches
-            .next()
-            .cloned()
-            .ok_or_else(|| format!("{path} is not in the selected review group"))?;
-        if matches.next().is_some() {
-            return Err(format!(
-                "{path} occurs in multiple groups; pass the group selector as source"
-            ));
-        }
+        let file = self.find_file(path, selector)?;
         let refusal = self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone()));
         refusal.map_or(Ok(file), Err)
     }
@@ -712,23 +690,12 @@ impl ReviewSurface {
             self.show_compare_hidden(shown);
             done.push(format!("hidden files shown: {shown}"));
         }
-        let wanted = change
-            .stack_view
-            .as_deref()
-            .and_then(parse_stack_view)
-            .or_else(|| {
-                change.all_layers.map(|all| {
-                    if all {
-                        StackView::AllLayers
-                    } else {
-                        StackView::OneLayer
-                    }
-                })
-            });
-        if let Some(wanted) = wanted {
-            let mode = super::series::from_stack(wanted);
+        if let Some(mode) = requested_grouping(change)? {
             self.set_series_view(mode);
-            done.push(format!("requested series view {mode:?}"));
+            done.push(format!(
+                "requested series view {}",
+                crate::assistant::context::series_view_name(mode)
+            ));
         }
         if let Some(member) = &change.member {
             if !self.select_series_member(member) {
@@ -760,27 +727,11 @@ impl ReviewSurface {
     }
 
     fn check_series_change(&self, change: &ComparisonChange) -> Result<(), String> {
-        if change.all_layers.is_some() && change.stack_view.is_some() {
-            return Err(
-                "pass one grouping setting, not both all_layers and series_view".to_owned(),
-            );
-        }
-        if change.all_layers.is_some() || change.stack_view.is_some() || change.member.is_some() {
+        let mode = requested_grouping(change)?;
+        if mode.is_some() || change.member.is_some() {
             let series = self
                 .active_series()
                 .ok_or("this review has no active series")?;
-            let mode = match change.stack_view.as_deref() {
-                Some(text) => Some(super::series::from_stack(
-                    parse_stack_view(text).ok_or_else(|| format!("unknown series view {text}"))?,
-                )),
-                None => change.all_layers.map(|all| {
-                    super::series::from_stack(if all {
-                        StackView::AllLayers
-                    } else {
-                        StackView::OneLayer
-                    })
-                }),
-            };
             if mode == Some(bcode_code_review_models::ReviewSeriesView::Combined)
                 && let Some(reason) = self
                     .commit_series
@@ -792,7 +743,10 @@ impl ReviewSurface {
             if let Some(mode) = mode
                 && !series.views().contains(&mode)
             {
-                return Err(format!("this series cannot show {mode:?}"));
+                return Err(format!(
+                    "this series cannot show {}",
+                    crate::assistant::context::series_view_name(mode)
+                ));
             }
             if let Some(member) = &change.member {
                 if !series
@@ -1062,6 +1016,44 @@ impl ReviewSurface {
 }
 
 /// The stack view `text` names (`one_pr`, `all_prs`, `whole`).
+/// The grouping `change` asks for, from whichever one of `all_layers`, `series_view` and
+/// `stack_view` it passes.
+///
+/// # Errors
+///
+/// * More than one of them is passed, or a view is not one of the schema's values.
+fn requested_grouping(
+    change: &ComparisonChange,
+) -> Result<Option<bcode_code_review_models::ReviewSeriesView>, String> {
+    let given = [
+        change.all_layers.is_some(),
+        change.series_view.is_some(),
+        change.stack_view.is_some(),
+    ];
+    if given.into_iter().filter(|given| *given).count() > 1 {
+        return Err("pass one grouping setting: all_layers, series_view or stack_view".to_owned());
+    }
+    let parse = |text: &str| {
+        parse_stack_view(text)
+            .map(super::series::from_stack)
+            .ok_or_else(|| format!("unknown series view {text}"))
+    };
+    if let Some(text) = change
+        .series_view
+        .as_deref()
+        .or(change.stack_view.as_deref())
+    {
+        return parse(text).map(Some);
+    }
+    Ok(change.all_layers.map(|all| {
+        super::series::from_stack(if all {
+            StackView::AllLayers
+        } else {
+            StackView::OneLayer
+        })
+    }))
+}
+
 fn parse_stack_view(text: &str) -> Option<StackView> {
     match text {
         "one_member" | "one_pr" => Some(StackView::OneLayer),

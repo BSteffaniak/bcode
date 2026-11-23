@@ -66,7 +66,7 @@ pub(super) struct GuideUi {
     pub(super) state: crate::guide::GuideState,
     /// The diff's markers.
     pub(super) marks: GuideMarks,
-    marks_stamp: Option<(u64, bool, Markers, u64)>,
+    marks_stamp: Option<(u64, bool, Markers, super::series::CatalogStamp)>,
     /// What the panel says.
     pub(super) model: PanelModel,
     model_stamp: Option<(u64, Placement, u64, bool)>,
@@ -187,10 +187,15 @@ fn choose_guide(
 /// the most recently changed guide when `newest`, else the newest whole-review guide, else the
 /// newest), that guide's current version (or the version `view` names for it) and reviewed
 /// sections, its versions, and its citations' freshness against `sources`.
+///
+/// `canonical` holds the same groups under their workspace source ids and `series` the
+/// commits sources that resolved as series: a group the guide pins but the document does not
+/// hold (a combined diff not computed yet, say) is assessed at its pinned pair, as the
+/// assistant's citation checks do, rather than reported gone.
 async fn read_guide(
     services: ReviewServices,
     scope: NoteScope,
-    sources: Vec<ResolvedSource>,
+    (sources, canonical, series): (Vec<ResolvedSource>, Vec<ResolvedSource>, BTreeSet<String>),
     workspace: Vec<bcode_code_review_models::ReviewSource>,
     (preferred, newest, view): (Option<String>, bool, Option<(String, u32)>),
 ) -> Result<Box<GuideLoaded>, String> {
@@ -260,11 +265,7 @@ async fn read_guide(
     // Freshness is best effort: a guide whose citations cannot be compared still shows.
     let freshness = services
         .blocking(move || {
-            let sources = bcode_code_review::guide::sources::with_legacy_pairs(
-                sources,
-                &workspace,
-                &shown.heads,
-            );
+            let sources = assessed_groups(sources, &canonical, &series, &workspace, &shown.heads);
             Ok(bcode_code_review::guide::sources::restore_objects(
                 &data,
                 &repo,
@@ -289,6 +290,30 @@ async fn read_guide(
     }))
 }
 
+/// The groups a guide version's freshness is assessed against: the document's groups as
+/// they resolve now (`sources`, keyed by selector), then each group the version pins that the
+/// document does not hold at its pinned pair, then the plain ids of legacy commit pins.
+fn assessed_groups(
+    mut sources: Vec<ResolvedSource>,
+    canonical: &[ResolvedSource],
+    series: &BTreeSet<String>,
+    workspace: &[bcode_code_review_models::ReviewSource],
+    heads: &std::collections::BTreeMap<String, bcode_code_review_models::GuideHead>,
+) -> Vec<ResolvedSource> {
+    let pinned = bcode_code_review::guide::sources::GuideSources::project(
+        workspace,
+        canonical,
+        series,
+        Some(heads),
+    );
+    for group in pinned.sources {
+        if !sources.iter().any(|s| s.source_id == group.source_id) {
+            sources.push(group);
+        }
+    }
+    bcode_code_review::guide::sources::with_legacy_pairs(sources, workspace, heads)
+}
+
 /// Read version `wanted` of `guide_id`, or its current version when `wanted` is absent or
 /// the guide does not have it.
 async fn read_version(
@@ -311,15 +336,18 @@ async fn read_version(
     Ok(found)
 }
 
-/// Selector of this document file, only if its representation is currently shown.
+/// Selector of this document file's group, unless the group is an alternate representation
+/// the review does not show. A group hidden only by focus (another layer or member shown alone)
+/// still counts: its files remain part of the review and its progress.
 pub(super) fn guide_file_selector(
     doc: &bcode_code_review::document::ReviewDocument,
     file: &FileRef,
 ) -> Option<String> {
-    let selector = doc
-        .group_of_key(&ItemKey::FileHeader(file.clone()))?
-        .selector();
-    doc.active_group(&selector).map(|_| selector)
+    let key = doc.group_of_key(&ItemKey::FileHeader(file.clone()))?;
+    doc.groups()
+        .find(|group| group.key == key)
+        .filter(|group| !group.alternate)
+        .map(|group| group.key.selector())
 }
 
 impl ReviewSurface {
@@ -345,6 +373,13 @@ impl ReviewSurface {
             .map(|w| w.sources.clone())
             .unwrap_or_default();
         self.guide.assessed.clone_from(&sources);
+        let canonical: Vec<ResolvedSource> = self
+            .review
+            .iter()
+            .flat_map(|review| review.doc.groups())
+            .map(|group| group.source.clone())
+            .collect();
+        let series: BTreeSet<String> = self.commit_series.keys().cloned().collect();
         let newest = self.guide.prefer == Some(Prefer::Newest);
         let preferred = match self.guide.prefer.take() {
             Some(Prefer::Guide(id)) => Some(id),
@@ -369,7 +404,7 @@ impl ReviewSurface {
             let result = read_guide(
                 services,
                 scope,
-                sources,
+                (sources, canonical, series),
                 workspace,
                 (preferred, newest, view),
             )
@@ -471,14 +506,16 @@ impl ReviewSurface {
         self.guide.peek.as_ref()
     }
 
-    /// Rebuild the diff's markers when the guide, its section, or the marker setting changed.
+    /// Rebuild the diff's markers when the guide, its section, the marker setting, or the
+    /// document's groups changed (edits within the document, such as folding or expanding,
+    /// leave the marks as they are).
     pub(super) fn sync_guide_marks(&mut self) {
         let markers = self.services.guide_config().markers;
         let stamp = (
             self.guide.state.revision,
             self.guide.state.engaged,
             markers,
-            self.review.as_ref().map_or(0, |r| r.doc.revision()),
+            self.catalog_stamp(),
         );
         if self.guide.marks_stamp == Some(stamp) {
             return;

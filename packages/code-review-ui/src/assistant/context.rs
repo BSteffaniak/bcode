@@ -958,11 +958,22 @@ fn guide_line(guide: &GuideView) -> String {
     line
 }
 
+/// How the assistant's tools spell `view` (`set_comparison`'s `series_view`).
+#[must_use]
+pub const fn series_view_name(view: bcode_code_review_models::ReviewSeriesView) -> &'static str {
+    match view {
+        bcode_code_review_models::ReviewSeriesView::OneMember => "one_member",
+        bcode_code_review_models::ReviewSeriesView::AllMembers => "all_members",
+        bcode_code_review_models::ReviewSeriesView::Combined => "combined",
+    }
+}
+
 /// The stack and the file counts.
 fn stack_lines(review: &ReviewView, lines: &mut Vec<String>) {
-    if let Some(mode) = &review.series_view {
+    if let Some(mode) = review.series_view {
         lines.push(format!(
-            "series: {mode:?}; source selectors: {}",
+            "series: {}; source selectors: {}",
+            series_view_name(mode),
             review.groups.join(", ")
         ));
     }

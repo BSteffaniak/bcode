@@ -821,8 +821,14 @@ pub struct ReviewSurface {
     file_view: FilePanelView,
     /// How a step-through stack review is shown (persisted).
     stack_view: stack::StackView,
+    /// Selected commits that resolved as series, by canonical source id.
     commit_series: BTreeMap<String, bcode_code_review::session::CommitSeriesState>,
+    /// The series group (selector) to land in once it arrives: a member that was not listed
+    /// yet, or a combined diff being computed. Cleared when it is reached or the load that
+    /// should have brought it completes without it.
     pending_member: Option<String>,
+    /// The series catalog, built once per document state (see [`series`]).
+    series_cache: series::CatalogCache,
     /// Sources that failed after the first frame, and listing-cut warnings already shown.
     source_notes: SourceNotes,
     /// The stack this review last saw (and its provider), for its history.
@@ -960,7 +966,7 @@ impl ReviewSurface {
             stack_view: stack::StackView::default(),
             commit_series: BTreeMap::new(),
             pending_member: None,
-
+            series_cache: series::CatalogCache::default(),
             source_notes: SourceNotes::default(),
             stack_news: None,
             gone_layers: std::collections::BTreeSet::new(),
@@ -1836,20 +1842,22 @@ impl ReviewSurface {
         if self.is_transient() {
             return;
         }
+        let revisions = self.passes_with(revisions);
         let workspace = self.workspace_mut();
-        let same = revisions.iter().all(|(id, revision)| {
-            workspace
-                .reviewed_revisions
-                .get(id)
-                .is_some_and(|recorded| {
-                    recorded.reviewed_base_oid == revision.reviewed_base_oid
-                        && recorded.reviewed_head_oid == revision.reviewed_head_oid
-                })
-        });
+        let same = workspace.reviewed_revisions.len() == revisions.len()
+            && revisions.iter().all(|(id, revision)| {
+                workspace
+                    .reviewed_revisions
+                    .get(id)
+                    .is_some_and(|recorded| {
+                        recorded.reviewed_base_oid == revision.reviewed_base_oid
+                            && recorded.reviewed_head_oid == revision.reviewed_head_oid
+                    })
+            });
         if same {
             return;
         }
-        workspace.reviewed_revisions.extend(revisions);
+        workspace.reviewed_revisions = revisions;
         self.request_save();
     }
 
@@ -1871,8 +1879,8 @@ impl ReviewSurface {
             );
             return;
         }
-        let revisions = self.active_pass_revisions();
-        self.workspace_mut().reviewed_revisions.extend(revisions);
+        let revisions = self.passes_with(self.active_pass_revisions());
+        self.workspace_mut().reviewed_revisions = revisions;
         let workspace = self.workspace_mut().clone();
         let notes = super::notes::LoadedNotes {
             drafts: self.notes.drafts().to_vec(),
@@ -2181,12 +2189,7 @@ impl ReviewSurface {
                 }
             }
             Message::Opened(opened) => self.finish_open(*opened, host),
-            Message::CommitSeries(state) => {
-                if let Some(review) = self.review.as_mut() {
-                    review.doc.set_commit_series(state.clone());
-                }
-                self.commit_series.insert(state.source_id.clone(), state);
-            }
+            Message::CommitSeries(state) => self.apply_commit_series(state),
             Message::Arrived(arrived) => self.apply_arrived(*arrived),
             Message::Bypass(done) => self.apply_bypass(*done),
             Message::SourceFailed(diagnostic) => self.apply_source_failed(diagnostic),
@@ -2198,6 +2201,7 @@ impl ReviewSurface {
             } => {
                 self.open_progress.filling = false;
                 self.open_progress.filling_note = None;
+                self.settle_member_jump();
                 if let Some(review) = self.review.as_mut() {
                     review.token = token;
                     review.working_tree = working_tree;
@@ -2228,6 +2232,7 @@ impl ReviewSurface {
             Message::HistoryPanel(result) => self.apply_history_panel(result),
             Message::OpenFailed(error) => {
                 self.switching = false;
+                self.pending_member = None;
                 if self.review.is_some() {
                     self.status = None;
                     self.toasts
@@ -2359,6 +2364,7 @@ impl ReviewSurface {
     fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
         self.commit_series.clone_from(&opened.commit_series);
+        self.invalidate_series();
         let opened_complete = opened.complete;
         let was_filling = std::mem::replace(&mut self.open_progress.filling, !opened.complete);
         let (first_open, deepest_stack) = (self.review.is_none(), deepest_stack(&opened));
@@ -2435,6 +2441,7 @@ impl ReviewSurface {
         for (source_id, answer) in &fingerprints {
             review.doc.accept_fingerprints(source_id, answer);
         }
+        self.adopt_series_marks();
         let workspace = self.workspace_mut().clone();
         review.doc.set_viewed_marks(&workspace);
         let _ = review.doc.take_splices();
@@ -2448,13 +2455,48 @@ impl ReviewSurface {
         }
         // A refreshed document starts unfocused; show the stack as chosen again.
         self.apply_stack_view();
-        self.finish_member_jump();
+        if opened_complete {
+            self.settle_member_jump();
+        } else {
+            self.finish_member_jump();
+        }
         // Annotations are re-applied to the new document (and re-listed by the next poll).
         self.notes_requested = false;
         self.sync_notes();
         for news in stacks {
             self.apply_stack_news(news);
         }
+    }
+
+    /// A selected-commits source resolved as a series after the document was built.
+    fn apply_commit_series(&mut self, state: bcode_code_review::session::CommitSeriesState) {
+        if let Some(review) = self.review.as_mut() {
+            review.doc.set_commit_series(state.clone());
+        }
+        self.commit_series.insert(state.source_id.clone(), state);
+        self.invalidate_series();
+        if self.adopt_series_marks() {
+            self.apply_viewed();
+        }
+    }
+
+    /// Carry the workspace-wide viewed marks of a review saved before a commits source was a
+    /// series into that series' groups, once per series (see
+    /// [`bcode_code_review::session::CommitSeriesState::adopt_legacy_marks`]). Only the review's
+    /// own copy changes, so the next save writes the adopted marks over the stored record.
+    /// Returns whether anything was adopted (a save is then requested).
+    fn adopt_series_marks(&mut self) -> bool {
+        let Some(workspace) = self.workspace.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        for state in self.commit_series.values() {
+            changed |= state.adopt_legacy_marks(workspace);
+        }
+        if changed {
+            self.request_save();
+        }
+        changed
     }
 
     /// Fill in (or add) the group of a source that arrived after the first frame, in place: the
@@ -2499,6 +2541,7 @@ impl ReviewSurface {
         review.totals = review.doc.totals();
         review.rebuild_files(&self.theme, self.file_view);
         review.note_splices();
+        self.invalidate_series();
         self.apply_stack_view();
         self.finish_member_jump();
     }

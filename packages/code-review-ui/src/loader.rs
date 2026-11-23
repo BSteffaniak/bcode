@@ -543,7 +543,7 @@ impl Streamer<'_> {
                 }
             }
             session::OpenEvent::Pending(opened) => {
-                if self.known.listed(&opened.source.source_id) {
+                if self.known.listed(&opened.source) {
                     return;
                 }
                 self.known.put(opened.clone(), true);
@@ -704,22 +704,19 @@ struct Known {
 }
 
 impl Known {
-    /// Whether source `id` was listed (a pending placeholder never replaces it).
-    fn listed(&self, id: &str) -> bool {
+    /// Whether the group `source` resolved to was listed (a pending placeholder never
+    /// replaces it). Each part of a commit series is its own group.
+    fn listed(&self, source: &ResolvedSource) -> bool {
         self.sources
             .iter()
-            .any(|(source, pending)| source.source.source_id == id && !pending)
+            .any(|(opened, pending)| !pending && same_group(&opened.source, source))
     }
 
     fn put(&mut self, source: session::OpenedSource, pending: bool) {
-        let existing = self.sources.iter_mut().find(|(opened, _)| {
-            opened.source.source_id == source.source.source_id
-                && match (&opened.source.part, &source.source.part) {
-                    (None, None) => true,
-                    (Some(_), Some(_)) => opened.source.head == source.source.head,
-                    _ => false,
-                }
-        });
+        let existing = self
+            .sources
+            .iter_mut()
+            .find(|(opened, _)| same_group(&opened.source, &source.source));
         if let Some(slot) = existing {
             *slot = (source, pending);
         } else {
@@ -785,6 +782,17 @@ impl Known {
         });
         inputs
     }
+}
+
+/// Whether `a` and `b` are the same document group: one source, and for a part of a commit
+/// series the same member commit (a combined diff has no part).
+fn same_group(a: &ResolvedSource, b: &ResolvedSource) -> bool {
+    a.source_id == b.source_id
+        && match (&a.part, &b.part) {
+            (None, None) => true,
+            (Some(_), Some(_)) => a.head == b.head,
+            _ => false,
+        }
 }
 
 /// Index of source `id` among the review's included sources.

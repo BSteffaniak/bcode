@@ -319,20 +319,12 @@ impl ReviewSurface {
                     .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed)
                     != viewed
             })
-            .filter_map(|file| review.doc.viewed_identity(file))
+            .filter_map(|file| super::viewed_sync::identity(&review.doc, file))
             .collect();
         if identities.is_empty() {
             return;
         }
-        let workspace = self.workspace_mut();
-        for (identity, patch) in &identities {
-            let file = identity.with_patch(patch.as_deref());
-            if viewed {
-                bcode_code_review::viewed::mark_viewed(workspace, &file);
-            } else {
-                bcode_code_review::viewed::unmark_viewed(workspace, &file);
-            }
-        }
+        super::viewed_sync::set_batch(self.workspace_mut(), &identities, viewed);
         self.apply_viewed();
     }
 

@@ -39,6 +39,29 @@ impl ReviewSurface {
             .collect()
     }
 
+    /// The review's recorded passes once the pass `revisions` (from
+    /// [`Self::active_pass_revisions`]) is recorded: the pass replaces every entry it covers
+    /// and every standalone source's; a series group the pass leaves out (a member not shown,
+    /// say) keeps its entry while its source is in the review; entries of sources the review
+    /// no longer has are dropped.
+    pub(super) fn passes_with(
+        &self,
+        revisions: BTreeMap<String, bcode_code_review_models::ReviewedRevision>,
+    ) -> BTreeMap<String, bcode_code_review_models::ReviewedRevision> {
+        let mut merged: BTreeMap<_, _> = self
+            .workspace
+            .iter()
+            .flat_map(|workspace| &workspace.reviewed_revisions)
+            .filter(|(key, _)| {
+                let owner = bcode_code_review_models::ReviewGroupKey::source_id_of_selector(key);
+                owner != key.as_str() && self.sources.iter().any(|source| source.id == owner)
+            })
+            .map(|(key, revision)| (key.clone(), revision.clone()))
+            .collect();
+        merged.extend(revisions);
+        merged
+    }
+
     /// What a history is about: the stack this review last saw, and the heads the reviewer
     /// engaged with (their looks, and the passes of this review before looks were listed).
     fn history_scope(&self) -> Option<HistoryScope> {

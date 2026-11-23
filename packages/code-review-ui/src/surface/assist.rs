@@ -435,8 +435,8 @@ impl ReviewSurface {
             .file
             .as_ref()
             .map_or_else(|| "the review".to_owned(), |file| file.path.clone());
-        self.notes
-            .add_draft(anchor.to_draft_anchor(), body, None, None, now_ms());
+        let draft = self.persisted_anchor(&anchor);
+        self.notes.add_draft(draft, body, None, None, now_ms());
         self.sync_notes();
         self.set_status("drafted the assistant's answer", StatusSeverity::Success);
         Ok(format!("drafted a comment on {label}"))
@@ -592,7 +592,9 @@ impl ReviewSurface {
         let files: Vec<_> = review
             .doc
             .groups()
-            .filter(|group| !group.hidden && !group.alternate)
+            // A layer or member shown alone still counts toward progress; an alternate
+            // representation that is not shown does not.
+            .filter(|group| !group.alternate)
             .flat_map(|group| review.doc.group_files(group.index))
             .cloned()
             .collect();
@@ -887,7 +889,7 @@ impl ReviewSurface {
             let unviewed: Vec<String> = review
                 .doc
                 .groups()
-                .filter(|group| !group.hidden && !group.alternate)
+                .filter(|group| !group.alternate)
                 .flat_map(|group| review.doc.group_files(group.index))
                 .filter(|file| {
                     !review

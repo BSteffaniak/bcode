@@ -359,9 +359,9 @@ impl ReviewSurface {
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
-        // A focused PR hides sibling layers from the ordinary assistant binding. A stack
-        // walkthrough needs their actual document revision pairs, in stack order. Do not
-        // expand a combined view or a selected-commit series.
+        // A stack walkthrough plans over every layer, with the revision pairs the document
+        // holds, in stack order, whichever layer is on screen. A combined view and a
+        // selected-commit series are not expanded.
         let stack_layers: Vec<_> = self
             .review
             .iter()
@@ -1360,10 +1360,9 @@ fn include_stack_layers(review: &mut OpenReview, layers: &[ResolvedSource]) {
     if layers.len() < 2 {
         return;
     }
-    // The session binding already contains only the on-screen PR. Opening that binding
-    // can filter it again using the saved presentation (e.g. after reconciliation added
-    // a new bottom layer). There need not be a surviving layer to replace. Use the
-    // document's pinned layers, but only for canonical members of this bound workspace.
+    // Opening the session binding resolves layers it did not pin (for example a bottom
+    // layer reconciliation added) on its own. Use the document's pinned layers instead, in
+    // stack order, but only for canonical members of this bound workspace.
     let layers: Vec<_> = layers
         .iter()
         .filter(|layer| {
