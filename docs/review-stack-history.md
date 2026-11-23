@@ -212,6 +212,13 @@ The default (`compare.start_view = "full"`) is the **full view**; `shift+l` swit
   (`theme.since.diff`) by default, the bar only, the tint only, or *strong*: an accent bar
   (`theme.since.strong_bar`), a deeper tint (`theme.since.strong_diff`), and a `new` label in
   the gutter. Newly removed old-side lines get the same treatment on their side.
+* **Readable tints.** The row, strong, and changed-word tints take the comparison hue (the
+  theme's second accent) at up to a fixed share, but no stronger than keeps the row readable:
+  the row's text keeps 4.5:1, its gutter and every code syntax color 3:1, or at least 90% of
+  the contrast it had on the plain row when that was less. The tint keeps the hue's color
+  while its lightness moves only as far as that allows, and is pushed slightly away from the
+  text before the share is lowered. The theme's own colors are never changed; only how much
+  of the hue the tint carries.
 * **Changed words.** A line new since the baseline that replaced a line there (the marks pair
   a hunk's replaced and replacing lines in order, as a line diff pairs a removed run with the
   added run after it) has the words that differ from that baseline line underlined and tinted

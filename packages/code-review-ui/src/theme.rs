@@ -24,8 +24,9 @@ pub use load::{DEFAULT_THEME, HostTheme};
 pub use tiers::Tiers;
 
 use bcode_code_review_models::ReviewFileStatus;
+use bcode_syntax_render::{SyntaxPalette, SyntaxRole};
 use bcode_tui_theme::components::{ComponentStyles, FileChromeRoles, ThreadCardRoles};
-use bmux_color::Rgb;
+use bmux_color::{Oklab, Rgb};
 use bmux_tui::capabilities::TerminalColorDepth;
 use bmux_tui::chrome::BorderSet;
 use bmux_tui::style::{Color, Modifier, Style};
@@ -587,6 +588,12 @@ impl ReviewTheme {
         .collect();
         let tiers = Tiers::derive(&component, styles.control_focused.fg, &alternates);
         let mut theme = Self::from_tiers(tiers, component, styles.diff, Icons::for_style(icons));
+        theme.since = since_styles(
+            &tiers,
+            &component,
+            &theme.diff,
+            &syntax_inks(&styles.syntax),
+        );
         theme.files = FileStyles::of(&tiers, styles.files);
         theme.threads = ThreadStyles::of(&tiers, &component, styles.threads);
         theme
@@ -714,7 +721,7 @@ impl ReviewTheme {
             status: components.status,
             toasts: components.toasts,
             publish: components.publish,
-            since: since_styles(&tiers, &component, &diff),
+            since: since_styles(&tiers, &component, &diff, &[]),
             guide: guide_styles(&tiers, &component),
             icons,
         }
@@ -1093,45 +1100,177 @@ const fn pill(tiers: &Tiers) -> Style {
 }
 
 /// `a` mixed into `b` by `share`, when both are RGB colors.
-/// Share of the comparison hue in the row tint of lines new since a baseline.
+/// Most of the comparison hue in the row tint of lines new since a baseline.
 const SINCE_TINT_SHARE: f64 = 0.22;
 
-/// Share of the comparison hue in the row tint of the strong mark style.
+/// Most of the comparison hue in the row tint of the strong mark style.
 const SINCE_STRONG_TINT_SHARE: f64 = 0.40;
 
-/// Share of the comparison hue behind words changed since the baseline line.
+/// Most of the comparison hue behind words changed since the baseline line.
 const SINCE_WORD_SHARE: f64 = 0.55;
+
+/// Contrast the row's text keeps on a comparison tint.
+const SINCE_TEXT_FLOOR: f64 = 4.5;
+
+/// Contrast the row's syntax colors and gutter keep on a comparison tint.
+const SINCE_INK_FLOOR: f64 = 3.0;
+
+/// Share of its own contrast an ink keeps on a comparison tint, when that is less than its
+/// floor.
+const SINCE_INK_KEEP: f64 = 0.9;
+
+/// Most a comparison tint's lightness is pushed away from the text (in `OKLab` lightness) so it
+/// can carry the hue's full share.
+const SINCE_MAX_DEEPEN: f64 = 0.08;
+
+/// Steps of each stage of the tint search.
+const SINCE_STEPS: u32 = 20;
+
+/// Syntax roles that color code in diff rows (markup-only roles are left out).
+const SINCE_CODE_ROLES: [SyntaxRole; 16] = [
+    SyntaxRole::Text,
+    SyntaxRole::Comment,
+    SyntaxRole::Keyword,
+    SyntaxRole::Function,
+    SyntaxRole::Variable,
+    SyntaxRole::String,
+    SyntaxRole::Number,
+    SyntaxRole::Type,
+    SyntaxRole::Operator,
+    SyntaxRole::Punctuation,
+    SyntaxRole::Constant,
+    SyntaxRole::Parameter,
+    SyntaxRole::Property,
+    SyntaxRole::Builtin,
+    SyntaxRole::Tag,
+    SyntaxRole::Attribute,
+];
+
+/// The colors `palette` paints code with.
+fn syntax_inks(palette: &SyntaxPalette) -> Vec<Color> {
+    SINCE_CODE_ROLES
+        .iter()
+        .map(|role| palette.resolve(*role, role.fallback()).to_tui())
+        .collect()
+}
+
+/// An ink a comparison tint must keep readable, and the contrast it needs.
+#[derive(Debug, Clone, Copy)]
+struct SinceInk {
+    color: Rgb,
+    floor: f64,
+}
+
+/// Background of a comparison tint over `base`: `share` of `hue`'s color, lit no further than
+/// keeps every ink readable.
+///
+/// Each ink keeps its floor, or nearly all of its contrast on `base` ([`SINCE_INK_KEEP`]) when
+/// that is less. The tint takes the hue and chroma of `share` of `hue` mixed into `base`; its
+/// lightness moves from `base`'s toward that mix only as far as the inks allow, and is pushed
+/// a little further away from `text` (darker under light text, lighter under dark text) when
+/// even `base`'s lightness is not enough. Only then is the share lowered; with no share left it
+/// is `base` itself. Only the strength of the tint is chosen: the hue, the base, and every ink
+/// are the theme's own.
+fn readable_tint(
+    base: Color,
+    hue: Color,
+    share: f64,
+    text: Option<Color>,
+    inks: &[SinceInk],
+) -> Option<Color> {
+    let base = base.approximate_rgb()?;
+    let hue = hue.approximate_rgb()?;
+    let needed: Vec<(Rgb, f64)> = inks
+        .iter()
+        .map(|ink| {
+            let own = ink.color.contrast_ratio(base);
+            (ink.color, ink.floor.min(own * SINCE_INK_KEEP))
+        })
+        .collect();
+    let readable = |fill: Rgb| {
+        needed
+            .iter()
+            .all(|(ink, needed)| ink.contrast_ratio(fill) >= *needed)
+    };
+    let text_is_lighter = text
+        .and_then(Color::approximate_rgb)
+        .is_none_or(|text| text.relative_luminance() > base.relative_luminance());
+    let away = if text_is_lighter { -1.0 } else { 1.0 };
+    let base_lab = Oklab::from(base);
+    let steps = f64::from(SINCE_STEPS);
+    let fractions = |from: u32, to: u32| (from..=to).map(move |step| f64::from(step) / steps);
+    let tint_at = |share: f64| {
+        let mix = Oklab::from(bmux_color::mix(hue, base, share));
+        let lit = fractions(0, SINCE_STEPS)
+            .rev()
+            .map(move |lift| (mix.l - base_lab.l).mul_add(lift, base_lab.l));
+        let deepened = fractions(1, SINCE_STEPS)
+            .map(move |deepen| (away * SINCE_MAX_DEEPEN).mul_add(deepen, base_lab.l));
+        lit.chain(deepened)
+            .map(move |l| Oklab::new(l, mix.a, mix.b).to_rgb())
+            .find(|fill| readable(*fill))
+    };
+    let fill = fractions(1, SINCE_STEPS)
+        .rev()
+        .map(|part| share * part)
+        .find_map(tint_at)
+        .unwrap_or(base);
+    Some(Color::from(fill))
+}
 
 /// A comparison's styles: its hue (the second accent, else info) tints changed rows more
 /// strongly and colors the gutter bar and badges.
-fn since_styles(tiers: &Tiers, component: &ComponentTheme, diff: &DiffViewerStyle) -> SinceStyles {
+///
+/// Tints keep the row's text, its gutter, and the `syntax` colors readable
+/// ([`readable_tint`]).
+fn since_styles(
+    tiers: &Tiers,
+    component: &ComponentTheme,
+    diff: &DiffViewerStyle,
+    syntax: &[Color],
+) -> SinceStyles {
     let hue = tiers.accent_alt.fg.or(component.info.fg);
+    let text = diff.added_row.fg.or(tiers.text.fg);
+    let ink_of = |color: Option<Color>, floor: f64| {
+        color
+            .and_then(Color::approximate_rgb)
+            .map(|color| SinceInk { color, floor })
+    };
+    let inks: Vec<SinceInk> = [
+        ink_of(text, SINCE_TEXT_FLOOR),
+        ink_of(diff.muted.fg, SINCE_INK_FLOOR),
+    ]
+    .into_iter()
+    .chain(
+        syntax
+            .iter()
+            .map(|color| ink_of(Some(*color), SINCE_INK_FLOOR)),
+    )
+    .flatten()
+    .collect();
     // Terminal palette colors blend by their usual values, so themes built on the terminal's
     // own colors get tints too.
-    let blend = |base: Option<Color>, share: f64| base?.mix(hue?, share);
-    let tint = |row: Style| {
-        blend(row.bg.or(tiers.canvas.bg), SINCE_TINT_SHARE).map_or(row, |bg| row.bg(bg))
+    let fill = |base: Option<Color>, share: f64| {
+        readable_tint(base.or(tiers.canvas.bg)?, hue?, share, text, &inks)
     };
+    let tinted = |row: Style, share: f64| fill(row.bg, share).map_or(row, |bg| row.bg(bg));
     let ink = hue.map_or(tiers.accent, |fg| Style::new().fg(fg));
-    let strong = |row: Style| {
-        blend(row.bg.or(tiers.canvas.bg), SINCE_STRONG_TINT_SHARE).map_or(row, |bg| row.bg(bg))
-    };
     let accent = tiers.accent.fg.map_or(ink, |fg| Style::new().fg(fg));
-    let word = blend(diff.added_row.bg.or(tiers.canvas.bg), SINCE_WORD_SHARE)
+    let word = fill(diff.added_row.bg, SINCE_WORD_SHARE)
         .map_or_else(Style::new, |bg| Style::new().bg(bg))
         .add_modifier(Modifier::UNDERLINE);
     SinceStyles {
         diff: DiffViewerStyle {
-            added_row: tint(diff.added_row),
-            removed_row: tint(diff.removed_row),
+            added_row: tinted(diff.added_row, SINCE_TINT_SHARE),
+            removed_row: tinted(diff.removed_row, SINCE_TINT_SHARE),
             ..*diff
         },
         bar: ink.add_modifier(Modifier::BOLD),
         badge: ink.add_modifier(Modifier::BOLD),
         note: tiers.muted,
         strong_diff: DiffViewerStyle {
-            added_row: strong(diff.added_row),
-            removed_row: strong(diff.removed_row),
+            added_row: tinted(diff.added_row, SINCE_STRONG_TINT_SHARE),
+            removed_row: tinted(diff.removed_row, SINCE_STRONG_TINT_SHARE),
             ..*diff
         },
         strong_bar: accent.add_modifier(Modifier::BOLD),
@@ -1263,6 +1402,60 @@ mod tests {
     }
 
     #[test]
+    fn marks_of_what_is_new_keep_the_rows_readable_in_every_bundled_theme() {
+        let rgb = |color: Option<Color>| color.and_then(Color::approximate_rgb);
+        for (name, host) in bundled_hosts() {
+            let theme = ReviewTheme::derive(Some(&host.styles), IconStyle::Unicode);
+            let since = theme.since;
+            let text = theme.diff.added_row.fg.or(theme.tiers.text.fg);
+            let inks: Vec<(&str, Option<Color>, f64)> = [
+                ("text", text, SINCE_TEXT_FLOOR),
+                ("gutter", theme.diff.muted.fg, SINCE_INK_FLOOR),
+            ]
+            .into_iter()
+            .chain(SINCE_CODE_ROLES.iter().map(|role| {
+                let color = host.styles.syntax.resolve(*role, role.fallback()).to_tui();
+                ("syntax", Some(color), SINCE_INK_FLOOR)
+            }))
+            .collect();
+            let fills = [
+                ("added", theme.diff.added_row, since.diff.added_row),
+                ("removed", theme.diff.removed_row, since.diff.removed_row),
+                (
+                    "strong added",
+                    theme.diff.added_row,
+                    since.strong_diff.added_row,
+                ),
+                (
+                    "strong removed",
+                    theme.diff.removed_row,
+                    since.strong_diff.removed_row,
+                ),
+                ("words", theme.diff.added_row, since.word),
+            ];
+            for (fill, plain, marked) in fills {
+                let canvas = theme.tiers.canvas.bg;
+                let (Some(plain), Some(marked)) =
+                    (rgb(plain.bg.or(canvas)), rgb(marked.bg.or(canvas)))
+                else {
+                    continue;
+                };
+                // A mark may cost an ink a little contrast, never its readability: each keeps
+                // its floor, or nearly all it had on the plain row when that was less.
+                for (ink_name, ink, floor) in &inks {
+                    let Some(ink) = rgb(*ink) else { continue };
+                    let own = ink.contrast_ratio(plain);
+                    let kept = ink.contrast_ratio(marked);
+                    assert!(
+                        kept + 1e-9 >= floor.min(own * SINCE_INK_KEEP),
+                        "{name}: {ink_name} on {fill}: {kept:.2} (plain {own:.2})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn marks_of_what_is_new_stand_out_in_every_bundled_theme() {
         for (name, theme) in bundled_themes() {
             let since = theme.since;
@@ -1327,7 +1520,7 @@ mod tests {
     }
 
     /// Every bundled bcode theme, dark and light variants alike.
-    fn bundled_themes() -> Vec<(String, ReviewTheme)> {
+    fn bundled_hosts() -> Vec<(String, HostTheme)> {
         use bcode_tui_theme::definition::{
             ResolvedThemeVariant, ThemeCatalog, ThemeKind, ThemeSelection,
         };
@@ -1351,14 +1544,21 @@ mod tests {
                 };
                 let id = format!("{selection:?}");
                 let host = HostTheme::from_definition(Some(&resolved));
-                themes.push((
-                    format!("{id} ({variant:?})"),
-                    ReviewTheme::derive(Some(&host.styles), IconStyle::Unicode),
-                ));
+                themes.push((format!("{id} ({variant:?})"), host));
             }
         }
         assert!(themes.len() > 20, "{}", themes.len());
         themes
+    }
+
+    fn bundled_themes() -> Vec<(String, ReviewTheme)> {
+        bundled_hosts()
+            .into_iter()
+            .map(|(name, host)| {
+                let theme = ReviewTheme::derive(Some(&host.styles), IconStyle::Unicode);
+                (name, theme)
+            })
+            .collect()
     }
 
     #[test]
