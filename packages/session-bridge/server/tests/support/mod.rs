@@ -1,6 +1,9 @@
 //! A real in-process daemon with the fake provider, and a bridge serving it, shared by the
 //! bridge's end-to-end tests.
 
+// Each test binary uses part of this support.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use bcode_client::BcodeClient;
@@ -13,19 +16,50 @@ pub const WAIT: Duration = Duration::from_secs(30);
 pub struct Daemon {
     pub directory: tempfile::TempDir,
     pub client: BcodeClient,
-    shutdown: bcode_agent_runtime::CancellationToken,
-    server: tokio::task::JoinHandle<()>,
+    served: Served,
 }
 
 impl Daemon {
     pub async fn stop(self) {
-        self.shutdown.cancel();
-        let _ = tokio::time::timeout(WAIT, self.server).await;
+        self.served.stop().await;
     }
 
     pub fn workspace(&self) -> String {
         self.directory.path().display().to_string()
     }
+}
+
+/// A daemon serving a state root the caller owns, so another daemon can serve it after this
+/// one stops.
+pub struct Served {
+    pub client: BcodeClient,
+    shutdown: bcode_agent_runtime::CancellationToken,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Served {
+    pub async fn stop(self) {
+        self.shutdown.cancel();
+        let _ = tokio::time::timeout(WAIT, self.server).await;
+    }
+}
+
+/// The state location of `root`'s `state` directory, as the daemon resolves it.
+pub fn state_location(root: &std::path::Path) -> bcode_config::StateLocation {
+    bcode_config::resolve_state_location_set_with_environment(
+        &bcode_config::StateConfig::default(),
+        &bcode_config::StateLocationSelection {
+            root: Some(root.join("state")),
+            profile: None,
+        },
+        &bcode_config::ConfigEnvironmentSnapshot::new(
+            std::collections::BTreeMap::new(),
+            root.to_path_buf(),
+        ),
+    )
+    .expect("locations")
+    .primary()
+    .clone()
 }
 
 fn config() -> bcode_config::BcodeConfig {
@@ -49,34 +83,60 @@ fn plugin_ids() -> Vec<String> {
 /// Start a daemon with the fake provider, SDK session import, and `extra` plugins.
 pub async fn start_daemon(extra: Vec<(bcode_plugin::StaticBundledPlugin, &str)>) -> Daemon {
     let directory = tempfile::tempdir().expect("directory");
+    // The daemon only binds sockets inside a private directory.
+    let ipc_directory = directory.path().join("ipc");
+    private_directory(&ipc_directory);
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(ipc_directory.join("bridge.sock"));
+    let served = serve_daemon(directory.path(), endpoint, extra, true).await;
+    Daemon {
+        client: served.client.clone(),
+        directory,
+        served,
+    }
+}
+
+/// Create `path` readable only by this user, as the daemon requires of its socket directory.
+pub fn private_directory(path: &std::path::Path) {
+    std::fs::create_dir_all(path).expect("ipc directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private ipc directory");
+    }
+}
+
+/// Serve `root`'s state at `endpoint` with SDK session import and `extra` plugins, and with
+/// the fake model provider when `provider` is set. Without it, the configured model's
+/// provider is missing, as in a provider outage.
+pub async fn serve_daemon(
+    root: &std::path::Path,
+    endpoint: bcode_ipc::IpcEndpoint,
+    extra: Vec<(bcode_plugin::StaticBundledPlugin, &str)>,
+    provider: bool,
+) -> Served {
+    let location = state_location(root);
     let locations = bcode_config::resolve_state_location_set_with_environment(
         &bcode_config::StateConfig::default(),
         &bcode_config::StateLocationSelection {
-            root: Some(directory.path().join("state")),
+            root: Some(root.join("state")),
             profile: None,
         },
         &bcode_config::ConfigEnvironmentSnapshot::new(
             std::collections::BTreeMap::new(),
-            directory.path().to_path_buf(),
+            root.to_path_buf(),
         ),
     )
     .expect("locations");
-    // The daemon only binds sockets inside a private directory.
-    let ipc_directory = directory.path().join("ipc");
-    std::fs::create_dir(&ipc_directory).expect("ipc directory");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&ipc_directory, std::fs::Permissions::from_mode(0o700))
-            .expect("private ipc directory");
-    }
-    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(ipc_directory.join("bridge.sock"));
     let config = config();
     let mut ids = plugin_ids();
+    if !provider {
+        ids.retain(|id| id != "bcode.fake-provider");
+    }
     ids.extend(extra.iter().map(|(_, id)| (*id).to_owned()));
     let selection = bcode_config::plugin_selection_with_default_plugin_ids(&config, ids.clone());
     let context = bcode_ipc::ClientRuntimeContext {
-        working_directory: Some(directory.path().to_path_buf()),
+        working_directory: Some(root.to_path_buf()),
         effective_config_toml: Some(Box::new(
             bcode_config::encode_effective_config(&config).expect("config"),
         )),
@@ -84,18 +144,18 @@ pub async fn start_daemon(extra: Vec<(bcode_plugin::StaticBundledPlugin, &str)>)
         selected_model_id: Some("fake-echo".into()),
         ..bcode_ipc::ClientRuntimeContext::default()
     };
-    let client = BcodeClient::for_state_location(endpoint.clone(), locations.primary())
+    let client = BcodeClient::for_state_location(endpoint.clone(), &location)
         .with_runtime_context(Some(context));
-    let mut static_plugins = vec![
-        bcode_plugin::StaticBundledPlugin::from_definition(
+    let mut static_plugins = vec![bcode_plugin::StaticBundledPlugin::from_definition(
+        include_str!("../../../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
+        bcode_sdk_session_import_plugin::plugin_definition,
+    )];
+    if provider {
+        static_plugins.push(bcode_plugin::StaticBundledPlugin::from_definition(
             include_str!("../../../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
             bcode_fake_provider_plugin::plugin_definition,
-        ),
-        bcode_plugin::StaticBundledPlugin::from_definition(
-            include_str!("../../../../../plugins/sdk-session-import-plugin/bcode-plugin.toml"),
-            bcode_sdk_session_import_plugin::plugin_definition,
-        ),
-    ];
+        ));
+    }
     static_plugins.extend(extra.into_iter().map(|(plugin, _)| plugin));
     let plugins =
         bcode_server::load_embedded_plugins(&selection, &static_plugins).expect("plugins");
@@ -125,8 +185,7 @@ pub async fn start_daemon(extra: Vec<(bcode_plugin::StaticBundledPlugin, &str)>)
     })
     .await
     .expect("daemon answers");
-    Daemon {
-        directory,
+    Served {
         client,
         shutdown,
         server,

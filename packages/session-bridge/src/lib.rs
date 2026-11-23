@@ -104,13 +104,18 @@ impl Drop for Shared {
 }
 
 /// A recorded feedback item and how its triage started.
+///
+/// The item's `triage_dispatch` says where triage stands: `started` with an intake turn,
+/// `queued` for a retry the daemon makes on its own, `blocked` until a person asks again, or
+/// `skipped`. Bridges that predate durable triage leave it absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedbackSubmission {
     /// The item, recorded whether or not triage started.
     pub item: models::bcode_feedback_models::FeedbackItem,
     /// The intake turn triaging it, when triage started.
     pub intake: Option<models::FeedbackIntake>,
-    /// Why triage did not start.
+    /// Why this attempt to start triage failed: `feedback_triage_queued` (it is retried) or
+    /// `feedback_triage_blocked`.
     pub triage_error: Option<models::BridgeError>,
 }
 
@@ -674,11 +679,13 @@ impl BridgeClient {
         }
     }
 
-    /// Record feedback, then hand it to the feedback intake session (bridge protocol 2).
+    /// Record feedback with the decision to triage it, then hand it to the feedback intake
+    /// session (bridge protocol 2).
     ///
     /// With `claim`, the intake session is claimed for this application's registered tools
-    /// first, so the intake agent can call them. The item is recorded even when triage cannot
-    /// start; the response's `triage_error` says why.
+    /// first, so the intake agent can call them. The item and its triage request are saved
+    /// together: when triage cannot start now, the daemon keeps delivering it, even after this
+    /// application closes. The response's item and `triage_error` say where triage stands.
     ///
     /// # Errors
     ///
@@ -690,15 +697,39 @@ impl BridgeClient {
         instructions: Option<String>,
         claim: bool,
     ) -> Result<FeedbackSubmission, BridgeClientError> {
-        match self
-            .request(BridgeRequest::FeedbackSubmit {
-                item,
-                instructions,
-                claim,
-                skip_triage: false,
-            })
-            .await?
-        {
+        self.feedback_submission(BridgeRequest::FeedbackSubmit {
+            item,
+            instructions,
+            claim,
+            skip_triage: false,
+        })
+        .await
+    }
+
+    /// Record feedback without triaging it (bridge protocol 2). Nothing sends it to the intake
+    /// agent unless a person asks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::feedback_submit`].
+    pub async fn feedback_record(
+        &self,
+        item: models::bcode_feedback_models::RecordFeedbackRequest,
+    ) -> Result<FeedbackSubmission, BridgeClientError> {
+        self.feedback_submission(BridgeRequest::FeedbackSubmit {
+            item,
+            instructions: None,
+            claim: false,
+            skip_triage: true,
+        })
+        .await
+    }
+
+    async fn feedback_submission(
+        &self,
+        request: BridgeRequest,
+    ) -> Result<FeedbackSubmission, BridgeClientError> {
+        match self.request(request).await? {
             BridgeResponse::FeedbackSubmitted {
                 item,
                 intake,

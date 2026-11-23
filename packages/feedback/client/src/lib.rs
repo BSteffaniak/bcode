@@ -6,10 +6,16 @@
 //!
 //! Every call acts for the person. The intake session is the single long-lived session that
 //! triages new items as follow-up turns, so it keeps what it learns across unrelated items.
-//! [`ensure_intake_session`], [`submit_to_intake`] and [`wait_for_reply`] are separate so a
-//! caller can claim the session for its own tools before the turn starts.
+//!
+//! Submitting clients record an item together with its triage request
+//! ([`record_for_triage`]) and try to deliver it at once ([`deliver`]); the daemon's
+//! dispatcher ([`worker`]) delivers whatever is still queued, with backoff and across
+//! restarts. [`ensure_intake_session`], [`submit_generation`] and [`wait_for_reply`] are the
+//! parts of one delivery.
 
+pub mod dispatch;
 mod intake;
+pub mod worker;
 
 use bcode_client::BcodeClient;
 use bcode_feedback_models::{
@@ -18,9 +24,14 @@ use bcode_feedback_models::{
     OP_LINK, OP_LIST, OP_RECORD, OP_SET_STATUS, RecordFeedbackRequest, SetFeedbackStatusRequest,
 };
 
+pub use bcode_feedback_models::MAX_APP_INSTRUCTIONS_BYTES;
+pub use dispatch::{
+    ClaimIntake, DELIVERY_LEASE, Delivery, deliver, deliver_leased, holder, record_for_triage,
+    request_triage,
+};
 pub use intake::{
-    IntakeReceipt, MAX_APP_INSTRUCTIONS_BYTES, ensure_intake_session, final_reply, intake_context,
-    submit_to_intake, wait_for_reply,
+    IntakeReceipt, SubmitFailure, ensure_intake_session, final_reply, intake_context,
+    submit_generation, submit_to_intake, wait_for_reply,
 };
 
 /// Failure of a feedback call.

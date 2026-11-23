@@ -33,6 +33,7 @@ tokio = { workspace = true, features = [
 [dev-dependencies]
 bcode_agent_runtime = { workspace = true }
 bcode_config = { workspace = true }
+bcode_default_agents_plugin = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = [
     "script-controls",
 ] }

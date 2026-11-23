@@ -43,6 +43,29 @@ pub const OP_INTAKE_SESSION: &str = "intake_session";
 pub const OP_CLAIM_INTAKE_SESSION: &str = "claim_intake_session";
 /// Copy a file or directory into an item: [`AttachFeedbackRequest`] → [`FeedbackItem`].
 pub const OP_ATTACH: &str = "attach";
+/// Record an item and its triage decision in one write: [`RecordForTriageRequest`] →
+/// [`FeedbackItem`].
+pub const OP_RECORD_FOR_TRIAGE: &str = "record_for_triage";
+/// Queue an untriaged item for triage, again or for the first time: [`RequestTriageRequest`] →
+/// [`FeedbackItem`].
+pub const OP_REQUEST_TRIAGE: &str = "request_triage";
+/// Take the dispatch lease of one queued item: [`LeaseTriageRequest`] →
+/// an optional [`TriageLease`].
+pub const OP_LEASE_TRIAGE: &str = "lease_triage";
+/// Take the dispatch leases of queued items that are due: [`LeaseDueTriageRequest`] →
+/// a list of [`TriageLease`].
+pub const OP_LEASE_DUE_TRIAGE: &str = "lease_due_triage";
+/// Record that a leased item's intake turn was admitted: [`TriageStartedRequest`] →
+/// [`FeedbackItem`].
+pub const OP_TRIAGE_STARTED: &str = "triage_started";
+/// Record that a leased item's dispatch failed: [`TriageFailedRequest`] → [`FeedbackItem`].
+pub const OP_TRIAGE_FAILED: &str = "triage_failed";
+/// Untriaged items whose intake turn was admitted: [`StartedTriageQuery`] →
+/// a list of [`StartedTriage`].
+pub const OP_STARTED_TRIAGES: &str = "started_triages";
+/// Record that an item's intake turn ended without triaging it: [`TriageTurnEndedRequest`] →
+/// [`FeedbackItem`].
+pub const OP_TRIAGE_TURN_ENDED: &str = "triage_turn_ended";
 
 /// Maximum UTF-8 bytes of feedback text.
 pub const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -82,6 +105,14 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_ATTACHMENT_FILES: usize = 1024;
 /// Maximum UTF-8 bytes of an attachment name or media type.
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 bytes of a dispatch lease holder.
+pub const MAX_HOLDER_BYTES: usize = 128;
+/// Longest dispatch lease, in milliseconds.
+pub const MAX_LEASE_MS: u64 = 10 * 60 * 1000;
+/// Maximum leases or started items returned by one call.
+pub const MAX_DISPATCH_BATCH: usize = 64;
+/// Maximum UTF-8 bytes of an application's own triage instructions.
+pub const MAX_APP_INSTRUCTIONS_BYTES: usize = 4 * 1024;
 
 /// Reason a feedback value or request is rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -146,6 +177,16 @@ pub enum FeedbackValidationError {
     /// A feedback id does not parse.
     #[error("feedback ids look like fb-12")]
     InvalidId,
+    /// Application triage instructions are empty or longer than
+    /// [`MAX_APP_INSTRUCTIONS_BYTES`].
+    #[error("application instructions must be 1-{MAX_APP_INSTRUCTIONS_BYTES} bytes")]
+    InvalidInstructions,
+    /// A dispatch lease holder is malformed, or a lease is empty or longer than
+    /// [`MAX_LEASE_MS`].
+    #[error(
+        "lease holders are 1-{MAX_HOLDER_BYTES} bytes without whitespace, and leases last 1-{MAX_LEASE_MS} ms"
+    )]
+    InvalidLease,
 }
 
 /// Stable, human-friendly identity of a feedback item, written `fb-<n>`.
@@ -355,6 +396,10 @@ pub struct FeedbackItem {
     /// Files and directories attached to the item, such as a recording clip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<FeedbackAttachment>,
+    /// Automatic triage: whether it was asked for and how far it got. Absent when the item
+    /// was recorded without a decision, such as by an agent or an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_dispatch: Option<TriageDispatch>,
 }
 
 impl FeedbackItem {
@@ -719,6 +764,370 @@ impl ClaimIntakeSessionRequest {
     }
 }
 
+/// Whether an item recorded with [`OP_RECORD_FOR_TRIAGE`] goes to the intake agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriageIntent {
+    /// Queue the item for the intake agent; it is delivered until a turn triages it.
+    Requested {
+        /// What the reporting application offers the intake agent, such as its own tools for
+        /// capturing context around the feedback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
+    /// Record only. Nothing sends the item to the intake agent unless a person asks.
+    Skipped,
+}
+
+/// Record an item together with its triage decision, in one write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordForTriageRequest {
+    /// The item.
+    pub item: RecordFeedbackRequest,
+    /// Whether it goes to the intake agent.
+    pub triage: TriageIntent,
+}
+
+impl RecordForTriageRequest {
+    /// Check every bound.
+    ///
+    /// # Errors
+    /// * [`RecordFeedbackRequest::validate`]'s errors.
+    /// * [`FeedbackValidationError::InvalidInstructions`] for empty or oversized application
+    ///   instructions.
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        self.item.validate()?;
+        if let TriageIntent::Requested {
+            instructions: Some(instructions),
+        } = &self.triage
+        {
+            validate_instructions(instructions)?;
+        }
+        Ok(())
+    }
+}
+
+/// How far an item's automatic triage got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageDispatchState {
+    /// Waiting to be delivered to the intake agent, now or after a retry delay.
+    Queued,
+    /// An intake turn was admitted and has not triaged the item yet.
+    Started,
+    /// Delivery stopped; a person must ask again (`feedback triage <id>`).
+    Blocked,
+    /// The person asked not to triage it.
+    Skipped,
+    /// The item was triaged.
+    Completed,
+}
+
+/// Automatic triage of one item: the durable request and its delivery progress.
+///
+/// Delivery is at-least-once per generation and deduplicated by the intake session: every
+/// attempt of a generation submits the same idempotent turn, so a retry after a lost
+/// acknowledgement finds the turn already admitted instead of starting another. A new
+/// generation, and so a new turn, begins only when a turn ended without triaging the item or a
+/// person asked again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageDispatch {
+    /// Where delivery stands.
+    pub state: TriageDispatchState,
+    /// Intake turn generation, from 1.
+    pub generation: u32,
+    /// Failed delivery attempts since the request or the last admitted turn.
+    pub attempts: u32,
+    /// When triage was requested, in Unix milliseconds.
+    pub requested_at_ms: u64,
+    /// When the delivery state last changed, in Unix milliseconds.
+    pub updated_at_ms: u64,
+    /// While queued: the earliest next attempt, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at_ms: Option<u64>,
+    /// Why the last attempt failed, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// While blocked: why delivery stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// The intake session of the latest admitted turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The latest admitted intake turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+impl TriageDispatch {
+    /// Whether delivery is waiting on a retry after a failure.
+    #[must_use]
+    pub const fn is_retrying(&self) -> bool {
+        matches!(self.state, TriageDispatchState::Queued) && self.attempts > 0
+    }
+}
+
+/// Queue an untriaged item for triage. A blocked or skipped item is queued again; an item whose
+/// turn was admitted gets a new generation, so a new turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestTriageRequest {
+    /// The item.
+    pub id: FeedbackId,
+}
+
+/// Take the dispatch lease of one queued item, whether or not its retry delay has passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseTriageRequest {
+    /// The item.
+    pub id: FeedbackId,
+    /// Who is dispatching, unique per dispatcher.
+    pub holder: String,
+    /// How long the lease lasts, at most [`MAX_LEASE_MS`].
+    pub lease_ms: u64,
+}
+
+impl LeaseTriageRequest {
+    /// Check the holder and lease length.
+    ///
+    /// # Errors
+    /// [`FeedbackValidationError::InvalidLease`] for a malformed holder or lease length.
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        validate_lease(&self.holder, self.lease_ms)
+    }
+}
+
+/// Take the dispatch leases of queued items whose retry delay has passed, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseDueTriageRequest {
+    /// Who is dispatching, unique per dispatcher.
+    pub holder: String,
+    /// How long each lease lasts, at most [`MAX_LEASE_MS`].
+    pub lease_ms: u64,
+    /// Most items, at most [`MAX_DISPATCH_BATCH`].
+    pub limit: usize,
+    /// Lease queued items even before their retry delay passed, as a dispatcher that just
+    /// started does: the outage that delayed them may be over.
+    #[serde(default)]
+    pub ignore_retry_delay: bool,
+}
+
+impl LeaseDueTriageRequest {
+    /// Check the holder, lease length and limit.
+    ///
+    /// # Errors
+    /// [`FeedbackValidationError::InvalidLease`] or [`FeedbackValidationError::InvalidLimit`].
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        validate_lease(&self.holder, self.lease_ms)?;
+        validate_batch(self.limit)
+    }
+}
+
+/// A leased item to deliver to the intake agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageLease {
+    /// The item, as stored.
+    pub item: FeedbackItem,
+    /// The generation to deliver; its intake turn uses [`TriageLease::idempotency_key`].
+    pub generation: u32,
+    /// The reporting application's instructions for the intake agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// The lease holder.
+    pub holder: String,
+}
+
+impl TriageLease {
+    /// The idempotency key of this generation's intake turn. Every attempt of a generation
+    /// uses the same key, so the intake session admits at most one turn for it.
+    #[must_use]
+    pub fn idempotency_key(&self) -> String {
+        triage_idempotency_key(self.item.id, self.generation)
+    }
+}
+
+/// The idempotency key of `generation`'s intake turn for `id`.
+#[must_use]
+pub fn triage_idempotency_key(id: FeedbackId, generation: u32) -> String {
+    if generation <= 1 {
+        format!("feedback:{id}")
+    } else {
+        format!("feedback:{id}:{generation}")
+    }
+}
+
+/// The leased generation's intake turn was admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageStartedRequest {
+    /// The item.
+    pub id: FeedbackId,
+    /// The lease holder.
+    pub holder: String,
+    /// The leased generation.
+    pub generation: u32,
+    /// The intake session.
+    pub session_id: String,
+    /// The admitted turn.
+    pub turn_id: String,
+}
+
+impl TriageStartedRequest {
+    /// Check the references.
+    ///
+    /// # Errors
+    /// [`FeedbackValidationError::InvalidReference`] or [`FeedbackValidationError::InvalidLease`].
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        validate_holder(&self.holder)?;
+        validate_reference(&self.session_id)?;
+        validate_reference(&self.turn_id)
+    }
+}
+
+/// The leased generation could not be delivered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageFailedRequest {
+    /// The item.
+    pub id: FeedbackId,
+    /// The lease holder.
+    pub holder: String,
+    /// The leased generation.
+    pub generation: u32,
+    /// What went wrong.
+    pub reason: String,
+    /// Retry after a delay (a transient failure); otherwise delivery is blocked.
+    pub retry: bool,
+}
+
+impl TriageFailedRequest {
+    /// Check the holder and reason.
+    ///
+    /// # Errors
+    /// [`FeedbackValidationError::InvalidLease`] or [`FeedbackValidationError::InvalidNote`].
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        validate_holder(&self.holder)?;
+        validate_note(&self.reason)
+    }
+}
+
+/// List untriaged items whose intake turn was admitted, oldest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartedTriageQuery {
+    /// Most items, at most [`MAX_DISPATCH_BATCH`].
+    pub limit: usize,
+}
+
+/// An admitted intake turn that has not triaged its item yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartedTriage {
+    /// The item.
+    pub id: FeedbackId,
+    /// The delivered generation.
+    pub generation: u32,
+    /// The intake session.
+    pub session_id: String,
+    /// The admitted turn.
+    pub turn_id: String,
+}
+
+/// How an intake turn that did not triage its item ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeTurnEnding {
+    /// The model or its provider failed; deliver a new generation after a delay.
+    Failed,
+    /// The turn finished without triaging; deliver a new generation, up to
+    /// [`MAX_TRIAGE_GENERATIONS`] turns.
+    Untriaged,
+    /// A person cancelled it; delivery is blocked until they ask again.
+    Cancelled,
+}
+
+/// Turns that may finish without triaging before delivery is blocked.
+pub const MAX_TRIAGE_GENERATIONS: u32 = 3;
+
+/// An item's admitted intake turn ended without triaging it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageTurnEndedRequest {
+    /// The item.
+    pub id: FeedbackId,
+    /// The delivered generation.
+    pub generation: u32,
+    /// The turn that ended.
+    pub turn_id: String,
+    /// How it ended.
+    pub ending: IntakeTurnEnding,
+    /// The turn's outcome, for the person.
+    pub detail: String,
+}
+
+impl TriageTurnEndedRequest {
+    /// Check the references.
+    ///
+    /// # Errors
+    /// [`FeedbackValidationError::InvalidReference`] or [`FeedbackValidationError::InvalidNote`].
+    pub fn validate(&self) -> Result<(), FeedbackValidationError> {
+        validate_reference(&self.turn_id)?;
+        validate_note(&self.detail)
+    }
+}
+
+/// Check an application's triage instructions: 1-[`MAX_APP_INSTRUCTIONS_BYTES`] bytes.
+///
+/// # Errors
+/// [`FeedbackValidationError::InvalidInstructions`] when empty or oversized.
+pub fn validate_instructions(instructions: &str) -> Result<(), FeedbackValidationError> {
+    if instructions.trim().is_empty() || instructions.len() > MAX_APP_INSTRUCTIONS_BYTES {
+        Err(FeedbackValidationError::InvalidInstructions)
+    } else {
+        Ok(())
+    }
+}
+
+/// Check the size of a dispatch batch: 1-[`MAX_DISPATCH_BATCH`].
+///
+/// # Errors
+/// [`FeedbackValidationError::InvalidLimit`] when out of range.
+pub const fn validate_batch(limit: usize) -> Result<(), FeedbackValidationError> {
+    if limit == 0 || limit > MAX_DISPATCH_BATCH {
+        Err(FeedbackValidationError::InvalidLimit)
+    } else {
+        Ok(())
+    }
+}
+
+/// `text` trimmed and cut to at most [`MAX_NOTE_BYTES`] on a character boundary, for
+/// diagnostics such as delivery errors whose length the caller does not control.
+#[must_use]
+pub fn bounded_note(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return "unknown failure".to_owned();
+    }
+    let mut end = text.len().min(MAX_NOTE_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+fn validate_holder(holder: &str) -> Result<(), FeedbackValidationError> {
+    if holder.is_empty()
+        || holder.len() > MAX_HOLDER_BYTES
+        || holder.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        Err(FeedbackValidationError::InvalidLease)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_lease(holder: &str, lease_ms: u64) -> Result<(), FeedbackValidationError> {
+    validate_holder(holder)?;
+    if lease_ms == 0 || lease_ms > MAX_LEASE_MS {
+        return Err(FeedbackValidationError::InvalidLease);
+    }
+    Ok(())
+}
+
 /// Check an application id: 1-64 bytes of `[a-z0-9._-]`.
 ///
 /// # Errors
@@ -875,6 +1284,7 @@ mod tests {
             status: FeedbackStatus::Open,
             status_change: None,
             links: Vec::new(),
+            triage_dispatch: None,
             attachments: vec![FeedbackAttachment {
                 ordinal: 1,
                 name: "clip".into(),

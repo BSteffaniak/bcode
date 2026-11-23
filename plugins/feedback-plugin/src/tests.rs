@@ -273,3 +273,78 @@ fn tools_record_and_search_facets_as_key_value_records() {
         [] as [Value; 0]
     );
 }
+
+#[test]
+fn recording_for_triage_saves_the_request_and_dispatch_operations_are_served() {
+    use bcode_feedback_models::{
+        LeaseDueTriageRequest, OP_LEASE_DUE_TRIAGE, OP_RECORD_FOR_TRIAGE, OP_REQUEST_TRIAGE,
+        OP_TRIAGE_FAILED, RecordForTriageRequest, RequestTriageRequest, TriageDispatchState,
+        TriageFailedRequest, TriageIntent, TriageLease,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut plugin = FeedbackPlugin::with_state_dir(dir.path().to_owned());
+    let item: FeedbackItem = service(
+        &mut plugin,
+        OP_RECORD_FOR_TRIAGE,
+        &RecordForTriageRequest {
+            item: RecordFeedbackRequest {
+                app: "bmux".into(),
+                text: "the pane froze".into(),
+                facets: Vec::new(),
+            },
+            triage: TriageIntent::Requested { instructions: None },
+        },
+    )
+    .unwrap();
+    let state = |item: &FeedbackItem| item.triage_dispatch.as_ref().map(|dispatch| dispatch.state);
+    assert_eq!(state(&item), Some(TriageDispatchState::Queued));
+
+    let leases: Vec<TriageLease> = service(
+        &mut plugin,
+        OP_LEASE_DUE_TRIAGE,
+        &LeaseDueTriageRequest {
+            holder: "test".into(),
+            lease_ms: 60_000,
+            limit: 4,
+            ignore_retry_delay: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(leases.len(), 1);
+    let blocked: FeedbackItem = service(
+        &mut plugin,
+        OP_TRIAGE_FAILED,
+        &TriageFailedRequest {
+            id: item.id,
+            holder: "test".into(),
+            generation: leases[0].generation,
+            reason: "the intake session refused the turn".into(),
+            retry: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(state(&blocked), Some(TriageDispatchState::Blocked));
+    let again: FeedbackItem = service(
+        &mut plugin,
+        OP_REQUEST_TRIAGE,
+        &RequestTriageRequest { id: item.id },
+    )
+    .unwrap();
+    assert_eq!(state(&again), Some(TriageDispatchState::Queued));
+
+    let invalid = service::<FeedbackItem>(
+        &mut plugin,
+        OP_RECORD_FOR_TRIAGE,
+        &RecordForTriageRequest {
+            item: RecordFeedbackRequest {
+                app: "bmux".into(),
+                text: "x".into(),
+                facets: Vec::new(),
+            },
+            triage: TriageIntent::Requested {
+                instructions: Some(" ".into()),
+            },
+        },
+    );
+    assert_eq!(invalid.unwrap_err(), "invalid_request");
+}

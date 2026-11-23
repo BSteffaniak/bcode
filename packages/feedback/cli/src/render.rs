@@ -2,15 +2,16 @@
 
 use std::fmt::Write as _;
 
-use bcode_feedback_models::{FeedbackItem, FeedbackPage, FeedbackStatus, TriageState};
+use bcode_feedback_models::{
+    FeedbackItem, FeedbackPage, FeedbackStatus, TriageDispatch, TriageDispatchState, TriageState,
+};
 use serde_json::json;
 
-pub fn submitted(
-    item: &FeedbackItem,
-    session: Option<&str>,
-    reply: Option<&str>,
-    json: bool,
-) -> Result<(), String> {
+pub fn submitted(item: &FeedbackItem, reply: Option<&str>, json: bool) -> Result<(), String> {
+    let session = item
+        .triage_dispatch
+        .as_ref()
+        .and_then(|dispatch| dispatch.session_id.as_deref());
     if json {
         return print_json(&json!({
             "item": item,
@@ -19,12 +20,79 @@ pub fn submitted(
         }));
     }
     println!("Recorded {} ({})", item.id, item.app);
+    println!("Triage: {}", triage_status(item));
     if let Some(reply) = reply {
         println!("\n{reply}");
-    } else if session.is_some() {
-        println!("Sent to the intake agent for triage.");
     }
     Ok(())
+}
+
+pub fn triaged(items: &[FeedbackItem], json: bool) -> Result<(), String> {
+    if json {
+        return print_json(&items);
+    }
+    for item in items {
+        println!("{}  triage: {}", item.id, triage_status(item));
+    }
+    Ok(())
+}
+
+/// Where an item's triage stands, for the person.
+pub fn triage_status(item: &FeedbackItem) -> String {
+    if item.triage_state == TriageState::Triaged {
+        return "triaged".to_owned();
+    }
+    item.triage_dispatch
+        .as_ref()
+        .map_or_else(|| "not requested".to_owned(), dispatch_status)
+}
+
+fn dispatch_status(dispatch: &TriageDispatch) -> String {
+    match dispatch.state {
+        TriageDispatchState::Queued if dispatch.attempts == 0 => "queued".to_owned(),
+        TriageDispatchState::Queued => {
+            let mut status = format!(
+                "queued, retrying after {} failed attempt{}",
+                dispatch.attempts,
+                if dispatch.attempts == 1 { "" } else { "s" }
+            );
+            if let Some(next) = dispatch.next_attempt_at_ms {
+                let _ = write!(status, " (next in {})", until(next));
+            }
+            if let Some(error) = &dispatch.last_error {
+                let _ = write!(status, ": {error}");
+            }
+            status
+        }
+        TriageDispatchState::Started => dispatch.turn_id.as_ref().map_or_else(
+            || "started".to_owned(),
+            |turn| format!("started (intake turn {turn})"),
+        ),
+        TriageDispatchState::Blocked => format!(
+            "blocked: {} (ask again with `feedback triage <id>`)",
+            dispatch
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("delivery stopped")
+        ),
+        TriageDispatchState::Skipped => "skipped at submission".to_owned(),
+        TriageDispatchState::Completed => "triaged".to_owned(),
+    }
+}
+
+/// Time from now until `at_ms`, coarsely.
+fn until(at_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        });
+    let seconds = at_ms.saturating_sub(now).div_ceil(1000);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m", seconds.div_ceil(60))
+    }
 }
 
 pub fn page(page: &FeedbackPage, json: bool) -> Result<(), String> {
@@ -46,14 +114,29 @@ pub fn page(page: &FeedbackPage, json: bool) -> Result<(), String> {
 pub fn inbox(
     resolved: &[FeedbackItem],
     questions: &[FeedbackItem],
+    stalled: &[FeedbackItem],
     json: bool,
 ) -> Result<(), String> {
     if json {
-        return print_json(&json!({ "to_verify": resolved, "open_questions": questions }));
+        return print_json(&json!({
+            "to_verify": resolved,
+            "open_questions": questions,
+            "triage_attention": stalled,
+        }));
     }
-    if resolved.is_empty() && questions.is_empty() {
+    if resolved.is_empty() && questions.is_empty() && stalled.is_empty() {
         println!("Nothing waiting on you.");
         return Ok(());
+    }
+    if !stalled.is_empty() {
+        println!("Not triaged yet; `feedback triage <id>` sends one again:");
+        for item in stalled {
+            println!("  {}", line(item));
+            println!("      triage: {}", triage_status(item));
+        }
+        if !resolved.is_empty() || !questions.is_empty() {
+            println!();
+        }
     }
     if !resolved.is_empty() {
         println!("Resolved by an agent; verify with `feedback verify <id>` or reopen:");
@@ -134,15 +217,22 @@ pub fn item(item: &FeedbackItem, json: bool) -> Result<(), String> {
         }
         out.push('\n');
     }
+    let _ = writeln!(out, "\nTriage: {}", triage_status(item));
     print!("{out}");
     Ok(())
 }
 
 fn line(item: &FeedbackItem) -> String {
-    let pending = if item.triage_state == TriageState::Pending {
-        " (untriaged)"
-    } else {
-        ""
+    let pending = match (item.triage_state, item.triage_dispatch.as_ref()) {
+        (TriageState::Triaged, _) => "",
+        (TriageState::Pending, Some(dispatch)) => match dispatch.state {
+            TriageDispatchState::Blocked => " (triage blocked)",
+            TriageDispatchState::Queued if dispatch.attempts > 0 => " (triage retrying)",
+            TriageDispatchState::Queued => " (triage queued)",
+            TriageDispatchState::Started => " (triaging)",
+            TriageDispatchState::Skipped | TriageDispatchState::Completed => " (untriaged)",
+        },
+        (TriageState::Pending, None) => " (untriaged)",
     };
     format!(
         "{:<7} {:<15} {:<10} {}{pending}",

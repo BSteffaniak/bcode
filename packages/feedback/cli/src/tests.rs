@@ -53,3 +53,17 @@ fn ids_parse_in_either_form() {
     assert_eq!(args.id, FeedbackId(12));
     assert!(FeedbackCli::try_parse_from(["feedback", "show", "fb-x"]).is_err());
 }
+
+#[test]
+fn triage_takes_one_or_more_ids() {
+    let cli = FeedbackCli::try_parse_from(["feedback", "triage", "fb-3", "4", "--json"]).unwrap();
+    let FeedbackCommand::Triage { ids, json } = cli.command else {
+        panic!("triage");
+    };
+    assert_eq!(ids, vec![FeedbackId(3), FeedbackId(4)]);
+    assert!(json);
+    assert!(
+        FeedbackCli::try_parse_from(["feedback", "triage"]).is_err(),
+        "an id is required"
+    );
+}

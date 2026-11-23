@@ -319,8 +319,11 @@ pub enum BridgeRequest {
     },
     /// Record feedback, then hand it to the feedback intake session (protocol 2).
     ///
-    /// The item is recorded before triage starts: when triage cannot start, the response still
-    /// carries the item, with `triage_error` saying why.
+    /// The item is recorded together with the decision to triage it, before triage starts.
+    /// When triage cannot start now, the response still carries the item, its
+    /// `triage_dispatch` saying whether delivery is queued for retry or blocked, and
+    /// `triage_error` saying why; queued items are delivered by the daemon without the
+    /// application.
     FeedbackSubmit {
         /// The feedback.
         item: bcode_feedback_models::RecordFeedbackRequest,
@@ -331,7 +334,7 @@ pub enum BridgeRequest {
         /// Claim the intake session for this bridge's registered tools before triage starts.
         #[serde(default)]
         claim: bool,
-        /// Record only; do not start triage.
+        /// Record only; do not triage, now or later, unless a person asks.
         #[serde(default)]
         skip_triage: bool,
     },
@@ -495,7 +498,8 @@ pub enum BridgeResponse {
         /// The intake turn triaging it, when triage started.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         intake: Option<FeedbackIntake>,
-        /// Why triage did not start, when it was asked for and failed.
+        /// Why triage did not start, when it was asked for and failed:
+        /// `feedback_triage_queued` (retried) or `feedback_triage_blocked`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         triage_error: Option<BridgeError>,
     },

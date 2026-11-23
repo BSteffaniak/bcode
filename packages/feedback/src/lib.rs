@@ -9,12 +9,21 @@
 //! serialize through `SQLite` locking. The store is the record of truth for feedback: an intake
 //! session's transcript may be compacted, but items, triage and status live here.
 //!
+//! Items recorded with [`FeedbackStore::record_for_triage`] carry a durable triage request,
+//! written in the same transaction, that dispatchers lease and deliver to the intake session
+//! until a turn triages the item (see [`dispatch`]).
+//!
+//! Compatibility: schema version 1 gained the `feedback_triage_requests` table additively. It
+//! is created on open when missing; builds that predate it ignore it, and items they record
+//! have no triage request.
+//!
 //! Status rules: an [`Actor::Agent`] may only move an item between
 //! [`FeedbackStatus::Open`] and [`FeedbackStatus::AgentResolved`], and never touches an item
 //! a person has verified or dismissed. Only an [`Actor::User`] verifies or dismisses.
 
 mod attachments;
 mod database;
+pub mod dispatch;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -158,26 +167,7 @@ impl FeedbackStore {
                 .database
                 .begin_transaction_with_mode(TransactionMode::Immediate)
                 .await?;
-            let row = tx
-                .insert("feedback_items")
-                .value("app", request.app.as_str())
-                .value("text", request.text.as_str())
-                .value("created_at_ms", int(now_ms)?)
-                .value("updated_at_ms", int(now_ms)?)
-                .value("triage_state", triage_state_name(TriageState::Pending))
-                .value("status", status_name(FeedbackStatus::Open))
-                .execute(&*tx)
-                .await?;
-            let id = FeedbackId(unsigned(&row, "id")?);
-            for facet in &request.facets {
-                tx.insert("feedback_facets")
-                    .value("item_id", int(id.0)?)
-                    .value("key", facet.key.as_str())
-                    .value("value", facet.value.as_str())
-                    .value("sensitive", i64::from(facet.sensitive))
-                    .execute(&*tx)
-                    .await?;
-            }
+            let id = insert_item(&*tx, request, now_ms).await?;
             tx.commit().await?;
             Ok::<_, FeedbackStoreError>(id)
         })
@@ -264,7 +254,7 @@ impl FeedbackStore {
         })
     }
 
-    /// Replace an item's triage and mark it triaged.
+    /// Replace an item's triage and mark it triaged, completing its triage request.
     ///
     /// # Errors
     /// [`FeedbackStoreError::Invalid`], [`FeedbackStoreError::NotFound`], or a database error.
@@ -276,18 +266,27 @@ impl FeedbackStore {
         request.validate()?;
         let triage = serde_json::to_string(&request.triage)
             .map_err(|error| FeedbackStoreError::Corrupt(error.to_string()))?;
-        let changed = database::block_on(
-            self.database
+        database::block_on(async {
+            let tx = self
+                .database
+                .begin_transaction_with_mode(TransactionMode::Immediate)
+                .await?;
+            let changed = tx
                 .update("feedback_items")
                 .where_eq("id", int(request.id.0)?)
                 .value("triage_json", triage)
                 .value("triage_state", triage_state_name(TriageState::Triaged))
                 .value("updated_at_ms", int(now_ms)?)
-                .execute(&*self.database),
-        )?;
-        if changed.is_empty() {
-            return Err(FeedbackStoreError::NotFound(request.id));
-        }
+                .execute(&*tx)
+                .await?;
+            if changed.is_empty() {
+                tx.rollback().await?;
+                return Err(FeedbackStoreError::NotFound(request.id));
+            }
+            dispatch::complete(&*tx, request.id, now_ms).await?;
+            tx.commit().await?;
+            Ok(())
+        })?;
         self.get(request.id)
     }
 
@@ -456,10 +455,18 @@ impl FeedbackStore {
         let attachments = self
             .database
             .select("feedback_attachments")
-            .filter(Box::new(where_in("item_id", ids)))
+            .filter(Box::new(where_in("item_id", ids.clone())))
             .sort("ordinal", SortDirection::Asc)
             .execute(&*self.database)
             .await?;
+        let dispatches = dispatch::dispatches(
+            &self
+                .database
+                .select(dispatch::TABLE)
+                .filter(Box::new(where_in("item_id", ids)))
+                .execute(&*self.database)
+                .await?,
+        )?;
         for item in &mut items {
             let id = item.id.0;
             for row in &facets {
@@ -484,6 +491,10 @@ impl FeedbackStore {
                     item.attachments.push(attachments::from_row(row)?);
                 }
             }
+            item.triage_dispatch = dispatches
+                .iter()
+                .find(|(item_id, _)| *item_id == id)
+                .map(|(_, dispatch)| dispatch.clone());
         }
         Ok(items)
     }
@@ -561,7 +572,38 @@ fn item_from_row(row: &Row) -> Result<FeedbackItem, FeedbackStoreError> {
         status_change,
         links: Vec::new(),
         attachments: Vec::new(),
+        triage_dispatch: None,
     })
+}
+
+/// Insert a new open, untriaged item and its facets inside `database`'s transaction.
+async fn insert_item(
+    database: &dyn Database,
+    request: &RecordFeedbackRequest,
+    now_ms: u64,
+) -> Result<FeedbackId, FeedbackStoreError> {
+    let row = database
+        .insert("feedback_items")
+        .value("app", request.app.as_str())
+        .value("text", request.text.as_str())
+        .value("created_at_ms", int(now_ms)?)
+        .value("updated_at_ms", int(now_ms)?)
+        .value("triage_state", triage_state_name(TriageState::Pending))
+        .value("status", status_name(FeedbackStatus::Open))
+        .execute(database)
+        .await?;
+    let id = FeedbackId(unsigned(&row, "id")?);
+    for facet in &request.facets {
+        database
+            .insert("feedback_facets")
+            .value("item_id", int(id.0)?)
+            .value("key", facet.key.as_str())
+            .value("value", facet.value.as_str())
+            .value("sensitive", i64::from(facet.sensitive))
+            .execute(database)
+            .await?;
+    }
+    Ok(id)
 }
 
 const fn status_name(status: FeedbackStatus) -> &'static str {

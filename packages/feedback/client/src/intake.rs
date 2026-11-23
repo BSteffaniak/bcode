@@ -5,21 +5,15 @@ use std::time::Duration;
 use bcode_client::{BcodeClient, ClientError};
 use bcode_feedback_models::{
     ClaimIntakeSessionRequest, FEEDBACK_INTAKE_APP_ID, FeedbackItem, IntakeSession,
-    OP_CLAIM_INTAKE_SESSION, OP_INTAKE_SESSION,
+    OP_CLAIM_INTAKE_SESSION, OP_INTAKE_SESSION, triage_idempotency_key, validate_instructions,
 };
 use bcode_session_models::{
     SessionEvent, SessionEventKind, SessionHistoryDirection, SessionHistoryQuery, SessionId,
     SessionOrigin, TurnAdmission, TurnAdmissionMetadata, TurnContext, TurnContextBlock, TurnId,
-    TurnOrigin,
+    TurnOrigin, TurnRejectionReason,
 };
 
 use crate::{FeedbackClientError, call};
-
-/// Maximum UTF-8 bytes of an application's own triage instructions.
-///
-/// With [`bcode_feedback_models::MAX_FACETS`] maximum-size facets the item's context still
-/// fits the turn-context bound.
-pub const MAX_APP_INSTRUCTIONS_BYTES: usize = 4 * 1024;
 
 /// Standing instructions carried with every item. Durable so later turns, and summaries made
 /// by compaction, still see what each turn was.
@@ -100,29 +94,68 @@ pub async fn ensure_intake_session(client: &BcodeClient) -> Result<SessionId, Fe
     })
 }
 
-/// Submit a recorded item to the intake session as a follow-up turn.
-///
-/// `app_instructions` tells the agent what the reporting application offers, such as its own
-/// tools for capturing context around the feedback. Submission is idempotent per item.
+/// Submit a recorded item to the intake session as a follow-up turn, as the first delivery
+/// generation. Submission is idempotent per item; see [`submit_generation`].
 ///
 /// # Errors
-/// * [`FeedbackClientError::Invalid`] when `app_instructions` is empty or longer than
-///   [`MAX_APP_INSTRUCTIONS_BYTES`].
-/// * [`FeedbackClientError::Intake`] when the turn is rejected or cannot be submitted.
+/// See [`submit_generation`].
 pub async fn submit_to_intake(
     client: &BcodeClient,
     session_id: SessionId,
     item: &FeedbackItem,
     app_instructions: Option<&str>,
 ) -> Result<IntakeReceipt, FeedbackClientError> {
-    let context = intake_context(item, app_instructions)?;
+    submit_generation(client, session_id, item, app_instructions, 1)
+        .await
+        .map_err(|failure| match failure {
+            SubmitFailure::Invalid(message) => FeedbackClientError::Invalid(message),
+            SubmitFailure::Transient(message) | SubmitFailure::Refused(message) => {
+                FeedbackClientError::Intake(message)
+            }
+        })
+}
+
+/// Why an intake turn was not admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitFailure {
+    /// The request is malformed; resending it cannot succeed.
+    Invalid(String),
+    /// The daemon or session could not take the turn now; the same generation may be resent.
+    Transient(String),
+    /// The session refused or cancelled this generation's turn; resending it cannot succeed.
+    Refused(String),
+}
+
+/// Submit `generation` of an item's delivery to the intake session as a follow-up turn.
+///
+/// `app_instructions` tells the agent what the reporting application offers, such as its own
+/// tools for capturing context around the feedback. Every submission of one generation uses
+/// the same idempotency key, so the session admits at most one turn for it: resending after a
+/// lost acknowledgement returns the turn already admitted.
+///
+/// # Errors
+/// * [`SubmitFailure::Invalid`] when `app_instructions` is empty or longer than
+///   [`bcode_feedback_models::MAX_APP_INSTRUCTIONS_BYTES`].
+/// * [`SubmitFailure::Transient`] when the daemon cannot be reached or the session is
+///   unavailable.
+/// * [`SubmitFailure::Refused`] when the session's execution policy rejects the turn or the
+///   generation's turn was cancelled before it started.
+pub async fn submit_generation(
+    client: &BcodeClient,
+    session_id: SessionId,
+    item: &FeedbackItem,
+    app_instructions: Option<&str>,
+    generation: u32,
+) -> Result<IntakeReceipt, SubmitFailure> {
+    let context = intake_context(item, app_instructions)
+        .map_err(|error| SubmitFailure::Invalid(error.to_string()))?;
     let admission = TurnAdmissionMetadata {
         origin: Some(TurnOrigin {
             producer: FEEDBACK_INTAKE_APP_ID.into(),
             correlation_id: Some(item.id.to_string()),
             display_label: Some(format!("Feedback {} · {}", item.id, item.app)),
         }),
-        idempotency_key: Some(format!("feedback:{}", item.id)),
+        idempotency_key: Some(triage_idempotency_key(item.id, generation)),
         context,
         ..TurnAdmissionMetadata::default()
     };
@@ -130,18 +163,23 @@ pub async fn submit_to_intake(
         .submit_turn(session_id, item.text.clone(), admission)
         .await
         .map_err(|error| {
-            FeedbackClientError::Intake(format!("submitting to the intake session: {error}"))
+            SubmitFailure::Transient(format!("submitting to the intake session: {error}"))
         })? {
         TurnAdmission::Accepted(receipt)
         | TurnAdmission::Existing(receipt)
         | TurnAdmission::Deferred(receipt) => receipt,
-        TurnAdmission::Rejected(reason) => {
-            return Err(FeedbackClientError::Intake(format!(
-                "the intake session rejected the item: {reason:?}"
-            )));
+        TurnAdmission::Rejected(TurnRejectionReason::SessionUnavailable) => {
+            return Err(SubmitFailure::Transient(
+                "the intake session is unavailable".into(),
+            ));
+        }
+        TurnAdmission::Rejected(TurnRejectionReason::ExecutionPolicy) => {
+            return Err(SubmitFailure::Refused(
+                "the intake session's execution policy rejected the turn".into(),
+            ));
         }
         TurnAdmission::CancelledBeforeStart(_) => {
-            return Err(FeedbackClientError::Intake(
+            return Err(SubmitFailure::Refused(
                 "the intake turn was cancelled before it started".into(),
             ));
         }
@@ -224,7 +262,7 @@ pub fn final_reply(events: &[SessionEvent], turn: &TurnId) -> Option<String> {
 ///
 /// # Errors
 /// [`FeedbackClientError::Invalid`] when `app_instructions` is empty or longer than
-/// [`MAX_APP_INSTRUCTIONS_BYTES`].
+/// [`bcode_feedback_models::MAX_APP_INSTRUCTIONS_BYTES`].
 pub fn intake_context(
     item: &FeedbackItem,
     app_instructions: Option<&str>,
@@ -234,11 +272,8 @@ pub fn intake_context(
         TurnContextBlock::new("app", item.app.clone()),
     ];
     if let Some(instructions) = app_instructions {
-        if instructions.trim().is_empty() || instructions.len() > MAX_APP_INSTRUCTIONS_BYTES {
-            return Err(FeedbackClientError::Invalid(format!(
-                "application instructions must be 1-{MAX_APP_INSTRUCTIONS_BYTES} bytes"
-            )));
-        }
+        validate_instructions(instructions)
+            .map_err(|error| FeedbackClientError::Invalid(error.to_string()))?;
         blocks.push(TurnContextBlock::new("app-instructions", instructions));
     }
     if !item.facets.is_empty() {

@@ -18,12 +18,16 @@ bcode_client          = { workspace = true }
 bcode_config          = { workspace = true }
 bcode_feedback        = { workspace = true }
 bcode_feedback_cli    = { workspace = true }
+bcode_feedback_client = { workspace = true }
 bcode_feedback_models = { workspace = true }
+bcode_ipc             = { workspace = true }
 bcode_plugin_sdk      = { workspace = true }
 bcode_tool            = { workspace = true }
 clap                  = { workspace = true, features = ["std"] }
 serde                 = { workspace = true, features = ["derive", "std"] }
 serde_json            = { workspace = true, features = ["std"] }
+tokio                 = { workspace = true, features = ["rt", "sync", "time"] }
+tracing               = { workspace = true }
 
 [dev-dependencies]
 bcode_model_schema = { workspace = true }

@@ -9,19 +9,29 @@
 //! * `bcode.tool/v1` gives every session `feedback.*` tools acting as [`Actor::Agent`]. Tool
 //!   output redacts sensitive facet values.
 //!
+//! * While active in the daemon, a dispatcher thread delivers queued triage requests to the
+//!   intake session ([`bcode_feedback_client::worker`]), so items whose submitting
+//!   application closed, or that were queued during an outage, are triaged once the daemon
+//!   (or a restarted one) can deliver them.
+//!
 //! The store opens lazily on first use, so a damaged or newer feedback database fails only
 //! feedback operations and never the daemon.
 
 mod tools;
+mod worker;
 
 use std::path::PathBuf;
 
 use bcode_feedback::{FeedbackStore, FeedbackStoreError};
 use bcode_feedback_models::{
     Actor, AttachFeedbackRequest, ClaimIntakeSessionRequest, FEEDBACK_SERVICE_INTERFACE_ID,
-    FeedbackQuery, GetFeedbackRequest, LinkFeedbackRequest, OP_ATTACH, OP_CLAIM_INTAKE_SESSION,
-    OP_GET, OP_INTAKE_SESSION, OP_LINK, OP_LIST, OP_RECORD, OP_SET_STATUS, OP_TRIAGE,
-    RecordFeedbackRequest, SetFeedbackStatusRequest, TriageFeedbackRequest,
+    FeedbackQuery, GetFeedbackRequest, LeaseDueTriageRequest, LeaseTriageRequest,
+    LinkFeedbackRequest, OP_ATTACH, OP_CLAIM_INTAKE_SESSION, OP_GET, OP_INTAKE_SESSION,
+    OP_LEASE_DUE_TRIAGE, OP_LEASE_TRIAGE, OP_LINK, OP_LIST, OP_RECORD, OP_RECORD_FOR_TRIAGE,
+    OP_REQUEST_TRIAGE, OP_SET_STATUS, OP_STARTED_TRIAGES, OP_TRIAGE, OP_TRIAGE_FAILED,
+    OP_TRIAGE_STARTED, OP_TRIAGE_TURN_ENDED, RecordFeedbackRequest, RecordForTriageRequest,
+    RequestTriageRequest, SetFeedbackStatusRequest, StartedTriageQuery, TriageFailedRequest,
+    TriageFeedbackRequest, TriageStartedRequest, TriageTurnEndedRequest,
 };
 use bcode_plugin_sdk::prelude::*;
 
@@ -32,6 +42,7 @@ pub use bcode_feedback_models::FEEDBACK_PLUGIN_ID as PLUGIN_ID;
 pub struct FeedbackPlugin {
     state_dir: Option<PathBuf>,
     store: Option<FeedbackStore>,
+    dispatcher: Option<worker::Dispatcher>,
 }
 
 impl FeedbackPlugin {
@@ -41,16 +52,19 @@ impl FeedbackPlugin {
         Self {
             state_dir: Some(state_dir),
             store: None,
+            dispatcher: None,
         }
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(bcode_config::default_state_dir)
     }
 
     fn store(&mut self) -> Result<&FeedbackStore, FeedbackStoreError> {
         if self.store.is_none() {
-            let state_dir = self
-                .state_dir
-                .clone()
-                .unwrap_or_else(bcode_config::default_state_dir);
-            self.store = Some(FeedbackStore::open_in_state_dir(&state_dir)?);
+            self.store = Some(FeedbackStore::open_in_state_dir(&self.state_dir())?);
         }
         Ok(self.store.as_ref().expect("store opened above"))
     }
@@ -86,6 +100,22 @@ impl FeedbackPlugin {
             OP_INTAKE_SESSION => encode(store.intake_session()),
             OP_CLAIM_INTAKE_SESSION => decode::<ClaimIntakeSessionRequest>(request)
                 .and_then(|payload| encode(store.claim_intake_session(&payload))),
+            OP_RECORD_FOR_TRIAGE => decode::<RecordForTriageRequest>(request)
+                .and_then(|payload| encode(store.record_for_triage(&payload, now))),
+            OP_REQUEST_TRIAGE => decode::<RequestTriageRequest>(request)
+                .and_then(|payload| encode(store.request_triage(payload.id, now))),
+            OP_LEASE_TRIAGE => decode::<LeaseTriageRequest>(request)
+                .and_then(|payload| encode(store.lease_triage(&payload, now))),
+            OP_LEASE_DUE_TRIAGE => decode::<LeaseDueTriageRequest>(request)
+                .and_then(|payload| encode(store.lease_due_triage(&payload, now))),
+            OP_TRIAGE_STARTED => decode::<TriageStartedRequest>(request)
+                .and_then(|payload| encode(store.triage_started(&payload, now))),
+            OP_TRIAGE_FAILED => decode::<TriageFailedRequest>(request)
+                .and_then(|payload| encode(store.triage_failed(&payload, now))),
+            OP_STARTED_TRIAGES => decode::<StartedTriageQuery>(request)
+                .and_then(|payload| encode(store.started_triages(payload))),
+            OP_TRIAGE_TURN_ENDED => decode::<TriageTurnEndedRequest>(request)
+                .and_then(|payload| encode(store.triage_turn_ended(&payload, now))),
             _ => Err(ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported feedback operation",
@@ -98,6 +128,25 @@ impl FeedbackPlugin {
 impl RustPlugin for FeedbackPlugin {
     fn component_registrations() -> bcode_plugin_sdk::definition::ProductRegistrations {
         product_registrations()
+    }
+
+    /// Start the triage dispatcher. Activation runs only for the daemon-side component.
+    fn activate(&mut self) -> Result<(), PluginError> {
+        if self.dispatcher.is_none() {
+            match worker::Dispatcher::start(&self.state_dir()) {
+                Ok(dispatcher) => self.dispatcher = Some(dispatcher),
+                // Feedback still records; queued items wait for a dispatcher.
+                Err(error) => tracing::warn!(%error, "feedback: triage dispatcher not started"),
+            }
+        }
+        Ok(())
+    }
+
+    fn deactivate(&mut self) -> Result<(), PluginError> {
+        if let Some(dispatcher) = self.dispatcher.take() {
+            dispatcher.stop();
+        }
+        Ok(())
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {

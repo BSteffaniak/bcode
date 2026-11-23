@@ -67,7 +67,48 @@ pub async fn initialize(database: &dyn Database) -> Result<(), FeedbackStoreErro
         tx.rollback().await?;
         return Err(FeedbackStoreError::UnsupportedSchema(version));
     }
+    let triage_requests = tx
+        .select("sqlite_master")
+        .columns(&["name"])
+        .where_eq("type", "table")
+        .where_eq("name", crate::dispatch::TABLE)
+        .execute(&*tx)
+        .await?;
+    if triage_requests.is_empty() {
+        // Additive: stores created before triage requests gain the table on open.
+        create_triage_schema(&*tx).await?;
+    }
     tx.commit().await?;
+    Ok(())
+}
+
+async fn create_triage_schema(db: &dyn Database) -> Result<(), FeedbackStoreError> {
+    create_table(crate::dispatch::TABLE)
+        .columns(vec![
+            column("item_id", DataType::BigInt, false),
+            column("state", DataType::Text, false),
+            column("generation", DataType::BigInt, false),
+            column("attempts", DataType::BigInt, false),
+            column("requested_at_ms", DataType::BigInt, false),
+            column("updated_at_ms", DataType::BigInt, false),
+            column("next_attempt_at_ms", DataType::BigInt, true),
+            column("last_error", DataType::Text, true),
+            column("blocked_reason", DataType::Text, true),
+            column("session_id", DataType::Text, true),
+            column("turn_id", DataType::Text, true),
+            column("lease_holder", DataType::Text, true),
+            column("lease_until_ms", DataType::BigInt, true),
+            column("instructions", DataType::Text, true),
+        ])
+        .primary_key("item_id")
+        .foreign_key_column("item_id", "feedback_items", "id")
+        .execute(db)
+        .await?;
+    create_index("feedback_triage_requests_state")
+        .table(crate::dispatch::TABLE)
+        .columns(vec!["state", "item_id"])
+        .execute(db)
+        .await?;
     Ok(())
 }
 

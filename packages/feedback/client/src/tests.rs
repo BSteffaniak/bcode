@@ -14,6 +14,7 @@ fn item(facets: Vec<Facet>) -> FeedbackItem {
         status_change: None,
         links: Vec::new(),
         attachments: Vec::new(),
+        triage_dispatch: None,
     }
 }
 

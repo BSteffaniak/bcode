@@ -2389,6 +2389,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2408,7 +2410,9 @@ dependencies = [
  "bcode_config",
  "bcode_feedback",
  "bcode_feedback_cli",
+ "bcode_feedback_client",
  "bcode_feedback_models",
+ "bcode_ipc",
  "bcode_model_schema",
  "bcode_plugin_sdk",
  "bcode_tool",
@@ -2416,6 +2420,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3606,6 +3612,7 @@ dependencies = [
  "bcode_agent_runtime",
  "bcode_client",
  "bcode_config",
+ "bcode_default_agents_plugin",
  "bcode_fake_provider_plugin",
  "bcode_feedback_client",
  "bcode_feedback_models",
