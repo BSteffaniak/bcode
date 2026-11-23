@@ -32,13 +32,22 @@ fn panel(setup: &Setup, width: u16, height: u16) -> Option<(Rect, Dock)> {
         .panel
 }
 
-/// The dock divider's painted handle.
+/// The painted handle of the divider on the panel's edge: the app dock's, or in a review
+/// the review body's divider before the panel (the panel is the body's last member).
 fn divider(screen: &Screen) -> Option<Rect> {
     let id = format!("{DOCK_ID}.divider.0");
-    screen
-        .hits()
-        .iter()
+    let hits = screen.hits();
+    hits.iter()
         .find(|hit| hit.id.as_str() == id)
+        .or_else(|| {
+            hits.iter()
+                .filter(|hit| {
+                    let id = hit.id.as_str();
+                    id.starts_with("review.panels.divider.")
+                        || id.starts_with("review.column.divider.")
+                })
+                .max_by_key(|hit| (hit.area.x, hit.area.y))
+        })
         .map(|hit| hit.area)
 }
 

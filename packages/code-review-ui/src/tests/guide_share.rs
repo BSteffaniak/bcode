@@ -271,8 +271,8 @@ fn start_guide(setup: &mut super::assistant::Setup, session: &str) {
 
 #[test]
 fn a_guide_started_in_a_narrow_assistant_shows_its_tab_and_the_pill_reopens_it() {
-    // Docked under a screen too short for the guide panel.
-    let mut setup = super::assistant::setup(80, 30, true);
+    // Under the document in a body too short for the guide panel too.
+    let mut setup = super::assistant::setup(80, 24, true);
     setup.scenario.key("ctrl+k");
     let session = setup.send("Walk me through this review.");
     start_guide(&mut setup, &session);

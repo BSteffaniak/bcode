@@ -7,6 +7,7 @@ mod assistant;
 mod assistant_actions;
 mod assistant_context;
 mod assistant_dock;
+mod assistant_in_review;
 mod assistant_models;
 mod assistant_threads;
 mod benchmark;

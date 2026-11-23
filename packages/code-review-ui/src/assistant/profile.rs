@@ -174,6 +174,9 @@ pub struct AssistantConfig {
     /// chip is toggled (`assistant.attach_context`, off by default). Off, they still name the
     /// screen and the review, and the assistant reads more with its tools.
     pub attach_context: bool,
+    /// Whether the panel's size in a review is kept with that review (`assistant.size_scope =
+    /// "review"`) rather than once for the app (`"app"`, the default).
+    pub size_per_review: bool,
 }
 
 /// A docked panel's default size along its axis (`assistant.width` or `assistant.height`).
@@ -246,6 +249,7 @@ impl Default for AssistantConfig {
             height: DockLength::default(),
             base_agent: BASE_AGENT.to_owned(),
             attach_context: false,
+            size_per_review: false,
         }
     }
 }
@@ -278,6 +282,14 @@ impl AssistantConfig {
             Some(toml::Value::Boolean(attach)) => config.attach_context = *attach,
             Some(_) => problems.push(format!(
                 "{prefix}.attach_context must be true or false; using false"
+            )),
+        }
+        match assistant.get("size_scope").map(toml::Value::as_str) {
+            None => {}
+            Some(Some("app")) => config.size_per_review = false,
+            Some(Some("review")) => config.size_per_review = true,
+            Some(_) => problems.push(format!(
+                "{prefix}.size_scope must be \"app\" or \"review\"; using \"app\""
             )),
         }
         match assistant.get("base_agent") {

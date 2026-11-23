@@ -596,6 +596,9 @@ keymap_actions = [
     { id = "bcode.code_review.assistant_back", scope = "code-review-assistant", description = "Back to the screen (the assistant stays open)", defaults = [
         "esc",
     ] },
+    { id = "bcode.code_review.assistant_focus_next", scope = "code-review-assistant", description = "In a review: back to the review's panels (the next pane after the assistant)", defaults = [
+        "tab",
+    ] },
     { id = "bcode.code_review.assistant_stop", scope = "code-review-assistant", description = "Stop the assistant's running turn", defaults = [
         "ctrl+c",
     ] },

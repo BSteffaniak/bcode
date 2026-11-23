@@ -34,9 +34,18 @@
 //! they were, so restoring brings them back. Minimized panels are kept with the presentation
 //! state; the maximized panel is not (a review reopens with every panel at its size).
 //!
-//! The review assistant is not a review panel: the app docks it beside or under the whole
-//! screen ([`crate::assistant::panel`]), with the same controls.
+//! **The assistant.** While the app's review assistant is open on a review, it is a member of
+//! the body too ([`Panels::set_assistant`]): its own column at the far right while the body is
+//! at least [`ASSISTANT_RIGHT_BODY`] columns, else under the document while the body is at least
+//! [`ASSISTANT_BOTTOM_BODY_HEIGHT`] rows, else not in the body (the app zooms it while it has the
+//! keyboard). Beside it, the other panels are planned for the columns it leaves at its narrowest,
+//! so the file panel and then the threads and guide panels give way before it moves under the
+//! document. The body only reserves its place: the app paints the assistant there, and the
+//! assistant keeps its own window state (minimized, maximized, focus), which the body mirrors.
+//! Its size is the app's (handed back after a resize, [`Panels::take_assistant_size`]) unless it
+//! is kept per review ([`AssistantMember::per_review`]), saved with the review's panels.
 
+use crate::assistant::profile::DockLength;
 use crate::panel_controls::{Command, Shape};
 use bcode_code_review_models::{PANEL_SHARE_SCALE, ReviewPanelState};
 use bmux_tui::geometry::Rect;
@@ -88,6 +97,14 @@ const GUIDE_DEFAULT_WIDTH: u16 = 48;
 const GUIDE_DEFAULT_HEIGHT: u16 = 10;
 /// Share of the right column the guide takes over the threads panel, in percent.
 const GUIDE_SIDE_PERCENT: u16 = 60;
+/// Body width from which the assistant has its own column at the right.
+pub const ASSISTANT_RIGHT_BODY: u16 = crate::assistant::panel::RIGHT_DOCK_WIDTH;
+/// Body height from which the assistant can sit under the document.
+pub const ASSISTANT_BOTTOM_BODY_HEIGHT: u16 = crate::assistant::panel::BOTTOM_DOCK_HEIGHT;
+/// Narrowest assistant column.
+pub const ASSISTANT_MIN_WIDTH: u16 = crate::assistant::panel::MIN_WIDTH;
+/// Shortest assistant under the document.
+pub const ASSISTANT_MIN_HEIGHT: u16 = crate::assistant::panel::MIN_HEIGHT;
 
 /// A panel of the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,6 +119,8 @@ pub enum PanelId {
     Guide,
     /// The right column holding the guide over the threads panel.
     Side,
+    /// The app's review assistant (its place only; the app paints it).
+    Assistant,
 }
 
 /// Where a side panel (threads) is.
@@ -126,6 +145,39 @@ pub struct PanelPlan {
     pub threads: SidePlacement,
     /// Where the guide panel shows.
     pub guide: SidePlacement,
+    /// Where the assistant shows.
+    pub assistant: SidePlacement,
+}
+
+/// The app's review assistant as the body lays it out: open on the review, with its window
+/// state and the size it should take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssistantMember {
+    /// Minimized: a strip at the right, or its title row under the document.
+    pub minimized: bool,
+    /// Maximized: the only panel the body lays out.
+    pub maximized: bool,
+    /// The app's width share for it beside the document, of the body width, when dragged.
+    pub right_share: Option<u16>,
+    /// The app's height share for it under the document, of the body height, when dragged.
+    pub bottom_share: Option<u16>,
+    /// Its configured width and height until dragged.
+    pub width: DockLength,
+    /// Its configured height until dragged.
+    pub height: DockLength,
+    /// Whether its size is kept with this review (else it is the app's).
+    pub per_review: bool,
+}
+
+/// A size the assistant took in the body by resizing, for the app to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantSize {
+    /// Its width beside the document, of the body width.
+    Right(u16),
+    /// Its height under the document, of the body height.
+    Bottom(u16),
+    /// Its size was reset to the configured default.
+    Reset,
 }
 
 /// Panel visibility, sizes, and the BMUX group states.
@@ -157,6 +209,21 @@ pub struct Panels {
     body: (u16, u16),
     /// Minimized and maximized panels.
     windows: PanelWindows<PanelId>,
+    /// The app's assistant as the body lays it out.
+    assistant: AssistantState,
+}
+
+/// The app's assistant as the body lays it out.
+#[derive(Debug, Clone, Copy, Default)]
+struct AssistantState {
+    /// The assistant, while the app shows it on this review.
+    member: Option<AssistantMember>,
+    /// The size it took by resizing, for the app (its size is the app's).
+    size: Option<AssistantSize>,
+    /// Whether it has the keyboard (no other panel stays maximized meanwhile).
+    focused: bool,
+    /// The keyboard moved on to it (`tab`): the app gives it the keyboard.
+    focus_requested: bool,
 }
 
 /// Index of the root group in [`Panels::tree`].
@@ -181,6 +248,10 @@ struct Shares {
     guide_bottom: Option<u16>,
     /// The guide's outline height, of the rows it shares with the current section.
     guide_outline: Option<u16>,
+    /// Assistant width beside the document, of the body width (kept per review).
+    assistant_right: Option<u16>,
+    /// Assistant height under the document, of the body height (kept per review).
+    assistant_bottom: Option<u16>,
 }
 
 /// Cell sizes saved before sizes were proportional.
@@ -207,6 +278,7 @@ impl Default for Panels {
             plan: None,
             body: (0, 0),
             windows: PanelWindows::new().with_closable(PanelId::Review, false),
+            assistant: AssistantState::default(),
         }
     }
 }
@@ -248,6 +320,8 @@ impl Panels {
             guide_right: state.guide_right_share,
             guide_bottom: state.guide_bottom_share,
             guide_outline: state.guide_outline_share,
+            assistant_right: state.assistant_right_share,
+            assistant_bottom: state.assistant_bottom_share,
         };
         Self {
             files_choice: state.file_panel_visible,
@@ -293,7 +367,92 @@ impl Panels {
             review_panel_minimized: flag(self.windows.is_minimized(PanelId::Review)),
             threads_panel_minimized: flag(self.windows.is_minimized(PanelId::Threads)),
             guide_panel_minimized: flag(self.windows.is_minimized(PanelId::Guide)),
+            assistant_right_share: self.shares.assistant_right,
+            assistant_bottom_share: self.shares.assistant_bottom,
         }
+    }
+
+    /// Lay the assistant out as `member` from the next layout on (`None`: it is not shown on
+    /// this review). Its minimized and maximized state follows the assistant's.
+    pub fn set_assistant(&mut self, member: Option<AssistantMember>) {
+        if self.assistant.member == member {
+            return;
+        }
+        // The size a drag hands back to the app comes back while the drag goes on: the groups
+        // already have it, and laying them out again would end the drag.
+        let size_only = |a: AssistantMember, b: AssistantMember| {
+            AssistantMember {
+                right_share: None,
+                bottom_share: None,
+                ..a
+            } == AssistantMember {
+                right_share: None,
+                bottom_share: None,
+                ..b
+            }
+        };
+        if let (Some(old), Some(new)) = (self.assistant.member, member)
+            && size_only(old, new)
+            && self.dragging()
+        {
+            self.assistant.member = member;
+            return;
+        }
+        self.assistant.member = member;
+        let minimized = member.is_some_and(|member| member.minimized);
+        if self.windows.is_minimized(PanelId::Assistant) != minimized {
+            self.windows.set_minimized(PanelId::Assistant, minimized);
+        }
+        let maximized = member.is_some_and(|member| member.maximized);
+        let is_maximized = self.windows.maximized() == Some(PanelId::Assistant);
+        if maximized && !is_maximized {
+            self.windows.restore_maximized();
+            let _ = self.windows.toggle_maximize(PanelId::Assistant);
+        } else if !maximized && is_maximized {
+            self.windows.restore_maximized();
+        }
+        self.plan = None;
+    }
+
+    /// Whether a divider of any group is being dragged.
+    #[must_use]
+    pub fn dragging(&self) -> bool {
+        [&self.root, &self.column, &self.side]
+            .iter()
+            .any(|state| state.borrow().active_divider().is_some())
+    }
+
+    /// Whether the assistant has the keyboard, as the app last said.
+    #[must_use]
+    pub const fn assistant_focused(&self) -> bool {
+        self.assistant.focused
+    }
+
+    /// Note whether the assistant has the keyboard (only while it is laid out).
+    pub const fn set_assistant_focused(&mut self, focused: bool) {
+        self.assistant.focused = focused && self.assistant.member.is_some();
+    }
+
+    /// Ask the app to give the assistant the keyboard.
+    pub const fn request_assistant_focus(&mut self) {
+        self.assistant.focus_requested = true;
+    }
+
+    /// Whether the keyboard was asked to move to the assistant since the last call.
+    pub const fn take_assistant_focus(&mut self) -> bool {
+        std::mem::replace(&mut self.assistant.focus_requested, false)
+    }
+
+    /// The assistant as laid out, while the app shows it on this review.
+    #[must_use]
+    pub const fn assistant(&self) -> Option<AssistantMember> {
+        self.assistant.member
+    }
+
+    /// The size the assistant took by resizing since the last call, for the app to keep (its
+    /// size is the app's). Reading clears it.
+    pub const fn take_assistant_size(&mut self) -> Option<AssistantSize> {
+        self.assistant.size.take()
     }
 
     /// The guide's outline height as dragged, of the rows it shares with the current section
@@ -320,7 +479,27 @@ impl Panels {
     /// Panels for a body of `width` x `height` cells.
     #[must_use]
     pub const fn plan(&self, width: u16, height: u16) -> PanelPlan {
+        self.plan_for(width, height, self.guide_open)
+    }
+
+    /// Panels for a body of `width` x `height` cells, with the guide panel open or not.
+    const fn plan_for(&self, width: u16, height: u16, guide_open: bool) -> PanelPlan {
         let bordered = width >= MIN_BORDERED_WIDTH && height >= MIN_BORDERED_HEIGHT;
+        let assistant = if !bordered || self.assistant.member.is_none() {
+            SidePlacement::Hidden
+        } else if width >= ASSISTANT_RIGHT_BODY {
+            SidePlacement::Right
+        } else if height >= ASSISTANT_BOTTOM_BODY_HEIGHT {
+            SidePlacement::Bottom
+        } else {
+            SidePlacement::Hidden
+        };
+        // The other panels are planned for what the assistant leaves at its narrowest.
+        let (width, height) = match assistant {
+            SidePlacement::Right => (width - ASSISTANT_MIN_WIDTH, height),
+            SidePlacement::Bottom => (width, height - ASSISTANT_MIN_HEIGHT),
+            SidePlacement::Hidden => (width, height),
+        };
         let threads = if !bordered || !self.threads_open {
             SidePlacement::Hidden
         } else if width >= THREADS_RIGHT_BODY {
@@ -330,7 +509,7 @@ impl Panels {
         } else {
             SidePlacement::Hidden
         };
-        let guide = if !bordered || !self.guide_open {
+        let guide = if !bordered || !guide_open {
             SidePlacement::Hidden
         } else if width >= GUIDE_RIGHT_BODY {
             SidePlacement::Right
@@ -358,6 +537,7 @@ impl Panels {
             files,
             threads,
             guide,
+            assistant,
         }
     }
 
@@ -432,38 +612,26 @@ impl Panels {
         self.convert_legacy(plan, width, height);
         self.plan = Some(plan);
         self.body = (width, height);
+        let guide_right = plan.guide == SidePlacement::Right;
+        // The assistant's column first; the other panels share what it leaves.
+        let assistant = self.assistant_column(plan, width);
+        let assistant_max = width
+            .saturating_sub(REVIEW_MIN_WIDTH)
+            .max(ASSISTANT_MIN_WIDTH);
+        let width_all = width;
+        let width = width.saturating_sub(assistant.unwrap_or(0));
         let side_room = width.saturating_sub(REVIEW_MIN_WIDTH);
         let side_max = side_room.max(FILES_MIN_WIDTH);
         let mut files = plan.files.then(|| {
-            let default = (width / 4).clamp(FILES_MIN_WIDTH, FILES_DEFAULT_MAX);
+            let default = (width_all / 4).clamp(FILES_MIN_WIDTH, FILES_DEFAULT_MAX);
             self.shares
                 .files
-                .map_or(default, |share| cells_of(share, width))
+                .map_or(default, |share| cells_of(share, width_all))
                 .clamp(FILES_MIN_WIDTH, side_max)
         });
-        let guide_right = plan.guide == SidePlacement::Right;
-        let right_member = match (guide_right, plan.threads == SidePlacement::Right) {
-            (true, true) => Some(PanelId::Side),
-            (true, false) => Some(PanelId::Guide),
-            (false, true) => Some(PanelId::Threads),
-            (false, false) => None,
-        };
-        let right_min = if guide_right {
-            GUIDE_MIN_WIDTH
-        } else {
-            FILES_MIN_WIDTH
-        };
-        let right_max = side_room.max(right_min);
-        let mut right = right_member.map(|_| {
-            let (share, default) = if guide_right {
-                (self.shares.guide_right, GUIDE_DEFAULT_WIDTH)
-            } else {
-                (self.shares.threads_right, THREADS_DEFAULT_WIDTH)
-            };
-            share
-                .map_or(default, |share| cells_of(share, width))
-                .clamp(right_min, right_max)
-        });
+        let right_column = self.right_column(plan, width_all, side_room);
+        let right_min = right_column.map_or(FILES_MIN_WIDTH, |(_, _, min, _)| min);
+        let mut right = right_column.map(|(_, cells, _, _)| cells);
         let sides = |files: Option<u16>, right: Option<u16>| {
             files.unwrap_or(0).saturating_add(right.unwrap_or(0))
         };
@@ -500,10 +668,18 @@ impl Panels {
             REVIEW_MIN_WIDTH.min(width),
             None,
         ));
-        if let (Some(member), Some(cells)) = (right_member, right) {
+        if let (Some((member, _, min, max)), Some(cells)) = (right_column, right) {
             members.push(member);
             lengths.push(cells);
-            constraints.push(PanelGroupConstraints::new(right_min, Some(right_max)));
+            constraints.push(PanelGroupConstraints::new(min, Some(max)));
+        }
+        if let Some(cells) = assistant {
+            members.push(PanelId::Assistant);
+            lengths.push(cells);
+            constraints.push(PanelGroupConstraints::new(
+                ASSISTANT_MIN_WIDTH.min(width_all),
+                Some(assistant_max),
+            ));
         }
         self.root_members = members;
         let (column_lengths, column_constraints) = self.column_layout(plan, height);
@@ -517,6 +693,42 @@ impl Panels {
         plan
     }
 
+    /// The panel to the right of the document (the guide, the threads, or both sharing a
+    /// column) when `plan` puts one there: its member, its length in a body `width` wide, and
+    /// its limits with `side_room` columns beside the document's minimum.
+    fn right_column(
+        &self,
+        plan: PanelPlan,
+        width: u16,
+        side_room: u16,
+    ) -> Option<(PanelId, u16, u16, u16)> {
+        let guide_right = plan.guide == SidePlacement::Right;
+        let member = match (guide_right, plan.threads == SidePlacement::Right) {
+            (true, true) => PanelId::Side,
+            (true, false) => PanelId::Guide,
+            (false, true) => PanelId::Threads,
+            (false, false) => return None,
+        };
+        let (share, default, min) = if guide_right {
+            (
+                self.shares.guide_right,
+                GUIDE_DEFAULT_WIDTH,
+                GUIDE_MIN_WIDTH,
+            )
+        } else {
+            (
+                self.shares.threads_right,
+                THREADS_DEFAULT_WIDTH,
+                FILES_MIN_WIDTH,
+            )
+        };
+        let max = side_room.max(min);
+        let cells = share
+            .map_or(default, |share| cells_of(share, width))
+            .clamp(min, max);
+        Some((member, cells, min, max))
+    }
+
     /// The review column: the document, then the guide and threads panels under it. Sets its
     /// members and returns their lengths and constraints.
     fn column_layout(
@@ -527,7 +739,14 @@ impl Panels {
         let mut members = vec![PanelId::Review];
         let mut lengths = Vec::new();
         let mut constraints = Vec::new();
-        let room = height.saturating_sub(MIN_PANE_ROWS);
+        let all_room = height.saturating_sub(MIN_PANE_ROWS);
+        // The assistant first, then the guide and threads in what it leaves.
+        let assistant = (plan.assistant == SidePlacement::Bottom).then(|| {
+            self.assistant_length(height, false)
+                .clamp(ASSISTANT_MIN_HEIGHT, all_room.max(ASSISTANT_MIN_HEIGHT))
+                .min(height)
+        });
+        let room = all_room.saturating_sub(assistant.unwrap_or(0));
         let mut guide = (plan.guide == SidePlacement::Bottom).then(|| {
             self.shares
                 .guide_bottom
@@ -558,10 +777,14 @@ impl Panels {
             // No room for both at their minimum: the threads panel is left out.
             threads = None;
         }
-        let document = height.saturating_sub(total(guide, threads));
+        if total(guide, None) > room {
+            // Beside the assistant, not even the guide fits.
+            guide = None;
+        }
+        let document = height.saturating_sub(total(guide, threads) + assistant.unwrap_or(0));
         lengths.push(document);
         constraints.push(PanelGroupConstraints::new(
-            if guide.is_some() || threads.is_some() {
+            if guide.is_some() || threads.is_some() || assistant.is_some() {
                 MIN_PANE_ROWS
             } else {
                 0
@@ -584,8 +807,65 @@ impl Panels {
                 Some(room.max(THREADS_MIN_HEIGHT)),
             ));
         }
+        if let Some(cells) = assistant {
+            members.push(PanelId::Assistant);
+            lengths.push(cells);
+            constraints.push(PanelGroupConstraints::new(
+                ASSISTANT_MIN_HEIGHT.min(height),
+                Some(all_room.max(ASSISTANT_MIN_HEIGHT)),
+            ));
+        }
         self.column_members = members;
         (lengths, constraints)
+    }
+
+    /// The assistant's column in a body `width` columns wide, when `plan` puts it beside the
+    /// document: its size, leaving the document and a right panel their narrowest.
+    fn assistant_column(&self, plan: PanelPlan, width: u16) -> Option<u16> {
+        if plan.assistant != SidePlacement::Right {
+            return None;
+        }
+        let right = if plan.guide == SidePlacement::Right {
+            GUIDE_MIN_WIDTH
+        } else if plan.threads == SidePlacement::Right {
+            FILES_MIN_WIDTH
+        } else {
+            0
+        };
+        let max = width
+            .saturating_sub(REVIEW_MIN_WIDTH + right)
+            .max(ASSISTANT_MIN_WIDTH);
+        Some(
+            self.assistant_length(width, true)
+                .clamp(ASSISTANT_MIN_WIDTH, max)
+                .min(width),
+        )
+    }
+
+    /// The assistant's preferred length along a body of `length` cells, beside the document
+    /// (`right`) or under it: the size kept with this review when its size is per review, else
+    /// (or before one was) the app's, else the configured one.
+    fn assistant_length(&self, length: u16, right: bool) -> u16 {
+        let Some(member) = self.assistant.member else {
+            return 0;
+        };
+        let (own, app, configured) = if right {
+            (
+                self.shares.assistant_right,
+                member.right_share,
+                member.width,
+            )
+        } else {
+            (
+                self.shares.assistant_bottom,
+                member.bottom_share,
+                member.height,
+            )
+        };
+        own.filter(|_| member.per_review).or(app).map_or_else(
+            || configured.cells_of(length),
+            |share| cells_of(share, length),
+        )
     }
 
     /// The body's groups as laid out for `plan` (nothing without pane chrome): the root group,
@@ -644,7 +924,8 @@ impl Panels {
         let root_state = self.root.borrow().clone();
         if !review_collapsed(&self.root_members, &root_state) {
             let root = Self::lengths(PanelGroupAxis::Horizontal, &root_state, width, height);
-            for (index, (member, cells)) in self.root_members.iter().zip(root).enumerate() {
+            let members = self.root_members.clone();
+            for (index, (member, cells)) in members.iter().zip(root).enumerate() {
                 if root_state.is_collapsed(index) {
                     continue;
                 }
@@ -654,6 +935,9 @@ impl Panels {
                     PanelId::Guide | PanelId::Side => {
                         self.shares.guide_right = Some(share_of(cells, width));
                     }
+                    PanelId::Assistant => {
+                        self.note_assistant(AssistantSize::Right(share_of(cells, width)));
+                    }
                     PanelId::Review => {}
                 }
             }
@@ -661,9 +945,8 @@ impl Panels {
         let column_state = self.column.borrow().clone();
         if !review_collapsed(&self.column_members, &column_state) {
             let column = Self::lengths(PanelGroupAxis::Vertical, &column_state, width, height);
-            for (index, (member, cells)) in
-                self.column_members.iter().zip(column).enumerate().skip(1)
-            {
+            let members = self.column_members.clone();
+            for (index, (member, cells)) in members.iter().zip(column).enumerate().skip(1) {
                 if column_state.is_collapsed(index) {
                     continue;
                 }
@@ -672,11 +955,33 @@ impl Panels {
                         self.shares.threads_bottom = Some(share_of(cells, height));
                     }
                     PanelId::Guide => self.shares.guide_bottom = Some(share_of(cells, height)),
+                    PanelId::Assistant => {
+                        self.note_assistant(AssistantSize::Bottom(share_of(cells, height)));
+                    }
                     PanelId::Files | PanelId::Review | PanelId::Side => {}
                 }
             }
         }
         before != self.shares
+    }
+
+    /// Keep a size the assistant took: with this review when its size is per review (then the
+    /// review's state changes), else for the app, when it differs from the app's.
+    fn note_assistant(&mut self, size: AssistantSize) {
+        let Some(member) = self.assistant.member else {
+            return;
+        };
+        match (size, member.per_review) {
+            (AssistantSize::Right(share), true) => self.shares.assistant_right = Some(share),
+            (AssistantSize::Bottom(share), true) => self.shares.assistant_bottom = Some(share),
+            (AssistantSize::Right(share), false) if member.right_share != Some(share) => {
+                self.assistant.size = Some(size);
+            }
+            (AssistantSize::Bottom(share), false) if member.bottom_share != Some(share) => {
+                self.assistant.size = Some(size);
+            }
+            _ => {}
+        }
     }
 
     /// The lengths `state` lays its panels out at in the body.
@@ -726,9 +1031,10 @@ impl Panels {
     #[must_use]
     pub const fn guide_fits(&self) -> bool {
         let (width, height) = self.body;
-        width >= MIN_BORDERED_WIDTH
-            && height >= MIN_BORDERED_HEIGHT
-            && (width >= GUIDE_RIGHT_BODY || height >= GUIDE_BOTTOM_BODY_HEIGHT)
+        !matches!(
+            self.plan_for(width, height, true).guide,
+            SidePlacement::Hidden
+        )
     }
 
     /// Open the guide panel (restored, when it was minimized).
@@ -757,7 +1063,8 @@ impl Panels {
             PanelId::Files => self.files_choice = Some(false),
             PanelId::Threads => self.threads_open = false,
             PanelId::Guide => self.guide_open = false,
-            PanelId::Review | PanelId::Side => return false,
+            // The assistant closes itself (it is the app's).
+            PanelId::Review | PanelId::Side | PanelId::Assistant => return false,
         }
         self.opened_or_closed(id);
         true
@@ -902,8 +1209,14 @@ impl Panels {
             panels.shares.guide_right = None;
             panels.shares.guide_bottom = None;
         };
+        let panels_column = |panels: &mut Self| panels.shares.guide_right = None;
         match id {
             PanelId::Files => files(self),
+            // Sharing the right column with the guide, its width is the column's.
+            PanelId::Threads if self.root_members.contains(&PanelId::Side) => {
+                threads(self);
+                panels_column(self);
+            }
             PanelId::Threads => threads(self),
             PanelId::Guide => guide(self),
             PanelId::Side => {
@@ -914,6 +1227,17 @@ impl Panels {
                 files(self);
                 threads(self);
                 guide(self);
+            }
+            PanelId::Assistant => {
+                self.shares.assistant_right = None;
+                self.shares.assistant_bottom = None;
+                if !self
+                    .assistant
+                    .member
+                    .is_some_and(|member| member.per_review)
+                {
+                    self.assistant.size = Some(AssistantSize::Reset);
+                }
             }
         }
         self.plan = None;
@@ -1189,6 +1513,162 @@ mod tests {
         // Short: no room for both under the document; the threads panel is left out.
         panels.sync(90, GUIDE_BOTTOM_BODY_HEIGHT);
         assert_eq!(panels.column_members(), [PanelId::Review, PanelId::Guide]);
+    }
+
+    fn assistant(per_review: bool) -> AssistantMember {
+        AssistantMember {
+            minimized: false,
+            maximized: false,
+            right_share: None,
+            bottom_share: None,
+            width: DockLength::Percent(40),
+            height: DockLength::Percent(40),
+            per_review,
+        }
+    }
+
+    #[test]
+    fn the_assistant_has_the_far_right_column_and_the_others_plan_for_what_it_leaves() {
+        let mut panels = Panels::restore(&ReviewPanelState {
+            threads_panel_visible: Some(true),
+            guide_panel_visible: Some(true),
+            ..ReviewPanelState::default()
+        });
+        panels.set_assistant(Some(assistant(false)));
+        for width in [ASSISTANT_RIGHT_BODY, 120, 170, 200, 260] {
+            let widths = root_widths(&mut panels, width, 40);
+            assert_eq!(widths.iter().sum::<u16>(), width, "{width}: {widths:?}");
+            let members = panels.root_members().to_vec();
+            assert_eq!(
+                members.last(),
+                Some(&PanelId::Assistant),
+                "{width}: {members:?}"
+            );
+            let review = members.iter().position(|member| *member == PanelId::Review);
+            assert!(
+                widths[review.unwrap()] >= REVIEW_MIN_WIDTH,
+                "{width}: {widths:?}"
+            );
+            assert!(
+                *widths.last().unwrap() >= ASSISTANT_MIN_WIDTH,
+                "{width}: {widths:?}"
+            );
+        }
+        // The threads and guide panels move under the document before the assistant does.
+        let plan = panels.plan(ASSISTANT_RIGHT_BODY, 40);
+        assert_eq!(plan.assistant, SidePlacement::Right);
+        assert_eq!(plan.threads, SidePlacement::Bottom);
+        assert_eq!(plan.guide, SidePlacement::Bottom);
+        // Narrower, the assistant moves under the document too; then out of the body.
+        let plan = panels.plan(ASSISTANT_RIGHT_BODY - 1, 40);
+        assert_eq!(plan.assistant, SidePlacement::Bottom);
+        panels.sync(ASSISTANT_RIGHT_BODY - 1, 40);
+        assert_eq!(panels.column_members().last(), Some(&PanelId::Assistant));
+        let heights = Panels::lengths(
+            PanelGroupAxis::Vertical,
+            &panels.column.borrow(),
+            ASSISTANT_RIGHT_BODY - 1,
+            40,
+        );
+        assert_eq!(heights.iter().sum::<u16>(), 40, "{heights:?}");
+        assert!(
+            *heights.last().unwrap() >= ASSISTANT_MIN_HEIGHT,
+            "{heights:?}"
+        );
+        assert_eq!(
+            panels
+                .plan(ASSISTANT_RIGHT_BODY - 1, ASSISTANT_BOTTOM_BODY_HEIGHT - 1)
+                .assistant,
+            SidePlacement::Hidden
+        );
+        assert_eq!(
+            panels.plan(MIN_BORDERED_WIDTH - 1, 40).assistant,
+            SidePlacement::Hidden
+        );
+        // Not shown on the review: nothing of it is laid out.
+        panels.set_assistant(None);
+        panels.sync(200, 40);
+        assert!(!panels.root_members().contains(&PanelId::Assistant));
+        assert_eq!(panels.plan(200, 40).assistant, SidePlacement::Hidden);
+    }
+
+    #[test]
+    fn the_guide_fits_where_the_plan_beside_the_assistant_has_room_for_it() {
+        let mut panels = Panels::default();
+        panels.set_assistant(Some(assistant(false)));
+        // Under the document with the assistant: the guide needs its rows on top of its own.
+        panels.sync(80, ASSISTANT_MIN_HEIGHT + GUIDE_BOTTOM_BODY_HEIGHT);
+        assert!(panels.guide_fits());
+        panels.sync(80, ASSISTANT_MIN_HEIGHT + GUIDE_BOTTOM_BODY_HEIGHT - 1);
+        assert!(!panels.guide_fits());
+        panels.set_assistant(None);
+        panels.sync(80, ASSISTANT_MIN_HEIGHT + GUIDE_BOTTOM_BODY_HEIGHT - 1);
+        assert!(panels.guide_fits());
+    }
+
+    #[test]
+    fn the_assistant_takes_the_apps_size_or_keeps_its_own_with_the_review() {
+        // The app's size: a resize is handed back, and nothing is saved with the review.
+        let mut panels = Panels::default();
+        let member = AssistantMember {
+            right_share: Some(share_of(50, 200)),
+            ..assistant(false)
+        };
+        panels.set_assistant(Some(member));
+        assert_eq!(*root_widths(&mut panels, 200, 40).last().unwrap(), 50);
+        assert!(panels.resize(PanelId::Assistant, 10));
+        assert_eq!(
+            panels.take_assistant_size(),
+            Some(AssistantSize::Right(share_of(60, 200)))
+        );
+        assert_eq!(panels.take_assistant_size(), None, "taken once");
+        assert_eq!(panels.state().assistant_right_share, None);
+        assert!(!panels.reset_size(PanelId::Assistant));
+        assert_eq!(panels.take_assistant_size(), Some(AssistantSize::Reset));
+
+        // Kept with the review: saved, restored, and preferred over the app's size.
+        let mut panels = Panels::default();
+        panels.set_assistant(Some(AssistantMember {
+            per_review: true,
+            ..member
+        }));
+        root_widths(&mut panels, 200, 40);
+        assert!(panels.resize(PanelId::Assistant, 10));
+        assert_eq!(panels.take_assistant_size(), None);
+        let state = panels.state();
+        assert_eq!(state.assistant_right_share, Some(share_of(60, 200)));
+        let mut restored = Panels::restore(&state);
+        restored.set_assistant(Some(AssistantMember {
+            per_review: true,
+            ..member
+        }));
+        assert_eq!(*root_widths(&mut restored, 200, 40).last().unwrap(), 60);
+        assert!(restored.reset_size(PanelId::Assistant));
+        assert_eq!(restored.take_assistant_size(), None);
+        // Without a size of its own, the review takes the app's.
+        assert_eq!(*root_widths(&mut restored, 200, 40).last().unwrap(), 50);
+    }
+
+    #[test]
+    fn the_assistant_window_state_follows_the_app() {
+        let mut panels = Panels::default();
+        panels.set_assistant(Some(AssistantMember {
+            minimized: true,
+            ..assistant(false)
+        }));
+        panels.sync(200, 40);
+        assert_eq!(panels.shape(PanelId::Assistant), Shape::Strip);
+        panels.set_assistant(Some(AssistantMember {
+            maximized: true,
+            ..assistant(false)
+        }));
+        panels.sync(200, 40);
+        assert_eq!(panels.maximized(), Some(PanelId::Assistant));
+        assert_eq!(panels.shape(PanelId::Assistant), Shape::Maximized);
+        panels.set_assistant(Some(assistant(false)));
+        panels.sync(200, 40);
+        assert_eq!(panels.maximized(), None);
+        assert_eq!(panels.shape(PanelId::Assistant), Shape::Normal);
     }
 
     #[test]

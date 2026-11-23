@@ -61,7 +61,7 @@ use bmux_tui::component::{
     Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId, LayoutNode,
     LogicalSize,
 };
-use bmux_tui::composition::{Column, Flex, Row, TextBlock};
+use bmux_tui::composition::{Column, Fill, Flex, Row, TextBlock};
 use bmux_tui::event::{Event, EventOutcome, FocusEvent, MouseButton, MouseEventKind};
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -121,6 +121,8 @@ pub const REVIEW_PANE_ID: &str = "review.pane";
 pub const FILES_PANE_ID: &str = "review.files";
 /// Pane of the threads panel.
 pub const THREADS_PANE_ID: &str = "review.threads";
+/// The place the body keeps for the app's review assistant.
+pub const ASSISTANT_SLOT_ID: &str = "review.assistant";
 /// The file tree.
 pub const TREE_ID: &str = "review.files.tree";
 /// The file tree's scroll viewport.
@@ -1138,6 +1140,96 @@ impl ReviewSurface {
             .frame
             .as_ref()
             .map(|frame| frame.list_area)
+    }
+
+    /// Lay the app's assistant out in the body as `member` (`None`: not shown on this review);
+    /// `focused` while it has the keyboard.
+    pub fn set_assistant_member(
+        &mut self,
+        member: Option<super::panels::AssistantMember>,
+        focused: bool,
+    ) {
+        self.panels.set_assistant(member);
+        self.panels.set_assistant_focused(focused);
+    }
+
+    /// Where the last frame kept the assistant's place in the body, and whether beside the
+    /// document (else under it); `None` while the body has no place for it.
+    #[must_use]
+    pub fn assistant_slot(&self) -> Option<(Rect, bool)> {
+        let plan = self.panels.current()?;
+        let right = match plan.assistant {
+            super::panels::SidePlacement::Right => true,
+            super::panels::SidePlacement::Bottom => false,
+            super::panels::SidePlacement::Hidden => return None,
+        };
+        if !self.panels.shown(PanelId::Assistant) {
+            return None;
+        }
+        self.body_area(ASSISTANT_SLOT_ID).map(|rect| (rect, right))
+    }
+
+    /// The divider before the assistant's place as the last frame laid it out (on the
+    /// assistant's own border beside the document), with the style it is highlighted in while
+    /// hovered or dragged.
+    #[must_use]
+    pub fn assistant_divider(&self) -> Option<(Rect, Option<Style>)> {
+        let (_, right) = self.assistant_slot()?;
+        let (id, state, members, axis) = if right {
+            (
+                ROOT_ID,
+                &self.panels.root,
+                self.panels.root_members(),
+                PanelGroupAxis::Horizontal,
+            )
+        } else {
+            (
+                COLUMN_ID,
+                &self.panels.column,
+                self.panels.column_members(),
+                PanelGroupAxis::Vertical,
+            )
+        };
+        let index = members
+            .iter()
+            .position(|member| *member == PanelId::Assistant)?
+            .checked_sub(1)?;
+        let area = self.body_area(id)?;
+        let state = state.borrow();
+        let layout = super::panels::group(axis, self.theme.panels).layout(area, &state);
+        let rect = *layout.dividers.get(index)?;
+        let style = if state.active_divider() == Some(index) {
+            Some(self.theme.panels.active_divider)
+        } else if state.hovered_divider() == Some(index) {
+            Some(self.theme.panels.hovered_divider)
+        } else {
+            None
+        };
+        Some((rect, style))
+    }
+
+    /// Whether a divider of the body is being dragged (the drag follows the pointer over the
+    /// assistant too).
+    #[must_use]
+    pub fn dragging_divider(&self) -> bool {
+        self.panels.dragging()
+    }
+
+    /// Whether `tab` moved the keyboard on to the assistant since the last call.
+    pub const fn take_assistant_focus(&mut self) -> bool {
+        self.panels.take_assistant_focus()
+    }
+
+    /// The size the assistant took in the body by resizing since the last call, for the app
+    /// to keep. Reading clears it.
+    pub const fn take_assistant_size(&mut self) -> Option<super::panels::AssistantSize> {
+        self.panels.take_assistant_size()
+    }
+
+    /// Grow, shrink or reset the assistant in the body (its other window commands are its
+    /// own).
+    pub fn assistant_panel_command(&mut self, command: Command, count: Option<u32>) -> Action {
+        self.panel_command(PanelId::Assistant, command, count)
     }
 
     /// Area (absolute) of a laid-out body node, such as [`FILES_PANE_ID`] or [`TREE_ID`], in
@@ -3301,6 +3393,7 @@ impl ReviewSurface {
         let files = open(PanelId::Files);
         let threads = open(PanelId::Threads);
         let guide = open(PanelId::Guide);
+        let assistant = open(PanelId::Assistant);
         self.focus = match self.focus {
             Focus::Review if files => Focus::Files,
             Focus::Review | Focus::Files | Focus::Filter if guide => Focus::Guide,
@@ -3308,6 +3401,14 @@ impl ReviewSurface {
                 Focus::Threads
             }
             Focus::Composer | Focus::Search => self.focus,
+            // After the last review panel, the assistant beside them; the review keeps the
+            // document focused for when the keyboard comes back.
+            Focus::Review | Focus::Files | Focus::Filter | Focus::Guide | Focus::Threads
+                if assistant =>
+            {
+                self.panels.request_assistant_focus();
+                Focus::Review
+            }
             _ => Focus::Review,
         };
     }
@@ -4234,6 +4335,10 @@ impl ReviewSurface {
             PanelId::Threads => Focus::Threads,
             PanelId::Guide => Focus::Guide,
             PanelId::Review | PanelId::Side => Focus::Review,
+            PanelId::Assistant => {
+                self.panels.request_assistant_focus();
+                return;
+            }
         };
     }
 
@@ -4314,7 +4419,7 @@ impl ReviewSurface {
             PanelId::Files => self.files_pane_chrome(review),
             PanelId::Threads => self.threads_pane_chrome(review),
             PanelId::Guide => self.guide_pane_chrome(),
-            PanelId::Review | PanelId::Side => self.review_pane_chrome(review),
+            PanelId::Review | PanelId::Side | PanelId::Assistant => self.review_pane_chrome(review),
         }
     }
 
@@ -4996,11 +5101,17 @@ impl ReviewSurface {
         if !shown {
             self.focus = Focus::Review;
         }
-        // A maximized panel stays maximized while it has the focus.
+        // A maximized panel stays maximized while it has the focus (the assistant follows its
+        // own state).
+        let focused = if self.panels.assistant_focused() {
+            PanelId::Assistant
+        } else {
+            self.focused_panel()
+        };
         if self
             .panels
             .maximized()
-            .is_some_and(|maximized| maximized != self.focused_panel())
+            .is_some_and(|maximized| maximized != focused && maximized != PanelId::Assistant)
         {
             self.panels.restore_maximized();
             self.title_clicks.reset();
@@ -5327,6 +5438,7 @@ impl ReviewSurface {
                             column = match member {
                                 PanelId::Threads => column.child(self.threads_pane(review)),
                                 PanelId::Guide => column.child(self.guide_pane(plan.guide)),
+                                PanelId::Assistant => column.child(self.assistant_slot_pane()),
                                 PanelId::Files | PanelId::Review | PanelId::Side => column,
                             };
                         }
@@ -5337,6 +5449,7 @@ impl ReviewSurface {
                 }
                 PanelId::Threads => root = root.child(self.threads_pane(review)),
                 PanelId::Guide => root = root.child(self.guide_pane(plan.guide)),
+                PanelId::Assistant => root = root.child(self.assistant_slot_pane()),
                 PanelId::Side => {
                     let side = PanelGroupComponent::new(
                         SIDE_ID,
@@ -5350,6 +5463,12 @@ impl ReviewSurface {
             }
         }
         Element::new(root)
+    }
+
+    /// The place kept for the app's assistant: the canvas, which the app paints the assistant
+    /// over.
+    fn assistant_slot_pane(&self) -> Fill<'static> {
+        Fill::new(self.theme.canvas, Column::new()).id(ASSISTANT_SLOT_ID)
     }
 
     fn guide_pane(&self, placement: super::panels::SidePlacement) -> PaneComponent<'_, '_> {
@@ -5482,6 +5601,7 @@ const fn pane_id(id: PanelId) -> &'static str {
         PanelId::Threads => THREADS_PANE_ID,
         PanelId::Guide => GUIDE_PANE_ID,
         PanelId::Review | PanelId::Side => REVIEW_PANE_ID,
+        PanelId::Assistant => ASSISTANT_SLOT_ID,
     }
 }
 
@@ -5492,6 +5612,7 @@ const fn panel_kind(id: PanelId) -> PanelKind {
         PanelId::Threads => PanelKind::Threads,
         PanelId::Guide => PanelKind::Guide,
         PanelId::Review | PanelId::Side => PanelKind::Review,
+        PanelId::Assistant => PanelKind::Assistant,
     }
 }
 

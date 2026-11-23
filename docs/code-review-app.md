@@ -853,7 +853,9 @@ columns by earlier versions are converted the first time the review shows them.
 ### Panel controls
 
 Every panel of the app (the file panel, the review document, the threads panel, the guide panel
-and the review assistant) has the same window controls. Their mechanics are BMUX
+and the review assistant) has the same window controls. In a review the assistant is one of the body's panels: its own
+column at the far right, or under the document when the body is narrow (see
+[the assistant's placement](code-review-assistant.md#placement)). Their mechanics are BMUX
 `tui-components`' `panel_window` (title-row controls, minimized rows and strips, nested
 maximize, double clicks, window commands); the app's policy (which panels close, glyphs, keys,
 what is saved) is `packages/code-review-ui/src/panel_controls.rs`:
@@ -887,8 +889,8 @@ what is saved) is `packages/code-review-ui/src/panel_controls.rs`:
   (under it, else beside it); otherwise the key says there is nothing to take its room. `tab`
   skips minimized panels; a click on a minimized title row focuses it; a key that opens or
   focuses a panel (`alt+g`, `f`, `ctrl+k`) restores it.
-* **Maximize** gives the panel the whole review body (the assistant: the whole app) and lays out
-  no other panel until it is restored. The same control or key restores it, as does the focused
+* **Maximize** gives the panel the whole review body (the assistant too, in a review; on home
+  and in the wizard the whole app) and lays out no other panel until it is restored. The same control or key restores it, as does the focused
   panel's back key (`esc`; in the document `esc` first clears a selection or search) and moving
   the keyboard focus to another panel.
 * **Close** hides the panel (the file panel's `t`, the threads panel's `shift+t`, `alt+g` and
@@ -1181,6 +1183,7 @@ markers.
 |---|---|
 | `ctrl+k` | Close the assistant |
 | `esc` | Back to the screen (the assistant stays open) |
+| `tab` | In a review: back to the review's panels (the review's `tab` cycle ends at the assistant) |
 | `ctrl+c` | Stop the assistant's running turn |
 | `ctrl+x` | Attach or detach what is on screen as context |
 | `ctrl+n`, `alt+n` | Start a new conversation |

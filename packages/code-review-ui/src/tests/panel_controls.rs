@@ -41,7 +41,27 @@ const fn open_key(kind: PanelKind) -> &'static str {
 /// A review with every panel open: the file panel (shown by width), the threads panel, the
 /// guide panel and the docked assistant, with the keyboard back on the review.
 fn all_open(width: u16, height: u16) -> Setup {
-    let mut setup = setup(width, height, true);
+    all_open_in(setup(width, height, true))
+}
+
+/// [`all_open`] with the assistant `columns` wide.
+fn all_open_with_assistant(width: u16, height: u16, columns: u16) -> Setup {
+    let (config, problems) = crate::assistant::profile::AssistantConfig::from_plugin_table(
+        &format!("[assistant]\nwidth = {columns}")
+            .parse()
+            .expect("toml"),
+    );
+    assert!(problems.is_empty(), "{problems:?}");
+    all_open_in(super::assistant::setup_with(
+        crate::testing::backend::TestBackend::default().with_assistant_config(config),
+        width,
+        height,
+        true,
+    ))
+}
+
+/// Open every panel in `setup`.
+fn all_open_in(mut setup: Setup) -> Setup {
     setup.scenario.key("shift+t");
     setup.scenario.key("alt+g");
     setup.scenario.key("ctrl+k");
@@ -326,7 +346,8 @@ fn every_panel_but_the_document_closes_by_click_and_by_key() {
 
 #[test]
 fn every_panel_grows_shrinks_and_resets_by_key() {
-    let mut setup = all_open(WIDTH, HEIGHT);
+    // Wide enough that the document has columns to give beside every panel and the assistant.
+    let mut setup = all_open(240, HEIGHT);
     for kind in PanelKind::ALL {
         focus(&mut setup, kind);
         let before = area(&setup, kind).unwrap();
@@ -404,7 +425,8 @@ fn minimized_panels_persist_across_restarts_and_maximize_does_not() {
 
 #[test]
 fn the_document_minimizes_only_with_an_expanded_panel_to_take_its_room() {
-    let mut setup = all_open(WIDTH, HEIGHT);
+    // Narrow enough beside the assistant that the threads panel sits under the document.
+    let mut setup = all_open(170, HEIGHT);
     // Under it, the threads panel takes its rows.
     click_control(&mut setup, PanelKind::Review, Control::Minimize);
     assert_eq!(shape(&setup, PanelKind::Review), Some(Shape::Row));
@@ -583,7 +605,9 @@ fn controls_show_on_the_focused_and_hovered_panels_and_follow_the_pointer() {
 
 #[test]
 fn minimized_panels_always_show_their_restore_control() {
-    let mut setup = all_open(WIDTH, HEIGHT);
+    // Narrow enough beside the assistant that the threads panel sits under the document, with
+    // the file panel wide enough for its controls.
+    let mut setup = all_open_with_assistant(185, HEIGHT, 40);
     for kind in [PanelKind::Files, PanelKind::Threads, PanelKind::Guide] {
         click_control(&mut setup, kind, Control::Minimize);
     }

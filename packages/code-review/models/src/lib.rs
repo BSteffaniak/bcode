@@ -464,6 +464,14 @@ pub struct ReviewPanelState {
     /// Whether the guide panel is minimized to its title row (or a strip, side by side).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide_panel_minimized: Option<bool>,
+    /// The review assistant's width beside the document, of the body width (parts of
+    /// [`PANEL_SHARE_SCALE`]), when its size is kept per review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_right_share: Option<u16>,
+    /// The review assistant's height under the document, of the body height (parts of
+    /// [`PANEL_SHARE_SCALE`]), when its size is kept per review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_bottom_share: Option<u16>,
 }
 
 /// Revealed context of one file.

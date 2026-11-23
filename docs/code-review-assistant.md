@@ -93,8 +93,23 @@ series view is not a change of comparison baseline.
 
 ### Placement
 
-The app splits its whole area between the route and the panel; each route renders unchanged in
-the rectangle it is given (its own header, body and footer), so no route lays the panel out.
+**In a review** the panel is a member of the review body's panels (`panels.rs`,
+`PanelId::Assistant`): its own column at the far right, beside the threads and guide panels,
+from the review's header row to its footer, while the body is at least 100 columns; under the
+document (below the guide and threads panels) while the body has at least 16 rows; otherwise
+not in the body, and the focused panel takes the whole area as below (step 3). The other
+panels are planned for the columns (or rows) it leaves at its narrowest, so as the screen
+narrows the file panel narrows and hides first, then the threads and guide panels move under
+the document, and only then does the assistant. The body keeps the panel's place (a canvas
+fill, `review.assistant`) and the app paints the panel there; the panel keeps its own window
+state, which the body mirrors each frame. The divider before it is the review group's: it
+highlights and drags like the review's other dividers, its handle on the panel's left border.
+The review's `tab` cycle (document, file panel, guide, threads) ends at the panel when it is
+shown and not minimized; `tab` in the panel (`assistant_focus_next`) and `esc` give the keyboard
+back to the review (to its document after a `tab` round, else to the panel it had).
+
+**On home and in the wizard** the app splits its whole area between the route and the panel;
+each route renders unchanged in the rectangle it is given (its own header, body and footer).
 The decision is made per frame from the app's area, in this order:
 
 1. **Right dock.** At least 100 columns: the panel takes the right column from the top row to
@@ -147,6 +162,12 @@ drag, so the cells it covered take pointer input for the route again.
 * **Reset.** The palette entry "Assistant: Reset the panel size to the configured default"
   (`assistant_reset_size`, unbound by default) forgets both shares, saves the cleared record
   and lays the panel out at the configured size again.
+* **In a review.** The panel's width beside the document and its height under it are the same
+  app-wide shares (of the review body's width or height): a drag of its divider, or grow and
+  shrink, among the review's panels saves them as above. With `assistant.size_scope =
+  "review"` the size is kept with each review instead (saved with its panels as
+  `assistant_right_share` / `assistant_bottom_share`); a review without a size of its own
+  takes the app's. Any other value is reported and `"app"` applies.
 
 #### Panel controls
 
@@ -160,17 +181,17 @@ The panel has the window controls every review app panel shares (see "Panel cont
   keyboard. Opening or focusing the panel (`ctrl+k`, Ask AI) and closing it restore it, so the
   state lasts for the run and is not saved with the size.
 * **Maximize** (`□`, `alt+z`, or a double click on the title row) zooms the focused panel over
-  the whole area; `❐`, the same key, another double click or `esc` restores it, keeping the
-  focus in the panel.
+  the whole area, and in a review over the review's body (its header and footer stay); `❐`,
+  the same key, another double click or `esc` restores it, keeping the focus in the panel.
 * **Close** (`✕`, `alt+w`, or `ctrl+k` while focused) closes it.
 * **Grow and shrink** (`alt+=`, `alt+-`) move the docked panel's inner edge by four cells within
   the dock limits, and **reset** (`alt+0`, or the palette's reset entry) forgets the dragged
   shares; both are saved like a drag.
 
-The review body loses its own assistant pane: `panels.rs` keeps the file and threads panels
-only.
+In a review, minimize collapses the panel within the review's group the same way (a strip at
+the right, its title row under the document), and the document takes the room.
 
-Right dock (at least 100 columns):
+Right dock on home (at least 100 columns):
 
 ```
 ┌ Code reviews · bcode ──── 3 needs attention  [✦ Ask AI] ┐┌ ✦ Assistant · Retry backoff #103 ┐
@@ -266,6 +287,7 @@ collides with an existing default in its scope (`code-review-home` has no `ctrl+
 | `code-review-assistant` | `alt+r` | Rename this conversation (`assistant_rename`) |
 | `code-review-assistant` | `alt+d` | Delete this conversation, after a confirmation (`assistant_delete`) |
 | `code-review-assistant` | `ctrl+k`, `esc`, `ctrl+c`, `ctrl+x`, `ctrl+o`, `pageup`, `pagedown` | As today; `esc` returns to the route, whichever it is |
+| `code-review-assistant` | `tab` | In a review, back to the review's panels (`assistant_focus_next`); elsewhere unbound |
 | `code-review-assistant` | `alt+m`, `shift+tab`, `alt+p`, `alt+t` | Model, effort, permissions, tools (see [Parity with bdata](#keys-1)) |
 | `code-review-assistant` | `alt+g` | Switch between the conversation and the guide, while the panel has `Chat` and `Guide` tabs (`assistant_guide_tab`) |
 | `code-review-assistant-history` | `up`, `down`, typing | Move, search |
@@ -641,6 +663,8 @@ which happens on start and on reconnect):
 # width = "40%"   # starting width of the right dock: columns (60) or a percentage ("40%")
 # height = "40%"  # starting height of the bottom dock: rows (14) or a percentage ("40%")
                   # a dragged size, remembered across runs, overrides these until reset
+# size_scope = "app"  # "review": keep the panel's size in a review with that review
+# attach_context = false  # attach what is on screen (cursor, selection) to every message
 # model = "fake-echo"   # app default model until one is chosen (`provider/model` too)
 # effort = "high"       # app default reasoning effort until one is chosen
 # base_agent = "build"  # Bcode agent whose tools and permission rules the assistant narrows

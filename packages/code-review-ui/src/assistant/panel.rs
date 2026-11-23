@@ -172,6 +172,17 @@ pub enum Dock {
     Zoomed,
 }
 
+/// Who lays the panel out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Placement {
+    /// The app docks it beside or under the screen (home, the wizard).
+    #[default]
+    Dock,
+    /// A review keeps a place for it in its body: this one in the last frame (beside the
+    /// document as [`Dock::Right`], under it as [`Dock::Bottom`]), or none.
+    Review(Option<(Rect, Dock)>),
+}
+
 /// The app's area split between the screen and the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Split {
@@ -384,6 +395,10 @@ pub struct Assistant {
     dock: RefCell<PanelGroupState>,
     /// The area, dock and minimized state the dock group was built for.
     dock_key: Cell<Option<(Rect, Dock, bool)>>,
+    /// Whether the app docks the panel or a review lays it out in its body.
+    placement: Cell<Placement>,
+    /// A size command for the review that lays the panel out (its divider is the review's).
+    review_command: Option<(crate::panel_controls::Command, Option<u32>)>,
     session: Option<String>,
     /// Title of the active conversation, once known.
     title: Option<String>,
@@ -500,6 +515,8 @@ impl Assistant {
             size: SizeSync::default(),
             dock: RefCell::new(PanelGroupState::new(Vec::new())),
             dock_key: Cell::new(None),
+            placement: Cell::new(Placement::Dock),
+            review_command: None,
             session: None,
             title: None,
             tag: None,
@@ -873,6 +890,24 @@ impl Assistant {
                 panel: None,
             };
         }
+        if let Placement::Review(slot) = self.placement.get() {
+            // The review lays the panel out; without a place for it, the focused panel takes
+            // the whole area.
+            return match slot {
+                Some(slot) => Split {
+                    screen: Some(area),
+                    panel: Some(slot),
+                },
+                None if self.is_focused() && !self.minimized() => Split {
+                    screen: None,
+                    panel: Some((area, Dock::Zoomed)),
+                },
+                None => Split {
+                    screen: Some(area),
+                    panel: None,
+                },
+            };
+        }
         if self.zoomed() && self.is_focused() {
             return Split {
                 screen: None,
@@ -983,7 +1018,7 @@ impl Assistant {
     /// Hand a pointer event to the dock group (a divider press, drag or hover), keeping a
     /// resized panel's size as a share of `area`. Returns what the group did.
     fn dock_event(&mut self, event: &Event, area: Rect, dock: Dock) -> PanelGroupOutcome {
-        if dock == Dock::Zoomed {
+        if dock == Dock::Zoomed || self.in_review() {
             return PanelGroupOutcome::Ignored;
         }
         self.sync_dock(area, dock);
@@ -2808,6 +2843,12 @@ impl Assistant {
         use crate::panel_controls::Shape;
         match dock {
             Dock::Zoomed => Shape::Maximized,
+            // In a review, maximized is the only panel the review's body lays out.
+            Dock::Right | Dock::Bottom
+                if self.in_review() && self.zoomed() && self.is_focused() =>
+            {
+                Shape::Maximized
+            }
             Dock::Right if self.minimized() => Shape::Strip,
             Dock::Bottom if self.minimized() => Shape::Row,
             Dock::Right | Dock::Bottom => Shape::Normal,
@@ -2846,12 +2887,80 @@ impl Assistant {
                 self.zoom = Zoom::Docked;
                 self.dock_key.set(None);
             }
+            // In a review, the review sizes the panel with its other panels.
+            Command::Grow | Command::Shrink | Command::ResetSize if self.in_review() => {
+                self.review_command = Some((command, count));
+            }
             Command::Grow | Command::Shrink => {
                 self.resize_by(command.delta(count, crate::panel_controls::RESIZE_STEP));
             }
             Command::ResetSize => self.reset_size(),
         }
         Outcome::Redraw
+    }
+
+    /// From this frame on a review lays the panel out, at `slot` (its rectangle and whether
+    /// beside the document, else under it), or nowhere while the review has no place for it.
+    pub fn place_in_review(&self, slot: Option<(Rect, bool)>) {
+        let slot = slot.map(|(rect, right)| (rect, if right { Dock::Right } else { Dock::Bottom }));
+        if !self.in_review() {
+            // The app's dock group is not used meanwhile.
+            self.dock_key.set(None);
+            *self.dock.borrow_mut() = PanelGroupState::new(Vec::new());
+        }
+        self.placement.set(Placement::Review(slot));
+    }
+
+    /// From this frame on the app docks the panel beside or under the screen.
+    pub fn place_in_dock(&self) {
+        if self.in_review() {
+            self.dock_key.set(None);
+        }
+        self.placement.set(Placement::Dock);
+    }
+
+    /// Whether a review lays the panel out.
+    #[must_use]
+    pub const fn in_review(&self) -> bool {
+        matches!(self.placement.get(), Placement::Review(_))
+    }
+
+    /// The panel as a review's body lays it out: its window state and size.
+    #[must_use]
+    pub fn review_member(&self) -> crate::panels::AssistantMember {
+        let config = self.services.assistant_config();
+        crate::panels::AssistantMember {
+            minimized: self.minimized(),
+            // Maximized only while it has the keyboard, as when docked.
+            maximized: self.zoomed() && self.is_focused(),
+            right_share: self.right_share,
+            bottom_share: self.bottom_share,
+            width: config.width,
+            height: config.height,
+            per_review: config.size_per_review,
+        }
+    }
+
+    /// The size command for the review that lays the panel out, since the last call.
+    pub const fn take_review_command(
+        &mut self,
+    ) -> Option<(crate::panel_controls::Command, Option<u32>)> {
+        self.review_command.take()
+    }
+
+    /// Keep `size`, which the panel took in a review's body, as the app's size (saved).
+    pub fn keep_review_size(&mut self, size: crate::panels::AssistantSize) {
+        match size {
+            crate::panels::AssistantSize::Right(share) => self.right_share = Some(share),
+            crate::panels::AssistantSize::Bottom(share) => self.bottom_share = Some(share),
+            crate::panels::AssistantSize::Reset => {
+                self.reset_size();
+                return;
+            }
+        }
+        self.size.chosen = true;
+        self.size.pending = SizeSave::Due;
+        self.touch();
     }
 
     /// Grow (positive) or shrink the docked panel by `delta` cells, within the limits of
@@ -3647,6 +3756,9 @@ impl Assistant {
                 self.dock_key.set(None);
             }
             "assistant_back" => self.visibility = Shown::Open,
+            // In a review the panel is the last of the review's panels: `tab` goes back to them.
+            "assistant_focus_next" if self.in_review() => self.visibility = Shown::Open,
+            "assistant_focus_next" => return Outcome::Ignored,
             "assistant_stop" => self.stop(ui),
             "assistant_context" => self.toggle_context(),
             "assistant_new" => self.new_conversation(),
@@ -3666,7 +3778,9 @@ impl Assistant {
             "assistant_permissions" => self.open_permissions(),
             "assistant_tools" => self.open_tools(),
             "assistant_permission_bypass" => self.toggle_bypass(ui),
-            "assistant_reset_size" => self.reset_size(),
+            "assistant_reset_size" => {
+                self.panel_command(crate::panel_controls::Command::ResetSize, None);
+            }
             "assistant_guide_tab" => {
                 if !self.guide.available {
                     self.notice = Some((
@@ -3855,6 +3969,9 @@ impl Assistant {
         push(self.key_of("assistant_new"), "new");
         push(self.key_of("assistant_stop"), "stop");
         push(self.key_of("assistant_context"), "context");
+        if self.in_review() {
+            push(self.key_of("assistant_focus_next"), "next pane");
+        }
         if self.session.is_some() {
             push(self.key_of("assistant_open"), "open in Bcode");
         }

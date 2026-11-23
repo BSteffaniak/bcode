@@ -442,8 +442,40 @@ impl ReviewApp {
         }
     }
 
+    /// Carry what a review and the assistant it lays out asked of each other: `tab` moving
+    /// the keyboard to the panel, a size the panel took among the review's panels, and a size
+    /// command from the panel for the review. Returns whether anything changed.
+    fn sync_review_assistant(&mut self) -> bool {
+        let Route::Review(review) = &mut self.route else {
+            return false;
+        };
+        let mut changed = review.take_assistant_focus();
+        if changed {
+            self.assistant.focus();
+        }
+        if let Some((command, count)) = self.assistant.take_review_command() {
+            review.assistant_panel_command(command, count);
+            changed = true;
+        }
+        if let Some(size) = review.take_assistant_size() {
+            self.assistant.keep_review_size(size);
+            changed = true;
+        }
+        changed
+    }
+
     /// Route an event to the assistant panel when it takes it.
     fn assistant_event(&mut self, event: &Event, host: &UiContext) -> Option<Action> {
+        if let Event::Mouse(mouse) = event
+            && let Route::Review(review) = &self.route
+            && (review.dragging_divider()
+                || review
+                    .assistant_divider()
+                    .is_some_and(|(divider, _)| divider.contains(mouse.position)))
+        {
+            // The divider on the panel's border, and any drag, are the review's.
+            return None;
+        }
         if let Event::Mouse(mouse) = event {
             if matches!(
                 mouse.kind,
@@ -1874,13 +1906,40 @@ impl View for ReviewApp {
         // Every cell inherits the canvas, so text without a background of its own sits on the
         // theme's canvas rather than the terminal's default background.
         frame.with_style(self.theme.canvas, |frame| {
-            let split = self.assistant.split(area);
-            match split.screen {
-                Some(screen) => {
-                    self.render_screen(screen, split.panel.is_some(), frame, styles, host);
+            let split = if matches!(self.route, Route::Review(_)) {
+                // A review lays the panel out with its own panels, then the panel is painted in
+                // the place it kept.
+                let shown = self.assistant.split(area).panel.is_some();
+                let member = self
+                    .assistant
+                    .is_open()
+                    .then(|| self.assistant.review_member());
+                let focused = self.assistant.is_focused();
+                if let Route::Review(review) = &mut self.route {
+                    review.set_assistant_member(member, focused);
                 }
-                None => self.button = None,
-            }
+                self.render_screen(area, shown, frame, styles, host);
+                let slot = match &self.route {
+                    Route::Review(review) => review.assistant_slot(),
+                    _ => None,
+                };
+                self.assistant.place_in_review(slot);
+                let split = self.assistant.split(area);
+                if split.screen.is_none() {
+                    self.button = None;
+                }
+                split
+            } else {
+                self.assistant.place_in_dock();
+                let split = self.assistant.split(area);
+                match split.screen {
+                    Some(screen) => {
+                        self.render_screen(screen, split.panel.is_some(), frame, styles, host);
+                    }
+                    None => self.button = None,
+                }
+                split
+            };
             self.screen_shown = split.screen.is_some();
             self.share_guide(self.screen_shown);
             if let Some((rect, dock)) = split.panel {
@@ -1894,6 +1953,20 @@ impl View for ReviewApp {
                     frame,
                 );
                 if let Route::Review(review) = &mut self.route {
+                    // The divider on the panel's border is the review's: keep its highlight.
+                    if dock != crate::assistant::panel::Dock::Zoomed
+                        && let Some((divider, Some(style))) = review.assistant_divider()
+                    {
+                        frame.restyle(
+                            bmux_tui::paint::LocalRect::new(
+                                divider.x.into(),
+                                divider.y.into(),
+                                divider.width,
+                                divider.height,
+                            ),
+                            style,
+                        );
+                    }
                     match self.assistant.guide_area() {
                         Some(guide) => review.paint_guide_tab(guide, frame),
                         None => review.guide_tab_hidden(),
@@ -1918,10 +1991,18 @@ impl View for ReviewApp {
             return EventResult::from_action(self.assistant_outcome(outcome, host));
         }
         if let Some(action) = self.assistant_event(event, host) {
+            let action = if self.sync_review_assistant() && action == Action::None {
+                Action::Redraw
+            } else {
+                action
+            };
             self.refresh_keymap(host);
             return EventResult::from_action(action);
         }
         let mut result = self.route_event(event, host);
+        if self.sync_review_assistant() && result.action == Action::None {
+            result = EventResult::from_action(Action::Redraw);
+        }
         if self.take_assistant_request() {
             self.assistant.toggle();
             if result.action == Action::None {
@@ -1943,6 +2024,9 @@ impl View for ReviewApp {
 
     fn poll(&mut self, host: &UiContext) -> Action {
         let mut action = self.poll_route(host);
+        if self.sync_review_assistant() && action == Action::None {
+            action = Action::Redraw;
+        }
         if self.take_assistant_request() {
             self.assistant.toggle();
         }

@@ -369,9 +369,18 @@ fn walking_through_a_review_fills_the_guide_live_and_its_card_drives_the_diff() 
 
 #[test]
 fn the_guide_is_a_tab_of_the_assistant_where_the_screen_has_no_room_for_its_panel() {
-    // Narrower than the right dock: the assistant docks under the screen, leaving the review
-    // too few rows for the guide panel.
-    let mut setup = setup(80, 30, true);
+    // Narrower than the right dock: the assistant sits under the document, leaving the body
+    // too few rows for the guide panel too. Tall enough to show the guide's outline.
+    let (config, problems) = crate::assistant::profile::AssistantConfig::from_plugin_table(
+        &"[assistant]\nheight = \"60%\"".parse().expect("toml"),
+    );
+    assert!(problems.is_empty(), "{problems:?}");
+    let mut setup = super::assistant::setup_with(
+        crate::testing::backend::TestBackend::default().with_assistant_config(config),
+        80,
+        26,
+        true,
+    );
     setup.scenario.key("ctrl+k");
     let session = setup.send("Walk me through this review.");
     let mut turn = Turn::new(&session, "Walk me through this review.");

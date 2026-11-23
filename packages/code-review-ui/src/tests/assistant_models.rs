@@ -389,7 +389,7 @@ fn usage_shows_tokens_and_cost_on_the_title_row() {
         .totals_micros
         .insert("USD".to_owned(), 12_300);
     let screen = setup.deliver(&session, used);
-    let title = screen.row_text(0);
+    let title = screen.row_text(title_row(&screen));
     assert!(title.contains("12.3k tok"), "{title}");
     assert!(title.contains("$0.0123"), "{title}");
 }
@@ -640,7 +640,12 @@ fn open_in_bcode_shows_only_with_a_conversation_and_the_title_row_closes_and_zoo
     with_models(&setup);
     setup.scenario.key("ctrl+k");
     let screen = setup.settle();
-    assert!(!screen.row_text(0).contains('↗'), "{}", screen.row_text(0));
+    let row = title_row(&screen);
+    assert!(
+        !screen.row_text(row).contains('↗'),
+        "{}",
+        screen.row_text(row)
+    );
     setup.scenario.key("ctrl+o");
     setup.settle();
     assert_eq!(
@@ -649,7 +654,12 @@ fn open_in_bcode_shows_only_with_a_conversation_and_the_title_row_closes_and_zoo
     );
     setup.send("first");
     let screen = setup.settle();
-    assert!(screen.row_text(0).contains('↗'), "{}", screen.row_text(0));
+    let row = title_row(&screen);
+    assert!(
+        screen.row_text(row).contains('↗'),
+        "{}",
+        screen.row_text(row)
+    );
     // A double click on the title zooms the panel over the whole area, and again restores it.
     let title = screen.find("Assistant").expect("title");
     setup.scenario.click(title.x, title.y);
@@ -662,11 +672,13 @@ fn open_in_bcode_shows_only_with_a_conversation_and_the_title_row_closes_and_zoo
     setup.settle();
     assert!(!setup.app().assistant().zoomed());
     let screen = setup.settle();
-    let close = screen
-        .find("× ")
-        .filter(|at| at.y == 0)
+    let row = title_row(&screen);
+    // The panel is the rightmost on its row: its ✕ is the last one there.
+    let close = (0..screen.width())
+        .rev()
+        .find(|x| screen.cell(*x, row).is_some_and(|cell| cell.symbol == "×"))
         .expect("the title row's ✕");
-    setup.scenario.click(close.x, close.y);
+    setup.scenario.click(close, row);
     setup.settle();
     assert!(!setup.app().assistant().is_open());
 }
@@ -1423,4 +1435,13 @@ fn a_long_message_shows_in_full_in_the_panel_wrapped_with_its_paragraphs() {
     // The long line wraps under the bar instead of being cut at the panel's edge.
     assert!(seen.contains("word1 "), "{seen}");
     assert!(seen.contains("word40"), "{seen}");
+}
+
+/// The row of the assistant's title (in a review, the panel sits in the body, under the
+/// review's header).
+fn title_row(screen: &crate::testing::harness::Screen) -> u16 {
+    screen.find("✦ Assistant").map_or_else(
+        || panic!("no assistant title:\n{}", screen.text()),
+        |at| at.y,
+    )
 }
