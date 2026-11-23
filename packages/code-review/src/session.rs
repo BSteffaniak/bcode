@@ -21,6 +21,9 @@
 //! Everything blocks; callers run it on a blocking thread. See
 //! `docs/review-loading-architecture.md`.
 
+mod series;
+pub use series::CommitSeriesState;
+
 use crate::data::{DataError, ReviewData};
 use crate::provider::{Freshness, ProviderRegistry, gather_provider_resolutions, quick_layer};
 use bcode_code_review_models::{
@@ -46,6 +49,9 @@ pub struct OpenRequest {
     pub sources: Vec<ReviewSource>,
     /// The source to make ready first (for example the one the reviewer was last in).
     pub first: Option<String>,
+    /// Requested presentation keyed by canonical source id. Missing entries use the initial view.
+    pub series_views:
+        std::collections::BTreeMap<String, bcode_code_review_models::ReviewSeriesPresentation>,
     /// Most layers a provider resolves per stack (`None`: all).
     pub max_layers: Option<usize>,
     /// Set when the review no longer wants the open (it was closed or opened again): the open
@@ -109,6 +115,8 @@ pub enum OpenEvent {
     Stage(OpenStage),
     /// A stack became known, or was confirmed.
     Stack(StackNews),
+    /// Metadata for a selected commit series, before its visible groups are listed.
+    CommitSeries(CommitSeriesState),
     /// A source to show before it is listed.
     Pending(OpenedSource),
     /// A source, listed (again, when its commits moved).
@@ -158,23 +166,32 @@ macro_rules! unless_cancelled {
     };
 }
 
+/// Included sources in workspace order, and the index to open first.
+fn opening_order(request: &OpenRequest) -> Option<(Vec<&ReviewSource>, usize)> {
+    let included: Vec<&ReviewSource> = request
+        .sources
+        .iter()
+        .filter(|source| source.included)
+        .collect();
+    let first_index = request
+        .first
+        .as_deref()
+        .and_then(|first| {
+            included
+                .iter()
+                .position(|source| series::owns_selector(source, first))
+        })
+        .or_else(|| (!included.is_empty()).then_some(0))?;
+    Some((included, first_index))
+}
+
 fn open_until_stopped(
     data: &ReviewData,
     registry: &ProviderRegistry,
     request: &OpenRequest,
     emit: &mut dyn FnMut(OpenEvent) -> ControlFlow<()>,
 ) -> Result<ControlFlow<()>, DataError> {
-    let included: Vec<&ReviewSource> = request
-        .sources
-        .iter()
-        .filter(|source| source.included)
-        .collect();
-    let Some(first_index) = request
-        .first
-        .as_deref()
-        .and_then(|first| included.iter().position(|source| source.id == first))
-        .or_else(|| (!included.is_empty()).then_some(0))
-    else {
+    let Some((included, first_index)) = opening_order(request) else {
         return Ok(ControlFlow::Continue(()));
     };
     let first = included[first_index];
@@ -377,6 +394,39 @@ fn send_stacks(
     Ok(ControlFlow::Continue(()))
 }
 
+fn resolve_ordinary_sources(
+    data: &ReviewData,
+    request: &OpenRequest,
+    sources: &[&ReviewSource],
+    resolutions: &[ReviewSourceProviderResolution],
+    ids: &[&str],
+) -> Result<bcode_code_review_models::ResolveReviewSourcesResponse, DataError> {
+    let ordinary: Vec<_> = sources
+        .iter()
+        .copied()
+        .filter(|s| !series::is_series(s))
+        .cloned()
+        .collect();
+    if ordinary.is_empty() {
+        Ok(bcode_code_review_models::ResolveReviewSourcesResponse {
+            sources: Vec::new(),
+            diagnostics: Vec::new(),
+            stacks: Vec::new(),
+        })
+    } else {
+        data.resolve_sources(&ResolveReviewSourcesRequest {
+            browse: request.browse,
+            repo_path: request.repo_path.clone(),
+            sources: ordinary,
+            provider_resolutions: resolutions
+                .iter()
+                .filter(|resolution| ids.contains(&resolution.source_id.as_str()))
+                .cloned()
+                .collect(),
+        })
+    }
+}
+
 /// Resolve `sources` (with their provider answers) and list every resolved source fully, in
 /// batches, reporting each source as its batch finishes ([`OpenEvent::Ready`] or
 /// [`OpenEvent::Failed`]) and, for more than one source, progress after each batch.
@@ -388,16 +438,26 @@ fn resolve_and_list(
     emit: &mut dyn FnMut(OpenEvent) -> ControlFlow<()>,
 ) -> Result<ControlFlow<()>, DataError> {
     let ids: Vec<&str> = sources.iter().map(|source| source.id.as_str()).collect();
-    let resolved = data.resolve_sources(&ResolveReviewSourcesRequest {
-        browse: request.browse,
-        repo_path: request.repo_path.clone(),
-        sources: sources.iter().map(|source| (*source).clone()).collect(),
-        provider_resolutions: resolutions
-            .iter()
-            .filter(|resolution| ids.contains(&resolution.source_id.as_str()))
-            .cloned()
-            .collect(),
-    })?;
+    let mut resolved = resolve_ordinary_sources(data, request, sources, resolutions, &ids)?;
+    let mut multi = std::collections::BTreeSet::new();
+    for source in sources.iter().filter(|s| series::is_series(s)) {
+        unless_cancelled!(request);
+        match series::resolve(data, request, source) {
+            Ok((state, groups)) => {
+                if let Some(state) = state {
+                    multi.insert(source.id.as_str());
+                    send!(emit, OpenEvent::CommitSeries(state));
+                }
+                resolved.sources.extend(groups);
+            }
+            Err(error) => resolved.diagnostics.push(ReviewSourceDiagnostic {
+                source_id: source.id.clone(),
+                severity: bcode_code_review_models::ReviewSourceDiagnosticSeverity::Error,
+                code: error.code().to_owned(),
+                message: error.to_string(),
+            }),
+        }
+    }
     for diagnostic in resolved.diagnostics {
         send!(emit, OpenEvent::Failed(diagnostic));
     }
@@ -417,7 +477,13 @@ fn resolve_and_list(
             .collect::<Vec<_>>(),
     )?;
     let total = sources.len();
-    let mut done = 0;
+    let mut remaining = std::collections::BTreeMap::new();
+    for source in &ordered {
+        *remaining
+            .entry(source.source_id.as_str())
+            .or_insert(0_usize) += 1;
+    }
+    let mut done = total.saturating_sub(remaining.len());
     for batch in ordered.chunks(LISTING_BATCH) {
         unless_cancelled!(request);
         let listed = data.index_get_many(&ReviewIndexManyRequest {
@@ -426,6 +492,7 @@ fn resolve_and_list(
             limit: Some(REVIEW_INDEX_MAX_PAGE_SIZE),
         })?;
         for (source, outcome) in batch.iter().zip(listed.indexes) {
+            unless_cancelled!(request);
             let event = match outcome.index {
                 Some(first_page) => OpenEvent::Ready(OpenedSource {
                     source: (*source).clone(),
@@ -438,15 +505,21 @@ fn resolve_and_list(
                         .cloned(),
                 }),
                 None => OpenEvent::Failed(ReviewSourceDiagnostic {
-                    source_id: source.source_id.clone(),
+                    source_id: series::group_selector(
+                        source,
+                        multi.contains(source.source_id.as_str()),
+                    ),
                     severity: bcode_code_review_models::ReviewSourceDiagnosticSeverity::Error,
                     code: outcome.error_code.unwrap_or_default(),
                     message: outcome.error_message.unwrap_or_default(),
                 }),
             };
             send!(emit, event);
+            if let Some(left) = remaining.get_mut(source.source_id.as_str()) {
+                *left -= 1;
+                done += usize::from(*left == 0);
+            }
         }
-        done += batch.len();
         if total > 1 {
             send!(emit, OpenEvent::Stage(OpenStage::Listing { done, total }));
         }

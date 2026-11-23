@@ -117,6 +117,11 @@ pub trait CitationReader {
     /// The pinned sources, primary first.
     fn sources(&self) -> &[CiteSource];
 
+    /// Whether `alias` names the workspace source owning this selector.
+    fn owns_alias(&self, _selector: &str, _alias: &str) -> bool {
+        false
+    }
+
     /// The files of a source's diff (or listing).
     ///
     /// # Errors
@@ -301,7 +306,26 @@ impl<'a> Check<'a> {
             .as_deref()
             .or(self.request.source.as_deref());
         if let Some(name) = named {
-            let Some(source) = sources.iter().find(|source| source.named(name)) else {
+            let name = name.trim();
+            let exact = sources.iter().find(|s| s.source_id == name);
+            let mut aliases = sources
+                .iter()
+                .filter(|s| s.named(name) || reader.owns_alias(&s.source_id, name));
+            let first = aliases.next();
+            if exact.is_none() && aliases.next().is_some() {
+                let candidates: Vec<_> = sources
+                    .iter()
+                    .filter(|s| s.named(name) || reader.owns_alias(&s.source_id, name))
+                    .map(|s| &s.source_id)
+                    .collect();
+                self.problem(
+                    GUIDE_CITE_AMBIGUOUS_SOURCE,
+                    format!("{name} names several groups; name an exact selector"),
+                    json!({ "candidates": candidates }),
+                );
+                return None;
+            }
+            let Some(source) = exact.or(first) else {
                 let layers: Vec<String> = sources.iter().map(label_of).collect();
                 self.citation.revision = primary.revision(self.request.side).clone();
                 self.problem(
@@ -325,7 +349,16 @@ impl<'a> Check<'a> {
             }
         }
         if hits.len() > 1 {
-            let candidates: Vec<String> = hits.iter().map(|(source, _)| label_of(source)).collect();
+            let candidates: Vec<String> = hits
+                .iter()
+                .map(|(source, _)| {
+                    if source.number.is_some() {
+                        label_of(source)
+                    } else {
+                        source.source_id.clone()
+                    }
+                })
+                .collect();
             self.citation.revision = primary.revision(self.request.side).clone();
             self.problem(
                 GUIDE_CITE_AMBIGUOUS_SOURCE,
@@ -344,7 +377,8 @@ impl<'a> Check<'a> {
                 entry: Some(entry),
             });
         }
-        // Repository context outside every source, at the primary source's revisions.
+        // Keep the exact group for repository context, too: the primary group may change.
+        self.citation.source_id = Some(primary.source_id.clone());
         Some(Resolved {
             source: Some(primary),
             entry: None,
@@ -362,7 +396,7 @@ impl<'a> Check<'a> {
                 .into_iter()
                 .find(|file| file.path == path || file.old_path.as_deref() == Some(path)),
             Err(message) => {
-                self.warn(
+                self.problem(
                     GUIDE_CITE_UNREADABLE,
                     format!(
                         "the files of {} could not be listed: {message}",
@@ -771,6 +805,7 @@ pub struct ReviewDataReader<'a> {
     data: &'a ReviewData,
     repo_path: PathBuf,
     sources: Vec<CiteSource>,
+    owners: BTreeMap<String, String>,
     resolved: BTreeMap<String, ResolvedSource>,
     files: Mutex<BTreeMap<String, Result<Vec<DiffFile>, String>>>,
     contents: Mutex<BTreeMap<(RevisionRef, String), FileRead>>,
@@ -801,6 +836,7 @@ impl<'a> ReviewDataReader<'a> {
                     browse: source.mode == ResolvedSourceMode::Browse,
                 })
                 .collect(),
+            owners: BTreeMap::new(),
             resolved: sources
                 .iter()
                 .map(|source| (source.source_id.clone(), source.clone()))
@@ -808,6 +844,24 @@ impl<'a> ReviewDataReader<'a> {
             files: Mutex::new(BTreeMap::new()),
             contents: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Read the guide's projected groups, accepting canonical source ids as aliases.
+    #[must_use]
+    pub fn grouped(
+        data: &'a ReviewData,
+        repo_path: PathBuf,
+        groups: &super::sources::GuideSources,
+    ) -> Self {
+        let mut reader = Self::new(
+            data,
+            repo_path,
+            &groups.sources,
+            &groups.labels,
+            &groups.numbers,
+        );
+        reader.owners.clone_from(&groups.owners);
+        reader
     }
 
     fn list(&self, source: &ResolvedSource) -> Result<Vec<DiffFile>, String> {
@@ -831,14 +885,23 @@ impl<'a> ReviewDataReader<'a> {
                 new_blob: entry.new_blob.oid().map(str::to_owned),
             }));
             cursor = page.next_cursor;
-            if cursor.is_none() || files.len() >= MAX_DIFF_FILES {
+            if cursor.is_none() {
                 return Ok(files);
+            }
+            if files.len() >= MAX_DIFF_FILES {
+                return Err(format!("diff listing exceeds {MAX_DIFF_FILES} files"));
             }
         }
     }
 }
 
 impl CitationReader for ReviewDataReader<'_> {
+    fn owns_alias(&self, selector: &str, alias: &str) -> bool {
+        self.owners
+            .get(selector)
+            .is_some_and(|owner| owner == alias)
+    }
+
     fn sources(&self) -> &[CiteSource] {
         &self.sources
     }

@@ -1164,6 +1164,7 @@ impl ReviewNotes {
 /// A review-level anchor (imported threads that do not map onto the review).
 fn review_anchor() -> DraftAnchor {
     DraftAnchor {
+        group: None,
         kind: bcode_code_review_models::ReviewAnchorKind::Review,
         file_path: bcode_code_review::document::REVIEW_LEVEL_PATH.to_owned(),
         diff_row: 0,
@@ -1619,6 +1620,7 @@ mod tests {
 
     fn anchor() -> DraftAnchor {
         DraftAnchor {
+            group: None,
             kind: ReviewAnchorKind::File,
             file_path: "a.rs".to_owned(),
             diff_row: 0,

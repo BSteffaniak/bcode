@@ -312,14 +312,23 @@ impl ReviewDocument {
                 .map(|index| self.files[*index].key.clone())
         };
         match key {
-            Persisted::SourceHeader { source_id } => Some(ItemKey::SourceHeader {
-                source_id: source_id.clone(),
-                part: self
-                    .groups
-                    .iter()
-                    .find(|group| &group.source.source_id == source_id)
-                    .and_then(|group| group.source.part.as_ref().map(|part| part.index)),
-            }),
+            Persisted::SourceHeader { source_id } => {
+                // Legacy headers store only the source id. Prefer its visible member to a
+                // hidden first part when restoring a cursor after a presentation switch.
+                let candidates = || {
+                    self.groups
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, group)| &group.source.source_id == source_id)
+                };
+                let (_, group) = candidates()
+                    .find(|(index, _)| !self.group_hidden(*index))
+                    .or_else(|| candidates().next())?;
+                Some(ItemKey::SourceHeader {
+                    source_id: source_id.clone(),
+                    part: group.source.part.as_ref().map(|part| part.index),
+                })
+            }
             Persisted::FileHeader {
                 source_id,
                 path,

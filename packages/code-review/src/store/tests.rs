@@ -77,6 +77,7 @@ fn test_workspace(repo: &Path, sources: Vec<ReviewSource>) -> ReviewWorkspace {
         updated_at_ms: None,
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
+        group_viewed_marks: BTreeMap::new(),
         viewed_marks: Vec::new(),
         viewed_threads: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
@@ -271,6 +272,7 @@ fn publish_record_thread_membership_round_trips() {
         updated_at_ms: None,
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
+        group_viewed_marks: BTreeMap::new(),
         viewed_marks: Vec::new(),
         viewed_threads: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
@@ -278,6 +280,7 @@ fn publish_record_thread_membership_round_trips() {
         stack_snapshots: Vec::new(),
     };
     let anchor = DraftAnchor {
+        group: None,
         kind: ReviewAnchorKind::Review,
         file_path: "<review>".to_string(),
         diff_row: 0,
@@ -339,6 +342,7 @@ fn review_bundle_excludes_requested_thread_anchors() {
         state_dir: Some(temp.path().join("state")),
     };
     let anchor = DraftAnchor {
+        group: None,
         kind: ReviewAnchorKind::Review,
         file_path: "<review>".to_string(),
         diff_row: 0,
@@ -403,6 +407,7 @@ fn ai_exchange_delete_is_explicit_and_idempotent() {
         schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
         exchange_id: "exchange-delete".to_string(),
         anchor: DraftAnchor {
+            group: None,
             kind: ReviewAnchorKind::Review,
             file_path: "<review>".to_string(),
             diff_row: 0,
@@ -625,6 +630,7 @@ fn review_level_exchange(id: &str, question: &str) -> ReviewAiExchange {
         schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
         exchange_id: id.to_string(),
         anchor: DraftAnchor {
+            group: None,
             kind: ReviewAnchorKind::Review,
             file_path: "<review>".to_string(),
             diff_row: 0,
@@ -755,6 +761,7 @@ fn ai_exchange_persistence_is_separate_from_publishable_drafts() {
         state_dir: Some(temp.path().join("state")),
     };
     let anchor = DraftAnchor {
+        group: None,
         kind: ReviewAnchorKind::Review,
         file_path: "<review>".to_string(),
         diff_row: 0,
@@ -845,6 +852,7 @@ fn suggestion_persistence_round_trips_and_updates_lifecycle() {
         state_dir: Some(temp.path().join("state")),
     };
     let anchor = DraftAnchor {
+        group: None,
         kind: ReviewAnchorKind::Range,
         file_path: "src/lib.rs".to_string(),
         diff_row: 2,
@@ -1083,6 +1091,7 @@ fn local_markdown_publisher_preview_is_local_review_report() {
             summary_only: false,
             thread_id: "thread-1".to_string(),
             anchor: DraftAnchor {
+                group: None,
                 kind: ReviewAnchorKind::Range,
                 file_path: "src/lib.rs".to_string(),
                 diff_row: 3,
@@ -1106,6 +1115,7 @@ fn local_markdown_publisher_preview_is_local_review_report() {
                 comment_id: "comment-1".to_string(),
                 thread_id: "thread-1".to_string(),
                 anchor: DraftAnchor {
+                    group: None,
                     kind: ReviewAnchorKind::Range,
                     file_path: "src/lib.rs".to_string(),
                     diff_row: 3,
@@ -1169,6 +1179,7 @@ fn local_markdown_groups_review_level_threads() {
             summary_only: false,
             thread_id: "thread-review".to_string(),
             anchor: DraftAnchor {
+                group: None,
                 kind: ReviewAnchorKind::Review,
                 file_path: "<review>".to_string(),
                 diff_row: 0,
@@ -1192,6 +1203,7 @@ fn local_markdown_groups_review_level_threads() {
                 comment_id: "comment-review".to_string(),
                 thread_id: "thread-review".to_string(),
                 anchor: DraftAnchor {
+                    group: None,
                     kind: ReviewAnchorKind::Review,
                     file_path: "<review>".to_string(),
                     diff_row: 0,
@@ -1301,6 +1313,7 @@ fn markdown_export_writes_selected_publish_bundle_to_requested_file() {
             summary_only: false,
             thread_id: "thread-1".to_string(),
             anchor: DraftAnchor {
+                group: None,
                 kind: ReviewAnchorKind::Range,
                 file_path: "src/lib.rs".to_string(),
                 diff_row: 1,
@@ -1324,6 +1337,7 @@ fn markdown_export_writes_selected_publish_bundle_to_requested_file() {
                 comment_id: "comment-1".to_string(),
                 thread_id: "thread-1".to_string(),
                 anchor: DraftAnchor {
+                    group: None,
                     kind: ReviewAnchorKind::Range,
                     file_path: "src/lib.rs".to_string(),
                     diff_row: 1,

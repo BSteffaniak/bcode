@@ -299,6 +299,7 @@ fn anchor() -> DraftAnchor {
         is_file_anchor: false,
         surface_id: None,
         source_id: None,
+        group: None,
         head_oid: None,
         blob_oid: None,
         reply_to: None,

@@ -24,7 +24,7 @@ use crate::services::ReviewServices;
 use bcode_code_review::document::{FileLoad, FileRef, ItemKey, ReviewItem};
 use bcode_code_review::guide::config::Markers;
 use bcode_code_review_models::{
-    CitationRelation, GetGuideVersionRequest, GetGuideVersionResponse, GuideScope,
+    CitationRelation, GetGuideVersionRequest, GetGuideVersionResponse, GuideRecord, GuideScope,
     ListGuideSectionMarksRequest, ListGuideSectionMarksResponse, ListGuideThreadsRequest,
     ListGuideVersionsRequest, ListReviewGuidesRequest, ListReviewGuidesResponse, ResolvedSource,
     ReviewLineInterval, ReviewLineSide, RevisionRef,
@@ -66,7 +66,7 @@ pub(super) struct GuideUi {
     pub(super) state: crate::guide::GuideState,
     /// The diff's markers.
     pub(super) marks: GuideMarks,
-    marks_stamp: Option<(u64, bool, Markers)>,
+    marks_stamp: Option<(u64, bool, Markers, u64)>,
     /// What the panel says.
     pub(super) model: PanelModel,
     model_stamp: Option<(u64, Placement, u64, bool)>,
@@ -166,6 +166,23 @@ impl GuideUi {
     }
 }
 
+fn choose_guide(
+    guides: &[GuideRecord],
+    preferred: Option<&str>,
+    newest: bool,
+) -> Option<GuideRecord> {
+    preferred
+        .and_then(|id| guides.iter().find(|record| record.guide.guide_id == id))
+        .or_else(|| guides.first().filter(|_| newest))
+        .or_else(|| {
+            guides
+                .iter()
+                .find(|record| record.guide.scope == GuideScope::Review)
+        })
+        .or_else(|| guides.first())
+        .cloned()
+}
+
 /// Read the review's guide: its guides, the one shown (`preferred` when it still exists, else
 /// the most recently changed guide when `newest`, else the newest whole-review guide, else the
 /// newest), that guide's current version (or the version `view` names for it) and reviewed
@@ -174,6 +191,7 @@ async fn read_guide(
     services: ReviewServices,
     scope: NoteScope,
     sources: Vec<ResolvedSource>,
+    workspace: Vec<bcode_code_review_models::ReviewSource>,
     (preferred, newest, view): (Option<String>, bool, Option<(String, u32)>),
 ) -> Result<Box<GuideLoaded>, String> {
     let listed: ListReviewGuidesResponse = services
@@ -186,16 +204,7 @@ async fn read_guide(
         .await
         .map_err(|error| error.message)?;
     let guides = listed.guides;
-    let chosen = preferred
-        .and_then(|id| guides.iter().find(|record| record.guide.guide_id == id))
-        .or_else(|| guides.first().filter(|_| newest))
-        .or_else(|| {
-            guides
-                .iter()
-                .find(|record| record.guide.scope == GuideScope::Review)
-        })
-        .or_else(|| guides.first())
-        .cloned();
+    let chosen = choose_guide(&guides, preferred.as_deref(), newest);
     let Some(chosen) = chosen else {
         return Ok(Box::new(GuideLoaded {
             guides,
@@ -251,10 +260,21 @@ async fn read_guide(
     // Freshness is best effort: a guide whose citations cannot be compared still shows.
     let freshness = services
         .blocking(move || {
-            Ok(
-                bcode_code_review::guide::freshness::assess_version(&data, &repo, &shown, &sources)
-                    .ok(),
+            let sources = bcode_code_review::guide::sources::with_legacy_pairs(
+                sources,
+                &workspace,
+                &shown.heads,
+            );
+            Ok(bcode_code_review::guide::sources::restore_objects(
+                &data,
+                &repo,
+                &workspace,
+                &shown.heads,
             )
+            .and_then(|()| {
+                bcode_code_review::guide::freshness::assess_version(&data, &repo, &shown, &sources)
+            })
+            .ok())
         })
         .await
         .ok()
@@ -291,26 +311,15 @@ async fn read_version(
     Ok(found)
 }
 
-/// Whether the distinct sources of `doc`, in order, are `assessed`.
-fn same_sources(
+/// Selector of this document file, only if its representation is currently shown.
+pub(super) fn guide_file_selector(
     doc: &bcode_code_review::document::ReviewDocument,
-    assessed: &[ResolvedSource],
-) -> bool {
-    let mut seen = 0;
-    for group in doc.groups() {
-        let source = &group.source;
-        if assessed[..seen]
-            .iter()
-            .any(|known| known.source_id == source.source_id)
-        {
-            continue;
-        }
-        if assessed.get(seen) != Some(source) {
-            return false;
-        }
-        seen += 1;
-    }
-    seen == assessed.len()
+    file: &FileRef,
+) -> Option<String> {
+    let selector = doc
+        .group_of_key(&ItemKey::FileHeader(file.clone()))?
+        .selector();
+    doc.active_group(&selector).map(|_| selector)
 }
 
 impl ReviewSurface {
@@ -323,23 +332,18 @@ impl ReviewSurface {
         if self.refreshing || self.guide.state.loading {
             return;
         }
-        let Some(review) = self.review.as_ref() else {
-            return;
-        };
-        if self.guide.state.load != GuideLoad::Idle
-            && same_sources(&review.doc, &self.guide.assessed)
-        {
+        if self.review.is_none() {
             return;
         }
-        let mut sources: Vec<ResolvedSource> = Vec::new();
-        for group in review.doc.groups() {
-            if !sources
-                .iter()
-                .any(|source| source.source_id == group.source.source_id)
-            {
-                sources.push(group.source.clone());
-            }
+        let sources = self.guide_sources();
+        if self.guide.state.load != GuideLoad::Idle && self.guide.assessed == sources {
+            return;
         }
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|w| w.sources.clone())
+            .unwrap_or_default();
         self.guide.assessed.clone_from(&sources);
         let newest = self.guide.prefer == Some(Prefer::Newest);
         let preferred = match self.guide.prefer.take() {
@@ -362,7 +366,14 @@ impl ReviewSurface {
         let inbox = self.inbox.clone();
         let view = self.guide.view.clone();
         host.spawn(Box::pin(async move {
-            let result = read_guide(services, scope, sources, (preferred, newest, view)).await;
+            let result = read_guide(
+                services,
+                scope,
+                sources,
+                workspace,
+                (preferred, newest, view),
+            )
+            .await;
             inbox.push(Message::Guide { generation, result });
         }));
     }
@@ -463,7 +474,12 @@ impl ReviewSurface {
     /// Rebuild the diff's markers when the guide, its section, or the marker setting changed.
     pub(super) fn sync_guide_marks(&mut self) {
         let markers = self.services.guide_config().markers;
-        let stamp = (self.guide.state.revision, self.guide.state.engaged, markers);
+        let stamp = (
+            self.guide.state.revision,
+            self.guide.state.engaged,
+            markers,
+            self.review.as_ref().map_or(0, |r| r.doc.revision()),
+        );
         if self.guide.marks_stamp == Some(stamp) {
             return;
         }
@@ -474,12 +490,16 @@ impl ReviewSurface {
                 .active
                 .as_ref()
                 .map_or_else(GuideMarks::default, |active| {
-                    GuideMarks::build(
+                    let mut marks = GuideMarks::build(
                         active,
                         markers,
                         self.guide.state.engaged,
-                        self.guide.state.revision,
-                    )
+                        self.guide.marks.revision().wrapping_add(1),
+                    );
+                    if let Some(review) = &self.review {
+                        marks.bind_document(&review.doc);
+                    }
+                    marks
                 });
     }
 
@@ -668,10 +688,9 @@ impl ReviewSurface {
             .file_keys()
             .find(|file| {
                 file.path == target.path
-                    && target
-                        .source_id
-                        .as_deref()
-                        .is_none_or(|source| source == file.source_id)
+                    && target.source_id.as_ref().is_some_and(|source| {
+                        guide_file_selector(&review.doc, file).as_ref() == Some(source)
+                    })
             })
             .cloned()
     }
@@ -749,15 +768,15 @@ impl ReviewSurface {
             .as_ref()
             .filter(|_| target.moved())
             .and_then(|review| {
-                let mut groups = review.doc.groups();
-                match target.source_id.as_deref() {
-                    Some(id) => groups.find(|group| group.source.source_id == id),
-                    None => groups.next(),
-                }
-                .map(|group| match target.side {
-                    ReviewLineSide::New => group.source.head.clone(),
-                    ReviewLineSide::Old => group.source.base.clone(),
-                })
+                let id = target.source_id.as_deref()?;
+                review
+                    .doc
+                    .groups()
+                    .find(|group| !group.hidden && !group.alternate && group.key.selector() == id)
+                    .map(|group| match target.side {
+                        ReviewLineSide::New => group.source.head.clone(),
+                        ReviewLineSide::Old => group.source.base.clone(),
+                    })
             });
         current.map_or_else(
             || (target.revision.clone(), target.cited),
@@ -785,16 +804,31 @@ impl ReviewSurface {
         let inbox = self.inbox.clone();
         let citation = target.citation.clone();
         let path = target.path.clone();
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|w| w.sources.clone())
+            .unwrap_or_default();
+        let heads = self
+            .guide
+            .state
+            .active
+            .as_ref()
+            .map(|g| g.version.heads.clone())
+            .unwrap_or_default();
         host.spawn(Box::pin(async move {
             let result = services
                 .blocking(move || {
-                    Ok(
-                        bcode_code_review::guide::cite::read_file(&data, &repo, &revision, &path)
-                            .and_then(|lines| {
-                                lines
-                                    .ok_or_else(|| format!("{path} is not in the repository there"))
-                            }),
+                    Ok(bcode_code_review::guide::sources::restore_objects(
+                        &data, &repo, &workspace, &heads,
                     )
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| {
+                        bcode_code_review::guide::cite::read_file(&data, &repo, &revision, &path)
+                    })
+                    .and_then(|lines| {
+                        lines.ok_or_else(|| format!("{path} is not in the repository there"))
+                    }))
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.message));
@@ -945,8 +979,15 @@ impl ReviewSurface {
             self.set_status("move to a line to see its section", StatusSeverity::Info);
             return Action::Redraw;
         };
+        let Some(selector) = self
+            .review
+            .as_ref()
+            .and_then(|r| guide_file_selector(&r.doc, &file))
+        else {
+            return Action::Redraw;
+        };
         let found = active
-            .citations_at(&file.source_id, &file.path, side, number)
+            .citations_at(&selector, &file.path, side, number)
             .into_iter()
             .find_map(|id| {
                 let entry = active.entry_citing(id)?;

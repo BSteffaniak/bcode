@@ -22,6 +22,8 @@ pub struct ViewedSet {
     pub files: BTreeSet<String>,
     /// Viewed marks.
     pub marks: Vec<ViewedMark>,
+    /// Group selector to marks, independent of the legacy global paths.
+    pub groups: BTreeMap<String, Vec<ViewedMark>>,
     /// Viewed threads.
     pub threads: Vec<ThreadViewMark>,
 }
@@ -33,6 +35,7 @@ impl ViewedSet {
         Self {
             files: workspace.viewed_files.clone(),
             marks: workspace.viewed_marks.clone(),
+            groups: workspace.group_viewed_marks.clone(),
             threads: workspace.viewed_threads.clone(),
         }
     }
@@ -41,6 +44,7 @@ impl ViewedSet {
     pub fn apply(&self, workspace: &mut ReviewWorkspace) {
         workspace.viewed_files.clone_from(&self.files);
         workspace.viewed_marks.clone_from(&self.marks);
+        workspace.group_viewed_marks.clone_from(&self.groups);
         workspace.viewed_threads.clone_from(&self.threads);
     }
 
@@ -64,6 +68,44 @@ impl ViewedSet {
     }
 }
 
+/// Apply the writer's additions, changes and deletions per key instead of replacing a map
+/// which another writer may have changed independently.
+fn merge_map<K: Ord + Clone, V: Clone + PartialEq>(
+    base: &BTreeMap<K, V>,
+    local: &BTreeMap<K, V>,
+    stored: &BTreeMap<K, V>,
+) -> BTreeMap<K, V> {
+    let mut result = stored.clone();
+    for (key, value) in local {
+        if base.get(key) != Some(value) {
+            result.insert(key.clone(), value.clone());
+        }
+    }
+    for key in base.keys() {
+        if !local.contains_key(key) {
+            result.remove(key);
+        }
+    }
+    result
+}
+
+fn by_group_path(set: &ViewedSet) -> BTreeMap<(&str, &str), Vec<&ViewedMark>> {
+    let mut entries = BTreeMap::<_, Vec<_>>::new();
+    for (key, marks) in &set.groups {
+        for mark in marks {
+            entries
+                .entry((key.as_str(), mark.path.as_str()))
+                .or_default()
+                .push(mark);
+        }
+    }
+    for marks in entries.values_mut() {
+        marks.sort_unstable();
+        marks.dedup();
+    }
+    entries
+}
+
 /// Merge `local` and `stored` from their common `base`: per file and per thread, the local
 /// state where it differs from the base, else the stored state.
 #[must_use]
@@ -74,6 +116,17 @@ pub fn merge_viewed(base: &ViewedSet, local: &ViewedSet, stored: &ViewedSet) -> 
         .chain(stored.paths())
         .collect();
     let mut merged = ViewedSet::default();
+    for ((key, _), marks) in merge_map(
+        &by_group_path(base),
+        &by_group_path(local),
+        &by_group_path(stored),
+    ) {
+        merged
+            .groups
+            .entry(key.to_owned())
+            .or_default()
+            .extend(marks.into_iter().cloned());
+    }
     for path in paths {
         let mine = local.path(path);
         let (listed, marks) = if mine == base.path(path) {
@@ -144,9 +197,10 @@ pub fn merge_workspace(
             &local.archived_at_ms,
             &stored.archived_at_ms,
         ),
+        group_viewed_marks: BTreeMap::new(),
         viewed_marks: Vec::new(),
         viewed_threads: Vec::new(),
-        reviewed_revisions: pick(
+        reviewed_revisions: merge_map(
             &base.reviewed_revisions,
             &local.reviewed_revisions,
             &stored.reviewed_revisions,
@@ -162,6 +216,22 @@ pub fn merge_workspace(
             &stored.stack_snapshots,
         ),
     };
+    if let Some(state) = &mut merged.presentation {
+        let empty = BTreeMap::new();
+        state.series_views = merge_map(
+            base.presentation
+                .as_ref()
+                .map_or(&empty, |s| &s.series_views),
+            local
+                .presentation
+                .as_ref()
+                .map_or(&empty, |s| &s.series_views),
+            stored
+                .presentation
+                .as_ref()
+                .map_or(&empty, |s| &s.series_views),
+        );
+    }
     merge_viewed(
         &ViewedSet::of(base),
         &ViewedSet::of(local),
@@ -188,6 +258,7 @@ mod tests {
                     patch_id: None,
                 })
                 .collect(),
+            groups: BTreeMap::new(),
             threads: Vec::new(),
         }
     }
@@ -202,6 +273,7 @@ mod tests {
             updated_at_ms: Some(1),
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
+            group_viewed_marks: BTreeMap::new(),
             viewed_marks: Vec::new(),
             viewed_threads: Vec::new(),
             reviewed_revisions: BTreeMap::new(),
@@ -259,6 +331,22 @@ mod tests {
             .map(|mark| mark.thread_id.as_str())
             .collect();
         assert_eq!(ids, vec!["t2", "t3"], "t1 was unviewed elsewhere");
+    }
+
+    #[test]
+    fn concurrent_file_marks_merge_within_a_group_and_across_groups() {
+        let mut base = ViewedSet::default();
+        let mark = |path: &str| ViewedMark::legacy(path.to_owned());
+        base.groups.insert("one".into(), vec![mark("removed")]);
+        let mut local = base.clone();
+        local.groups.insert("one".into(), vec![mark("mine")]);
+        let mut stored = base.clone();
+        stored.groups.get_mut("one").unwrap().push(mark("theirs"));
+        stored.groups.insert("two".into(), vec![mark("removed")]);
+        let merged = merge_viewed(&base, &local, &stored);
+        assert_eq!(merged.groups["one"], vec![mark("mine"), mark("theirs")]);
+        assert_eq!(merged.groups["two"], vec![mark("removed")]);
+        assert!(merged.files.is_empty());
     }
 
     #[test]

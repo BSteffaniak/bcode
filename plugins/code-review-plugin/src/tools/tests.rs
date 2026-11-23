@@ -1219,6 +1219,8 @@ fn files_are_marked_viewed_by_list_glob_layer_and_unchanged_since_a_pass() {
         SESSION,
     );
     assert_eq!(listed["changed"], json!([first]), "{listed}");
+    assert_eq!(listed["changed_count"], 1);
+    assert_eq!(listed["unchanged"], json!([]), "{listed}");
     assert_eq!(listed["not_found"], json!(["nope.rs"]));
     let again = harness.json(
         "code_review.mark_viewed",

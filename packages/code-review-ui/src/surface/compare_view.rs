@@ -326,9 +326,9 @@ impl ReviewSurface {
 
     /// Open the comparison menu, holding the choice in effect so `esc` can put it back.
     pub(super) fn open_compare_menu(&mut self) {
-        if !self.compares_pulls() {
+        if !self.compares_pulls() && self.series_menu_state().is_none() {
             self.set_status(
-                "nothing to compare: no pull request, and no completed pass of another source",
+                "No series or earlier version to compare",
                 StatusSeverity::Info,
             );
             return;
@@ -375,7 +375,8 @@ impl ReviewSurface {
         };
         let counts = self.compare_counts();
         MenuState {
-            current: Some(current),
+            series: self.series_menu_state(),
+            current: self.compares_pulls().then_some(current),
             detail,
             last_looked: self.last_looked_detail(),
             last_push: self.last_push_detail(),
@@ -383,6 +384,7 @@ impl ReviewSurface {
             only_changed: self.comparing.only_changed(),
             changes_view: self.comparing.view() == CompareView::Changes,
             offers: crate::compare_menu::MenuOffers {
+                pull_history: !self.layer_sources().is_empty(),
                 pushes: self
                     .stack_history
                     .as_ref()
@@ -482,6 +484,11 @@ impl ReviewSurface {
                 self.sync_compare_menu();
                 Action::Redraw
             }
+            CompareMenuOutcome::ApplyAndClose(MenuChoice::Group(view)) => {
+                self.close_compare_menu();
+                self.select_series_view(view, host);
+                Action::Redraw
+            }
             CompareMenuOutcome::ApplyAndClose(MenuChoice::Guide) => {
                 self.close_compare_menu();
                 self.guide_since(host)
@@ -565,7 +572,7 @@ impl ReviewSurface {
                 self.change_marks(|marks| marks.removed_inline = !marks.removed_inline);
             }
             // An action the menu's outcome runs, never a choice applied here.
-            MenuChoice::Guide => {}
+            MenuChoice::Guide | MenuChoice::Group(_) => {}
         }
     }
 

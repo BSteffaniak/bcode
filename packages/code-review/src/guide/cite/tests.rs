@@ -397,8 +397,8 @@ fn code_outside_the_diff_is_outside_the_review() {
     );
     assert_eq!(check.status, CitationCheckStatus::Verified, "{check:?}");
     assert_eq!(check.citation.relation, CitationRelation::OutsideReview);
-    // Repository context reads the primary source's head, with no source of its own.
-    assert_eq!(check.citation.source_id, None);
+    // Repository context still records exactly which group's revision it read.
+    assert_eq!(check.citation.source_id.as_deref(), Some("pr-102"));
     assert_eq!(check.citation.revision, head());
 }
 
@@ -467,26 +467,26 @@ fn quotes_compare_without_trailing_whitespace_or_indentation() {
     assert_eq!(check.status, CitationCheckStatus::Verified, "{check:?}");
 }
 
-#[test]
-fn citations_are_read_from_a_repository_at_the_pinned_revisions() {
-    use std::process::Command;
+fn repo_git(root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("git");
+    assert!(output.status.success(), "{args:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn citation_repo() -> (tempfile::TempDir, ResolvedSource) {
     let temp = tempfile::tempdir().expect("tempdir");
-    let root = temp.path().to_path_buf();
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&root)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .expect("git");
-        assert!(output.status.success(), "{args:?}");
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
+    let root = temp.path();
+    let git = |args: &[&str]| repo_git(root, args);
     git(&["init", "-q", "-b", "main"]);
     std::fs::write(root.join("lib.rs"), "fn one() {}\n").expect("write");
     std::fs::write(root.join("other.rs"), "fn other() {}\n").expect("write");
@@ -499,18 +499,24 @@ fn citations_are_read_from_a_repository_at_the_pinned_revisions() {
     let source = ResolvedSource {
         source_id: "range".to_owned(),
         base: RevisionRef::commit(base),
-        head: RevisionRef::commit(head.clone()),
+        head: RevisionRef::commit(head),
         mode: ResolvedSourceMode::Diff,
         paths: Vec::new(),
         line_range: None,
         part: None,
         selection: None,
     };
+    (temp, source)
+}
+
+#[test]
+fn citations_are_read_from_a_repository_at_the_pinned_revisions() {
+    let (repo, source) = citation_repo();
     let data = ReviewData::default();
     let reader = ReviewDataReader::new(
         &data,
-        root.clone(),
-        &[source],
+        repo.path().to_owned(),
+        std::slice::from_ref(&source),
         &BTreeMap::new(),
         &BTreeMap::new(),
     );
@@ -530,11 +536,143 @@ fn citations_are_read_from_a_repository_at_the_pinned_revisions() {
         checks[0]
     );
     assert_eq!(checks[0].citation.relation, CitationRelation::Changed);
-    assert_eq!(checks[0].citation.revision, RevisionRef::commit(head));
+    assert_eq!(checks[0].citation.revision, source.head);
     assert!(checks[0].citation.blob_oid.is_some());
     assert_eq!(checks[1].citation.relation, CitationRelation::OutsideReview);
     assert_eq!(checks[1].status, CitationCheckStatus::Verified);
     assert_eq!(codes(&checks[2].problems), [GUIDE_CITE_PATH_NOT_FOUND]);
+}
+
+#[test]
+fn restored_member_citations_use_exact_listings_and_reject_ambiguous_paths() {
+    use crate::guide::{lifecycle, sources::GuideSources};
+    use bcode_code_review_models::{ResolvedSourcePart, ReviewSource, ReviewSourceKind};
+
+    let (repo, mut first) = citation_repo();
+    let root = repo.path();
+    let git = |args: &[&str]| repo_git(root, args);
+    let data = ReviewData::default();
+    let first_oid = first.head.commit_oid().unwrap().to_owned();
+    std::fs::write(root.join("lib.rs"), "fn one() {}\nfn three() {}\n").expect("write");
+    std::fs::write(root.join("other.rs"), "fn next() {}\n").expect("write");
+    git(&["commit", "-q", "-am", "next"]);
+    let second_oid = git(&["rev-parse", "HEAD"]);
+    let mut second = first.clone();
+    second.base = first.head.clone();
+    second.head = RevisionRef::commit(second_oid.clone());
+    for (index, part) in [(0, &mut first), (1, &mut second)] {
+        part.part = Some(ResolvedSourcePart {
+            index,
+            count: 2,
+            label: "same subject".to_owned(),
+        });
+    }
+    let workspace = [ReviewSource {
+        id: "range".to_owned(),
+        label: "selection".to_owned(),
+        included: true,
+        kind: ReviewSourceKind::Commits {
+            revs: vec![first_oid, second_oid],
+        },
+    }];
+    let mut combined = first.clone();
+    combined.part = None;
+    combined.head = second.head.clone();
+    let active = GuideSources::project(&workspace, &[first, second], None);
+    let pins = lifecycle::heads_of(&active.sources, &active.labels);
+    assert_eq!(pins.len(), 2);
+    let restored = GuideSources::project(&workspace, &[combined], Some(&pins));
+    let reader = ReviewDataReader::grouped(&data, root.to_owned(), &restored);
+    for (index, expected) in ["fn two() {}", "fn three() {}"].into_iter().enumerate() {
+        let key = &active.sources[index].source_id;
+        let files = reader.diff_files(key).expect("pinned listing");
+        assert_eq!(files.iter().any(|file| file.path == "other.rs"), index == 1);
+        let mut request = cite("lib.rs", 2, 2, Some(expected));
+        request.source = Some(key.clone());
+        let checked = check_citation(&reader, &request, 1);
+        assert_eq!(checked.status, CitationCheckStatus::Verified, "{checked:?}");
+        assert_eq!(checked.citation.revision, active.sources[index].head);
+        assert_eq!(checked.citation.source_id.as_ref(), Some(key));
+    }
+    for alias in [None, Some("range"), Some("same subject")] {
+        let mut request = cite("lib.rs", 2, 2, None);
+        request.source = alias.map(str::to_owned);
+        let checked = check_citation(&reader, &request, 1);
+        assert_eq!(codes(&checked.problems), [GUIDE_CITE_AMBIGUOUS_SOURCE]);
+    }
+}
+
+#[test]
+fn sparse_combined_pin_recreates_its_own_content_after_collection() {
+    use crate::guide::{
+        lifecycle::heads_of,
+        sources::{GuideSources, restore_objects},
+    };
+    use bcode_code_review_models::{ReviewSource, ReviewSourceKind};
+    use std::process::Command;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let git = |args: &[&str]| {
+        let result = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git");
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    let commit = |file: &str, text: &str| {
+        std::fs::write(root.join(file), text).unwrap();
+        git(&["add", file]);
+        git(&["commit", "-qm", file]);
+        git(&["rev-parse", "HEAD"])
+    };
+    commit("context", "original\n");
+    let first = commit("first", "first selected\n");
+    commit("context", "excluded\n");
+    let last = commit("last", "last selected\n");
+    let source = ReviewSource {
+        id: "picked".into(),
+        label: "Selected".into(),
+        included: true,
+        kind: ReviewSourceKind::Commits {
+            revs: vec![first, last],
+        },
+    };
+    let data = ReviewData::default();
+    let plan = data.commit_series(root, &source, true).unwrap();
+    let combined = plan.combined.unwrap();
+    let workspace = [source];
+    let groups = GuideSources::project(&workspace, &[combined], None);
+    let pins = heads_of(&groups.sources, &groups.labels);
+    git(&["prune", "--expire=now"]);
+    restore_objects(&data, root, &workspace, &pins).expect("recreate exact pin");
+    let restored = GuideSources::project(&workspace, &plan.members, Some(&pins));
+    let reader = ReviewDataReader::grouped(&data, root.to_owned(), &restored);
+    let selector = &groups.sources[0].source_id;
+    let paths: Vec<_> = reader
+        .diff_files(selector)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    assert_eq!(paths, ["first", "last"]);
+    let checked = check_citation(&reader, &cite("context", 1, 1, Some("original")), 1);
+    assert_eq!(checked.status, CitationCheckStatus::Verified, "{checked:?}");
+    assert_eq!(checked.citation.source_id.as_ref(), Some(selector));
+    assert_eq!(checked.citation.revision, groups.sources[0].head);
 }
 
 #[test]

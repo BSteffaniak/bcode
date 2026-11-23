@@ -34,14 +34,15 @@ use crate::host::{ClientToolReply, ContextBlock, TurnRequest};
 use crate::loader::Message;
 use crate::services::ReviewServices;
 use bcode_code_review::assistant::guide::{DeclaredContext, GuideStart, ScopeInput};
-use bcode_code_review::assistant::{ReviewRef, ReviewTools};
+use bcode_code_review::assistant::{OpenReview, ReviewRef, ReviewTools};
 use bcode_code_review::guide::config::StrategyChoice;
 use bcode_code_review::guide::plan::GuidePlan;
 use bcode_code_review::guide::write::OutlineInput;
 use bcode_code_review_models::{
     BindReviewAssistantRequest, GenerationArea, GenerationState, GetGuideVersionRequest, GrantMode,
     GuideAreaStatus, GuideDepth, GuideGrant, GuideStatus, GuideStrategy, GuideVersion,
-    ListGuideAreasRequest, ReviewAssistantBinding, Section, SectionKind, SectionState,
+    ListGuideAreasRequest, ResolvedSource, ReviewAssistantBinding, ReviewSourceKind, Section,
+    SectionKind, SectionState,
 };
 use bmux_tui_components::status_bar::StatusSeverity;
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,6 +72,7 @@ pub struct FanOutRequest {
 /// A planned fan-out, before it starts.
 #[derive(Debug, Clone)]
 pub struct Prepared {
+    stack_layers: Vec<ResolvedSource>,
     request: FanOutRequest,
     plan: GuidePlan,
     estimate: Estimate,
@@ -357,8 +359,26 @@ impl ReviewSurface {
         let repo = self.note_scope().repo_path;
         let services = self.services.clone();
         let inbox = self.inbox.clone();
+        // A focused PR hides sibling layers from the ordinary assistant binding. A stack
+        // walkthrough needs their actual document revision pairs, in stack order. Do not
+        // expand a combined view or a selected-commit series.
+        let stack_layers: Vec<_> = self
+            .review
+            .iter()
+            .flat_map(|r| r.doc.groups())
+            .filter(|g| {
+                !g.alternate
+                    && !g.loading
+                    && self.sources.iter().any(|s| {
+                        s.included
+                            && s.id == g.source.source_id
+                            && matches!(s.kind, ReviewSourceKind::StackLayer { .. })
+                    })
+            })
+            .map(|g| g.source.clone())
+            .collect();
         host.spawn(Box::pin(async move {
-            let result = prepare(&services, repo, parent, request)
+            let result = prepare(&services, repo, parent, request, stack_layers)
                 .await
                 .map(Box::new);
             inbox.push(Message::GuideFanOut(Box::new(FanOutDone::Prepared(result))));
@@ -1334,12 +1354,46 @@ const fn depth_name(depth: GuideDepth) -> &'static str {
     }
 }
 
+/// Expand just the bound stack layers for guide planning and pinning. Leave all other
+/// active groups (including commit selectors and their exact revision pairs) alone.
+fn include_stack_layers(review: &mut OpenReview, layers: &[ResolvedSource]) {
+    if layers.len() < 2 {
+        return;
+    }
+    // The session binding already contains only the on-screen PR. Opening that binding
+    // can filter it again using the saved presentation (e.g. after reconciliation added
+    // a new bottom layer). There need not be a surviving layer to replace. Use the
+    // document's pinned layers, but only for canonical members of this bound workspace.
+    let layers: Vec<_> = layers
+        .iter()
+        .filter(|layer| {
+            review.workspace.sources.iter().any(|s| {
+                s.included
+                    && s.id == layer.source_id
+                    && matches!(s.kind, ReviewSourceKind::StackLayer { .. })
+            })
+        })
+        .collect();
+    let first = review
+        .resolved
+        .iter()
+        .position(|r| layers.iter().any(|l| l.source_id == r.source_id))
+        .unwrap_or(review.resolved.len());
+    review
+        .resolved
+        .retain(|r| !layers.iter().any(|l| l.source_id == r.source_id));
+    review
+        .resolved
+        .splice(first..first, layers.into_iter().cloned());
+}
+
 /// Plan a fan-out of the review `parent` is bound to, and estimate its cost on `parent`'s model.
 async fn prepare(
     services: &ReviewServices,
     repo: PathBuf,
     parent: String,
     request: FanOutRequest,
+    stack_layers: Vec<ResolvedSource>,
 ) -> Result<Prepared, String> {
     let host = services.host();
     let model = host.session_model(parent.clone()).await.ok();
@@ -1358,12 +1412,14 @@ async fn prepare(
     let strategy = request.strategy;
     let depth = request.depth;
     let user_started = request.user_started;
+    let layers = stack_layers.clone();
     let mut plan = services
         .blocking(move || {
             let mut tools = ReviewTools::new(&data, &store);
-            let review = tools
+            let mut review = tools
                 .open(&repo, &ReviewRef::Session(parent))
                 .map_err(|error| failure(&error.to_string()))?;
+            include_stack_layers(&mut review, &layers);
             let choice = if strategy.is_some() || user_started {
                 StrategyChoice::FanOut
             } else {
@@ -1392,6 +1448,7 @@ async fn prepare(
             .unwrap_or_default(),
     };
     Ok(Prepared {
+        stack_layers,
         request,
         plan,
         estimate,
@@ -1434,7 +1491,12 @@ async fn begin(
     let data = services.data();
     let store = services.store().clone();
     let config = services.guide_config();
-    let Prepared { request, plan, .. } = prepared;
+    let Prepared {
+        request,
+        plan,
+        stack_layers,
+        ..
+    } = prepared;
     let strategy = plan.strategy;
     let depth = plan.depth;
     let directions = request.directions.clone();
@@ -1452,7 +1514,7 @@ async fn begin(
                 &config,
                 (&repo, &session),
                 (title, directions, depth, strategy),
-                &plan,
+                (&plan, &stack_layers),
             )
         })
         .await
@@ -1506,13 +1568,16 @@ fn start_versions(
         GuideDepth,
         GuideStrategy,
     ),
-    plan: &GuidePlan,
+    (plan, stack_layers): (&GuidePlan, &[ResolvedSource]),
 ) -> Result<(String, u32, Vec<GenerationArea>), bcode_code_review::provider::ProviderCallError> {
     let fail = |error: bcode_code_review::assistant::AssistantError| failure(&error.to_string());
     let mut tools = ReviewTools::new(data, store);
     let mut review = tools
         .open(repo, &ReviewRef::Session(session.to_owned()))
         .map_err(fail)?;
+    if strategy == GuideStrategy::PerLayer {
+        include_stack_layers(&mut review, stack_layers);
+    }
     review.guide_grant = None;
     let start = |scope: Option<ScopeInput>,
                  title: Option<String>,

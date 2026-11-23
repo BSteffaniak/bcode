@@ -51,6 +51,13 @@ impl ReviewSurface {
             return view;
         };
         let doc = &review.doc;
+        view.series_view = self.shown_series_view();
+        view.groups = doc
+            .groups()
+            .filter(|group| !group.alternate && !group.hidden)
+            .take(MAX_SOURCES)
+            .map(|group| group.key.selector())
+            .collect();
         view.files = doc.groups().fold((0, 0), |(files, viewed), group| {
             (files + group.file_count, viewed + group.viewed)
         });
@@ -90,7 +97,14 @@ impl ReviewSurface {
         };
         view.file = Some(FileView {
             path: file.path.clone(),
-            source_id: file.source_id.clone(),
+            source_id: doc
+                .group_of_key(&bcode_code_review::document::ItemKey::FileHeader(
+                    file.clone(),
+                ))
+                .map_or_else(
+                    || file.source_id.clone(),
+                    bcode_code_review_models::ReviewGroupKey::selector,
+                ),
             status: doc
                 .entry(file)
                 .map_or("unknown", |entry| status_name(entry.status))
@@ -108,7 +122,14 @@ impl ReviewSurface {
         });
         let (threads, omitted) = self.other_threads(&file.path, None);
         let total = threads.len() + omitted;
-        let (open, resolved) = self.thread_counts(&file.path);
+        let group = doc.group_of_key(&ItemKey::FileHeader(file.clone()));
+        let anchor_group = group.filter(|key| {
+            !matches!(
+                key,
+                bcode_code_review_models::ReviewGroupKey::Standalone { .. }
+            )
+        });
+        let (open, resolved) = self.thread_counts(&file.path, anchor_group);
         view.threads = ThreadsView {
             open,
             resolved,
@@ -230,25 +251,39 @@ impl ReviewSurface {
         )
     }
 
-    /// Open and resolved threads (local and the pull requests') on `path`.
-    fn thread_counts(&self, path: &str) -> (usize, usize) {
+    /// Count roots, not replies, on this occurrence of the file. These are file-context
+    /// counts, not the thread panel's workspace-wide totals.
+    fn thread_counts(
+        &self,
+        path: &str,
+        group: Option<&bcode_code_review_models::ReviewGroupKey>,
+    ) -> (usize, usize) {
         let mut seen = std::collections::BTreeSet::new();
-        let (mut open, mut resolved) = (0, 0);
+        let mut resolved = 0;
         for draft in self.notes.drafts() {
-            if draft.anchor.file_path != path || !seen.insert(draft.thread_id.clone()) {
-                continue;
-            }
-            let comments = self.notes.thread(&draft.thread_id);
-            if comments
-                .iter()
-                .all(|comment| comment.resolved_at_ms.is_some())
+            if draft.anchor.reply_to.is_none()
+                && draft.anchor.file_path == path
+                && draft.anchor.group.as_ref() == group
+                && seen.insert(draft.thread_id.as_str())
             {
-                resolved += 1;
-            } else {
-                open += 1;
+                resolved += usize::from(self.notes.thread_resolved(&draft.thread_id));
             }
         }
-        (open, resolved)
+        if group.is_none() {
+            for (id, info) in self.notes.remote_threads() {
+                if (info.thread.anchor.path == path
+                    || self
+                        .notes
+                        .thread(id)
+                        .first()
+                        .is_some_and(|first| first.anchor.file_path == path))
+                    && seen.insert(id.as_str())
+                {
+                    resolved += usize::from(info.resolved);
+                }
+            }
+        }
+        (seen.len() - resolved, resolved)
     }
 
     /// The comparison as the user chose it, with each layer's result.

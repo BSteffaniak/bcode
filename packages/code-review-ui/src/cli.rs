@@ -326,9 +326,10 @@ pub enum ReviewCommand {
         #[arg(long)]
         two_dot: bool,
     },
-    /// Review one or more commits.
+    /// Review selected commits. Consecutive commits start combined; other selections start
+    /// separately. Use Compare to change grouping without changing the selection.
     Commit {
-        /// Commit revisions; one range when they form a first-parent chain.
+        /// Commit revisions to include; unselected commits are not part of the review.
         #[arg(required = true, num_args = 1..)]
         revs: Vec<String>,
         /// Repository path.

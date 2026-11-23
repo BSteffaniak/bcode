@@ -90,6 +90,112 @@ fn several_sources_and_parts_get_headers_and_distinct_file_keys() {
     );
 }
 
+#[test]
+fn series_focus_and_alternates_do_not_hide_or_count_the_wrong_group() {
+    use bcode_code_review_models::{
+        ReviewGroupKey, ReviewTarget, ReviewWorkspace, RevisionRef, ViewedMark,
+    };
+
+    let fake = one_file();
+    let oid = "a".repeat(40);
+    let mut member = fake.input("commits");
+    member.source.head = RevisionRef::commit(oid.clone());
+    member.source.part = Some(ResolvedSourcePart {
+        index: 7,
+        count: 8,
+        label: "member".into(),
+    });
+    let member_key = ReviewGroupKey::Member {
+        source_id: "commits".into(),
+        member: oid,
+    };
+    let aggregate = ReviewGroupKey::Combined {
+        source_id: "commits".into(),
+    };
+    let mut doc = ReviewDocument::new_with_combined_sources(
+        PathBuf::from("/repo"),
+        vec![member, fake.input("commits"), fake.input("other")],
+        DocumentConfig::default(),
+        ["commits".to_owned()].into(),
+    );
+    let file = |source: &str, part| ItemKey::FileHeader(FileKey::new(source, part, "s.rs").into());
+    let member_file = file("commits", Some(7));
+    assert_eq!(doc.group_of_key(&member_file), Some(&member_key));
+    assert_eq!(doc.group_of_key(&file("commits", None)), Some(&aggregate));
+    let anchor = doc.anchor_for(&member_file).expect("file anchor");
+    assert_eq!(doc.draft_anchor(&anchor).group.as_ref(), Some(&member_key));
+    let mut workspace =
+        ReviewWorkspace::from_target(PathBuf::from("/repo"), ReviewTarget::WorkingTreeUnstaged);
+    workspace
+        .group_viewed_marks
+        .insert(member_key.selector(), vec![ViewedMark::legacy("s.rs")]);
+    doc.set_viewed_marks(&workspace);
+    assert_eq!(
+        doc.groups().map(|group| group.viewed).collect::<Vec<_>>(),
+        [1, 0, 0]
+    );
+    doc.set_group_focus("commits", Some(&member_key));
+    assert!(doc.index_of(&file("other", None)).is_some());
+    assert!(doc.index_of(&file("commits", None)).is_none());
+    assert_eq!(doc.viewed_progress().total, 3);
+    doc.set_alternate_groups([aggregate].into());
+    doc.set_group_focus("commits", None);
+    assert_eq!(doc.viewed_progress().total, 2);
+    assert!(doc.index_of(&member_file).is_some());
+    assert!(doc.index_of(&file("commits", None)).is_none());
+    let entry = &fake.input("other").entries[0];
+    assert_eq!(
+        doc.totals(),
+        (
+            2 * u64::from(entry.additions),
+            2 * u64::from(entry.deletions)
+        )
+    );
+}
+
+#[test]
+fn presentation_focus_survives_streaming_without_hiding_unrelated_sources() {
+    use bcode_code_review_models::{ReviewGroupKey, ReviewItemKey, RevisionRef};
+
+    let fake = one_file();
+    let mut member = fake.input("commits");
+    member.source.head = RevisionRef::commit("a".repeat(40));
+    member.source.part = Some(ResolvedSourcePart {
+        index: 2,
+        count: 3,
+        label: "third".into(),
+    });
+    let member_key = ReviewGroupKey::Member {
+        source_id: "commits".into(),
+        member: "a".repeat(40),
+    };
+    let mut doc = ReviewDocument::new_with_combined_sources(
+        PathBuf::from("/repo"),
+        vec![member, fake.input("commits")],
+        DocumentConfig::default(),
+        ["commits".to_owned()].into(),
+    );
+    assert!(doc.set_hidden_groups([member_key.clone()].into()));
+    assert_eq!(doc.focus(), Some("commits"));
+    let header = ReviewItemKey::SourceHeader {
+        source_id: "commits".into(),
+    };
+    assert_eq!(
+        doc.resolve_persisted(&header),
+        Some(ItemKey::SourceHeader {
+            source_id: "commits".into(),
+            part: None,
+        })
+    );
+    assert!(doc.upsert_group(fake.input("other"), 1));
+    assert_eq!(doc.focus(), None);
+    assert!(doc.active_group("other").is_some());
+    assert!(doc.active_group(&member_key.selector()).is_none());
+    assert_eq!(doc.viewed_progress().total, 3);
+    assert!(doc.set_hidden_groups(std::collections::BTreeSet::new()));
+    assert_eq!(doc.active_group(&member_key.selector()), Some(&member_key));
+}
+
 /// Kind, old line, new line, and layer of one changed line.
 type LineLayer = (LineKind, Option<u32>, Option<u32>, Option<u64>);
 
@@ -432,6 +538,7 @@ fn a_thread_on_a_source_as_a_whole_shows_with_that_source_only() {
             is_file_anchor: false,
             surface_id: None,
             source_id: source.map(str::to_owned),
+            group: None,
             head_oid: None,
             blob_oid: None,
             reply_to: None,

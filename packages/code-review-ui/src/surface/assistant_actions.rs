@@ -196,7 +196,10 @@ pub struct ComparisonChange {
     /// Every pull request of the stack at once (`false`: one at a time).
     pub all_layers: Option<bool>,
     /// How a stack shows: `one_pr`, `all_prs`, or `whole` (the whole stack as one diff).
+    #[serde(alias = "series_view")]
     pub stack_view: Option<String>,
+    /// Stable member id or selector of the active series.
+    pub member: Option<String>,
     /// Compare one pull request between two of its versions (1-based: v1 is the first).
     pub versions: Option<VersionPick>,
     /// How new lines are marked: `both`, `bar`, `tint`, `strong`.
@@ -357,13 +360,7 @@ impl ReviewSurface {
             let file = target
                 .path
                 .as_deref()
-                .map(|path| {
-                    let within = alone.as_deref().filter(|_| target.source.is_none());
-                    let file = self.find_file(path, target.source.as_deref(), within)?;
-                    let refusal =
-                        self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone()));
-                    refusal.map_or(Ok(file), Err)
-                })
+                .map(|path| self.go_to_file(path, target.source.as_deref().or(alone.as_deref())))
                 .transpose()?;
             (version, file)
         };
@@ -393,6 +390,39 @@ impl ReviewSurface {
             answer.push(')');
         }
         Ok(answer)
+    }
+
+    fn go_to_file(
+        &self,
+        path: &str,
+        selector: Option<&str>,
+    ) -> Result<bcode_code_review::document::FileRef, String> {
+        let doc = &self
+            .review
+            .as_ref()
+            .ok_or("the review is still loading")?
+            .doc;
+        let mut matches = doc
+            .groups()
+            .filter(|group| {
+                !group.alternate
+                    && selector.map_or(!group.hidden, |id| {
+                        group.key.selector() == id || group.source.source_id == id
+                    })
+            })
+            .flat_map(|group| doc.group_files(group.index))
+            .filter(|file| file.path == path.trim_start_matches("./"));
+        let file = matches
+            .next()
+            .cloned()
+            .ok_or_else(|| format!("{path} is not in the selected review group"))?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "{path} occurs in multiple groups; pass the group selector as source"
+            ));
+        }
+        let refusal = self.hidden_refusal(&file.path, &ItemKey::FileHeader(file.clone()));
+        refusal.map_or(Ok(file), Err)
     }
 
     /// The source a path is looked for in: the rail entry at `position` when it will show
@@ -696,17 +726,15 @@ impl ReviewSurface {
                 })
             });
         if let Some(wanted) = wanted {
-            if self.shown_stack_view() != Some(wanted) {
-                self.set_stack_view(wanted);
+            let mode = super::series::from_stack(wanted);
+            self.set_series_view(mode);
+            done.push(format!("requested series view {mode:?}"));
+        }
+        if let Some(member) = &change.member {
+            if !self.select_series_member(member) {
+                return Err(format!("member {member} cannot be selected in this view"));
             }
-            done.push(
-                match wanted {
-                    StackView::OneLayer => "one pull request at a time",
-                    StackView::AllLayers => "every pull request",
-                    StackView::Whole => "the whole stack as one diff",
-                }
-                .to_owned(),
-            );
+            done.push(format!("member {member}"));
         }
         if let Some((number, from, to)) = plan.versions {
             self.pick_versions(number, from, to, host);
@@ -729,6 +757,61 @@ impl ReviewSurface {
             done.push(format!("removed code inline: {inline}"));
         }
         Ok(done.join("; "))
+    }
+
+    fn check_series_change(&self, change: &ComparisonChange) -> Result<(), String> {
+        if change.all_layers.is_some() && change.stack_view.is_some() {
+            return Err(
+                "pass one grouping setting, not both all_layers and series_view".to_owned(),
+            );
+        }
+        if change.all_layers.is_some() || change.stack_view.is_some() || change.member.is_some() {
+            let series = self
+                .active_series()
+                .ok_or("this review has no active series")?;
+            let mode = match change.stack_view.as_deref() {
+                Some(text) => Some(super::series::from_stack(
+                    parse_stack_view(text).ok_or_else(|| format!("unknown series view {text}"))?,
+                )),
+                None => change.all_layers.map(|all| {
+                    super::series::from_stack(if all {
+                        StackView::AllLayers
+                    } else {
+                        StackView::OneLayer
+                    })
+                }),
+            };
+            if mode == Some(bcode_code_review_models::ReviewSeriesView::Combined)
+                && let Some(reason) = self
+                    .commit_series
+                    .get(&series.id)
+                    .and_then(|s| s.unavailable.as_deref())
+            {
+                return Err(reason.to_owned());
+            }
+            if let Some(mode) = mode
+                && !series.views().contains(&mode)
+            {
+                return Err(format!("this series cannot show {mode:?}"));
+            }
+            if let Some(member) = &change.member {
+                if !series
+                    .members
+                    .iter()
+                    .any(|key| series.member_id(key) == member || key.selector() == *member)
+                {
+                    return Err(format!("unknown series member {member}"));
+                }
+                if mode.or_else(|| series.view(self))
+                    == Some(bcode_code_review_models::ReviewSeriesView::Combined)
+                {
+                    return Err(
+                        "select one_member or all_members before naming a member".to_owned()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check every argument of `change`; nothing is applied when one is wrong.
@@ -774,22 +857,7 @@ impl ReviewSurface {
                 other => return Err(format!("unknown view {other:?} (full or changes)")),
             });
         }
-        if change.all_layers.is_some() && !self.steps_through_stack() {
-            return Err("only a review that steps through a stack has layers".to_owned());
-        }
-        if let Some(view) = change.stack_view.as_deref() {
-            let Some(wanted) = parse_stack_view(view) else {
-                return Err(format!(
-                    "unknown stack_view {view:?} (one_pr, all_prs, or whole)"
-                ));
-            };
-            if !self.can_show_stack_as(wanted) {
-                return Err(format!(
-                    "this review cannot show {view}: it needs a stack (all_prs needs two or more \
-                     pull requests)"
-                ));
-            }
-        }
+        self.check_series_change(change)?;
         if let Some(pick) = change.versions {
             let count = self.version_count(pick.number)?;
             let to = pick.to.unwrap_or(count);
@@ -996,9 +1064,9 @@ impl ReviewSurface {
 /// The stack view `text` names (`one_pr`, `all_prs`, `whole`).
 fn parse_stack_view(text: &str) -> Option<StackView> {
     match text {
-        "one_pr" => Some(StackView::OneLayer),
-        "all_prs" => Some(StackView::AllLayers),
-        "whole" => Some(StackView::Whole),
+        "one_member" | "one_pr" => Some(StackView::OneLayer),
+        "all_members" | "all_prs" => Some(StackView::AllLayers),
+        "combined" | "whole" => Some(StackView::Whole),
         _ => None,
     }
 }

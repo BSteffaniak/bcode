@@ -10,8 +10,35 @@ use crate::context::UiContext;
 use bcode_code_review::history::version_at;
 use bcode_code_review_models::{ReviewCompareBaseline, StackTimeline};
 use bmux_tui_components::status_bar::StatusSeverity;
+use std::collections::BTreeMap;
 
 impl ReviewSurface {
+    /// Standalone sources (including PR layers) participate in a workspace pass regardless
+    /// of focus. A commit series advances only the member(s) or aggregate being reviewed.
+    /// Record the original revisions, not the temporary sides of a comparison.
+    pub(super) fn active_pass_revisions(
+        &self,
+    ) -> BTreeMap<String, bcode_code_review_models::ReviewedRevision> {
+        let Some(review) = &self.review else {
+            return BTreeMap::default();
+        };
+        review
+            .doc
+            .groups()
+            .filter(|group| {
+                !group.loading
+                    && (matches!(
+                        group.key,
+                        bcode_code_review_models::ReviewGroupKey::Standalone { .. }
+                    ) || (!group.hidden && !group.alternate))
+            })
+            .filter_map(|group| {
+                let key = group.key.selector();
+                Some((key.clone(), self.pass_revisions.get(&key)?.clone()))
+            })
+            .collect()
+    }
+
     /// What a history is about: the stack this review last saw, and the heads the reviewer
     /// engaged with (their looks, and the passes of this review before looks were listed).
     fn history_scope(&self) -> Option<HistoryScope> {
@@ -19,9 +46,17 @@ impl ReviewSurface {
         let mut reviewed_heads = self.comparing.engaged_heads();
         if let Some(workspace) = self.workspace.as_ref() {
             reviewed_heads.extend(
-                workspace
-                    .reviewed_revisions
-                    .values()
+                self.sources
+                    .iter()
+                    .filter(|source| {
+                        matches!(
+                            &source.kind,
+                            bcode_code_review_models::ReviewSourceKind::PullRequest { .. }
+                                | bcode_code_review_models::ReviewSourceKind::StackLayer { .. }
+                                | bcode_code_review_models::ReviewSourceKind::Stack { .. }
+                        )
+                    })
+                    .filter_map(|source| workspace.reviewed_revisions.get(&source.id))
                     .filter_map(|revision| revision.reviewed_head_oid.clone()),
             );
         }

@@ -307,8 +307,12 @@ impl ActiveGuide {
     /// Where citation `id` is, at the lines it moved to when it moved.
     #[must_use]
     pub fn target(&self, id: &str) -> Option<CiteTarget> {
-        self.citation(id)
-            .map(|citation| CiteTarget::of(citation, self.freshness.get(id)))
+        let citation = self.citation(id)?;
+        let mut target = CiteTarget::of(citation, self.freshness.get(id));
+        target.source_id =
+            bcode_code_review::guide::sources::citation_selector(citation, &self.version.heads)
+                .map(str::to_owned);
+        Some(target)
     }
 
     /// The freshness of citation `id`, when told.
@@ -378,10 +382,10 @@ impl ActiveGuide {
             .filter(|citation| {
                 citation.path == path
                     && citation.side == side
-                    && citation
-                        .source_id
-                        .as_deref()
-                        .is_none_or(|cited| cited == source_id)
+                    && bcode_code_review::guide::sources::citation_selector(
+                        citation,
+                        &self.version.heads,
+                    ) == Some(source_id)
             })
             .filter(|citation| {
                 let lines = self

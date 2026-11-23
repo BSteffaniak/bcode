@@ -49,6 +49,7 @@ pub fn transient_workspace(
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
         viewed_marks: Vec::new(),
+        group_viewed_marks: BTreeMap::new(),
         viewed_threads: Vec::new(),
         reviewed_revisions: BTreeMap::new(),
         presentation: None,

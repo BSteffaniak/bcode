@@ -449,6 +449,7 @@ fn empty_anchor(target: &LayerTarget) -> DraftAnchor {
         is_file_anchor: false,
         surface_id: None,
         source_id: Some(target.source_id.clone()),
+        group: None,
         head_oid: Some(target.head_oid.clone()),
         blob_oid: None,
         reply_to: None,

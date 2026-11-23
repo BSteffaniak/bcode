@@ -14,7 +14,7 @@ use super::config::compare::{MarkOptions, MarkStyle, SeenHunks};
 use super::history::ago;
 use super::picker::{Picker, PickerItem, PickerOutcome};
 use super::theme::ReviewTheme;
-use bcode_code_review_models::{ChangeKind, LayerLook, LayerTimeline, LookKind};
+use bcode_code_review_models::{ChangeKind, LayerLook, LayerTimeline, LookKind, ReviewSeriesView};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::event::{Event, MouseButton, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -34,6 +34,8 @@ pub const AGO_PRESETS: [(u64, &str); 3] = [
 /// A row of the comparison menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuChoice {
+    /// Choose the grouping, without changing the baseline.
+    Group(ReviewSeriesView),
     /// Compare with what the reviewer last looked at.
     LastLooked,
     /// Compare with each layer's version before the latest push.
@@ -85,6 +87,12 @@ const fn seen_id(seen: SeenHunks) -> &'static str {
 impl MenuChoice {
     fn id(self) -> String {
         match self {
+            Self::Group(view) => match view {
+                ReviewSeriesView::OneMember => "group:one",
+                ReviewSeriesView::AllMembers => "group:all",
+                ReviewSeriesView::Combined => "group:combined",
+            }
+            .to_owned(),
             Self::LastLooked => "last".to_owned(),
             Self::PreviousPush => "previous".to_owned(),
             Self::Push => "push".to_owned(),
@@ -104,6 +112,9 @@ impl MenuChoice {
 
     fn from_id(id: &str) -> Option<Self> {
         Some(match id {
+            "group:one" => Self::Group(ReviewSeriesView::OneMember),
+            "group:all" => Self::Group(ReviewSeriesView::AllMembers),
+            "group:combined" => Self::Group(ReviewSeriesView::Combined),
             "last" => Self::LastLooked,
             "previous" => Self::PreviousPush,
             "push" => Self::Push,
@@ -150,7 +161,7 @@ impl MenuChoice {
     /// Whether the row is an action that closes the menu rather than a choice.
     #[must_use]
     pub const fn is_action(self) -> bool {
-        matches!(self, Self::Guide)
+        matches!(self, Self::Guide | Self::Group(_))
     }
 
     /// Whether picking the row opens another picker (the push timeline or the version picker)
@@ -191,9 +202,24 @@ pub enum CompareMenuOutcome {
     Ignored,
 }
 
+/// Read-only projection of the active series for the grouping controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesMenuState {
+    /// The controller's effective view, including its initial default.
+    pub view: ReviewSeriesView,
+    /// Whether to use commit rather than pull-request terminology.
+    pub commits: bool,
+    /// A successful combined comparison with no changed files.
+    pub empty_combined: bool,
+    /// Why a combined diff cannot be shown, when already known.
+    pub unavailable: Option<String>,
+}
+
 /// What the comparison menu offers and how things stand.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MenuState {
+    /// Absent for a standalone source or a single commit.
+    pub series: Option<SeriesMenuState>,
     /// The baseline in effect: marked, and the row the cursor opens on.
     pub current: Option<MenuChoice>,
     /// What the baseline in effect resolves to (`4m ago`, `push 3 → now`, `v2 → now`).
@@ -228,6 +254,8 @@ pub struct MenuState {
 /// What the menu can offer to pick from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MenuOffers {
+    /// At least one active source supports historical pull-request comparisons.
+    pub pull_history: bool,
     /// The stack has pushes.
     pub pushes: bool,
     /// The current pull request has several versions.
@@ -268,7 +296,12 @@ impl CompareMenu {
             state: MenuState::default(),
         };
         menu.update(state, theme);
-        if let Some(current) = state.current {
+        if let Some(current) = state.current.or_else(|| {
+            state
+                .series
+                .as_ref()
+                .map(|series| MenuChoice::Group(series.view))
+        }) {
             menu.picker.focus_id(&current.id());
         }
         menu
@@ -295,6 +328,81 @@ impl CompareMenu {
     }
 
     fn items(state: &MenuState, theme: &ReviewTheme) -> Vec<PickerItem> {
+        let mut items: Vec<_> = Self::guide_item(state, theme).into_iter().collect();
+        if let Some(series) = &state.series {
+            Self::series_items(&mut items, series, theme);
+            if state.current.is_none() {
+                return items;
+            }
+        }
+        Self::baseline_items(&mut items, state, theme);
+        items.push(Self::heading(theme, "s.view", "View"));
+        items.extend(Self::option_items(state, theme));
+        items.extend(Self::mark_items(state, theme));
+        items.push(PickerItem::section(
+            "s.legend",
+            Line::from_spans(vec![Span::styled(state.legend.clone(), theme.muted)]),
+        ));
+        items
+    }
+
+    fn heading(theme: &ReviewTheme, id: &str, label: &str) -> PickerItem {
+        PickerItem::section(
+            id,
+            Line::from_spans(vec![Span::styled(label.to_owned(), theme.title)]),
+        )
+    }
+
+    fn series_items(items: &mut Vec<PickerItem>, series: &SeriesMenuState, theme: &ReviewTheme) {
+        let ascii = theme.icons.menu.is_ascii();
+        let labels = if series.commits {
+            [
+                "One commit at a time",
+                "All commits separately",
+                "Selected commits combined",
+            ]
+        } else {
+            [
+                "One pull request at a time",
+                "All pull requests separately",
+                "Whole stack combined",
+            ]
+        };
+        items.push(Self::heading(theme, "s.group", "Group changes"));
+        for (view, label) in [
+            ReviewSeriesView::OneMember,
+            ReviewSeriesView::AllMembers,
+            ReviewSeriesView::Combined,
+        ]
+        .into_iter()
+        .zip(labels)
+        {
+            if view == ReviewSeriesView::Combined
+                && let Some(reason) = &series.unavailable
+            {
+                items.push(Self::heading(
+                    theme,
+                    "s.group.unavailable",
+                    &format!("{label} unavailable: {reason}"),
+                ));
+                continue;
+            }
+            let label = if view == ReviewSeriesView::Combined && series.empty_combined {
+                format!("{label} (no net changes)")
+            } else {
+                label.to_owned()
+            };
+            items.push(PickerItem::new(
+                MenuChoice::Group(view).id(),
+                Line::from_spans(vec![
+                    Span::styled(radio(series.view == view, ascii), theme.accent),
+                    Span::styled(label, theme.text),
+                ]),
+            ));
+        }
+    }
+
+    fn baseline_items(items: &mut Vec<PickerItem>, state: &MenuState, theme: &ReviewTheme) {
         let ascii = theme.icons.menu.is_ascii();
         let separator = theme.icons.separator;
         let ellipsis = theme.icons.ellipsis;
@@ -323,20 +431,13 @@ impl CompareMenu {
             }
             PickerItem::new(choice.id(), Line::from_spans(spans))
         };
-        let section = |id: &str, label: &str| {
-            PickerItem::section(
-                id,
-                Line::from_spans(vec![Span::styled(label.to_owned(), theme.title)]),
-            )
-        };
-        let mut items: Vec<PickerItem> = Self::guide_item(state, theme).into_iter().collect();
         items.extend([
-            section("s.since", "Show changes since"),
+            Self::heading(theme, "s.since", "Show changes since"),
             target(
                 MenuChoice::LastLooked,
                 "you last looked".to_owned(),
                 state.last_looked.as_deref(),
-                "each pull request as you last saw it",
+                "each source as you last saw it",
             ),
         ]);
         if state.offers.pushes {
@@ -347,12 +448,15 @@ impl CompareMenu {
                 "each pull request before the latest push",
             ));
         }
-        for (ms, label) in AGO_PRESETS {
+        for (ms, label) in AGO_PRESETS
+            .into_iter()
+            .filter(|_| state.offers.pull_history)
+        {
             items.push(target(
                 MenuChoice::Ago(ms),
                 label.to_owned(),
                 None,
-                "each pull request as it was then",
+                "each source as it was then",
             ));
         }
         if state.offers.pushes {
@@ -389,14 +493,6 @@ impl CompareMenu {
             None,
             "no comparison",
         ));
-        items.push(section("s.view", "View"));
-        items.extend(Self::option_items(state, theme));
-        items.extend(Self::mark_items(state, theme));
-        items.push(PickerItem::section(
-            "s.legend",
-            Line::from_spans(vec![Span::styled(state.legend.clone(), theme.muted)]),
-        ));
-        items
     }
 
     /// The row asking for a guide of the changes, while some pull request is compared.
@@ -514,7 +610,11 @@ impl CompareMenu {
             option(
                 MenuChoice::OnlyChanged,
                 state.only_changed,
-                "Only pull requests with real changes",
+                if state.series.as_ref().is_some_and(|series| series.commits) {
+                    "Only sources with real changes"
+                } else {
+                    "Only pull requests with real changes"
+                },
                 "hide unchanged and rebased-only ones".to_owned(),
             ),
         ]
@@ -921,6 +1021,7 @@ mod tests {
 
     fn menu_state() -> MenuState {
         MenuState {
+            series: None,
             current: Some(MenuChoice::LastLooked),
             detail: Some("4m ago".into()),
             last_looked: Some("4m ago".into()),
@@ -929,6 +1030,7 @@ mod tests {
             only_changed: true,
             changes_view: false,
             offers: MenuOffers {
+                pull_history: true,
                 pushes: false,
                 versions: true,
             },
@@ -939,6 +1041,29 @@ mod tests {
             legend: crate::history::badge_legend(&crate::theme::Icons::UNICODE),
             guide: false,
         }
+    }
+
+    #[test]
+    fn series_without_a_baseline_offers_grouping_not_pr_history() {
+        let theme = ReviewTheme::derive(None, IconStyle::Unicode);
+        let state = MenuState {
+            series: Some(SeriesMenuState {
+                view: ReviewSeriesView::AllMembers,
+                commits: true,
+                empty_combined: false,
+                unavailable: Some("conflicting selected changes".into()),
+            }),
+            ..MenuState::default()
+        };
+        let menu = CompareMenu::new(&state, &theme);
+        assert_eq!(
+            menu.focused(),
+            Some(MenuChoice::Group(ReviewSeriesView::AllMembers))
+        );
+        let rows = menu.rows().join("\n");
+        assert!(rows.contains("combined unavailable: conflicting selected changes"));
+        assert!(!rows.contains("Show changes since"));
+        assert!(!rows.contains("pull request"));
     }
 
     #[test]

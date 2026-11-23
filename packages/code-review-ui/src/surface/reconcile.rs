@@ -233,11 +233,7 @@ impl ReviewSurface {
         if change.layers_filled {
             // A review made of the whole-stack diff keeps showing it, now with layers to switch
             // to.
-            self.stack_view = super::stack::StackView::Whole;
-            self.workspace_mut()
-                .presentation
-                .get_or_insert_with(Default::default)
-                .set_stack_view(super::stack::StackView::Whole);
+            self.seed_stack_series_view(bcode_code_review_models::ReviewSeriesView::Combined);
         }
         self.request_save();
         // Opening again with the new sources is not a refresh to announce.

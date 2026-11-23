@@ -23,6 +23,8 @@ mod graph;
 pub mod looks;
 pub mod reflog;
 
+pub use delta::replay_selected;
+
 use crate::data::DataError;
 use crate::data::git;
 use bcode_code_review_models::{

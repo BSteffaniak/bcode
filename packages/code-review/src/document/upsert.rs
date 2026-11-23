@@ -30,11 +30,21 @@ impl ReviewDocument {
         let Some(regrouped) = self.regroup(input, at) else {
             return false;
         };
-        let mut rebuilt = Self::structure(self.repo_path.clone(), regrouped.inputs, self.config);
+        let mut rebuilt = Self::structure(
+            self.repo_path.clone(),
+            regrouped.inputs,
+            self.config,
+            std::mem::take(&mut self.combined_sources),
+        );
+        rebuilt.source_focus = self.source_focus.take();
+        rebuilt.hidden_groups = std::mem::take(&mut self.hidden_groups);
+        rebuilt.group_focus = std::mem::take(&mut self.group_focus);
+        rebuilt.group_alternates = std::mem::take(&mut self.group_alternates);
         rebuilt.layout = self.layout;
         rebuilt.ignore_whitespace = self.ignore_whitespace;
         rebuilt.composer.clone_from(&self.composer);
         rebuilt.marks = std::mem::take(&mut self.marks);
+        rebuilt.scoped_marks = std::mem::take(&mut self.scoped_marks);
         rebuilt.comparisons = std::mem::take(&mut self.comparisons);
         rebuilt.comparison_summaries = std::mem::take(&mut self.comparison_summaries);
         rebuilt.compare_files_shown = std::mem::take(&mut self.compare_files_shown);
@@ -113,9 +123,14 @@ impl ReviewDocument {
             index
         } else {
             let index = at.min(inputs.len());
+            // Only explicit workspace-wide focus applies to an unrelated arriving group.
+            hidden.insert(
+                index,
+                self.source_focus
+                    .as_ref()
+                    .is_some_and(|id| id != &input.source.source_id),
+            );
             inputs.insert(index, input);
-            // A new group is hidden when the document shows one other source alone.
-            hidden.insert(index, self.focus().is_some());
             index
         };
         Some(Regrouped {

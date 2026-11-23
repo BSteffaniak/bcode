@@ -170,6 +170,7 @@ mod history;
 mod pointer;
 mod reconcile;
 mod review_tools;
+mod series;
 mod stack;
 mod stack_files;
 mod threads;
@@ -408,6 +409,7 @@ impl Review {
     fn new(
         repo_path: PathBuf,
         opened: Opened,
+        combined_sources: BTreeSet<String>,
         config: DocumentConfig,
         theme: &ReviewTheme,
         view: FilePanelView,
@@ -427,25 +429,23 @@ impl Review {
                 )
             })
         });
+        let doc =
+            ReviewDocument::new_with_combined_sources(repo_path, inputs, config, combined_sources);
         let recorded_at = Some(annotate::now_ms());
-        let mut revisions = BTreeMap::new();
-        for input in &inputs {
-            // A source resolving to several parts records its first part.
-            revisions
-                .entry(input.source.source_id.clone())
-                .or_insert_with(|| {
-                    bcode_code_review_models::ReviewedRevision::from_resolved(
-                        &input.source,
-                        recorded_at,
-                    )
-                });
-        }
-        revisions.retain(
-            |_, revision: &mut bcode_code_review_models::ReviewedRevision| {
-                revision.reviewed_head_oid.is_some()
-            },
-        );
-        let doc = ReviewDocument::new(repo_path, inputs, config);
+        let revisions = doc
+            .groups()
+            .filter(|group| !group.loading)
+            .filter_map(|group| {
+                let revision = bcode_code_review_models::ReviewedRevision::from_resolved(
+                    group.source,
+                    recorded_at,
+                );
+                revision
+                    .reviewed_head_oid
+                    .is_some()
+                    .then(|| (group.key.selector(), revision))
+            })
+            .collect();
         let mut files = FileTree::with_layout(&doc, theme, view.layout);
         files.set_hide_viewed(view.hide_viewed, theme);
         let mut tree = TreeViewState::new(None);
@@ -516,10 +516,18 @@ impl Review {
     }
 
     /// Open the file panel's group of source `source` and close the other groups.
-    fn open_only_group(&self, source: &str) {
+    fn open_only_group(&self, source: &str, series: &series::Series) {
         let mut tree = self.tree.borrow_mut();
         for (id, group) in self.files.group_ids() {
-            tree.set_expanded(id, group == source);
+            let selector = self.files.first_file_under(id).and_then(|file| {
+                self.doc
+                    .group_of_key(&ItemKey::FileHeader(file.clone()))
+                    .map(bcode_code_review_models::ReviewGroupKey::selector)
+            });
+            let selector = selector.as_deref().unwrap_or(group);
+            if series.contains(selector) {
+                tree.set_expanded(id, selector == source);
+            }
         }
     }
 
@@ -671,6 +679,18 @@ struct Leaving {
     start: Option<crate::entry::Entry>,
 }
 
+/// Progress and timing reported while opening a review.
+#[derive(Default)]
+struct OpenProgress {
+    started: Option<Instant>,
+    /// The review shown has sources still loading; they arrive one by one.
+    filling: bool,
+    /// What is still loading after the first frame (the open's stage), shown on the layer strip.
+    filling_note: Option<String>,
+    /// When the review's stack was last resolved or confirmed by its provider.
+    stack_confirmed_at: Option<std::time::SystemTime>,
+}
+
 /// What the review noted about its sources across opens.
 #[derive(Debug, Default)]
 struct SourceNotes {
@@ -693,7 +713,7 @@ pub struct ReviewSurface {
     document_config: DocumentConfig,
     inbox: Inbox,
     phase: Phase,
-    started: Option<Instant>,
+    open_progress: OpenProgress,
     review: Option<Review>,
     theme_input: Option<ComponentStyles>,
     theme: ReviewTheme,
@@ -802,12 +822,8 @@ pub struct ReviewSurface {
     file_view: FilePanelView,
     /// How a step-through stack review is shown (persisted).
     stack_view: stack::StackView,
-    /// The review shown has sources still loading; they arrive one by one.
-    filling: bool,
-    /// What is still loading after the first frame (the open's stage), shown on the layer strip.
-    filling_note: Option<String>,
-    /// When the review's stack was last resolved or confirmed by its provider.
-    stack_confirmed_at: Option<std::time::SystemTime>,
+    commit_series: BTreeMap<String, bcode_code_review::session::CommitSeriesState>,
+    pending_member: Option<String>,
     /// Sources that failed after the first frame, and listing-cut warnings already shown.
     source_notes: SourceNotes,
     /// The stack this review last saw (and its provider), for its history.
@@ -870,7 +886,7 @@ impl ReviewSurface {
             document_config: document_config(&config),
             inbox: Inbox::default(),
             phase: Phase::Idle,
-            started: None,
+            open_progress: OpenProgress::default(),
             review: None,
             theme_input: None,
             theme: ReviewTheme::derive(None, icons),
@@ -943,9 +959,9 @@ impl ReviewSurface {
             hide_resolved: false,
             file_view: config.file_view(),
             stack_view: stack::StackView::default(),
-            filling: false,
-            filling_note: None,
-            stack_confirmed_at: None,
+            commit_series: BTreeMap::new(),
+            pending_member: None,
+
             source_notes: SourceNotes::default(),
             stack_news: None,
             gone_layers: std::collections::BTreeSet::new(),
@@ -1487,7 +1503,7 @@ impl ReviewSurface {
         self.phase = Phase::Opening {
             stage: "opening".to_owned(),
         };
-        self.started = Some(Instant::now());
+        self.open_progress.started = Some(Instant::now());
         let services = self.services.clone();
         let repo = self.repo_path.clone();
         let sources = self.sources.clone();
@@ -1500,25 +1516,26 @@ impl ReviewSurface {
                 .map(bcode_code_review::scope::annotation_workspace_id),
             ..self.viewed_inputs()
         };
+        let series_views = self
+            .workspace
+            .as_ref()
+            .and_then(|w| w.presentation.as_ref())
+            .map(|p| p.series_views.clone())
+            .unwrap_or_default();
         let first = self.first_source();
         let cancel = self.opening.start();
         let browse = self.browse_options();
         host.spawn(Box::pin(async move {
             // Streamed: the first frame, then each source as it arrives.
             let options = loader::OpenOptions {
+                series_views,
                 viewed,
                 first,
                 stream: true,
                 cancel,
                 browse,
             };
-            let message = match loader::open(services, repo, sources, inbox.clone(), options).await
-            {
-                Ok(Some(opened)) => Message::Opened(Box::new(opened)),
-                Ok(None) => return,
-                Err(error) => Message::OpenFailed(error),
-            };
-            inbox.push(message);
+            loader::open_into(services, repo, sources, inbox, options).await;
         }));
     }
 
@@ -1555,6 +1572,13 @@ impl ReviewSurface {
                     bcode_code_review::viewed::effective_marks(workspace)
                         .into_iter()
                         .map(|mark| mark.path)
+                        .chain(
+                            workspace
+                                .group_viewed_marks
+                                .values()
+                                .flatten()
+                                .map(|mark| mark.path.clone()),
+                        )
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1803,8 +1827,10 @@ impl ReviewSurface {
 
     /// Record the revisions this pass reviewed (durable reviews; saved with the workspace).
     fn record_pass(&mut self) {
+        // A completed PR pass engages every layer, even in the one-layer presentation.
+        // These forge looks are independent of commit-series group revisions.
         self.record_layer_looks(None, bcode_code_review_models::LookKind::Pass);
-        let revisions = self.pass_revisions.clone();
+        let revisions = self.active_pass_revisions();
         if revisions.is_empty() {
             return;
         }
@@ -1812,20 +1838,19 @@ impl ReviewSurface {
             return;
         }
         let workspace = self.workspace_mut();
-        let same = workspace.reviewed_revisions.len() == revisions.len()
-            && revisions.iter().all(|(id, revision)| {
-                workspace
-                    .reviewed_revisions
-                    .get(id)
-                    .is_some_and(|recorded| {
-                        recorded.reviewed_base_oid == revision.reviewed_base_oid
-                            && recorded.reviewed_head_oid == revision.reviewed_head_oid
-                    })
-            });
+        let same = revisions.iter().all(|(id, revision)| {
+            workspace
+                .reviewed_revisions
+                .get(id)
+                .is_some_and(|recorded| {
+                    recorded.reviewed_base_oid == revision.reviewed_base_oid
+                        && recorded.reviewed_head_oid == revision.reviewed_head_oid
+                })
+        });
         if same {
             return;
         }
-        workspace.reviewed_revisions = revisions;
+        workspace.reviewed_revisions.extend(revisions);
         self.request_save();
     }
 
@@ -1847,9 +1872,8 @@ impl ReviewSurface {
             );
             return;
         }
-        if !self.pass_revisions.is_empty() {
-            self.workspace_mut().reviewed_revisions = self.pass_revisions.clone();
-        }
+        let revisions = self.active_pass_revisions();
+        self.workspace_mut().reviewed_revisions.extend(revisions);
         let workspace = self.workspace_mut().clone();
         let notes = super::notes::LoadedNotes {
             drafts: self.notes.drafts().to_vec(),
@@ -2072,7 +2096,7 @@ impl ReviewSurface {
     /// Apply finished work. Returns whether anything visible changed.
     fn drain(&mut self, host: &UiContext) -> bool {
         let mut changed = false;
-        for message in self.inbox.drain() {
+        for message in self.inbox.current_messages() {
             // Highlights for files off screen land without a frame; every other result (and a
             // highlight on screen) is drawn by the one frame that follows this drain.
             changed |= match message {
@@ -2081,6 +2105,13 @@ impl ReviewSurface {
                 }
                 message => {
                     self.apply_message(message, host);
+                    // Reconciliation can request a replacement while draining an open's batch.
+                    // Invalidate the remaining scoped deliveries before taking the next one.
+                    if self.reopen_pending
+                        && let Some(cancel) = self.opening.0.take()
+                    {
+                        cancel.cancel();
+                    }
                     true
                 }
             };
@@ -2133,6 +2164,15 @@ impl ReviewSurface {
         changed
     }
 
+    fn finish_open(&mut self, opened: Opened, host: &UiContext) {
+        self.apply_opened(opened);
+        self.refresh_conversations(host);
+        // Review-wide bypass of this launch reaches every review it opens.
+        if self.review_bypass() {
+            self.apply_review_bypass(bypass::BypassScope::Review, host);
+        }
+    }
+
     /// Apply one finished piece of work.
     fn apply_message(&mut self, message: Message, host: &UiContext) {
         match message {
@@ -2141,25 +2181,21 @@ impl ReviewSurface {
                     *stage = text;
                 }
             }
-            Message::Opened(opened) => {
-                self.apply_opened(*opened);
-                self.refresh_conversations(host);
-                // Review-wide bypass of this launch reaches every review it opens.
-                if self.review_bypass() {
-                    self.apply_review_bypass(bypass::BypassScope::Review, host);
-                }
+            Message::Opened(opened) => self.finish_open(*opened, host),
+            Message::CommitSeries(state) => {
+                self.commit_series.insert(state.source_id.clone(), state);
             }
             Message::Arrived(arrived) => self.apply_arrived(*arrived),
             Message::Bypass(done) => self.apply_bypass(*done),
             Message::SourceFailed(diagnostic) => self.apply_source_failed(diagnostic),
             Message::StackConfirmed(news) => self.apply_stack_news(*news),
-            Message::Filling(note) => self.filling_note = note,
+            Message::Filling(note) => self.open_progress.filling_note = note,
             Message::Filled {
                 token,
                 working_tree,
             } => {
-                self.filling = false;
-                self.filling_note = None;
+                self.open_progress.filling = false;
+                self.open_progress.filling_note = None;
                 if let Some(review) = self.review.as_mut() {
                     review.token = token;
                     review.working_tree = working_tree;
@@ -2293,6 +2329,12 @@ impl ReviewSurface {
                     .dismissed_notices
                     .extend(stored.dismissed_notices.iter().cloned());
             }
+            for (selector, marks) in stored.group_viewed_marks {
+                let entry = workspace.group_viewed_marks.entry(selector).or_default();
+                entry.extend(marks);
+                entry.sort();
+                entry.dedup();
+            }
             workspace.viewed_files.extend(stored.viewed_files);
             workspace.viewed_marks.extend(stored.viewed_marks);
             workspace.viewed_marks.sort();
@@ -2307,19 +2349,16 @@ impl ReviewSurface {
                 }
             }
         }
-        let viewed = (
-            workspace.viewed_files.clone(),
-            workspace.viewed_marks.clone(),
-            workspace.viewed_threads.clone(),
-        );
+        let viewed = viewed_sync::Viewed::of(workspace);
         self.viewed_sync.transient = Some(viewed);
         self.viewed_sync.base = Some(stored_viewed.unwrap_or_default());
     }
 
     fn apply_opened(&mut self, mut opened: Opened) {
         let arrived = Instant::now();
+        self.commit_series.clone_from(&opened.commit_series);
         let opened_complete = opened.complete;
-        let was_filling = std::mem::replace(&mut self.filling, !opened.complete);
+        let was_filling = std::mem::replace(&mut self.open_progress.filling, !opened.complete);
         let (first_open, deepest_stack) = (self.review.is_none(), deepest_stack(&opened));
         self.refreshing = false;
         self.generation += 1;
@@ -2334,6 +2373,7 @@ impl ReviewSurface {
         let mut review = Review::new(
             self.repo_path.clone(),
             opened,
+            self.sources.iter().filter(|s| matches!(&s.kind, bcode_code_review_models::ReviewSourceKind::Commits { revs } if revs.len() > 1)).map(|s| s.id.clone()).collect(),
             DocumentConfig {
                 uncommitted_marks: self.uncommitted_marks(),
                 ..self.document_config
@@ -2354,7 +2394,11 @@ impl ReviewSurface {
                 .position()
                 .anchor()
                 .map(|anchor| anchor.key.0.clone());
-            if let Some(key) = top.and_then(|key| carried_key(&review.doc, &key)) {
+            let carry = |doc: &ReviewDocument, key: &ItemKey| {
+                let carried = carried_key(doc, key)?;
+                (doc.group_of_key(&carried) == previous.doc.group_of_key(key)).then_some(carried)
+            };
+            if let Some(key) = top.and_then(|key| carry(&review.doc, &key)) {
                 review
                     .list
                     .borrow_mut()
@@ -2363,7 +2407,7 @@ impl ReviewSurface {
             if let Some(cursor) = previous
                 .cursor
                 .clone()
-                .and_then(|key| carried_key(&review.doc, &key))
+                .and_then(|key| carry(&review.doc, &key))
             {
                 review.cursor = Some(cursor);
                 review.cursor_index = previous.cursor_index;
@@ -2402,6 +2446,7 @@ impl ReviewSurface {
         }
         // A refreshed document starts unfocused; show the stack as chosen again.
         self.apply_stack_view();
+        self.finish_member_jump();
         // Annotations are re-applied to the new document (and re-listed by the next poll).
         self.notes_requested = false;
         self.sync_notes();
@@ -2414,39 +2459,36 @@ impl ReviewSurface {
     /// cursor, the scroll position, and every other group stay as they are.
     fn apply_arrived(&mut self, mut arrived: loader::Arrived) {
         self.note_truncated(arrived.truncated.take().into_iter().collect());
-        let order: Vec<&str> = self
-            .sources
-            .iter()
-            .filter(|source| source.included)
-            .map(|source| source.id.as_str())
-            .collect();
         let Some(review) = self.review.as_mut() else {
             return;
         };
         let id = arrived.input.source.source_id.clone();
-        self.source_notes.failed.remove(&id);
-        // Its place among the groups shown: after every group earlier in the workspace.
-        let at = review
+        let part = arrived.input.source.part.as_ref().map(|part| part.index);
+        let selector = self.commit_series.get(&id).map_or_else(
+            || id.clone(),
+            |series| series.selector(&arrived.input.source),
+        );
+        self.source_notes.failed.remove(&selector);
+        if !review
             .doc
-            .groups()
-            .filter(|group| {
-                order
-                    .iter()
-                    .position(|source| *source == group.source.source_id)
-                    .is_some_and(|index| index < arrived.position)
-            })
-            .count();
-        if !arrived.input.loading {
+            .upsert_group(arrived.input, arrived.group_position)
+        {
+            return;
+        }
+        if let Some(group) = review.doc.groups().find(|group| {
+            !group.loading
+                && group.source.source_id == id
+                && group.source.part.as_ref().map(|part| part.index) == part
+        }) {
             let revision = bcode_code_review_models::ReviewedRevision::from_resolved(
-                &arrived.input.source,
+                group.source,
                 Some(annotate::now_ms()),
             );
             if revision.reviewed_head_oid.is_some() {
-                review.revisions.insert(id.clone(), revision);
+                let selector = group.key.selector();
+                review.revisions.insert(selector.clone(), revision.clone());
+                self.pass_revisions.insert(selector, revision);
             }
-        }
-        if !review.doc.upsert_group(arrived.input, at) {
-            return;
         }
         if let Some((source, answer)) = &arrived.fingerprints {
             review.doc.accept_fingerprints(source, answer);
@@ -2456,13 +2498,46 @@ impl ReviewSurface {
         review.rebuild_files(&self.theme, self.file_view);
         review.note_splices();
         self.apply_stack_view();
+        self.finish_member_jump();
     }
 
     /// A stack the review follows was resolved or confirmed (or recalled): shown on the layer
     /// strip, and saved with the review so it opens at once next time.
     fn apply_stack_news(&mut self, news: bcode_code_review::session::StackNews) {
-        self.stack_confirmed_at = Some(news.confirmed_at);
+        self.open_progress.stack_confirmed_at = Some(news.confirmed_at);
         self.stack_news = Some(news.clone());
+        // Reconciliation can prepend a previously unknown bottom PR before the first
+        // requested PR, even before the latter's first document group arrives. Keep
+        // the original reading position by source id, not its old list index.
+        if self.rail_layer.is_none() {
+            // Initial frames may contain only pending groups; a restored source still
+            // has priority over the first requested layer in that case.
+            let restored = self.first_source();
+            let matches_layer =
+                |source: &&bcode_code_review_models::ReviewSource| match &source.kind {
+                    bcode_code_review_models::ReviewSourceKind::StackLayer {
+                        provider,
+                        repository,
+                        number,
+                    } => {
+                        source.included
+                            && provider == &news.provider
+                            && repository == &news.repository
+                            && news
+                                .stack
+                                .layers
+                                .iter()
+                                .any(|layer| layer.pull.number == *number)
+                    }
+                    _ => false,
+                };
+            let mut layers = self.sources.iter().filter(matches_layer);
+            self.rail_layer = layers
+                .clone()
+                .find(|s| Some(&s.id) == restored.as_ref())
+                .or_else(|| layers.next())
+                .map(|s| s.id.clone());
+        }
         self.reconcile_stack();
         let confirmed_at_ms = news
             .confirmed_at
@@ -2571,7 +2646,11 @@ impl ReviewSurface {
         let failed = review
             .doc
             .groups()
-            .find(|group| group.source.source_id == diagnostic.source_id && group.loading)
+            .find(|group| {
+                group.loading
+                    && (group.key.selector() == diagnostic.source_id
+                        || group.source.source_id == diagnostic.source_id)
+            })
             .map(|group| {
                 (
                     bcode_code_review::document::SourceInput {
@@ -2627,18 +2706,24 @@ impl ReviewSurface {
         let sources = self.sources.clone();
         let inbox = self.inbox.clone();
         let viewed = self.viewed_inputs();
+        let series_views = self
+            .workspace
+            .as_ref()
+            .and_then(|w| w.presentation.as_ref())
+            .map(|p| p.series_views.clone())
+            .unwrap_or_default();
         let first = self.first_source();
-        // A refresh keeps showing the review until every source is listed again: early,
-        // incomplete answers go to a throwaway inbox.
+        // Atomic refresh: retain the previous document until the replacement is ready.
         let browse = self.browse_options();
         let cancel = self.opening.start();
         host.spawn(Box::pin(async move {
-            let message = match loader::open(
+            loader::open_into(
                 services,
                 repo,
                 sources,
-                Inbox::default(),
+                inbox,
                 loader::OpenOptions {
+                    series_views,
                     viewed,
                     first,
                     stream: false,
@@ -2646,13 +2731,7 @@ impl ReviewSurface {
                     browse,
                 },
             )
-            .await
-            {
-                Ok(Some(opened)) => Message::Opened(Box::new(opened)),
-                Ok(None) => return,
-                Err(error) => Message::OpenFailed(error),
-            };
-            inbox.push(message);
+            .await;
         }));
     }
 
@@ -4346,6 +4425,7 @@ impl ReviewSurface {
 
     fn paint_loading(&self, area: Rect, cx: &mut PaintCx<'_, '_>) {
         let elapsed = self
+            .open_progress
             .started
             .map_or(Duration::ZERO, |started| started.elapsed());
         let (title, body) = match &self.phase {

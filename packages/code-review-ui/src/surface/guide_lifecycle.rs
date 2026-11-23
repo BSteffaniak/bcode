@@ -111,34 +111,27 @@ impl ReviewSurface {
         self.guide.grant.as_ref()
     }
 
-    /// The review's sources as they resolve now, each once, primary first.
+    /// Guide revision pairs in document order, excluding hidden and alternate groups.
     pub(super) fn guide_sources(&self) -> Vec<ResolvedSource> {
-        let mut sources: Vec<ResolvedSource> = Vec::new();
-        if let Some(review) = self.review.as_ref() {
-            for group in review.doc.groups() {
-                if !sources
-                    .iter()
-                    .any(|source| source.source_id == group.source.source_id)
-                {
-                    sources.push(group.source.clone());
-                }
-            }
-        }
-        sources
+        self.review
+            .iter()
+            .flat_map(|review| review.doc.groups())
+            .filter(|group| !group.hidden && !group.alternate)
+            .map(|group| {
+                let mut source = group.source.clone();
+                source.source_id = group.key.selector();
+                source
+            })
+            .collect()
     }
 
-    /// The review's source labels, by source id.
     fn source_labels(&self) -> BTreeMap<String, String> {
-        self.workspace
-            .as_ref()
-            .map(|workspace| {
-                workspace
-                    .sources
-                    .iter()
-                    .map(|source| (source.id.clone(), source.label.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.review
+            .iter()
+            .flat_map(|review| review.doc.groups())
+            .filter(|group| !group.hidden && !group.alternate)
+            .map(|group| (group.key.selector(), group.label.to_owned()))
+            .collect()
     }
 
     // ----------------------------------------------------------------------------------------

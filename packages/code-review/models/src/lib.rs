@@ -13,6 +13,7 @@ mod history;
 mod paths;
 mod review_discovery;
 mod review_source;
+mod series;
 
 pub use assistant::*;
 pub use compare::*;
@@ -23,6 +24,7 @@ pub use history::*;
 pub use paths::*;
 pub use review_discovery::*;
 pub use review_source::*;
+pub use series::*;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -161,6 +163,11 @@ pub struct ReviewWorkspace {
     /// unknown identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub viewed_marks: Vec<ViewedMark>,
+    /// Viewed marks scoped by [`ReviewGroupKey::selector`], using canonical paths within each
+    /// group. A mark's presence records viewed membership even if its identities are unknown.
+    /// These marks do not populate the legacy workspace-wide `viewed_files` set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub group_viewed_marks: BTreeMap<String, Vec<ViewedMark>>,
     /// Threads marked viewed, each pinned to the comments it had then: a comment from someone
     /// else after that makes the thread unviewed again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -493,6 +500,9 @@ pub struct ReviewPresentationState {
     /// Last position in each stack layer of a step-through review, by workspace source id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub layer_positions: BTreeMap<String, ReviewItemKey>,
+    /// Grouping choices by series id. Legacy stack preferences apply when absent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub series_views: BTreeMap<String, ReviewSeriesPresentation>,
     /// Thread ids folded by hand, from before folds recorded their comment count (read as
     /// [`Self::thread_folds`] without a count).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -579,6 +589,7 @@ impl Default for ReviewPresentationState {
             panels: ReviewPanelState::default(),
             expansions: Vec::new(),
             layer_positions: BTreeMap::new(),
+            series_views: BTreeMap::new(),
             collapsed_threads: BTreeSet::new(),
             thread_folds: BTreeMap::new(),
             hide_resolved_threads: false,
@@ -618,6 +629,7 @@ impl ReviewWorkspace {
             viewed_files: BTreeSet::new(),
             archived_at_ms: None,
             viewed_marks: Vec::new(),
+            group_viewed_marks: BTreeMap::new(),
             viewed_threads: Vec::new(),
             reviewed_revisions: BTreeMap::new(),
             presentation: None,
@@ -1582,6 +1594,9 @@ pub enum ReviewAnchorKind {
 /// Persisted draft anchor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftAnchor {
+    /// Group this anchor was written against; absent for legacy ungrouped anchors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ReviewGroupKey>,
     /// Anchor scope.
     #[serde(default)]
     pub kind: ReviewAnchorKind,
@@ -3364,6 +3379,7 @@ mod tests {
             schema_version: REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
             exchange_id: "exchange-1".to_string(),
             anchor: DraftAnchor {
+                group: None,
                 kind: ReviewAnchorKind::Range,
                 file_path: "src/lib.rs".to_string(),
                 diff_row: 3,
@@ -3420,6 +3436,7 @@ mod tests {
         let suggestion = ReviewSuggestion {
             suggestion_id: "suggestion-1".to_string(),
             anchor: DraftAnchor {
+                group: None,
                 kind: ReviewAnchorKind::Range,
                 file_path: "src/lib.rs".to_string(),
                 diff_row: 3,
@@ -3481,14 +3498,92 @@ mod workspace_compat_tests {
             "viewed_files": ["a.rs"]
         }"#;
         let workspace: ReviewWorkspace = serde_json::from_str(json).unwrap();
+        assert!(workspace.group_viewed_marks.is_empty());
+        assert!(workspace.viewed_files.contains("a.rs"));
         assert_eq!(workspace.viewed_marks, Vec::new());
         assert_eq!(workspace.reviewed_revisions, BTreeMap::new());
         assert!(workspace.presentation.is_none());
         let encoded = serde_json::to_value(&workspace).unwrap();
+        assert!(encoded.get("group_viewed_marks").is_none());
         assert!(
             encoded.get("viewed_marks").is_none(),
             "empty viewed marks are omitted"
         );
+    }
+
+    #[test]
+    fn legacy_anchor_round_trips_without_group() {
+        let mut anchor: DraftAnchor =
+            serde_json::from_str(r#"{"file_path":"a.rs","diff_row":1,"line_kind":"added"}"#)
+                .unwrap();
+        assert!(anchor.group.is_none());
+        assert!(
+            serde_json::to_value(&anchor)
+                .unwrap()
+                .get("group")
+                .is_none()
+        );
+        anchor.group = Some(ReviewGroupKey::Member {
+            source_id: "source-1".into(),
+            member: "8dfce61a83e6c65e7b4d6a5ce0aa59e84ee3acfb".into(),
+        });
+        let saved = serde_json::to_value(&anchor).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DraftAnchor>(saved).unwrap(),
+            anchor
+        );
+    }
+
+    #[test]
+    fn series_preference_round_trips_without_changing_legacy_stack_view() {
+        let mut state: ReviewPresentationState =
+            serde_json::from_str(r#"{"schema_version":2,"all_stack_layers":true}"#).unwrap();
+        assert!(state.series_views.is_empty());
+        assert!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("series_views")
+                .is_none()
+        );
+        state.series_views.insert(
+            "source-1".into(),
+            ReviewSeriesPresentation {
+                view: ReviewSeriesView::Combined,
+                last_member: Some("source-2".into()),
+            },
+        );
+        let saved = serde_json::to_value(&state).unwrap();
+        assert_eq!(saved["series_views"]["source-1"]["view"], "combined");
+        let loaded: ReviewPresentationState = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.stack_view(), ReviewStackView::AllLayers);
+    }
+
+    #[test]
+    fn group_selectors_preserve_source_ids_and_member_boundaries() {
+        let member = |source_id: &str, member: &str| {
+            ReviewGroupKey::Member {
+                source_id: source_id.into(),
+                member: member.into(),
+            }
+            .selector()
+        };
+        assert_eq!(
+            ReviewGroupKey::Standalone {
+                source_id: "s".into()
+            }
+            .selector(),
+            "s"
+        );
+        assert_eq!(
+            ReviewGroupKey::Combined {
+                source_id: "s".into()
+            }
+            .selector(),
+            "series:combined:s"
+        );
+        assert_eq!(member("s", "a:b"), "series:member:1:s:a:b");
+        assert_ne!(member("s", "a:b"), member("s:a", "b"));
     }
 
     #[test]

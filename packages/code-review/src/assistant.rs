@@ -22,6 +22,7 @@ pub mod guide;
 pub mod manage;
 pub mod offline;
 pub mod pull_threads;
+mod series;
 
 pub use fit::MAX_THREADS_OUTPUT_BYTES;
 pub use pull_threads::{PullThreadQuery, PullThreadView, PullThreadsView, ThreadOrigin};
@@ -177,6 +178,7 @@ impl OpenReview {
             viewed_files: self.workspace.viewed_files.clone(),
             archived_at_ms: None,
             viewed_marks: self.workspace.viewed_marks.clone(),
+            group_viewed_marks: self.workspace.group_viewed_marks.clone(),
             viewed_threads: self.workspace.viewed_threads.clone(),
             reviewed_revisions: BTreeMap::new(),
             presentation: None,
@@ -205,6 +207,8 @@ pub struct ReviewListing {
 pub struct SourceSummary {
     /// Source id.
     pub id: String,
+    /// Stable selector of the active group.
+    pub selector: String,
     /// Label.
     pub label: String,
     /// Base side (`index`, `working_tree`, `empty_tree`, or a commit id).
@@ -476,6 +480,20 @@ impl<'a> ReviewTools<'a> {
         repo_path: &Path,
         review: &ReviewRef,
     ) -> Result<OpenReview, AssistantError> {
+        self.open_with_series(repo_path, review, None)
+    }
+
+    /// Open a review with a request-local grouping for one canonical series. The override
+    /// is used only for resolution, never written into the saved workspace or binding.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::open`], or an invalid series or member diagnostic.
+    pub fn open_with_series(
+        &mut self,
+        repo_path: &Path,
+        review: &ReviewRef,
+        selection: Option<(&str, bcode_code_review_models::ReviewSeriesPresentation)>,
+    ) -> Result<OpenReview, AssistantError> {
         let (mut workspace, resolved, stacks, session_id, guide_grant) = match review {
             ReviewRef::Session(session_id) => {
                 let binding = self
@@ -519,15 +537,37 @@ impl<'a> ReviewTools<'a> {
             if crate::scope::is_transient(&workspace) {
                 workspace.viewed_files = stored.viewed_files;
                 workspace.viewed_marks = stored.viewed_marks;
+                workspace.group_viewed_marks = stored.group_viewed_marks;
             } else {
                 workspace = stored;
             }
         }
-        let (resolved, stacks) = if resolved.is_empty() {
-            self.resolve_sources(&workspace)?
+        if selection.is_some() && session_id.is_some() && !resolved.is_empty() {
+            return Err(AssistantError::Invalid("the attached session uses the on-screen grouping; use set_comparison, or name the saved review for a request-local grouping".into()));
+        }
+        let explicit = selection.is_some();
+        let requested = selection
+            .map(|(series, preference)| Self::series_projection(&workspace, series, preference))
+            .transpose()?;
+        let projection = requested.as_ref().unwrap_or(&workspace);
+        let (mut resolved, stacks) = if resolved.is_empty() || explicit {
+            self.resolve_sources(projection)?
         } else {
             (resolved, stacks)
         };
+        let stack_sources = series::stack_sources(projection)?;
+        resolved.retain(|part| {
+            projection
+                .sources
+                .iter()
+                .find(|s| s.id == part.source_id)
+                .is_none_or(|source| {
+                    !matches!(
+                        source.kind,
+                        ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+                    ) || stack_sources.contains(&source.id)
+                })
+        });
         Ok(OpenReview {
             repo_root: workspace.repo_root.clone(),
             workspace,
@@ -536,6 +576,40 @@ impl<'a> ReviewTools<'a> {
             session_id,
             guide_grant,
         })
+    }
+
+    fn series_projection(
+        workspace: &ReviewWorkspace,
+        series: &str,
+        preference: bcode_code_review_models::ReviewSeriesPresentation,
+    ) -> Result<ReviewWorkspace, AssistantError> {
+        let source = workspace
+            .sources
+            .iter()
+            .find(|source| source.id == series && source.included)
+            .ok_or_else(|| AssistantError::Invalid(format!("unknown series {series}")))?;
+        if !series::is_commit_series(source)
+            && !matches!(
+                source.kind,
+                ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+            )
+        {
+            return Err(AssistantError::Invalid(format!("{series} is not a series")));
+        }
+        let owner = match &source.kind {
+            ReviewSourceKind::StackLayer { provider, repository, .. } => workspace.sources.iter().filter(|s| s.included)
+                .find(|s| matches!(&s.kind, ReviewSourceKind::Stack { provider: p, repository: r, .. } if p == provider && r == repository))
+                .or_else(|| workspace.sources.iter().filter(|s| s.included).find(|s| matches!(&s.kind, ReviewSourceKind::StackLayer { provider: p, repository: r, .. } if p == provider && r == repository)))
+                .unwrap_or(source),
+            _ => source,
+        };
+        let mut requested = workspace.clone();
+        requested
+            .presentation
+            .get_or_insert_with(Default::default)
+            .series_views
+            .insert(owner.id.clone(), preference);
+        Ok(requested)
     }
 
     /// The guide grant `session_id`'s binding records, whether or not the binding shows a
@@ -575,8 +649,17 @@ impl<'a> ReviewTools<'a> {
         &self,
         workspace: &ReviewWorkspace,
     ) -> Result<(Vec<ResolvedSource>, Vec<ResolvedReviewStack>), AssistantError> {
+        let stack_sources = series::stack_sources(workspace)?;
+        let active_source = |source: &bcode_code_review_models::ReviewSource| {
+            !matches!(
+                source.kind,
+                ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+            ) || stack_sources.contains(&source.id)
+        };
         let needs_provider = workspace.sources.iter().any(|source| {
-            source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
+            source.included
+                && active_source(source)
+                && bcode_code_review_models::source_kind_requires_provider(&source.kind)
         });
         let provider_resolutions = if needs_provider {
             offline::resolutions(workspace, self.providers)
@@ -595,7 +678,12 @@ impl<'a> ReviewTools<'a> {
                 ..bcode_code_review_models::BrowseOptions::default()
             },
             repo_path: workspace.repo_root.clone(),
-            sources: workspace.sources.clone(),
+            sources: workspace
+                .sources
+                .iter()
+                .filter(|source| active_source(source) && !series::is_commit_series(source))
+                .cloned()
+                .collect(),
             provider_resolutions,
         })?;
         if needs_provider
@@ -611,7 +699,21 @@ impl<'a> ReviewTools<'a> {
                 diagnostic.message
             )));
         }
-        if response.sources.is_empty()
+        let mut active = Vec::new();
+        for source in workspace.sources.iter().filter(|source| source.included) {
+            if series::is_commit_series(source) {
+                active.extend(series::active_commits(self.data, workspace, source)?);
+            } else {
+                active.extend(
+                    response
+                        .sources
+                        .iter()
+                        .filter(|part| part.source_id == source.id)
+                        .cloned(),
+                );
+            }
+        }
+        if active.is_empty()
             && let Some(diagnostic) = response.diagnostics.first()
         {
             return Err(AssistantError::Invalid(format!(
@@ -619,7 +721,7 @@ impl<'a> ReviewTools<'a> {
                 diagnostic.message
             )));
         }
-        Ok((response.sources, response.stacks))
+        Ok((active, response.stacks))
     }
 
     /// Index entries of every source, in review order, with their source.
@@ -696,6 +798,7 @@ impl<'a> ReviewTools<'a> {
             .iter()
             .map(|source| SourceSummary {
                 id: source.source_id.clone(),
+                selector: review.group_key(source).selector(),
                 label: review
                     .workspace
                     .sources
@@ -738,7 +841,22 @@ impl<'a> ReviewTools<'a> {
                 .iter()
                 .map(|(_, entry)| u64::from(entry.deletions))
                 .sum(),
-            viewed: review.workspace.viewed_files.len(),
+            viewed: entries
+                .iter()
+                .filter(|(index, entry)| {
+                    let group = review.group_key(&review.resolved[*index]);
+                    match group {
+                        bcode_code_review_models::ReviewGroupKey::Standalone { .. } => {
+                            review.workspace.viewed_files.contains(&entry.path)
+                        }
+                        _ => review
+                            .workspace
+                            .group_viewed_marks
+                            .get(&group.selector())
+                            .is_some_and(|marks| marks.iter().any(|m| m.path == entry.path)),
+                    }
+                })
+                .count(),
             open_threads: threads
                 .threads
                 .iter()
@@ -777,8 +895,9 @@ impl<'a> ReviewTools<'a> {
                     .cloned()
                     .unwrap_or_default();
                 let identity = EntryIdentity::from_entry(entry).with_content(content.as_deref());
-                let viewed = crate::viewed::viewed_state(
+                let viewed = series::viewed_state(
                     &review.workspace,
+                    &review.group_key(&review.resolved[*source]),
                     &identity.with_patch(patch.as_deref()),
                     reset,
                 ) != ViewedState::Unviewed;
@@ -789,7 +908,10 @@ impl<'a> ReviewTools<'a> {
                     additions: entry.additions,
                     deletions: entry.deletions,
                     viewed,
-                    source: several.then(|| review.resolved[*source].source_id.clone()),
+                    source: (several
+                        || review.group_key(&review.resolved[*source]).selector()
+                            != review.resolved[*source].source_id)
+                        .then(|| review.group_key(&review.resolved[*source]).selector()),
                 }
             })
             .collect();
@@ -857,17 +979,23 @@ impl<'a> ReviewTools<'a> {
     ) -> Result<(usize, ReviewIndexEntry), AssistantError> {
         let path = path.trim().trim_start_matches("./");
         let entries = self.entries(review)?;
-        entries
-            .into_iter()
-            .find(|(index, entry)| {
-                source.is_none_or(|source| review.resolved[*index].source_id == source)
-                    && (entry.path == path || entry.old_path.as_deref() == Some(path))
-            })
-            .ok_or_else(|| {
-                AssistantError::NotFound(format!(
-                    "{path} is not a file of this review (code_review.list_files lists them)"
-                ))
-            })
+        let mut matches = entries.into_iter().filter(|(index, entry)| {
+            source.is_none_or(|id| review.matches_selector(&review.resolved[*index], id))
+                && (entry.path == path || entry.old_path.as_deref() == Some(path))
+        });
+        let first = matches.next().ok_or_else(|| {
+            AssistantError::NotFound(format!(
+                "{path} is not a file of this review (code_review.list_files lists them)"
+            ))
+        })?;
+        if let Some(second) = matches.next() {
+            return Err(AssistantError::Invalid(format!(
+                "{path} occurs in multiple groups; pass a source selector (such as {} or {})",
+                review.group_key(&review.resolved[first.0]).selector(),
+                review.group_key(&review.resolved[second.0]).selector(),
+            )));
+        }
+        Ok(first)
     }
 
     /// The diff of one file as numbered lines: `old new marker content`, with hunk headers.
@@ -1205,6 +1333,7 @@ impl<'a> ReviewTools<'a> {
         location: &Location,
     ) -> Result<DraftAnchor, AssistantError> {
         let mut anchor = DraftAnchor {
+            group: None,
             kind: ReviewAnchorKind::Review,
             file_path: REVIEW_LEVEL_PATH.to_owned(),
             diff_row: 0,
@@ -1236,6 +1365,10 @@ impl<'a> ReviewTools<'a> {
         anchor.kind = ReviewAnchorKind::File;
         anchor.file_path.clone_from(&entry.path);
         anchor.source_id = Some(resolved.source_id.clone());
+        let group = review.group_key(resolved);
+        if group.selector() != resolved.source_id {
+            anchor.group = Some(group);
+        }
         anchor.head_oid = resolved.head.commit_oid().map(str::to_owned);
         let Some(start) = location.line else {
             return Ok(anchor);
@@ -1489,16 +1622,17 @@ impl<'a> ReviewTools<'a> {
                 .get(&(*index, entry.path.clone()))
                 .cloned()
                 .unwrap_or_default();
-            identities.push((EntryIdentity::from_entry(entry), patch, content));
+            identities.push((
+                review.group_key(&review.resolved[*index]),
+                EntryIdentity::from_entry(entry),
+                patch,
+                content,
+            ));
         }
-        for (entry, patch, content) in &identities {
+        for (group, entry, patch, content) in &identities {
             let identity = entry.clone().with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
-            if viewed {
-                crate::viewed::mark_viewed(&mut record, &identity);
-            } else {
-                crate::viewed::unmark_viewed(&mut record, &identity);
-            }
+            series::set_viewed(&mut record, group, &identity, viewed);
         }
         let written = self
             .store
@@ -1510,10 +1644,10 @@ impl<'a> ReviewTools<'a> {
             .workspace;
         // Say what the store holds now, which another writer may have changed meanwhile.
         let (mut done, mut other) = (Vec::new(), Vec::new());
-        for (entry, patch, content) in &identities {
+        for (group, entry, patch, content) in &identities {
             let identity = entry.clone().with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
-            let is_viewed = crate::viewed::viewed_state(&written, &identity, ViewedReset::Diff)
+            let is_viewed = series::viewed_state(&written, group, &identity, ViewedReset::Diff)
                 != ViewedState::Unviewed;
             let path = identity.path.to_string();
             if is_viewed == viewed {
@@ -1564,6 +1698,7 @@ impl<'a> ReviewTools<'a> {
             Some(stored) if review.is_transient() => ReviewWorkspace {
                 viewed_files: stored.viewed_files,
                 viewed_marks: stored.viewed_marks,
+                group_viewed_marks: stored.group_viewed_marks,
                 viewed_threads: stored.viewed_threads,
                 ..own
             },
@@ -1571,6 +1706,7 @@ impl<'a> ReviewTools<'a> {
             None if review.is_transient() => ReviewWorkspace {
                 viewed_files: std::collections::BTreeSet::new(),
                 viewed_marks: Vec::new(),
+                group_viewed_marks: BTreeMap::new(),
                 viewed_threads: Vec::new(),
                 ..own
             },
@@ -1865,6 +2001,7 @@ pub fn bound_workspace(workspace: &ReviewWorkspace) -> ReviewWorkspace {
         viewed_files: std::collections::BTreeSet::new(),
         archived_at_ms: workspace.archived_at_ms,
         viewed_marks: Vec::new(),
+        group_viewed_marks: BTreeMap::new(),
         viewed_threads: Vec::new(),
         reviewed_revisions: BTreeMap::new(),
         presentation: None,

@@ -962,10 +962,10 @@ fn range(
     ))
 }
 
-struct CommitInfo {
-    oid: String,
+pub(super) struct CommitInfo {
+    pub(super) oid: String,
     short: String,
-    parent: Option<String>,
+    pub(super) parent: Option<String>,
     subject: String,
 }
 
@@ -985,6 +985,21 @@ fn commits(root: &Path, source: &ReviewSource, revs: &[String]) -> Result<Resolu
     if oids.is_empty() {
         return Ok(unresolved("no commits selected"));
     }
+    let infos = commit_infos(root, &oids)?;
+    if let Some((oldest, newest)) = first_parent_chain(&oids, &infos) {
+        return Ok(diff(
+            source,
+            head_or_empty(infos[&oldest].parent.as_deref()),
+            RevisionRef::commit(newest),
+        ));
+    }
+    Ok(Resolution::Resolved(commit_parts(source, &oids, &infos)))
+}
+
+pub(super) fn commit_infos(
+    root: &Path,
+    oids: &[String],
+) -> Result<BTreeMap<String, CommitInfo>, DataError> {
     let mut args = vec![
         "log",
         "--no-walk=unsorted",
@@ -1014,17 +1029,16 @@ fn commits(root: &Path, source: &ReviewSource, revs: &[String]) -> Result<Resolu
         })
         .collect();
 
-    if let Some((oldest, newest)) = first_parent_chain(&oids, &infos) {
-        return Ok(diff(
-            source,
-            head_or_empty(infos[&oldest].parent.as_deref()),
-            RevisionRef::commit(newest),
-        ));
-    }
+    Ok(infos)
+}
 
+pub(super) fn commit_parts(
+    source: &ReviewSource,
+    oids: &[String],
+    infos: &BTreeMap<String, CommitInfo>,
+) -> Vec<ResolvedSource> {
     let count = u32::try_from(oids.len()).unwrap_or(u32::MAX);
-    let parts = oids
-        .iter()
+    oids.iter()
         .enumerate()
         .filter_map(|(index, oid)| {
             let info = infos.get(oid)?;
@@ -1043,12 +1057,11 @@ fn commits(root: &Path, source: &ReviewSource, revs: &[String]) -> Result<Resolu
                 }),
             })
         })
-        .collect();
-    Ok(Resolution::Resolved(parts))
+        .collect()
 }
 
 /// When the commits form one first-parent chain, return its `(oldest, newest)` ends.
-fn first_parent_chain(
+pub(super) fn first_parent_chain(
     oids: &[String],
     infos: &BTreeMap<String, CommitInfo>,
 ) -> Option<(String, String)> {

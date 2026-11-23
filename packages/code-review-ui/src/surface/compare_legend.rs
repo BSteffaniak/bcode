@@ -13,7 +13,7 @@
 //! and its click target is exactly the rect it was laid out in.
 
 use super::ReviewSurface;
-use super::stack::StackView;
+use bcode_code_review_models::ReviewSeriesView;
 use bcode_code_review_models::{DeltaKind, ReviewCompareBaseline as Baseline};
 use bmux_tui::geometry::Point;
 use bmux_tui::text::{Line, Span};
@@ -118,8 +118,9 @@ impl ReviewSurface {
             action: Some(LegendAction::OpenMenu),
         });
         let sources = self.panel_sources();
-        let every_layer =
-            self.shown_stack_view() == Some(StackView::AllLayers) && self.steps_through_stack();
+        let every_layer = self
+            .series_menu_state()
+            .is_some_and(|series| series.view == ReviewSeriesView::AllMembers);
         match sources.as_slice() {
             [source] if !every_layer => rows.extend(self.source_legend(source)),
             _ => rows.extend(self.sources_legend()),
@@ -221,8 +222,13 @@ impl ReviewSurface {
         if filtered == 0 {
             return None;
         }
-        let pulls = plural(filtered, "pull request", "pull requests");
-        let text = if self.shown_stack_view() == Some(StackView::AllLayers) {
+        let series = self.series_menu_state();
+        let pulls = if series.as_ref().is_some_and(|series| series.commits) {
+            plural(filtered, "source", "sources")
+        } else {
+            plural(filtered, "pull request", "pull requests")
+        };
+        let text = if series.is_some_and(|series| series.view == ReviewSeriesView::AllMembers) {
             format!("{pulls} hidden: no real changes ")
         } else {
             format!("{pulls} without real changes skipped ")

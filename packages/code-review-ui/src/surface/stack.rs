@@ -24,8 +24,10 @@
 //! [`ReviewDocument::set_alternate_sources`]: bcode_code_review::document::ReviewDocument::set_alternate_sources
 
 use super::ReviewSurface;
-use bcode_code_review::document::{FileKey, FileRef, ItemKey, ReviewItem};
+use super::series::{Series, to_stack};
+use bcode_code_review::document::{FileRef, ItemKey, ReviewItem};
 use bcode_code_review_models::ReviewSourceKind;
+use bcode_code_review_models::{ReviewGroupKey, ReviewSeriesView as View};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, EventOutcome};
@@ -36,7 +38,6 @@ use bmux_tui_components::status_bar::StatusSeverity;
 use bmux_tui_components::tab_bar::{TabBar, TabBarComponent, TabBarPolicy, TabItem};
 use bmux_tui_components::virtual_list::AnchorPolicy;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 /// Layout id of the rail.
 pub const RAIL_ID: &str = "review.stack_rail";
@@ -61,94 +62,13 @@ pub struct RailEntry {
 /// banners, or the whole stack as one diff labeled by layer.
 pub use bcode_code_review_models::ReviewStackView as StackView;
 
-/// What `shift+o` names `view`.
-const fn describe(view: StackView) -> &'static str {
-    match view {
-        StackView::OneLayer => "one pull request at a time",
-        StackView::AllLayers => "every pull request of the stack",
-        StackView::Whole => "the whole stack as one diff",
-    }
-}
-
-/// A review's stack sources, by the way they show the stack.
-#[derive(Debug, Default)]
-struct StackGroups {
-    /// Stack-layer sources, in document order.
-    layers: Vec<String>,
-    /// Whole-stack sources.
-    whole: Vec<String>,
-}
-
-impl StackGroups {
-    /// The views these sources can show, in `shift+o` order.
-    fn views(&self) -> Vec<StackView> {
-        let mut views = Vec::new();
-        if !self.layers.is_empty() {
-            views.push(StackView::OneLayer);
-        }
-        if self.layers.len() >= 2 {
-            views.push(StackView::AllLayers);
-        }
-        if !self.whole.is_empty() {
-            views.push(StackView::Whole);
-        }
-        views
-    }
-
-    /// `wanted` when these sources can show it, else the closest view they can.
-    fn effective(&self, wanted: StackView) -> Option<StackView> {
-        let views = self.views();
-        if views.contains(&wanted) {
-            return Some(wanted);
-        }
-        match wanted {
-            StackView::AllLayers if views.contains(&StackView::OneLayer) => {
-                Some(StackView::OneLayer)
-            }
-            _ => views.first().copied(),
-        }
-    }
-
-    /// Sources left out as alternates in `view`.
-    fn alternates(&self, view: StackView) -> BTreeSet<String> {
-        let hidden = match view {
-            StackView::Whole => &self.layers,
-            // Without layers the whole stack is all there is to show.
-            StackView::OneLayer | StackView::AllLayers if self.layers.is_empty() => {
-                return BTreeSet::new();
-            }
-            StackView::OneLayer | StackView::AllLayers => &self.whole,
-        };
-        hidden.iter().cloned().collect()
-    }
-}
-
 impl ReviewSurface {
-    /// The review's stack sources: layers and whole stacks.
-    fn stack_groups(&self) -> StackGroups {
-        let mut groups = StackGroups::default();
-        let Some(review) = self.review.as_ref() else {
-            return groups;
-        };
-        for group in review.doc.groups() {
-            let Some(stack) = group.stack else {
-                continue;
-            };
-            let list = if stack.whole {
-                &mut groups.whole
-            } else {
-                &mut groups.layers
-            };
-            if !list.contains(&group.source.source_id) {
-                list.push(group.source.source_id.clone());
-            }
-        }
-        groups
-    }
-
-    /// The view the stack shows: the chosen one when the review can show it, else the closest.
+    /// Legacy PR-only view for comparison, forge and assistant actions.
     pub(super) fn shown_stack_view(&self) -> Option<StackView> {
-        self.stack_groups().effective(self.stack_view)
+        self.active_series()
+            .filter(|s| !s.commits)?
+            .view(self)
+            .map(to_stack)
     }
 
     /// The pull request numbers of the stack's layer sources, bottom first (shown or not).
@@ -165,21 +85,20 @@ impl ReviewSurface {
         })
     }
 
-    /// Whether the review can show its stack as `view`.
-    pub(super) fn can_show_stack_as(&self, view: StackView) -> bool {
-        self.stack_groups().views().contains(&view)
-    }
-
     /// Whether source `source_id` is left out because the stack shows another way.
     pub(super) fn source_shows_stack_otherwise(&self, source_id: &str) -> bool {
-        self.review
-            .as_ref()
-            .is_some_and(|review| review.doc.source_alternate(source_id))
+        self.review.as_ref().is_some_and(|review| {
+            review
+                .doc
+                .groups()
+                .any(|g| g.key.selector() == source_id && g.alternate)
+        })
     }
 
     /// Whether the review steps through a stack: two or more stack-layer groups.
     pub(super) fn steps_through_stack(&self) -> bool {
-        self.stack_groups().layers.len() >= 2
+        self.active_series()
+            .is_some_and(|s| !s.commits && s.members.len() >= 2)
     }
 
     /// Show the stack as [`Self::stack_view`] says: the whole-stack diff, or its layers with the
@@ -191,42 +110,42 @@ impl ReviewSurface {
 
     /// [`Self::apply_stack_view`] on layer `wanted` (a workspace source id), else the current one.
     pub(super) fn show_stack_layer(&mut self, wanted: Option<&str>) {
-        let groups = self.stack_groups();
-        let Some(view) = groups.effective(self.stack_view) else {
-            return;
-        };
-        let alternates = groups.alternates(view);
-        let entries: Vec<RailEntry> = self
-            .rail_entries()
-            .into_iter()
-            .filter(|entry| !entry.whole)
-            .collect();
-        let current = wanted
-            .and_then(|wanted| entries.iter().position(|entry| entry.source_id == wanted))
-            .or_else(|| self.current_layer(&entries))
-            .or_else(|| {
-                let remembered = self.rail_layer.as_ref()?;
-                entries
-                    .iter()
-                    .position(|entry| &entry.source_id == remembered)
-            })
-            .unwrap_or(0);
-        let target = (view != StackView::Whole)
-            .then(|| entries.get(current))
-            .flatten()
-            .map(|entry| (entry.source_id.clone(), entry.home.clone()));
+        let series = self.active_series();
+        let entries = self.rail_entries();
+        let target = series
+            .as_ref()
+            .filter(|s| s.view(self) != Some(View::Combined))
+            .and_then(|series| {
+                wanted
+                    .and_then(|id| entries.iter().find(|entry| entry.source_id == id))
+                    .or_else(|| {
+                        series
+                            .selected(self)
+                            .and_then(|key| entries.iter().find(|e| e.source_id == key.selector()))
+                    })
+                    .or_else(|| entries.iter().find(|e| !e.whole))
+                    .map(|e| (e.source_id.clone(), e.home.clone()))
+            });
+        let (mut alternates, hidden) =
+            self.series_visibility(series.as_ref(), target.as_ref().map(|(id, _)| id.as_str()));
         let theme = self.theme;
         let file_view = self.file_view;
         let Some(review) = self.review.as_mut() else {
             return;
         };
         let cursor = review.cursor.clone();
-        let focus = match (&target, view) {
-            (Some((source, _)), StackView::OneLayer) => Some(source.as_str()),
-            _ => None,
-        };
-        let swapped = review.doc.set_alternate_sources(alternates);
-        let focused = review.doc.set_focus(focus);
+        // Standalone PR ids remain visible to legacy PR comparison and publishing callers.
+        let source_alternates = alternates
+            .iter()
+            .filter_map(|key| match key {
+                ReviewGroupKey::Standalone { source_id } => Some(source_id.clone()),
+                _ => None,
+            })
+            .collect();
+        alternates.retain(|key| !matches!(key, ReviewGroupKey::Standalone { .. }));
+        let swapped = review.doc.set_alternate_sources(source_alternates)
+            | review.doc.set_alternate_groups(alternates);
+        let focused = review.doc.set_hidden_groups(hidden);
         if swapped {
             // The sources shown changed: compare the ones now shown, and show each pull
             // request thread on them.
@@ -247,24 +166,28 @@ impl ReviewSurface {
                 .as_ref()
                 .and_then(ItemKey::file)
                 .map(|file| file.path.clone());
-            let shown_sources: Vec<String> = match (&target, view) {
-                (Some((source, _)), StackView::OneLayer) => vec![source.clone()],
-                (_, StackView::Whole) => groups.whole,
-                // The layer that last touched the file, of every layer shown.
-                _ => groups.layers.into_iter().rev().collect(),
-            };
             let landing = cursor
                 .filter(|key| review.doc.index_of(key).is_some())
                 .or_else(|| {
                     let path = same_file?;
-                    shown_sources.iter().find_map(|source| {
-                        let key = ItemKey::FileHeader(Arc::new(FileKey::new(
-                            source.clone(),
-                            None,
-                            path.clone(),
-                        )));
-                        review.doc.index_of(&key).map(|_| key)
-                    })
+                    review
+                        .doc
+                        .groups()
+                        .filter(|g| {
+                            !g.alternate
+                                && !g.hidden
+                                && series
+                                    .as_ref()
+                                    .is_some_and(|s| s.contains(&g.key.selector()))
+                        })
+                        .find_map(|g| {
+                            review
+                                .doc
+                                .group_files(g.index)
+                                .find(|f| f.path == path)
+                                .cloned()
+                                .map(ItemKey::FileHeader)
+                        })
                 })
                 .or_else(|| target.as_ref().map(|(_, home)| home.clone()));
             let index = landing
@@ -272,47 +195,137 @@ impl ReviewSurface {
                 .unwrap_or(0);
             review.set_cursor(index, AnchorPolicy::ItemTopAtTop);
         }
-        if let Some((source, _)) = target {
-            review.open_only_group(&source);
+        if let (Some((source, _)), Some(series)) = (target, series) {
+            review.open_only_group(&source, &series);
             self.rail_layer = Some(source);
         }
+    }
+
+    fn series_visibility(
+        &self,
+        series: Option<&Series>,
+        target: Option<&str>,
+    ) -> (BTreeSet<ReviewGroupKey>, BTreeSet<ReviewGroupKey>) {
+        let catalog = self.series_catalog();
+        let mut alternates = BTreeSet::new();
+        let mut hidden = BTreeSet::new();
+        for set in &catalog {
+            match set.view(self) {
+                Some(View::Combined) => alternates.extend(set.members.iter().cloned()),
+                Some(mode) => {
+                    alternates.extend(set.combined.iter().cloned());
+                    if mode == View::OneMember {
+                        let selected = target
+                            .filter(|_| series.is_some_and(|s| s.id == set.id))
+                            .and_then(|selector| {
+                                set.members.iter().find(|key| key.selector() == selector)
+                            })
+                            .or_else(|| set.selected(self));
+                        hidden.extend(set.members.iter().filter(|k| Some(*k) != selected).cloned());
+                    }
+                }
+                None => {}
+            }
+        }
+        (alternates, hidden)
     }
 
     /// Switch to the next way of showing the stack: one layer at a time, every layer, then the
     /// whole stack as one diff (skipping the ones the review cannot show).
     pub(super) fn toggle_stack_view(&mut self) {
-        let views = self.stack_groups().views();
+        let Some(series) = self.active_series() else {
+            self.set_status("this review has no series to switch", StatusSeverity::Info);
+            return;
+        };
+        let mut views = series.views();
+        if self
+            .commit_series
+            .get(&series.id)
+            .is_some_and(|state| state.unavailable.is_some())
+        {
+            views.retain(|view| *view != View::Combined);
+        }
         if views.len() < 2 {
-            self.set_status(
-                "only a stack review has other ways to show the stack",
-                StatusSeverity::Info,
-            );
             return;
         }
-        let shown = self.shown_stack_view().unwrap_or_default();
+        let current = series.view(self);
         let next = views
             .iter()
-            .position(|view| *view == shown)
-            .map_or(views[0], |index| views[(index + 1) % views.len()]);
-        self.set_stack_view(next);
+            .position(|v| Some(*v) == current)
+            .map_or(0, |i| (i + 1) % views.len());
+        self.set_series_view(views[next]);
     }
 
-    /// Show the stack as `view`, saying so (and what `shift+o` shows next).
-    pub(super) fn set_stack_view(&mut self, view: StackView) {
-        self.stack_view = view;
-        self.apply_stack_view();
-        self.apply_compare_filter();
-        let views = self.stack_groups().views();
-        let after = views
-            .iter()
-            .position(|candidate| *candidate == view)
-            .map(|index| views[(index + 1) % views.len()])
-            .filter(|after| *after != view);
-        let text = after.map_or_else(
-            || describe(view).to_owned(),
-            |after| format!("{} (shift+o: {})", describe(view), describe(after)),
-        );
-        self.set_status(text, StatusSeverity::Info);
+    /// Change grouping without changing a comparison baseline or workspace source.
+    pub fn set_series_view(&mut self, view: View) {
+        let Some(series) = self.active_series() else {
+            return;
+        };
+        if !series.views().contains(&view) {
+            return;
+        }
+        if view == View::Combined
+            && let Some(reason) = self
+                .commit_series
+                .get(&series.id)
+                .and_then(|s| s.unavailable.clone())
+        {
+            self.set_status(reason, StatusSeverity::Info);
+            return;
+        }
+        let key = self
+            .review
+            .as_ref()
+            .and_then(|r| r.doc.group_of_key(r.cursor.as_ref()?))
+            .cloned();
+        if let Some(cursor) = self
+            .review
+            .as_ref()
+            .and_then(|r| r.cursor.as_ref())
+            .and_then(ItemKey::to_persisted)
+            && let Some(key) = &key
+        {
+            self.layer_positions.insert(key.selector(), cursor);
+        }
+        let member = key.as_ref().filter(|key| series.members.contains(key));
+        self.remember_series(&series, view, member);
+        self.pending_member = if view == View::Combined {
+            series.combined.as_ref()
+        } else {
+            member.or_else(|| series.selected(self))
+        }
+        .map(ReviewGroupKey::selector);
+        if series.commits && (series.view(self) != Some(view) || self.switching) {
+            self.schedule_series_reload();
+        } else {
+            self.apply_stack_view();
+            self.finish_member_jump();
+            self.apply_compare_filter();
+        }
+        let status = if series.commits {
+            match view {
+                View::Combined => "combined diff",
+                View::AllMembers => "every member separately",
+                View::OneMember => "one member at a time",
+            }
+            .to_owned()
+        } else {
+            let description = |mode| match mode {
+                View::OneMember => "one pull request at a time",
+                View::AllMembers => "every pull request of the stack",
+                View::Combined => "the whole stack as one diff",
+            };
+            let views = series.views();
+            match views.iter().position(|mode| *mode == view) {
+                Some(i) if views.len() > 1 => format!(
+                    "{} (shift+o: {})",
+                    description(view),
+                    description(views[(i + 1) % views.len()])
+                ),
+                _ => description(view).to_owned(),
+            }
+        };
+        self.set_status(status, StatusSeverity::Info);
         self.persist_presentation(true);
     }
 
@@ -368,73 +381,65 @@ impl ReviewSurface {
         let Some(review) = self.review.as_ref() else {
             return Vec::new();
         };
-        if !review.doc.groups().any(|group| group.stack.is_some()) {
+        let Some(series) = self.active_series() else {
             return Vec::new();
-        }
+        };
+        let loaded: std::collections::BTreeMap<_, _> =
+            review.doc.groups().map(|g| (g.key.selector(), g)).collect();
         let theme = &self.theme;
         let drafts = self.draft_threads();
         let filtered = self.compare_filtered();
         let mut entries = Vec::new();
-        for group in review.doc.groups() {
-            let source_id = group.source.source_id.clone();
-            let Some(stack) = group
-                .stack
-                .filter(|_| !self.folded_away(&filtered, &source_id))
-            else {
+        for (i, key) in series.members.iter().chain(&series.combined).enumerate() {
+            let source_id = key.selector();
+            if self.folded_away(&filtered, &source_id) {
                 continue;
-            };
+            }
+            let group = loaded.get(&source_id);
+            let stack = group.and_then(|g| g.stack);
+            let whole = series.combined.as_ref() == Some(key);
             let threads: BTreeSet<&str> = drafts
                 .iter()
                 .filter(|(source, _)| *source == Some(source_id.as_str()))
                 .map(|(_, thread)| *thread)
                 .collect();
-            let Some(home) = group_home(&review.doc, &group) else {
-                continue;
-            };
-            let layers = &stack.stack.layers;
-            let (name, position) = if stack.whole {
-                let first = layers.first().map_or(0, |layer| layer.number);
-                let last = layers.last().map_or(0, |layer| layer.number);
-                (
-                    format!("Whole stack #{first}–#{last}"),
-                    format!("{} layers", layers.len()),
-                )
-            } else {
-                let top = layers.last();
-                (
-                    top.map_or_else(String::new, |layer| {
-                        format!("#{} {}", layer.number, layer.title)
-                    }),
-                    format!(
-                        "{}/{}",
-                        layers.len(),
-                        self.stack_size(&source_id).max(layers.len())
-                    ),
-                )
-            };
-            let number = if stack.whole {
-                "all".to_owned()
-            } else {
-                layers
-                    .last()
-                    .map_or_else(String::new, |layer| format!("#{}", layer.number))
-            };
+            let home = group
+                .and_then(|g| group_home(&review.doc, g))
+                .unwrap_or_else(|| ItemKey::SourceHeader {
+                    source_id: series.id.clone(),
+                    part: if whole { None } else { u32::try_from(i).ok() },
+                });
+            let (name, position, number) = self.rail_caption(&series, key, i, stack);
             let failed = self.source_notes.failed.contains(&source_id);
-            let (viewed, viewed_style, cells) =
-                tab_progress(failed, group.loading, group.viewed, group.file_count, theme);
+            let (viewed, viewed_style, cells) = tab_progress(
+                failed,
+                group.is_some_and(|g| g.loading),
+                group.map_or(0, |g| g.viewed),
+                group.map_or(0, |g| g.file_count),
+                theme,
+            );
             let mut full = vec![
                 Span::styled(name, theme.text),
                 Span::raw(" "),
                 Span::styled(position, theme.muted),
                 Span::raw(" "),
             ];
-            full.extend(cells);
-            full.push(Span::raw(" "));
-            full.push(Span::styled(viewed.clone(), viewed_style));
+            if group.is_some() {
+                full.extend(cells);
+                full.push(Span::raw(" "));
+                full.push(Span::styled(viewed.clone(), viewed_style));
+            }
             let mut compact = vec![
                 Span::styled(number.clone(), theme.badge_open),
                 Span::raw(" "),
-                Span::styled(viewed, viewed_style),
+                Span::styled(
+                    if group.is_some() {
+                        viewed
+                    } else {
+                        String::new()
+                    },
+                    viewed_style,
+                ),
             ];
             if !threads.is_empty() {
                 let count = Span::styled(
@@ -455,7 +460,7 @@ impl ReviewSurface {
             entries.push(RailEntry {
                 source_id,
                 home,
-                whole: stack.whole,
+                whole,
                 labels: [
                     Line::from_spans(full),
                     Line::from_spans(compact),
@@ -464,6 +469,71 @@ impl ReviewSurface {
             });
         }
         entries
+    }
+
+    /// Full name, position, and compact identifier for a rail tab.
+    fn rail_caption(
+        &self,
+        series: &Series,
+        key: &ReviewGroupKey,
+        i: usize,
+        stack: Option<&bcode_code_review::document::SourceStack>,
+    ) -> (String, String, String) {
+        let whole = series.combined.as_ref() == Some(key);
+        stack.map_or_else(
+            || {
+                if whole {
+                    (
+                        "Combined commits".to_owned(),
+                        format!("{} commits", series.members.len()),
+                        "all".to_owned(),
+                    )
+                } else {
+                    let oid = series.member_id(key);
+                    let label = self
+                        .commit_series
+                        .get(&series.id)
+                        .and_then(|s| s.members.get(i))
+                        .map_or_else(|| oid.to_owned(), |(_, label)| label.clone());
+                    (
+                        label,
+                        format!("{}/{}", i + 1, series.members.len()),
+                        oid.chars().take(8).collect(),
+                    )
+                }
+            },
+            |stack| {
+                let layers = &stack.stack.layers;
+                let (name, position) = if stack.whole {
+                    let first = layers.first().map_or(0, |layer| layer.number);
+                    let last = layers.last().map_or(0, |layer| layer.number);
+                    (
+                        format!("Whole stack #{first}–#{last}"),
+                        format!("{} layers", layers.len()),
+                    )
+                } else {
+                    let top = layers.last();
+                    (
+                        top.map_or_else(String::new, |layer| {
+                            format!("#{} {}", layer.number, layer.title)
+                        }),
+                        format!(
+                            "{}/{}",
+                            layers.len(),
+                            self.stack_size(&key.selector()).max(layers.len())
+                        ),
+                    )
+                };
+                let number = if stack.whole {
+                    "all".to_owned()
+                } else {
+                    layers
+                        .last()
+                        .map_or_else(String::new, |layer| format!("#{}", layer.number))
+                };
+                (name, position, number)
+            },
+        )
     }
 
     /// Append `spans` to both labels.
@@ -495,10 +565,21 @@ impl ReviewSurface {
 
     /// Index of the rail entry the cursor is in.
     pub(super) fn current_layer(&self, entries: &[RailEntry]) -> Option<usize> {
-        let source = self.cursor_source()?;
-        let found = entries.iter().position(|entry| entry.source_id == source);
+        let cursor = self
+            .review
+            .as_ref()
+            .and_then(|r| r.doc.group_of_key(r.cursor.as_ref()?))
+            .map(ReviewGroupKey::selector);
+        let found = cursor
+            .as_ref()
+            .and_then(|id| entries.iter().position(|entry| &entry.source_id == id))
+            .or_else(|| {
+                self.rail_layer
+                    .as_ref()
+                    .and_then(|id| entries.iter().position(|entry| &entry.source_id == id))
+            });
         // Layers do not show with the whole stack: a layer found is only the one last entered.
-        if self.shown_stack_view() == Some(StackView::Whole)
+        if self.shown_series_view() == Some(View::Combined)
             && found.is_none_or(|index| !entries[index].whole)
             && let Some(whole) = entries.iter().position(|entry| entry.whole)
         {
@@ -565,20 +646,50 @@ impl ReviewSurface {
                 .as_ref()
                 .and_then(|review| review.cursor.clone()),
         ) && let Some(persisted) = cursor.to_persisted()
+            && self
+                .review
+                .as_ref()
+                .and_then(|r| r.doc.group_of_key(&cursor))
+                .is_some_and(|key| key.selector() == current.source_id)
         {
             self.layer_positions
                 .insert(current.source_id.clone(), persisted);
         }
         if target.whole {
             // The whole-stack tab shows the whole stack as one diff.
-            self.set_stack_view(StackView::Whole);
+            self.set_series_view(View::Combined);
             return;
         }
-        if self.shown_stack_view() == Some(StackView::Whole) {
-            // A layer entered from the whole stack shows alone.
-            self.stack_view = StackView::OneLayer;
-            self.apply_compare_filter();
+        let Some(series) = self.active_series() else {
+            return;
+        };
+        let Some(key) = series
+            .members
+            .iter()
+            .find(|key| key.selector() == target.source_id)
+        else {
+            return;
+        };
+        let prior = series.view(self);
+        let view = if prior == Some(View::AllMembers) {
+            View::AllMembers
+        } else {
+            View::OneMember
+        };
+        self.remember_series(&series, view, Some(key));
+        if series.commits
+            && (prior != Some(view)
+                || !self
+                    .review
+                    .as_ref()
+                    .is_some_and(|r| r.doc.groups().any(|g| g.key == key)))
+        {
+            self.pending_member = Some(key.selector());
+            self.rail_layer = self.pending_member.clone();
+            self.schedule_series_reload();
+            return;
         }
+        self.apply_compare_filter();
         self.rail_layer = Some(target.source_id.clone());
         // Show the entered layer (alone, or with only its file group open).
         let entered = target.source_id.clone();
@@ -587,9 +698,12 @@ impl ReviewSurface {
             .layer_positions
             .get(&target.source_id)
             .and_then(|persisted| {
-                self.review
-                    .as_ref()
-                    .and_then(|review| review.doc.resolve_persisted(persisted))
+                self.review.as_ref().and_then(|review| {
+                    review
+                        .doc
+                        .resolve_persisted(persisted)
+                        .filter(|item| review.doc.group_of_key(item) == Some(key))
+                })
             });
         let Some(review) = self.review.as_mut() else {
             return;
@@ -613,7 +727,7 @@ impl ReviewSurface {
 
     /// Whether the strip naming the cursor's layer shows: every layer in one document.
     pub(super) fn shows_layer_strip(&self) -> bool {
-        self.shown_stack_view() == Some(StackView::AllLayers) && self.steps_through_stack()
+        self.shown_series_view() == Some(View::AllMembers)
     }
 
     /// Paint the strip naming the layer the cursor is in on `area` (one row): its position,
@@ -633,11 +747,15 @@ impl ReviewSurface {
         let Some(group) = review
             .doc
             .groups()
-            .find(|group| group.source.source_id == entries[index].source_id)
+            .find(|group| group.key.selector() == entries[index].source_id)
         else {
             return;
         };
         let Some(layers) = group.stack.map(|stack| &stack.stack.layers) else {
+            cx.paint_component(
+                &TextBlock::new(Text::from_lines(vec![entries[index].labels[0].clone()])),
+                area,
+            );
             return;
         };
         let Some(top) = layers.last() else {
@@ -689,8 +807,8 @@ impl ReviewSurface {
             ));
         }
         if let Some(status) = stack_status(
-            self.filling_note.as_deref(),
-            self.stack_confirmed_at,
+            self.open_progress.filling_note.as_deref(),
+            self.open_progress.stack_confirmed_at,
             std::time::SystemTime::now(),
         ) {
             spans.push(Span::styled(separator, theme.muted));

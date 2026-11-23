@@ -149,6 +149,55 @@ impl ReviewSurface {
     // Reviewed and viewed
     // ----------------------------------------------------------------------------------------
 
+    fn guide_unreview(
+        &mut self,
+        id: &str,
+        number: &str,
+        guide_id: String,
+        scope: NoteScope,
+        host: &UiContext,
+    ) {
+        let Some(active) = self.guide.state.active.as_mut() else {
+            return;
+        };
+        let was_marked = active.marks.remove(id).is_some();
+        let still = active.reviewed(id);
+        let files = coverage::cited_files(&active.version, id);
+        self.guide.state.bump();
+        if was_marked {
+            let services = self.services.clone();
+            let (repo, guide, section) = (scope.repo_path, guide_id, id.to_owned());
+            host.spawn(Box::pin(async move {
+                drop(
+                    services
+                        .call(ClearGuideSectionMarkRequest {
+                            repo_path: repo,
+                            guide_id: guide,
+                            section_id: section,
+                        })
+                        .await,
+                );
+            }));
+        }
+        if still {
+            // Reviewed because its files are viewed. The guide changes viewed files only
+            // when it may mark them (`mark_files_viewed` other than `never`); then
+            // un-viewing them un-reviews it.
+            if self.services.guide_config().mark_files_viewed == MarkFilesViewed::Never {
+                self.set_status(
+                    format!(
+                        "§{number} counts as reviewed while its files are viewed; un-view \
+                         them to un-review it"
+                    ),
+                    StatusSeverity::Info,
+                );
+                return;
+            }
+            self.set_files_viewed(&files, false);
+        }
+        self.set_status(format!("§{number} not reviewed"), StatusSeverity::Info);
+    }
+
     /// `v`: mark the current section reviewed (marking files viewed), or un-review it.
     fn guide_toggle_reviewed(&mut self, host: &UiContext) {
         let Some((id, number, guide_id, _)) = self.guide_current() else {
@@ -159,42 +208,7 @@ impl ReviewSurface {
             return;
         };
         if active.reviewed(&id) {
-            let was_marked = active.marks.remove(&id).is_some();
-            let still = active.reviewed(&id);
-            let files = coverage::cited_files(&active.version, &id);
-            self.guide.state.bump();
-            if was_marked {
-                let services = self.services.clone();
-                let (repo, guide, section) = (scope.repo_path, guide_id, id.clone());
-                host.spawn(Box::pin(async move {
-                    drop(
-                        services
-                            .call(ClearGuideSectionMarkRequest {
-                                repo_path: repo,
-                                guide_id: guide,
-                                section_id: section,
-                            })
-                            .await,
-                    );
-                }));
-            }
-            if still {
-                // Reviewed because its files are viewed. The guide changes viewed files only
-                // when it may mark them (`mark_files_viewed` other than `never`); then
-                // un-viewing them un-reviews it.
-                if self.services.guide_config().mark_files_viewed == MarkFilesViewed::Never {
-                    self.set_status(
-                        format!(
-                            "§{number} counts as reviewed while its files are viewed; un-view \
-                             them to un-review it"
-                        ),
-                        StatusSeverity::Info,
-                    );
-                    return;
-                }
-                self.set_files_viewed(&files, false);
-            }
-            self.set_status(format!("§{number} not reviewed"), StatusSeverity::Info);
+            self.guide_unreview(&id, &number, guide_id, scope, host);
             return;
         }
         let Some(section) = active.section(&id) else {
@@ -220,7 +234,18 @@ impl ReviewSurface {
         self.guide.state.bump();
         let mode = self.services.guide_config().mark_files_viewed;
         let services = self.services.clone();
-        let sources = self.guide_sources();
+        let sources: Vec<_> = self
+            .review
+            .iter()
+            .flat_map(|r| r.doc.groups())
+            .filter(|g| !g.hidden && !g.alternate)
+            .map(|g| g.source.clone())
+            .collect();
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|w| w.sources.clone())
+            .unwrap_or_default();
         let inbox = self.inbox.clone();
         let repo = scope.repo_path;
         host.spawn(Box::pin(async move {
@@ -240,8 +265,28 @@ impl ReviewSurface {
             let data = services.data();
             let files = services
                 .blocking(move || {
+                    if bcode_code_review::guide::sources::restore_objects(
+                        &data,
+                        &repo,
+                        &workspace,
+                        &version.heads,
+                    )
+                    .is_err()
+                    {
+                        return Ok(BTreeSet::new());
+                    }
+                    let groups = bcode_code_review::guide::sources::GuideSources::project(
+                        &workspace,
+                        &sources,
+                        Some(&version.heads),
+                    );
                     Ok(files_to_view(
-                        &data, repo, &sources, &version, &reviewed, mode,
+                        &data,
+                        repo,
+                        &groups.sources,
+                        &version,
+                        &reviewed,
+                        mode,
                     ))
                 })
                 .await
@@ -261,7 +306,10 @@ impl ReviewSurface {
         let identities: Vec<_> = review
             .doc
             .file_keys()
-            .filter(|file| files.contains(&(file.source_id.clone(), file.path.clone())))
+            .filter(|file| {
+                super::guide::guide_file_selector(&review.doc, file)
+                    .is_some_and(|key| files.contains(&(key, file.path.clone())))
+            })
             .filter(|file| {
                 review
                     .doc
@@ -309,23 +357,31 @@ impl ReviewSurface {
             .iter()
             .flat_map(|entry| coverage::cited_files(&active.version, &entry.id))
             .collect();
-        let viewed: BTreeSet<ReviewFile> = review
-            .doc
-            .file_keys()
-            .filter(|file| {
-                cited.contains(&(file.source_id.clone(), file.path.clone()))
-                    && review
+        let mut shown = BTreeSet::new();
+        let mut viewed = BTreeSet::new();
+        for group in review.doc.groups().filter(|g| !g.hidden && !g.alternate) {
+            let selector = group.key.selector();
+            for file in review.doc.group_files(group.index) {
+                let key = (selector.clone(), file.path.clone());
+                if cited.contains(&key) {
+                    shown.insert(key.clone());
+                    if review
                         .doc
                         .viewed_state(file)
                         .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed)
-            })
-            .map(|file| (file.source_id.clone(), file.path.clone()))
-            .collect();
+                    {
+                        viewed.insert(key);
+                    }
+                }
+            }
+        }
         let guide_id = active.guide.guide_id.clone();
         let unviewed: BTreeSet<ReviewFile> = match &self.guide.review.viewed {
-            Some((known, before)) if *known == guide_id => {
-                before.difference(&viewed).cloned().collect()
-            }
+            Some((known, before)) if *known == guide_id => before
+                .difference(&viewed)
+                .filter(|file| shown.contains(*file))
+                .cloned()
+                .collect(),
             _ => BTreeSet::new(),
         };
         self.guide.review.viewed = Some((guide_id.clone(), viewed.clone()));

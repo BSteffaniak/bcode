@@ -111,6 +111,7 @@ impl ReviewSurface {
             updated_at_ms: None,
             viewed_files: std::collections::BTreeSet::new(),
             archived_at_ms: None,
+            group_viewed_marks: std::collections::BTreeMap::new(),
             viewed_marks: Vec::new(),
             viewed_threads: Vec::new(),
             reviewed_revisions: std::collections::BTreeMap::new(),
@@ -359,9 +360,8 @@ impl ReviewSurface {
         }
         let result = match mode {
             ComposerMode::Comment => {
-                let local =
-                    self.notes
-                        .add_draft(anchor.to_draft_anchor(), text, None, Some(classify), now);
+                let draft = self.persisted_anchor(&anchor);
+                let local = self.notes.add_draft(draft, text, None, Some(classify), now);
                 self.guide_comment_drafted(&anchor, local);
                 Ok("draft saved")
             }
@@ -690,11 +690,28 @@ impl ReviewSurface {
             self.set_status("move to a thread first", StatusSeverity::Warning);
             return None;
         };
+        self.local_thread_action(thread_id, action)
+    }
+
+    fn local_thread_action(&mut self, thread_id: String, action: ThreadAction) -> Option<Action> {
         let comments = self.notes.thread(&thread_id);
         let first = comments.first().map(|comment| (*comment).clone());
         let latest = comments.last().map(|comment| (*comment).clone());
         let first = first?;
         let anchor = self.doc_anchor(&first.anchor);
+        if first.anchor.kind != ReviewAnchorKind::Review
+            && anchor.file.is_none()
+            && matches!(
+                action,
+                ThreadAction::Reply | ThreadAction::Edit | ThreadAction::Ask
+            )
+        {
+            self.set_status(
+                "the original file or group is not loaded",
+                StatusSeverity::Warning,
+            );
+            return None;
+        }
         let result = match action {
             ThreadAction::Reply => {
                 self.open_composer(anchor, ComposerMode::Reply { thread_id }, "");
@@ -908,7 +925,7 @@ impl ReviewSurface {
         {
             return Some(session);
         }
-        let identity = notes::anchor_identity(&anchor.to_draft_anchor());
+        let identity = notes::anchor_identity(&self.persisted_anchor(anchor));
         self.notes
             .exchanges()
             .iter()
@@ -1085,7 +1102,7 @@ impl ReviewSurface {
         bypass: bool,
     ) {
         self.next_exchange += 1;
-        let draft_anchor = anchor.to_draft_anchor();
+        let draft_anchor = self.persisted_anchor(anchor);
         let session = self.anchor_session(anchor, thread_id);
         let owner = thread_id.map(|thread_id| self.notes.current_thread_id(thread_id));
         let exchange_id = format!("exchange-{now}-{}", self.next_exchange);
@@ -1109,7 +1126,8 @@ impl ReviewSurface {
                 || exchange.anchor.file_path.clone(),
                 |written| written.path.clone(),
             );
-        let (threads, threads_omitted) = self.other_threads(&path, thread_id);
+        let (threads, threads_omitted) =
+            self.other_threads_in_group(&path, thread_id, exchange.anchor.group.as_ref());
         let context = AskContext {
             title: self.title.clone(),
             repo: self.repo_path.clone(),
@@ -1120,7 +1138,10 @@ impl ReviewSurface {
                 .map(|source| source.label.clone())
                 .collect(),
             selected_source: exchange.anchor.source_id.as_ref().map(|id| AskSource {
-                id: id.clone(),
+                id: exchange.anchor.group.as_ref().map_or_else(
+                    || id.clone(),
+                    bcode_code_review_models::ReviewGroupKey::selector,
+                ),
                 label: self.source_label(id),
             }),
             threads,
@@ -1149,13 +1170,39 @@ impl ReviewSurface {
     /// the review's own and its pull requests', one line each, without `except`; and how many
     /// were left out past [`agent::MAX_PROMPT_THREADS`].
     pub(super) fn other_threads(&self, path: &str, except: Option<&str>) -> (Vec<String>, usize) {
+        let group = self
+            .review
+            .as_ref()
+            .and_then(|review| {
+                let file = review.cursor_file()?;
+                review.doc.group_of_key(&ItemKey::FileHeader(file))
+            })
+            .filter(|g| {
+                !matches!(
+                    g,
+                    bcode_code_review_models::ReviewGroupKey::Standalone { .. }
+                )
+            });
+        self.other_threads_in_group(path, except, group)
+    }
+
+    fn other_threads_in_group(
+        &self,
+        path: &str,
+        except: Option<&str>,
+        group: Option<&bcode_code_review_models::ReviewGroupKey>,
+    ) -> (Vec<String>, usize) {
         let mut seen = std::collections::BTreeSet::new();
         let local = self
             .notes
             .drafts()
             .iter()
             .filter(|draft| draft.anchor.reply_to.is_none())
-            .filter(|draft| draft.anchor.file_path == path && seen.insert(&draft.thread_id))
+            .filter(|draft| {
+                draft.anchor.file_path == path
+                    && draft.anchor.group.as_ref() == group
+                    && seen.insert(&draft.thread_id)
+            })
             .filter(|draft| Some(draft.thread_id.as_str()) != except)
             .filter_map(|draft| self.notes.thread(&draft.thread_id).first().copied())
             .map(|first| {
@@ -1172,6 +1219,7 @@ impl ReviewSurface {
             .remote_threads()
             .iter()
             .filter(|(thread_id, _)| Some(thread_id.as_str()) != except)
+            .filter(|_| group.is_none())
             .filter(|(thread_id, info)| {
                 info.thread.anchor.path == path
                     || self.notes.thread(thread_id).first().is_some_and(|first| {
@@ -1425,23 +1473,51 @@ impl ReviewSurface {
         self.set_status("returned from linked Bcode session", StatusSeverity::Info);
     }
 
+    fn persisted_anchor(&self, anchor: &DocAnchor) -> bcode_code_review_models::DraftAnchor {
+        self.review.as_ref().map_or_else(
+            || anchor.to_draft_anchor(),
+            |review| review.doc.draft_anchor(anchor),
+        )
+    }
+
     /// The document anchor of a persisted anchor (at its file in this review).
     pub(super) fn doc_anchor(&self, anchor: &bcode_code_review_models::DraftAnchor) -> DocAnchor {
         let file = self.review.as_ref().and_then(|review| {
             if anchor.kind == ReviewAnchorKind::Review {
                 return None;
             }
-            review
+            let mut matches = review
                 .doc
-                .file_keys()
-                .filter(|file| file.path == anchor.file_path)
-                .find(|file| {
-                    anchor
+                .groups()
+                .filter(|group| {
+                    if let Some(key) = &anchor.group {
+                        return group.key == key;
+                    }
+                    if anchor
                         .source_id
-                        .as_deref()
-                        .is_none_or(|id| id == file.source_id)
+                        .as_ref()
+                        .is_some_and(|id| id != &group.source.source_id)
+                    {
+                        return false;
+                    }
+                    // Before group identity was recorded, a commit part can only be recovered
+                    // from its pinned OID. Never place a legacy member on a combined diff.
+                    match group.key {
+                        bcode_code_review_models::ReviewGroupKey::Member { member, .. } => {
+                            anchor.head_oid.as_ref() == Some(member)
+                        }
+                        bcode_code_review_models::ReviewGroupKey::Combined { .. } => false,
+                        bcode_code_review_models::ReviewGroupKey::Standalone { .. } => true,
+                    }
                 })
-                .cloned()
+                .filter_map(|group| {
+                    review
+                        .doc
+                        .group_files(group.index)
+                        .find(|f| f.path == anchor.file_path)
+                });
+            let file = matches.next()?;
+            matches.next().is_none().then(|| file.clone())
         });
         DocAnchor {
             file,

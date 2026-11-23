@@ -123,7 +123,7 @@ impl SourceType {
             Self::WorkingTree => "unstaged, staged, or both",
             Self::CurrentBranch => "everything on this branch since its base",
             Self::CompareBranches => "any base and head reference",
-            Self::Commits => "one commit, a range, or a selection",
+            Self::Commits => "select commits; use Compare to review them separately or combined",
             Self::PullRequest => "an open pull request",
             Self::Stack => "stacked pull requests: whole, step through, or one layer",
             Self::Files => "whole files, folders, globs, or line ranges as they are now",
@@ -2218,16 +2218,11 @@ impl Wizard {
                         },
                         format!("{} {}", only.short_oid, only.subject),
                     ),
-                    [first, .., last] => (
+                    _ => (
                         ReviewSourceKind::Commits {
                             revs: revs.iter().map(|commit| commit.oid.clone()).collect(),
                         },
-                        format!(
-                            "{} commits {}..{}",
-                            revs.len(),
-                            first.short_oid,
-                            last.short_oid
-                        ),
+                        format!("{} selected commits", revs.len()),
                     ),
                 };
                 self.add_sources(vec![source]);

@@ -73,11 +73,46 @@ pub fn replay_commit(
     Ok(String::from_utf8_lossy(&output).trim().to_owned())
 }
 
+/// Replay `old_fork..old_head` onto `new_fork` using full commit OIDs.
+///
+/// Returns the deterministic replay commit and its unresolved paths. A nonempty
+/// path set is not an exact combined result. `None` means an input is missing
+/// or Git could not identify the paths affected by a conflict.
+///
+/// # Errors
+///
+/// * Returns [`DataError`] for malformed object IDs or a failed Git operation.
+pub fn replay_selected(
+    root: &Path,
+    disk: &ReviewCache,
+    old_fork: &str,
+    new_fork: &str,
+    old_head: &str,
+) -> Result<Option<(String, BTreeSet<String>)>, DataError> {
+    let named = BTreeSet::from([old_fork, new_fork, old_head]);
+    for oid in &named {
+        git::validate_oid(oid)?;
+    }
+    let present = present_commits(root, &named)?;
+    if named.iter().any(|oid| !present.contains(*oid)) {
+        return Ok(None);
+    }
+    let triple = (
+        old_fork.to_owned(),
+        new_fork.to_owned(),
+        old_head.to_owned(),
+    );
+    Ok(replays(root, disk, std::slice::from_ref(&triple))?
+        .remove(&triple)
+        .flatten()
+        .map(|r| (r.oid, r.conflicts)))
+}
+
 /// Replay commits and their unresolved paths by (old fork, new fork, old head).
 type Replays = BTreeMap<(String, String, String), Option<Replay>>;
 
-/// The replay of `(old fork, new fork, old head)`: its commit, or `None` when it conflicts.
-/// Cached; a cached commit git collected since is made again.
+/// Replayed changes, including any identified conflict paths. A cached commit git collected
+/// since is made again.
 fn replays(
     root: &Path,
     disk: &ReviewCache,

@@ -138,6 +138,8 @@ pub fn descriptors() -> Vec<ClientToolDescriptor> {
                 "only_changed": {"type": "boolean"},
                 "show_hidden_files": {"type": "boolean"},
                 "all_layers": {"type": "boolean", "description": "Every pull request of the stack at once (false: one at a time)."},
+                "series_view": {"type":"string", "enum":["one_member", "all_members", "combined"], "description":"Grouping of the active commit series or PR stack, independent of baseline."},
+                "member": {"type":"string", "description":"Full commit oid, PR source id, or member group selector."},
                 "stack_view": {"type": "string", "enum": ["one_pr", "all_prs", "whole"], "description": "How a stack shows: one pull request at a time, every pull request, or the whole stack as one diff."},
                 "versions": {
                     "type": "object",

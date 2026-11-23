@@ -12,8 +12,8 @@ use bcode_code_review_models::{
     REVIEW_BLOB_LINES_MAX_COUNT, REVIEW_HUNKS_DEFAULT_CONTEXT, ResolvedReviewStack, ResolvedSource,
     ResolvedSourceMode, ReviewBlobLinesRequest, ReviewBlobLinesResponse, ReviewBlobRef,
     ReviewBlobSelector, ReviewCompareMarksRequest, ReviewFileExpansion, ReviewFileHunksRequest,
-    ReviewFileHunksResponse, ReviewHunksTruncation, ReviewIndexEntry, ReviewLineKind,
-    ReviewLineSide, ReviewStackAttributionRequest, ReviewStackAttributionResponse,
+    ReviewFileHunksResponse, ReviewGroupKey, ReviewHunksTruncation, ReviewIndexEntry,
+    ReviewLineKind, ReviewLineSide, ReviewStackAttributionRequest, ReviewStackAttributionResponse,
     ReviewStackLineAttribution, ReviewWorkspace, RevisionRef, ViewedMark,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -102,6 +102,8 @@ pub type Ticket = u64;
 /// One source group of the document (a source, or one part of a multi-part source).
 #[derive(Debug, Clone)]
 pub struct GroupInfo<'a> {
+    /// Stable group identity; independent of the part index in document item keys.
+    pub key: &'a ReviewGroupKey,
     /// The resolved source.
     pub source: &'a ResolvedSource,
     /// Display label.
@@ -477,6 +479,7 @@ impl FileState {
 
 #[derive(Debug, Clone)]
 pub(super) struct Group {
+    pub key: ReviewGroupKey,
     pub source: ResolvedSource,
     pub label: String,
     pub stack: Option<SourceStack>,
@@ -653,6 +656,7 @@ pub struct ReviewDocument {
     /// changes (see [`Self::upsert_group`]).
     pub(super) annotations_input: Option<Annotations>,
     pub(super) marks: BTreeMap<String, Vec<ViewedMark>>,
+    pub(super) scoped_marks: BTreeMap<String, BTreeMap<String, Vec<ViewedMark>>>,
     pub(super) pending: BTreeMap<Ticket, Pending>,
     pub(super) next_ticket: Ticket,
     pub(super) tick: u64,
@@ -683,6 +687,11 @@ pub struct ReviewDocument {
     /// its whole-stack diff is shown, or the other way round): hidden, and not counted in
     /// totals or viewed progress.
     pub(super) alternates: BTreeSet<String>,
+    pub(super) combined_sources: BTreeSet<String>,
+    pub(super) source_focus: Option<String>,
+    pub(super) hidden_groups: BTreeSet<ReviewGroupKey>,
+    pub(super) group_focus: BTreeMap<String, ReviewGroupKey>,
+    pub(super) group_alternates: BTreeSet<ReviewGroupKey>,
 }
 
 /// Viewport, protected, and prefetch block ranges (inclusive).
@@ -698,7 +707,19 @@ impl ReviewDocument {
     /// content is loaded until requested through [`Self::take_needs`].
     #[must_use]
     pub fn new(repo_path: PathBuf, sources: Vec<SourceInput>, config: DocumentConfig) -> Self {
-        let mut doc = Self::structure(repo_path, sources, config);
+        Self::new_with_combined_sources(repo_path, sources, config, BTreeSet::new())
+    }
+
+    /// Build a document with part-less aggregate groups explicitly identified by canonical
+    /// workspace source id. Without registration a part-less source is standalone.
+    #[must_use]
+    pub fn new_with_combined_sources(
+        repo_path: PathBuf,
+        sources: Vec<SourceInput>,
+        config: DocumentConfig,
+        combined_sources: BTreeSet<String>,
+    ) -> Self {
+        let mut doc = Self::structure(repo_path, sources, config, combined_sources);
         doc.build_all();
         doc
     }
@@ -708,6 +729,7 @@ impl ReviewDocument {
         repo_path: PathBuf,
         sources: Vec<SourceInput>,
         config: DocumentConfig,
+        combined_sources: BTreeSet<String>,
     ) -> Self {
         let show_headers = sources.len() > 1 || sources.iter().any(|input| input.stack.is_some());
         let mut doc = Self {
@@ -733,6 +755,7 @@ impl ReviewDocument {
             composer_after: None,
             annotations_input: None,
             marks: BTreeMap::new(),
+            scoped_marks: BTreeMap::new(),
             pending: BTreeMap::new(),
             next_ticket: 1,
             tick: 0,
@@ -750,6 +773,11 @@ impl ReviewDocument {
             revealed_hunks: BTreeSet::new(),
             filtered: BTreeSet::new(),
             alternates: BTreeSet::new(),
+            combined_sources,
+            source_focus: None,
+            hidden_groups: BTreeSet::new(),
+            group_focus: BTreeMap::new(),
+            group_alternates: BTreeSet::new(),
         };
         for input in sources {
             doc.add_source(input, show_headers);
@@ -815,6 +843,7 @@ impl ReviewDocument {
             self.file_annotations.push(Vec::new());
         }
         self.groups.push(Group {
+            key: super::series::group_key(&input.source, &self.combined_sources),
             source: input.source,
             label: input.label,
             stack: input.stack,
@@ -1883,14 +1912,20 @@ impl ReviewDocument {
                     affected.insert(file);
                 }
                 _ => match self.source_group(&annotation.anchor) {
-                    Some(group) if annotation.target == AnchorTarget::Review => {
+                    // A scoped annotation stays with its group even when the path no longer
+                    // exists. If the group hasn't streamed in yet, upsert places it later.
+                    Some(group)
+                        if annotation.target == AnchorTarget::Review
+                            || annotation.anchor.group.is_some() =>
+                    {
                         self.source_annotations
                             .entry(group)
                             .or_default()
                             .push(index);
                         groups.insert(group);
                     }
-                    _ => self.review_annotations.push(index),
+                    _ if annotation.anchor.group.is_none() => self.review_annotations.push(index),
+                    _ => {}
                 },
             }
         }
@@ -1926,6 +1961,9 @@ impl ReviewDocument {
     /// The group a review-level anchor naming a source belongs to: that source's (first part's)
     /// group.
     fn source_group(&self, anchor: &bcode_code_review_models::DraftAnchor) -> Option<usize> {
+        if let Some(key) = &anchor.group {
+            return self.groups.iter().position(|group| &group.key == key);
+        }
         let source = anchor.source_id.as_deref()?;
         self.groups.iter().position(|group| {
             group.source.source_id == source
@@ -1944,6 +1982,12 @@ impl ReviewDocument {
             return None;
         }
         let candidates = self.paths.get(&anchor.file_path)?;
+        if let Some(key) = &anchor.group {
+            return candidates
+                .iter()
+                .copied()
+                .find(|&index| &self.groups[self.files[index].group].key == key);
+        }
         anchor
             .source_id
             .as_ref()
@@ -2152,6 +2196,16 @@ impl ReviewDocument {
     /// Apply the workspace's viewed marks (its effective marks, including legacy path marks).
     pub fn set_viewed_marks(&mut self, workspace: &ReviewWorkspace) {
         self.marks.clear();
+        self.scoped_marks.clear();
+        for (selector, marks) in &workspace.group_viewed_marks {
+            let paths = self.scoped_marks.entry(selector.clone()).or_default();
+            for mark in marks {
+                paths
+                    .entry(mark.path.clone())
+                    .or_default()
+                    .push(mark.clone());
+            }
+        }
         for mark in crate::viewed::effective_marks(workspace) {
             self.marks.entry(mark.path.clone()).or_default().push(mark);
         }
@@ -2173,9 +2227,14 @@ impl ReviewDocument {
         let state = &self.files[file];
         let identity = Self::identity(state);
         let viewed_identity = identity.with_patch(state.patch_id.as_deref());
+        let key = &self.groups[state.group].key;
+        let paths = match key {
+            ReviewGroupKey::Standalone { .. } => Some(&self.marks),
+            _ => self.scoped_marks.get(&key.selector()),
+        };
         let marks = std::iter::once(viewed_identity.path)
             .chain(viewed_identity.old_path)
-            .filter_map(|path| self.marks.get(path))
+            .filter_map(|path| paths?.get(path))
             .flatten();
         let viewed = best_state(marks, &viewed_identity, self.config.viewed_reset);
         let state = &mut self.files[file];
@@ -2277,6 +2336,7 @@ impl ReviewDocument {
             .iter()
             .enumerate()
             .map(|(index, group)| GroupInfo {
+                key: &group.key,
                 index,
                 source: &group.source,
                 label: &group.label,
@@ -2287,8 +2347,8 @@ impl ReviewDocument {
                     source_id: group.source.source_id.clone(),
                     part: group.source.part.as_ref().map(|part| part.index),
                 }),
-                hidden: group.hidden,
-                alternate: self.alternates.contains(&group.source.source_id),
+                hidden: self.focus_hidden(group),
+                alternate: self.is_alternate(group),
                 loading: group.loading,
             })
     }
@@ -2297,6 +2357,7 @@ impl ReviewDocument {
     /// their files, viewed state, and annotations but contribute no items, so the review reads as
     /// that source alone; the change reaches the list as splices. Returns whether anything changed.
     pub fn set_focus(&mut self, focus: Option<&str>) -> bool {
+        self.source_focus = focus.map(str::to_owned);
         let mut changed = Vec::new();
         for (index, group) in self.groups.iter_mut().enumerate() {
             let hidden = focus.is_some_and(|focus| group.source.source_id != focus);
@@ -2343,15 +2404,23 @@ impl ReviewDocument {
             BlockKind::SourceHeader(group) => (group, None),
             BlockKind::File(file) => (self.files[file].group, Some(file)),
         };
-        let source = self.groups[group].source.source_id.clone();
-        if self.alternates.contains(&source) {
-            Some(KeyHidden::Alternate { source })
-        } else if self.filtered.contains(&source) {
-            Some(KeyHidden::Filtered { source })
-        } else if self.groups[group].hidden {
-            Some(KeyHidden::Focused { source })
+        let group = &self.groups[group];
+        if self.is_alternate(group) {
+            Some(KeyHidden::Alternate {
+                source: group.key.selector(),
+            })
+        } else if self.filtered.contains(&group.source.source_id) {
+            Some(KeyHidden::Filtered {
+                source: group.source.source_id.clone(),
+            })
+        } else if self.focus_hidden(group) {
+            Some(KeyHidden::Focused {
+                source: group.key.selector(),
+            })
         } else if file.is_some_and(|file| self.compare_hidden(file)) {
-            Some(KeyHidden::Comparison { source })
+            Some(KeyHidden::Comparison {
+                source: group.source.source_id.clone(),
+            })
         } else {
             None
         }
@@ -2364,12 +2433,12 @@ impl ReviewDocument {
         let mut shown = self
             .groups
             .iter()
-            .filter(|group| !group.hidden && !self.alternates.contains(&group.source.source_id));
+            .filter(|group| !self.focus_hidden(group) && !self.is_alternate(group));
         let first = shown.next()?;
         let focused = self
             .groups
             .iter()
-            .any(|group| group.hidden || self.alternates.contains(&group.source.source_id))
+            .any(|group| self.focus_hidden(group) || self.is_alternate(group))
             && shown.all(|group| group.source.source_id == first.source.source_id);
         focused.then_some(first.source.source_id.as_str())
     }
@@ -2382,9 +2451,9 @@ impl ReviewDocument {
     /// Whether group `group` contributes no items: focused away, filtered out, or an alternate.
     pub(super) fn group_hidden(&self, group: usize) -> bool {
         let source = &self.groups[group].source.source_id;
-        self.groups[group].hidden
+        self.focus_hidden(&self.groups[group])
             || self.filtered.contains(source)
-            || self.alternates.contains(source)
+            || self.is_alternate(&self.groups[group])
     }
 
     /// Leave the groups of `sources` out as alternates: they show the same changes as other
@@ -2462,11 +2531,7 @@ impl ReviewDocument {
     pub fn totals(&self) -> (u64, u64) {
         self.files
             .iter()
-            .filter(|file| {
-                !self
-                    .alternates
-                    .contains(&self.groups[file.group].source.source_id)
-            })
+            .filter(|file| !self.is_alternate(&self.groups[file.group]))
             .fold((0, 0), |(add, del), file| {
                 (
                     add + u64::from(file.entry.additions),
@@ -2481,7 +2546,7 @@ impl ReviewDocument {
         let (viewed, total) = self
             .groups
             .iter()
-            .filter(|group| self.alternates.contains(&group.source.source_id))
+            .filter(|group| self.is_alternate(group))
             .fold(
                 (self.viewed_count, self.files.len()),
                 |(viewed, total), group| {
@@ -2524,18 +2589,25 @@ impl ReviewDocument {
                         && group.source.part.as_ref().map(|p| p.index) == *part
                 })
                 .map(|group| group.header_block),
-            ItemKey::SourceIntro { source_id } => self
-                .groups
-                .iter()
-                .find(|group| {
+            ItemKey::SourceIntro { source_id } => {
+                let mut candidates = self.groups.iter().enumerate().filter(|(_, group)| {
                     &group.source.source_id == source_id
                         && group
                             .source
                             .part
                             .as_ref()
                             .is_none_or(|part| part.index == 0)
-                })
-                .map(|group| group.header_block),
+                });
+                let first = candidates.next()?;
+                Some(
+                    std::iter::once(first)
+                        .chain(candidates)
+                        .find(|(index, _)| !self.group_hidden(*index))
+                        .unwrap_or(first)
+                        .1
+                        .header_block,
+                )
+            }
             ItemKey::Thread { .. } | ItemKey::AgentThread { .. } => {
                 self.annotation_blocks.get(key).copied()
             }

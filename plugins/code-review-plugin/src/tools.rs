@@ -104,7 +104,7 @@ fn location_properties() -> serde_json::Map<String, Value> {
         "line": {"type": "integer", "minimum": 1, "description": "First line; omit for the whole file."},
         "end_line": {"type": "integer", "minimum": 1, "description": "Last line of a range."},
         "side": {"type": "string", "enum": ["new", "old"], "description": "Side the line numbers are on: new (added and unchanged lines, the default) or old (removed lines)."},
-        "source": {"type": "string", "description": "Source id, when the file is in several sources."},
+        "source": {"type": "string", "description": "Active group selector from list_files or summary, or an unambiguous source id. Required when the path occurs in multiple groups."},
         "review": review_property(),
     }) else {
         return serde_json::Map::new();
@@ -180,7 +180,7 @@ const SPECS: &[Spec] = &[
             with_review(
                 json!({
                     "path": {"type": "string", "description": "File path."},
-                    "source": {"type": "string", "description": "Source id, when the file is in several sources."},
+                    "source": {"type": "string", "description": "Active group selector from list_files or summary, or an unambiguous source id. Required when the path occurs in multiple groups."},
                     "context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Context lines around changes (default 3)."},
                     "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Diff lines to return at most (default 600)."},
                 }),
@@ -199,7 +199,7 @@ const SPECS: &[Spec] = &[
                     "side": {"type": "string", "enum": ["new", "old"], "description": "new (the reviewed revision, default) or old (the base)."},
                     "start_line": {"type": "integer", "minimum": 1, "description": "First line (default 1)."},
                     "count": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Lines to return (default 400)."},
-                    "source": {"type": "string", "description": "Source id, when the file is in several sources."},
+                    "source": {"type": "string", "description": "Active group selector from list_files or summary, or an unambiguous source id. Required when the path occurs in multiple groups."},
                     "revision": {"type": "string", "description": "head (default, with side), base, or a commit id the review knows: one of its sources' revisions, a recorded version of its pull requests, or a guide's pinned head. Arbitrary refs are refused."},
                 }),
                 &["path"],
@@ -513,7 +513,15 @@ pub fn definitions() -> Vec<ToolDefinition> {
         .map(|spec| ToolDefinition {
             name: spec.name.to_owned(),
             description: spec.description.to_owned(),
-            input_schema: (spec.schema)(),
+            input_schema: {
+                let mut schema = (spec.schema)();
+                if matches!(spec.name, "code_review.summary" | "code_review.list_files" | "code_review.file_diff" | "code_review.file_content" | "code_review.diff_hunks" | "code_review.add_comment" | "code_review.add_comments" | "code_review.suggest_change") {
+                    schema["properties"]["series"] = json!({"type":"string", "description":"Canonical series source id to project for this call only. Requires series_view."});
+                    schema["properties"]["series_view"] = json!({"type":"string", "enum":["one_member", "all_members", "combined"], "description":"Request-local grouping; does not change the saved review."});
+                    schema["properties"]["member"] = json!({"type":"string", "description":"Full commit oid or PR layer source id for one_member."});
+                }
+                schema
+            },
         })
         .collect()
 }
@@ -774,6 +782,9 @@ fn repository_url(working_directory: &std::path::Path) -> String {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Arguments {
+    series: Option<String>,
+    series_view: Option<bcode_code_review_models::ReviewSeriesView>,
+    member: Option<String>,
     review: Option<String>,
     path: Option<String>,
     line: Option<u32>,
@@ -909,6 +920,35 @@ fn review_ids(arguments: &Arguments) -> Result<Vec<String>, AssistantError> {
 }
 
 impl Arguments {
+    fn series_selection(
+        &self,
+    ) -> Result<Option<(&str, bcode_code_review_models::ReviewSeriesPresentation)>, AssistantError>
+    {
+        use bcode_code_review_models::{ReviewSeriesPresentation, ReviewSeriesView};
+
+        match (
+            self.series.as_deref(),
+            self.series_view,
+            self.member.as_deref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(series), Some(view), member)
+                if member.is_none() || view == ReviewSeriesView::OneMember =>
+            {
+                Ok(Some((
+                    series,
+                    ReviewSeriesPresentation {
+                        view,
+                        last_member: member.map(str::to_owned),
+                    },
+                )))
+            }
+            _ => Err(AssistantError::Invalid(
+                "pass series and series_view together; member applies only to one_member".into(),
+            )),
+        }
+    }
+
     fn location(&self) -> Location {
         Location {
             path: self.path.clone(),
@@ -1020,7 +1060,7 @@ fn run(
         return result;
     }
     let reference = review_ref(arguments, descriptor)?;
-    let review = tools.open(repo, &reference)?;
+    let review = tools.open_with_series(repo, &reference, arguments.series_selection()?)?;
     match name {
         "code_review.summary" => encode(&tools.summary(&review)?),
         "code_review.list_files" => encode(&tools.files(&review, reset)?),

@@ -90,6 +90,7 @@ struct Mark {
 /// The shown version's citation ranges, by path and side.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuideMarks {
+    selectors: BTreeMap<String, BTreeMap<Option<u32>, String>>,
     by_file: BTreeMap<String, [Vec<Mark>; 2]>,
     revision: u64,
 }
@@ -117,6 +118,9 @@ impl GuideMarks {
                 let Some(target) = active.target(id) else {
                     continue;
                 };
+                let Some(source) = target.source_id else {
+                    continue;
+                };
                 let badge = badged
                     .then(|| {
                         active.number(id).map(|number| MarkBadge {
@@ -127,7 +131,7 @@ impl GuideMarks {
                     .flatten();
                 by_file.entry(citation.path.clone()).or_default()[side_index(citation.side)].push(
                     Mark {
-                        source: citation.source_id.clone(),
+                        source: Some(source),
                         start: target.lines.start,
                         end: target.lines.end.max(target.lines.start),
                         badge,
@@ -139,7 +143,24 @@ impl GuideMarks {
         for marks in by_file.values_mut().flatten() {
             marks.sort_by_key(|mark| (mark.start, mark.badge.map_or(u16::MAX, |b| b.number)));
         }
-        Self { by_file, revision }
+        Self {
+            by_file,
+            revision,
+            ..Self::default()
+        }
+    }
+
+    /// Bind row-local part positions to the displayed document's stable selectors.
+    pub(crate) fn bind_document(&mut self, doc: &bcode_code_review::document::ReviewDocument) {
+        for group in doc.groups().filter(|g| !g.hidden && !g.alternate) {
+            self.selectors
+                .entry(group.source.source_id.clone())
+                .or_default()
+                .insert(
+                    group.source.part.as_ref().map(|p| p.index),
+                    group.key.selector(),
+                );
+        }
     }
 
     /// Whether there are no marks.
@@ -173,6 +194,11 @@ impl GuideMarks {
             return RowMarks::default();
         };
         let mut row = RowMarks::default();
+        let selector = self
+            .selectors
+            .get(&file.source_id)
+            .and_then(|parts| parts.get(&file.part))
+            .map_or(file.source_id.as_str(), String::as_str);
         for mark in marks {
             if mark.start > line {
                 break;
@@ -181,7 +207,7 @@ impl GuideMarks {
                 || mark
                     .source
                     .as_deref()
-                    .is_some_and(|source| source != file.source_id)
+                    .is_some_and(|source| source != selector)
             {
                 continue;
             }
@@ -216,6 +242,7 @@ mod tests {
         GuideMarks {
             by_file,
             revision: 1,
+            ..GuideMarks::default()
         }
     }
 

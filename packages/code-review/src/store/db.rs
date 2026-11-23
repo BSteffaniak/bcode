@@ -7,6 +7,7 @@ struct WorkspaceColumns {
     sources: String,
     viewed_files: String,
     viewed_marks: String,
+    group_viewed_marks: String,
     viewed_threads: String,
     reviewed_revisions: String,
     presentation: Option<String>,
@@ -19,6 +20,7 @@ impl WorkspaceColumns {
             sources: serde_json::to_string(&workspace.sources)?,
             viewed_files: serde_json::to_string(&workspace.viewed_files)?,
             viewed_marks: serde_json::to_string(&workspace.viewed_marks)?,
+            group_viewed_marks: serde_json::to_string(&workspace.group_viewed_marks)?,
             viewed_threads: serde_json::to_string(&workspace.viewed_threads)?,
             reviewed_revisions: serde_json::to_string(&workspace.reviewed_revisions)?,
             presentation: workspace
@@ -65,6 +67,7 @@ impl<'a> CodeReviewDb<'a> {
                 "archived_at_ms",
                 "viewed_files_json",
                 "viewed_marks_json",
+                "group_viewed_marks_json",
                 "viewed_threads_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
@@ -122,6 +125,7 @@ impl<'a> CodeReviewDb<'a> {
                 "archived_at_ms",
                 "viewed_files_json",
                 "viewed_marks_json",
+                "group_viewed_marks_json",
                 "viewed_threads_json",
                 "reviewed_revisions_json",
                 "presentation_v2_json",
@@ -175,6 +179,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("sources_json", columns.sources)
             .value("viewed_files_json", columns.viewed_files)
             .value("viewed_marks_json", columns.viewed_marks)
+            .value("group_viewed_marks_json", columns.group_viewed_marks)
             .value("viewed_threads_json", columns.viewed_threads)
             .value("reviewed_revisions_json", columns.reviewed_revisions)
             .value("presentation_v2_json", columns.presentation)
@@ -202,6 +207,7 @@ impl<'a> CodeReviewDb<'a> {
             .value("sources_json", columns.sources)
             .value("viewed_files_json", columns.viewed_files)
             .value("viewed_marks_json", columns.viewed_marks)
+            .value("group_viewed_marks_json", columns.group_viewed_marks)
             .value("viewed_threads_json", columns.viewed_threads)
             .value("reviewed_revisions_json", columns.reviewed_revisions)
             .value("presentation_v2_json", columns.presentation)
@@ -858,6 +864,7 @@ impl<'a> CodeReviewDb<'a> {
                 "surface_id",
                 "source_id",
                 "head_oid",
+                "group_json",
                 "blob_oid",
                 "reply_to",
             ])
@@ -879,30 +886,7 @@ impl<'a> CodeReviewDb<'a> {
                     .unwrap_or("info"),
             )?;
             let resolved_at_ms = optional_i64(&thread, "resolved_at_ms").map(i64_to_u64);
-            let anchor = DraftAnchor {
-                kind: anchor_kind_from_str(
-                    optional_text(&thread, "anchor_kind")
-                        .as_deref()
-                        .unwrap_or("range"),
-                )?,
-                file_path: required_text(&thread, "file_path")?,
-                diff_row: i64_to_u64(required_i64(&thread, "diff_row")?),
-                start_diff_row: optional_i64(&thread, "start_diff_row").map(i64_to_u64),
-                end_diff_row: optional_i64(&thread, "end_diff_row").map(i64_to_u64),
-                old_start: optional_i64(&thread, "old_start").map(i64_to_u32),
-                old_end: optional_i64(&thread, "old_end").map(i64_to_u32),
-                new_start: optional_i64(&thread, "new_start").map(i64_to_u32),
-                new_end: optional_i64(&thread, "new_end").map(i64_to_u32),
-                old_line: optional_i64(&thread, "old_line").map(i64_to_u32),
-                new_line: optional_i64(&thread, "new_line").map(i64_to_u32),
-                line_kind: line_kind_from_str(&required_text(&thread, "line_kind")?)?,
-                is_file_anchor: optional_bool(&thread, "is_file_anchor"),
-                surface_id: optional_text(&thread, "surface_id"),
-                source_id: optional_text(&thread, "source_id"),
-                head_oid: optional_text(&thread, "head_oid"),
-                blob_oid: optional_text(&thread, "blob_oid"),
-                reply_to: optional_text(&thread, "reply_to"),
-            };
+            let anchor = draft_anchor_from_row(&thread)?;
             let comment_rows = self
                 .db
                 .select("draft_comments")
@@ -1236,6 +1220,14 @@ impl<'a> CodeReviewDb<'a> {
             .value("surface_id", anchor.surface_id.clone())
             .value("source_id", anchor.source_id.clone())
             .value("head_oid", anchor.head_oid.clone())
+            .value(
+                "group_json",
+                anchor
+                    .group
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
             .value("blob_oid", anchor.blob_oid.clone())
             .value("reply_to", anchor.reply_to.clone())
             .value("resolved_at_ms", Option::<i64>::None)
@@ -1705,6 +1697,26 @@ fn add_later_migrations(source: &mut CodeMigrationSource<'static>) {
     source.add_migration(super::guides::review_guide_threads_table_migration());
     source.add_migration(super::guides::review_guide_marks_table_migration());
     source.add_migration(ai_exchange_thread_column_migration());
+    source.add_migration(CodeMigration::new(
+        "037_workspace_group_viewed_marks".to_string(),
+        Box::new(alter_table("review_workspaces").add_column(
+            "group_viewed_marks_json".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    ));
+    source.add_migration(CodeMigration::new(
+        "038_draft_thread_group".to_string(),
+        Box::new(alter_table("draft_threads").add_column(
+            "group_json".to_string(),
+            DataType::Text,
+            true,
+            None,
+        )),
+        None,
+    ));
 }
 
 /// The thread an AI exchange was asked from (see `ReviewAiExchange::thread_id`); older rows
@@ -2162,6 +2174,8 @@ pub fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, StoreError> {
         updated_at_ms: Some(i64_to_u64(required_i64(row, "updated_at_ms")?)),
         viewed_files,
         archived_at_ms: optional_i64(row, "archived_at_ms").map(i64_to_u64),
+        group_viewed_marks: optional_text(row, "group_viewed_marks_json")
+            .map_or_else(|| Ok(BTreeMap::new()), |json| serde_json::from_str(&json))?,
         viewed_marks: optional_text(row, "viewed_marks_json")
             .map_or_else(|| Ok(Vec::new()), |json| serde_json::from_str(&json))?,
         viewed_threads: optional_text(row, "viewed_threads_json")
@@ -2182,6 +2196,36 @@ pub fn workspace_from_row(row: &Row) -> Result<ReviewWorkspace, StoreError> {
         stack_snapshots: optional_text(row, "stack_snapshots_json")
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default(),
+    })
+}
+
+fn draft_anchor_from_row(row: &Row) -> Result<DraftAnchor, StoreError> {
+    Ok(DraftAnchor {
+        kind: anchor_kind_from_str(
+            optional_text(row, "anchor_kind")
+                .as_deref()
+                .unwrap_or("range"),
+        )?,
+        file_path: required_text(row, "file_path")?,
+        diff_row: i64_to_u64(required_i64(row, "diff_row")?),
+        start_diff_row: optional_i64(row, "start_diff_row").map(i64_to_u64),
+        end_diff_row: optional_i64(row, "end_diff_row").map(i64_to_u64),
+        old_start: optional_i64(row, "old_start").map(i64_to_u32),
+        old_end: optional_i64(row, "old_end").map(i64_to_u32),
+        new_start: optional_i64(row, "new_start").map(i64_to_u32),
+        new_end: optional_i64(row, "new_end").map(i64_to_u32),
+        old_line: optional_i64(row, "old_line").map(i64_to_u32),
+        new_line: optional_i64(row, "new_line").map(i64_to_u32),
+        line_kind: line_kind_from_str(&required_text(row, "line_kind")?)?,
+        is_file_anchor: optional_bool(row, "is_file_anchor"),
+        surface_id: optional_text(row, "surface_id"),
+        source_id: optional_text(row, "source_id"),
+        head_oid: optional_text(row, "head_oid"),
+        group: optional_text(row, "group_json")
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?,
+        blob_oid: optional_text(row, "blob_oid"),
+        reply_to: optional_text(row, "reply_to"),
     })
 }
 

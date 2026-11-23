@@ -1606,6 +1606,7 @@ fn create_review_workspace_for_request(
         updated_at_ms: Some(now),
         viewed_files: BTreeSet::new(),
         archived_at_ms: None,
+        group_viewed_marks: BTreeMap::new(),
         viewed_marks: Vec::new(),
         viewed_threads: Vec::new(),
         reviewed_revisions: std::collections::BTreeMap::new(),
@@ -1668,6 +1669,7 @@ fn same_review(a: &ReviewWorkspace, b: &ReviewWorkspace) -> bool {
     a.title == b.title
         && a.sources == b.sources
         && a.viewed_files == b.viewed_files
+        && a.group_viewed_marks == b.group_viewed_marks
         && a.viewed_marks == b.viewed_marks
         && a.reviewed_revisions == b.reviewed_revisions
         && a.archived_at_ms == b.archived_at_ms

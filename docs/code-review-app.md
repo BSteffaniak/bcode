@@ -572,6 +572,22 @@ Home's "Updated" column, its order, and `resume` follow when a review last chang
 sources, viewed files, reviewed revisions or archive state, or its comments. Opening or scrolling
 a review records where it was left without making it updated.
 
+### Selected commits
+
+A review of several selected commits stays one saved review. Use `shift+o` to switch between
+one commit at a time, all selected commits as separate diffs, and one combined diff. In the
+one-commit view, `.` and `,` move between commits. Reopening the review restores the view and
+the last member. A single selected commit has no view switch.
+
+A contiguous first-parent selection opens combined. A sparse selection opens with all members
+separate; each diff shows just that commit against its first parent (the empty tree for a root
+commit). Combining a sparse selection must leave out intervening changes. If the selected
+changes cannot be combined exactly, the app explains why rather than showing an endpoint diff.
+
+The same path in two commits is reviewable twice. Viewed marks and comments on a member are
+its own, not the combined diff’s. File counts and progress exclude representations that aren’t
+shown. Changing views does not change a comparison baseline.
+
 ### Stacks of pull requests
 
 A stack review holds the stack two ways: one source per pull request (each against its parent)

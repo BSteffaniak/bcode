@@ -127,7 +127,7 @@ pub fn render_markdown(version: &GuideVersion, options: &ExportOptions<'_>) -> S
                     out,
                     "{}. {} · {} · {} · {}",
                     index + 1,
-                    location(citation, options),
+                    location(citation, version, options),
                     side_name(citation.side),
                     relation_name(citation.relation),
                     verification_name(&citation.verification)
@@ -269,7 +269,7 @@ fn replace_tokens(
     out
 }
 
-fn location(citation: &Citation, options: &ExportOptions<'_>) -> String {
+fn location(citation: &Citation, version: &GuideVersion, options: &ExportOptions<'_>) -> String {
     let lines = if citation.lines.start == citation.lines.end {
         citation.lines.start.to_string()
     } else {
@@ -283,19 +283,8 @@ fn location(citation: &Citation, options: &ExportOptions<'_>) -> String {
     };
     match (options.links, citation.revision.commit_oid()) {
         (LinkStyle::Permalink, Some(oid)) => {
-            let repository = citation
-                .source_id
-                .as_ref()
-                .and_then(|source| options.repositories.get(source))
-                .or_else(|| {
-                    // Repository context outside the sources links through the only forge
-                    // repository the review has, when it has one.
-                    let mut all = options.repositories.values();
-                    match (all.next(), all.next()) {
-                        (Some(only), None) if citation.source_id.is_none() => Some(only),
-                        _ => None,
-                    }
-                });
+            let repository = super::sources::citation_selector(citation, &version.heads)
+                .and_then(|source| options.repositories.get(source));
             repository.map_or_else(
                 || format!("`{text}` @ {}", short(oid)),
                 |web| format!("[{text}]({web}/blob/{oid}/{}{anchor})", citation.path),
@@ -473,6 +462,34 @@ mod tests {
             "{markdown}"
         );
         assert!(!markdown.contains("2. "), "{markdown}");
+    }
+
+    #[test]
+    fn commit_group_context_never_borrows_an_unrelated_pr_repository() {
+        let mut version = version();
+        let key = bcode_code_review_models::ReviewGroupKey::Combined {
+            source_id: "commits".to_owned(),
+        }
+        .selector();
+        version.heads.insert(
+            key.clone(),
+            GuideHead {
+                base: RevisionRef::commit(OID),
+                head: RevisionRef::commit(OID),
+                label: "Selected commits".to_owned(),
+            },
+        );
+        let options = ExportOptions {
+            repositories: BTreeMap::from([("pr".to_owned(), "https://github.com/o/r".to_owned())]),
+            ..ExportOptions::default()
+        };
+        for source in [Some(key.as_str()), None] {
+            let cited = citation("c", source, true);
+            assert_eq!(
+                location(&cited, &version, &options),
+                "`net/budget.rs:12-40` @ 0123456"
+            );
+        }
     }
 
     #[test]

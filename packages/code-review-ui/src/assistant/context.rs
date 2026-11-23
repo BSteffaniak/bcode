@@ -420,6 +420,12 @@ pub struct ReviewView {
     pub kind: String,
     /// Sources.
     pub sources: Listed<SourceView>,
+    /// Effective grouping of the active series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_view: Option<bcode_code_review_models::ReviewSeriesView>,
+    /// Active group selectors (bounded in document order).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     /// The stack, for step-through reviews.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stack: Option<StackView>,
@@ -954,6 +960,12 @@ fn guide_line(guide: &GuideView) -> String {
 
 /// The stack and the file counts.
 fn stack_lines(review: &ReviewView, lines: &mut Vec<String>) {
+    if let Some(mode) = &review.series_view {
+        lines.push(format!(
+            "series: {mode:?}; source selectors: {}",
+            review.groups.join(", ")
+        ));
+    }
     // Stack.
     if let Some(stack) = &review.stack {
         let numbers: Vec<String> = stack
@@ -1603,6 +1615,8 @@ mod tests {
             review: Some(ReviewView {
                 id: Some("rv".to_owned()),
                 scope_id: "rv".to_owned(),
+                groups: Vec::new(),
+                series_view: None,
                 title: "T\u{7}\n".repeat(400),
                 kind: "stack_step_through".to_owned(),
                 sources: Listed::of(

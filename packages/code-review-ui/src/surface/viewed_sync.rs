@@ -14,8 +14,10 @@
 //!   the stored state. So a save never undoes a change made elsewhere, and a reload never drops
 //!   a change the reviewer made that is still being saved.
 
+use bcode_code_review::document::{FileRef, ItemKey, ReviewDocument};
+use bcode_code_review::viewed::{self, EntryIdentity, ViewedIdentity};
+use bcode_code_review_models::ReviewGroupKey;
 use bcode_code_review_models::ReviewWorkspace;
-use std::collections::BTreeSet;
 
 pub use bcode_code_review::workspace_merge::{ViewedSet as Viewed, merge_viewed as merge};
 
@@ -23,11 +25,7 @@ pub use bcode_code_review::workspace_merge::{ViewedSet as Viewed, merge_viewed a
 #[derive(Debug, Clone, Default)]
 pub struct Tracking {
     /// An unsaved review's viewed files, marks and threads as last stored for its target.
-    pub transient: Option<(
-        BTreeSet<String>,
-        Vec<bcode_code_review_models::ViewedMark>,
-        Vec<bcode_code_review_models::ThreadViewMark>,
-    )>,
+    pub transient: Option<Viewed>,
     /// The viewed state as last read from or written to the store.
     pub base: Option<Viewed>,
     /// A saved review's whole record as last read from or written to the store: the base of
@@ -49,4 +47,55 @@ pub enum SaveFailure {
     Deleted,
     /// Any other failure, with its message.
     Failed(String),
+}
+
+/// Capture the group before taking the mutable workspace borrow. A file can occur at the
+/// exact same path and blob sides on both representations of a series.
+pub(super) fn identity(
+    doc: &ReviewDocument,
+    file: &FileRef,
+) -> Option<(ReviewGroupKey, EntryIdentity, Option<String>)> {
+    let group = doc.group_of_key(&ItemKey::FileHeader(file.clone()))?;
+    let (identity, patch) = doc.viewed_identity(file)?;
+    Some((group.clone(), identity, patch))
+}
+
+pub(super) fn set(
+    workspace: &mut ReviewWorkspace,
+    group: &ReviewGroupKey,
+    file: &ViewedIdentity<'_>,
+    value: bool,
+) {
+    match (group, value) {
+        (ReviewGroupKey::Standalone { .. }, true) => viewed::mark_viewed(workspace, file),
+        (ReviewGroupKey::Standalone { .. }, false) => viewed::unmark_viewed(workspace, file),
+        (_, true) => viewed::mark_group_viewed(workspace, group, std::slice::from_ref(file)),
+        (_, false) => viewed::unmark_group_viewed(workspace, group, file),
+    }
+}
+
+/// Update a batch together so marking a whole review sorts each group's marks just once.
+pub(super) fn set_batch(
+    workspace: &mut ReviewWorkspace,
+    batch: &[(ReviewGroupKey, EntryIdentity, Option<String>)],
+    value: bool,
+) {
+    let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (key, identity, patch) in batch {
+        groups
+            .entry(key)
+            .or_default()
+            .push(identity.with_patch(patch.as_deref()));
+    }
+    for (key, files) in groups {
+        if !value {
+            for file in files {
+                set(workspace, key, &file, false);
+            }
+        } else if matches!(key, ReviewGroupKey::Standalone { .. }) {
+            viewed::mark_all_viewed(workspace, &files);
+        } else {
+            viewed::mark_group_viewed(workspace, key, &files);
+        }
+    }
 }

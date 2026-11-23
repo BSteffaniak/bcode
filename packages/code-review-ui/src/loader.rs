@@ -4,6 +4,31 @@
 //! Every function here runs on a host-spawned task and reports through the [`Inbox`]; the
 //! surface drains the inbox from `poll`, so frames never wait on a service.
 
+#[cfg(test)]
+mod series_tests;
+
+#[cfg(test)]
+#[test]
+fn a_reload_during_delivery_invalidates_only_the_superseded_open() {
+    let inbox = Inbox::default();
+    let cancel = bcode_code_review::provider::Cancel::default();
+    let first = inbox.scoped(&cancel);
+    first.push(Message::Stage("opening".into()));
+    first.push(Message::OpenFailed("obsolete".into()));
+    inbox.push(Message::Stage("unrelated".into()));
+    let mut batch = inbox.current_messages();
+    assert!(matches!(batch.next(), Some(Message::Stage(text)) if text == "opening"));
+    cancel.cancel();
+    first.push(Message::OpenFailed("late".into()));
+    inbox
+        .scoped(&bcode_code_review::provider::Cancel::default())
+        .push(Message::Stage("replacement".into()));
+    assert!(matches!(batch.next(), Some(Message::Stage(text)) if text == "unrelated"));
+    assert!(batch.next().is_none());
+    let next = inbox.drain();
+    assert!(matches!(next.as_slice(), [Message::Stage(text)] if text == "replacement"));
+}
+
 use crate::services::ReviewServices;
 use bcode_code_review::document::{DocumentNeed, SourceInput, SourceStack, Ticket};
 use bcode_code_review::provider::ProviderCallError;
@@ -16,7 +41,7 @@ use bcode_code_review_models::{
     ReviewSourcesTokenRequest, ReviewSourcesTokenResponse, ReviewStackAttributionResponse,
     ReviewWorkspace, RevisionRef,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +50,8 @@ use std::sync::{Arc, Mutex};
 pub enum Message {
     /// What opening is doing, for the loading screen.
     Stage(String),
+    /// A commit series discovered after the first frame; arrives before any of its groups.
+    CommitSeries(session::CommitSeriesState),
     /// The review opened (possibly with sources still loading; see [`Opened::complete`]).
     Opened(Box<Opened>),
     /// The review could not be opened.
@@ -191,29 +218,73 @@ pub enum NeedResult {
 
 /// Shared queue of results.
 #[derive(Debug, Clone, Default)]
-pub struct Inbox(Arc<Mutex<Vec<Message>>>);
+pub struct Inbox {
+    queue: Arc<Mutex<Vec<Delivery>>>,
+    open: Option<bcode_code_review::provider::Cancel>,
+}
+
+#[derive(Debug)]
+struct Delivery {
+    open: Option<bcode_code_review::provider::Cancel>,
+    message: Message,
+}
 
 impl Inbox {
-    /// Queue one result.
-    pub fn push(&self, message: Message) {
-        if let Ok(mut queue) = self.0.lock() {
-            queue.push(message);
+    /// A sender for this open only. Closing or superseding it invalidates queued answers too.
+    fn scoped(&self, cancel: &bcode_code_review::provider::Cancel) -> Self {
+        Self {
+            queue: Arc::clone(&self.queue),
+            open: Some(cancel.clone()),
         }
     }
 
-    /// Take every queued result, oldest first.
+    /// Queue one result.
+    pub fn push(&self, message: Message) {
+        if self
+            .open
+            .as_ref()
+            .is_some_and(bcode_code_review::provider::Cancel::is_cancelled)
+        {
+            return;
+        }
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.push(Delivery {
+                open: self.open.clone(),
+                message,
+            });
+        }
+    }
+
+    /// Drain in order, checking cancellation at each delivery (handling an earlier message
+    /// may itself start a new open). The queue lock is released before invoking the caller.
+    pub fn current_messages(&self) -> impl Iterator<Item = Message> + use<> {
+        let batch = self
+            .queue
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
+        batch.into_iter().filter_map(|delivery| {
+            (!delivery
+                .open
+                .as_ref()
+                .is_some_and(bcode_code_review::provider::Cancel::is_cancelled))
+            .then_some(delivery.message)
+        })
+    }
+
+    /// Collect currently valid deliveries for inspection. Interactive consumers should use
+    /// `current_messages` so a reload triggered mid-batch invalidates later deliveries.
     #[must_use]
     pub fn drain(&self) -> Vec<Message> {
-        self.0
-            .lock()
-            .map(|mut queue| std::mem::take(&mut *queue))
-            .unwrap_or_default()
+        self.current_messages().collect()
     }
 }
 
 /// An opened review: document inputs plus what refresh needs.
 #[derive(Debug)]
 pub struct Opened {
+    /// Commit-series descriptions known at this frame, including unlisted member labels.
+    pub commit_series: BTreeMap<String, session::CommitSeriesState>,
     /// One input per resolved source (or part).
     pub inputs: Vec<SourceInput>,
     /// Per-source diagnostics.
@@ -273,6 +344,8 @@ pub struct Arrived {
     pub input: SourceInput,
     /// Its index among the review's included sources (workspace order).
     pub position: usize,
+    /// Insertion index among the currently known document groups, including sibling parts.
+    pub group_position: usize,
     /// Fingerprints of its files with viewed marks.
     pub fingerprints: Option<(String, ReviewPatchIdsResponse)>,
     /// What it says when its listing was cut to its file limit.
@@ -282,6 +355,8 @@ pub struct Arrived {
 /// How [`open`] runs.
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
+    /// Current grouping demand, from persisted or transient presentation state.
+    pub series_views: BTreeMap<String, bcode_code_review_models::ReviewSeriesPresentation>,
     /// What the first frame's viewed state needs.
     pub viewed: ViewedInputs,
     /// The source to make ready first.
@@ -292,6 +367,23 @@ pub struct OpenOptions {
     pub cancel: bcode_code_review::provider::Cancel,
     /// How browse sources list: ignored files, and the file limit.
     pub browse: bcode_code_review_models::BrowseOptions,
+}
+
+/// Open into the surface inbox, fencing every message, including terminal errors and atomic
+/// refresh snapshots, with the same cancellation token as the progressive results.
+pub async fn open_into(
+    services: ReviewServices,
+    repo_path: PathBuf,
+    sources: Vec<ReviewSource>,
+    inbox: Inbox,
+    options: OpenOptions,
+) {
+    let destination = inbox.scoped(&options.cancel);
+    match open(services, repo_path, sources, inbox, options).await {
+        Ok(Some(opened)) => destination.push(Message::Opened(Box::new(opened))),
+        Err(error) => destination.push(Message::OpenFailed(error)),
+        Ok(None) => {}
+    }
 }
 
 /// Open a review progressively ([`bcode_code_review::session::open`]).
@@ -320,6 +412,11 @@ pub async fn open(
     inbox: Inbox,
     options: OpenOptions,
 ) -> Result<Option<Opened>, String> {
+    let cancel = options.cancel.clone();
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let inbox = inbox.scoped(&cancel);
     let labels: Vec<(String, String, bool)> = sources
         .iter()
         .filter(|source| source.included)
@@ -335,6 +432,7 @@ pub async fn open(
         repo_path: repo_path.clone(),
         sources,
         first: options.first,
+        series_views: options.series_views,
         max_layers: services.stack_limit().resolve_limit(),
         cancel: options.cancel,
         browse: options.browse,
@@ -364,6 +462,11 @@ pub async fn open(
         let mut streamer = Streamer {
             services: &services,
             repo_path: &repo_path,
+            positions: labels
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _, _))| (id.as_str(), i))
+                .collect(),
             labels: &labels,
             inbox: &inbox,
             stream: options.stream,
@@ -374,13 +477,24 @@ pub async fn open(
             shown: false,
         };
         while let Some(event) = events.recv().await {
+            if cancel.is_cancelled() {
+                break;
+            }
             streamer.handle(event).await;
         }
         streamer
     };
     let (result, streamer) = tokio::join!(work, consume);
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
     result.map_err(|error| error.message)?;
-    streamer.finish().await
+    let answer = streamer.finish().await;
+    if cancel.is_cancelled() {
+        Ok(None)
+    } else {
+        answer
+    }
 }
 
 /// What [`open`] made of the session's events so far, and where it pushes them.
@@ -388,6 +502,7 @@ struct Streamer<'a> {
     services: &'a ReviewServices,
     repo_path: &'a std::path::Path,
     labels: &'a [(String, String, bool)],
+    positions: BTreeMap<&'a str, usize>,
     inbox: &'a Inbox,
     stream: bool,
     stored_viewed: Option<ReviewWorkspace>,
@@ -404,7 +519,7 @@ impl Streamer<'_> {
         let live = self.shown && self.stream;
         match event {
             session::OpenEvent::Stage(stage) => {
-                if !self.shown {
+                if self.stream && !self.shown {
                     self.inbox.push(Message::Stage(stage_text(&stage)));
                 } else if self.stream {
                     self.inbox.push(Message::Filling(Some(stage_text(&stage))));
@@ -417,6 +532,14 @@ impl Streamer<'_> {
                     self.inbox.push(Message::StackConfirmed(Box::new(news)));
                 } else {
                     self.stacks.push(news);
+                }
+            }
+            session::OpenEvent::CommitSeries(state) => {
+                self.known
+                    .commit_series
+                    .insert(state.source_id.clone(), state.clone());
+                if live {
+                    self.inbox.push(Message::CommitSeries(state));
                 }
             }
             session::OpenEvent::Pending(opened) => {
@@ -452,8 +575,11 @@ impl Streamer<'_> {
         let mut opened = opened_from(
             self.services,
             self.repo_path,
-            self.known.inputs(self.labels),
-            self.known.diagnostics.clone(),
+            FrameSources {
+                inputs: self.known.inputs(self.labels),
+                diagnostics: self.known.diagnostics.clone(),
+                commit_series: self.known.commit_series.clone(),
+            },
             &self.marked,
             self.stored_viewed.clone(),
             false,
@@ -478,6 +604,7 @@ impl Streamer<'_> {
                 self.services,
                 self.repo_path,
                 std::slice::from_ref(&input),
+                &self.known.commit_series,
                 &self.marked,
             )
             .await
@@ -485,6 +612,7 @@ impl Streamer<'_> {
         };
         self.inbox.push(Message::Arrived(Box::new(Arrived {
             position: position(self.labels, &input.source.source_id),
+            group_position: self.known.group_position(&self.positions, &input.source),
             input,
             fingerprints,
             truncated,
@@ -519,8 +647,11 @@ impl Streamer<'_> {
         let mut opened = opened_from(
             self.services,
             self.repo_path,
-            inputs,
-            self.known.diagnostics,
+            FrameSources {
+                inputs,
+                diagnostics: self.known.diagnostics,
+                commit_series: self.known.commit_series,
+            },
             &self.marked,
             self.stored_viewed,
             complete,
@@ -567,6 +698,7 @@ fn record_observed(
 /// What an open reported so far: each source with whether it is only pending, and failures.
 #[derive(Debug, Default)]
 struct Known {
+    commit_series: BTreeMap<String, session::CommitSeriesState>,
     sources: Vec<(session::OpenedSource, bool)>,
     diagnostics: Vec<ReviewSourceDiagnostic>,
 }
@@ -580,13 +712,47 @@ impl Known {
     }
 
     fn put(&mut self, source: session::OpenedSource, pending: bool) {
-        self.forget(&source.source.source_id);
-        self.sources.push((source, pending));
+        let existing = self.sources.iter_mut().find(|(opened, _)| {
+            opened.source.source_id == source.source.source_id
+                && match (&opened.source.part, &source.source.part) {
+                    (None, None) => true,
+                    (Some(_), Some(_)) => opened.source.head == source.source.head,
+                    _ => false,
+                }
+        });
+        if let Some(slot) = existing {
+            *slot = (source, pending);
+        } else {
+            self.sources.push((source, pending));
+        }
     }
 
     fn forget(&mut self, id: &str) {
+        self.sources.retain(|(opened, _)| {
+            let source = &opened.source;
+            source.source_id != id
+                && self
+                    .commit_series
+                    .get(&source.source_id)
+                    .is_none_or(|state| state.selector(source) != id)
+        });
+    }
+
+    fn group_position(&self, positions: &BTreeMap<&str, usize>, source: &ResolvedSource) -> usize {
+        let order = |s: &ResolvedSource| {
+            (
+                positions
+                    .get(s.source_id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                s.part.as_ref().map(|p| p.index),
+            )
+        };
+        let target = order(source);
         self.sources
-            .retain(|(source, _)| source.source.source_id != id);
+            .iter()
+            .filter(|(opened, _)| order(&opened.source) < target)
+            .count()
     }
 
     /// What every listed source cut to its file limit says, in workspace order.
@@ -611,7 +777,12 @@ impl Known {
             .iter()
             .map(|(source, pending)| document_input(labels, source.clone(), *pending))
             .collect();
-        inputs.sort_by_key(|input| position(labels, &input.source.source_id));
+        inputs.sort_by_key(|input| {
+            (
+                position(labels, &input.source.source_id),
+                input.source.part.as_ref().map(|p| p.index),
+            )
+        });
         inputs
     }
 }
@@ -696,26 +867,44 @@ async fn viewed_state(
         marked.extend(
             bcode_code_review::viewed::effective_marks(stored)
                 .into_iter()
-                .map(|mark| mark.path),
+                .map(|mark| mark.path)
+                .chain(
+                    stored
+                        .group_viewed_marks
+                        .values()
+                        .flatten()
+                        .map(|mark| mark.path.clone()),
+                ),
         );
     }
     (stored_viewed, marked)
 }
 
-/// An [`Opened`] of `inputs`, with the change token and the fingerprints of marked files.
+struct FrameSources {
+    inputs: Vec<SourceInput>,
+    diagnostics: Vec<ReviewSourceDiagnostic>,
+    commit_series: BTreeMap<String, session::CommitSeriesState>,
+}
+
+/// An [`Opened`] with the change token and fingerprints for this frame's sources.
 async fn opened_from(
     services: &ReviewServices,
     repo_path: &std::path::Path,
-    inputs: Vec<SourceInput>,
-    diagnostics: Vec<ReviewSourceDiagnostic>,
+    sources: FrameSources,
     marked: &BTreeSet<String>,
     stored_viewed: Option<ReviewWorkspace>,
     complete: bool,
 ) -> Opened {
+    let FrameSources {
+        inputs,
+        diagnostics,
+        commit_series,
+    } = sources;
     let working_tree = inputs.iter().any(|input| reads_working_tree(&input.source));
     let token = token(services, repo_path, working_tree).await.ok();
-    let fingerprints = fingerprints(services, repo_path, &inputs, marked).await;
+    let fingerprints = fingerprints(services, repo_path, &inputs, &commit_series, marked).await;
     Opened {
+        commit_series,
         inputs,
         diagnostics,
         token,
@@ -735,6 +924,7 @@ async fn fingerprints(
     services: &ReviewServices,
     repo_path: &std::path::Path,
     inputs: &[SourceInput],
+    commit_series: &BTreeMap<String, session::CommitSeriesState>,
     marked: &BTreeSet<String>,
 ) -> Vec<(String, ReviewPatchIdsResponse)> {
     let mut answers = Vec::new();
@@ -787,7 +977,11 @@ async fn fingerprints(
             merged.content_ids.extend(answer.content_ids);
         }
         if !merged.patch_ids.is_empty() || !merged.content_ids.is_empty() {
-            answers.push((input.source.source_id.clone(), merged));
+            let selector = commit_series.get(&input.source.source_id).map_or_else(
+                || input.source.source_id.clone(),
+                |state| state.selector(&input.source),
+            );
+            answers.push((selector, merged));
         }
     }
     answers
@@ -853,6 +1047,7 @@ pub fn transient_viewed_record(
         updated_at_ms: None,
         viewed_files: transient.viewed_files.clone(),
         archived_at_ms: None,
+        group_viewed_marks: transient.group_viewed_marks.clone(),
         viewed_marks: transient.viewed_marks.clone(),
         viewed_threads: transient.viewed_threads.clone(),
         reviewed_revisions: std::collections::BTreeMap::new(),
@@ -912,6 +1107,7 @@ pub async fn save_as(
     // The viewed state moves with the review, like its notes.
     let mut left = transient_viewed_record(&transient);
     left.viewed_files.clear();
+    left.group_viewed_marks.clear();
     left.viewed_marks.clear();
     left.viewed_threads.clear();
     save_workspace(services.clone(), left).await?;

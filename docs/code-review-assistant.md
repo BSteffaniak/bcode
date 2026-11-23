@@ -14,6 +14,20 @@ on), [embedded sessions](embedded-sessions.md) (session origin, app-provided too
 app-contributed agent profiles, turn context blocks), [permissions](permissions.md),
 [review stack history](review-stack-history.md) (comparisons), [TUI rendering](tui-rendering.md).
 
+### Review series in assistant context
+
+When two selected commits change the same file, the path alone does not identify what the
+reviewer is looking at. Use the active group selector from the current view for file reads,
+navigation, marks and drafts. A workspace source id remains valid; a member selector names a
+specific diff within it. Refresh the view after switching members or switching to the combined
+diff: the same path can now have different lines, comments and viewed state. Totals describe
+what is shown, not the sum of member and combined representations.
+
+A selected-commits review remains a `commits` source. Its members are identified by full commit
+OIDs, not PR numbers; cite local paths and revisions rather than inventing forge permalinks.
+Existing stack reviews retain their provider, PR numbers and layer source ids. A change of
+series view is not a change of comparison baseline.
+
 ## Status
 
 * **Built.** Every build step below is built, with the deviations listed under

@@ -26,6 +26,7 @@ pub mod freshness;
 pub mod lifecycle;
 pub mod lint;
 pub mod plan;
+pub mod sources;
 pub mod template;
 mod text;
 pub mod write;

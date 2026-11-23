@@ -407,7 +407,8 @@ impl ReviewSurface {
             );
             return;
         };
-        let Some((identity, patch)) = review.doc.viewed_identity(&file) else {
+        let Some((group, identity, patch)) = super::viewed_sync::identity(&review.doc, &file)
+        else {
             return;
         };
         let viewed = review
@@ -415,16 +416,13 @@ impl ReviewSurface {
             .viewed_state(&file)
             .is_some_and(bcode_code_review::viewed::ViewedState::is_viewed);
         let workspace = self.workspace_mut();
-        if viewed {
-            bcode_code_review::viewed::unmark_viewed(
-                workspace,
-                &identity.with_patch(patch.as_deref()),
-            );
-        } else {
-            bcode_code_review::viewed::mark_viewed(
-                workspace,
-                &identity.with_patch(patch.as_deref()),
-            );
+        super::viewed_sync::set(
+            workspace,
+            &group,
+            &identity.with_patch(patch.as_deref()),
+            !viewed,
+        );
+        if !viewed {
             self.record_look(&file, bcode_code_review_models::LookKind::Viewed);
         }
         // Marking (or unmarking) hands the fold back to the mark: viewed folds, unviewed opens.
@@ -488,18 +486,13 @@ impl ReviewSurface {
             .doc
             .viewed_marks_to_update()
             .into_iter()
-            .filter_map(|file| review.doc.viewed_identity(&file))
+            .filter_map(|file| super::viewed_sync::identity(&review.doc, &file))
             .collect();
         if stale.is_empty() {
             return;
         }
         let workspace = self.workspace_mut();
-        for (identity, patch) in &stale {
-            bcode_code_review::viewed::mark_viewed(
-                workspace,
-                &identity.with_patch(patch.as_deref()),
-            );
-        }
+        super::viewed_sync::set_batch(workspace, &stale, true);
         self.apply_viewed();
     }
 
@@ -675,11 +668,7 @@ impl ReviewSurface {
         let wanted = match &self.workspace {
             None => false,
             Some(workspace) if workspace.id == super::TRANSIENT_WORKSPACE_ID => {
-                let viewed = (
-                    workspace.viewed_files.clone(),
-                    workspace.viewed_marks.clone(),
-                    workspace.viewed_threads.clone(),
-                );
+                let viewed = super::viewed_sync::Viewed::of(workspace);
                 let changed = self.viewed_sync.transient.as_ref() != Some(&viewed);
                 self.viewed_sync.transient = Some(viewed);
                 changed

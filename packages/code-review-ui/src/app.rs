@@ -724,6 +724,19 @@ impl ReviewApp {
             };
             if whole_stack {
                 state.set_stack_view(bcode_code_review_models::ReviewStackView::Whole);
+                if let Some(stack) = draft
+                    .sources
+                    .iter()
+                    .find(|s| matches!(s.kind, ReviewSourceKind::Stack { .. }))
+                {
+                    state.series_views.insert(
+                        stack.id.clone(),
+                        bcode_code_review_models::ReviewSeriesPresentation {
+                            view: bcode_code_review_models::ReviewSeriesView::Combined,
+                            last_member: None,
+                        },
+                    );
+                }
             }
             state
         });

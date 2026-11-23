@@ -245,6 +245,53 @@ pub fn viewed_state(
     best_state(&effective_marks(workspace), file, reset)
 }
 
+/// Viewed state within a series group. Workspace-wide legacy marks are not evidence that a
+/// member or the combined diff was reviewed, even when the blobs happen to be identical.
+#[must_use]
+pub fn group_viewed_state(
+    workspace: &ReviewWorkspace,
+    group: &bcode_code_review_models::ReviewGroupKey,
+    file: &ViewedIdentity<'_>,
+    reset: ViewedReset,
+) -> ViewedState {
+    let marks = workspace.group_viewed_marks.get(&group.selector());
+    best_state(marks.into_iter().flatten(), file, reset)
+}
+
+/// Record marks for canonical paths within one group, without touching any alternate view.
+pub fn mark_group_viewed(
+    workspace: &mut ReviewWorkspace,
+    group: &bcode_code_review_models::ReviewGroupKey,
+    files: &[ViewedIdentity<'_>],
+) {
+    if files.is_empty() {
+        return;
+    }
+    let marks = workspace
+        .group_viewed_marks
+        .entry(group.selector())
+        .or_default();
+    marks.retain(|mark| !files.iter().any(|file| replaced_by(mark, file)));
+    marks.extend(files.iter().map(new_mark));
+    marks.sort();
+    marks.dedup();
+}
+
+/// Remove matching marks only in this group, leaving legacy and other group marks alone.
+pub fn unmark_group_viewed(
+    workspace: &mut ReviewWorkspace,
+    group: &bcode_code_review_models::ReviewGroupKey,
+    file: &ViewedIdentity<'_>,
+) {
+    let key = group.selector();
+    if let Some(marks) = workspace.group_viewed_marks.get_mut(&key) {
+        marks.retain(|mark| match_mark(mark, file, ViewedReset::Diff) == ViewedState::Unviewed);
+        if marks.is_empty() {
+            workspace.group_viewed_marks.remove(&key);
+        }
+    }
+}
+
 /// Whether `existing` describes `file` closely enough to be replaced by a new mark for it.
 fn replaced_by(existing: &ViewedMark, file: &ViewedIdentity<'_>) -> bool {
     names_file(existing, file)
@@ -332,6 +379,39 @@ mod tests {
             new_oid: Some(new),
             patch_id: patch,
         }
+    }
+
+    #[test]
+    fn identical_diffs_in_different_groups_are_independent() {
+        use bcode_code_review_models::ReviewGroupKey;
+
+        let member = ReviewGroupKey::Member {
+            source_id: "set".into(),
+            member: "a".repeat(40),
+        };
+        let combined = ReviewGroupKey::Combined {
+            source_id: "set".into(),
+        };
+        let file = file("before", "after", Some("2:identical"));
+        let mut ws = workspace();
+        mark_viewed(&mut ws, &file);
+        assert_eq!(
+            group_viewed_state(&ws, &member, &file, DIFF),
+            ViewedState::Unviewed
+        );
+        mark_group_viewed(&mut ws, &member, &[file]);
+        assert_eq!(
+            group_viewed_state(&ws, &combined, &file, DIFF),
+            ViewedState::Unviewed
+        );
+        mark_group_viewed(&mut ws, &combined, &[file]);
+        unmark_group_viewed(&mut ws, &member, &file);
+        assert!(!ws.group_viewed_marks.contains_key(&member.selector()));
+        assert_eq!(
+            group_viewed_state(&ws, &combined, &file, DIFF),
+            ViewedState::Viewed
+        );
+        assert_eq!(viewed_state(&ws, &file, DIFF), ViewedState::Viewed);
     }
 
     #[test]

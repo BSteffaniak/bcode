@@ -458,13 +458,21 @@ impl ReviewTools<'_> {
             ));
         }
         let (mut selected, not_found) = self.select_files(review, selection)?;
-        // The same path in several layers is one file to the reviewer's marks.
-        selected.dedup_by(|a, b| a.1.path == b.1.path);
+        // Legacy sources share a path mark (and its fingerprint). Series groups
+        // have independent marks, even when they display the same path.
+        let mut legacy_paths = BTreeSet::new();
+        selected.retain(|(index, entry)| {
+            !matches!(
+                review.group_key(&review.resolved[*index]),
+                bcode_code_review_models::ReviewGroupKey::Standalone { .. }
+            ) || legacy_paths.insert(entry.path.clone())
+        });
         let fingerprints = self.fingerprints_of(review, &selected)?;
         let base = self.current_viewed_record(review)?;
         let mut record = base.clone();
-        let mut changed = Vec::new();
-        let mut kept = Vec::new();
+        // The public report counts display paths, not marks: if any selected
+        // group changed, report that path as changed rather than unchanged.
+        let mut outcomes = BTreeMap::new();
         for (index, entry) in &selected {
             let (patch, content) = fingerprints
                 .get(&(*index, entry.path.clone()))
@@ -472,18 +480,23 @@ impl ReviewTools<'_> {
                 .unwrap_or_default();
             let identity = EntryIdentity::from_entry(entry).with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
-            let is_viewed = crate::viewed::viewed_state(&record, &identity, reset)
+            let group = review.group_key(&review.resolved[*index]);
+            let is_viewed = super::series::viewed_state(&record, &group, &identity, reset)
                 != crate::viewed::ViewedState::Unviewed;
-            if is_viewed == viewed {
-                kept.push(entry.path.clone());
-                continue;
+            let changed = outcomes.entry(entry.path.clone()).or_insert(false);
+            if is_viewed != viewed {
+                super::series::set_viewed(&mut record, &group, &identity, viewed);
+                *changed = true;
             }
-            if viewed {
-                crate::viewed::mark_viewed(&mut record, &identity);
+        }
+        let mut changed = Vec::new();
+        let mut kept = Vec::new();
+        for (path, did_change) in outcomes {
+            if did_change {
+                changed.push(path);
             } else {
-                crate::viewed::unmark_viewed(&mut record, &identity);
+                kept.push(path);
             }
-            changed.push(entry.path.clone());
         }
         if !changed.is_empty() {
             // Only these files' marks are written; marks the open review or another writer
@@ -496,14 +509,15 @@ impl ReviewTools<'_> {
         }
         let state = if viewed { "viewed" } else { "not viewed" };
         let changed_count = changed.len();
-        let omitted = (changed.len() + kept.len()).saturating_sub(MAX_REPORTED_PATHS);
+        let kept_count = kept.len();
+        let omitted = (changed_count + kept_count).saturating_sub(MAX_REPORTED_PATHS);
         changed.truncate(MAX_REPORTED_PATHS);
         kept.truncate(MAX_REPORTED_PATHS.saturating_sub(changed.len()));
         Ok(ViewedReport {
             message: format!(
                 "marked {changed_count} file{} {state}; {} already {state}{}",
                 if changed_count == 1 { "" } else { "s" },
-                kept.len(),
+                kept_count,
                 if not_found.is_empty() {
                     String::new()
                 } else {
@@ -597,7 +611,7 @@ impl ReviewTools<'_> {
                 .iter()
                 .enumerate()
                 .filter(|(_, resolved)| {
-                    resolved.source_id == wanted
+                    review.matches_selector(resolved, wanted)
                         || review
                             .workspace
                             .sources

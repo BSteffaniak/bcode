@@ -28,6 +28,7 @@ mod items;
 mod keys;
 mod navigation;
 mod review;
+mod series;
 mod upsert;
 
 #[cfg(test)]

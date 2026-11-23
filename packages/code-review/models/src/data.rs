@@ -178,6 +178,19 @@ pub struct ResolvedSource {
     pub selection: Option<BrowseSelection>,
 }
 
+/// Ordered description of a selected-commit source and, when requested, its exact aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitSeriesResolution {
+    /// Members in series order; each has a part position and its commit as head.
+    pub members: Vec<ResolvedSource>,
+    /// Exact combined diff, with no part position. Absent if not requested or unavailable.
+    pub combined: Option<ResolvedSource>,
+    /// Why an exact combined diff could not be produced, when known.
+    pub unavailable: Option<String>,
+    /// Whether the selection is a contiguous chain.
+    pub contiguous: bool,
+}
+
 /// Request payload for `review.sources.resolve`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveReviewSourcesRequest {

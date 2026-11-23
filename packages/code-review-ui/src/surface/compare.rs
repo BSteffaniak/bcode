@@ -608,7 +608,11 @@ impl ReviewSurface {
             .filter(|group| {
                 !group.loading
                     && !group.alternate
-                    && group.source.part.is_none()
+                    && (group.source.part.is_none()
+                        || matches!(
+                            group.key,
+                            bcode_code_review_models::ReviewGroupKey::Member { .. }
+                        ))
                     && group.source.mode == ResolvedSourceMode::Diff
                     && !layers.contains(&group.source.source_id)
             })
@@ -621,7 +625,7 @@ impl ReviewSurface {
             })
             .filter_map(|group| {
                 Some(PlainSource {
-                    source_id: group.source.source_id.clone(),
+                    source_id: group.key.selector(),
                     head: group.source.head.commit_oid()?.to_owned(),
                     base: group.source.base.commit_oid()?.to_owned(),
                 })
@@ -1225,13 +1229,25 @@ impl ReviewSurface {
 
     /// How many compared layers found what.
     pub(super) fn compare_counts(&self) -> CompareCounts {
-        let others = self.plain_sources().len();
+        let layers = self.layer_sources();
+        let plain = self.plain_sources();
+        let others = plain.len();
+        let active: BTreeSet<_> = layers
+            .into_iter()
+            .map(|layer| layer.source_id)
+            .chain(plain.into_iter().map(|source| source.source_id))
+            .collect();
         let mut counts = CompareCounts {
-            layers: self.layer_sources().len() + others,
+            layers: active.len(),
             others,
             ..CompareCounts::default()
         };
-        for source in self.comparing.pairs.keys() {
+        for source in self
+            .comparing
+            .pairs
+            .keys()
+            .filter(|source| active.contains(*source))
+        {
             match self.compared_kind(source) {
                 None => counts.pending += 1,
                 Some(DeltaKind::Changed) => counts.changed += 1,
@@ -1280,7 +1296,9 @@ impl ReviewSurface {
     /// Leave filtered sources out of the document when every layer shows in it (one layer at a
     /// time, the filter only changes which layers `.`/`,` visit).
     pub(super) fn apply_compare_filter(&mut self) {
-        let filtered = if self.shown_stack_view() == Some(super::stack::StackView::AllLayers) {
+        let filtered = if self.series_menu_state().is_some_and(|series| {
+            series.view == bcode_code_review_models::ReviewSeriesView::AllMembers
+        }) {
             self.compare_filtered()
         } else {
             BTreeSet::new()

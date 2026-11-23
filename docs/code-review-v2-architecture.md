@@ -350,6 +350,32 @@ under the chat host; the tables and their attribution are in 13.2.
 
 ### 4.1 Revision-pinned sources
 
+#### Series presentation versus revision resolution
+
+A review series changes which diffs are shown, not what the workspace reviews or which
+per-source comparison baseline is active. `ReviewSeriesView` selects `OneMember`, `AllMembers`
+or `Combined`. The saved presentation’s `series_views` map records the view and optional
+`last_member` by series, without changing the workspace id. Existing PR layer/whole-stack
+sources retain their source ids and forge metadata. A `Commits` series remains one canonical
+source; its groups do not create additional workspace sources or borrow PR identities.
+
+`ReviewData::commit_series(root, source, combined)` returns `CommitSeriesResolution` with
+`members`, optional `combined`, optional `unavailable` diagnostic and `contiguous`. The cheap
+description (`combined = false`) does not replay sparse commits; the explicit combined request
+returns the exact diff or a reason it is unavailable. Never approximate a sparse selection
+with an endpoint range. This planner is separate from legacy `review.sources.resolve` below.
+
+The adapter consults the canonical source kind. For a commits source a resolved member has a
+`part` and its head is the member’s full OID; a combined diff has no `part`. Use
+`ReviewGroupKey::selector()` for stable addressing: a standalone group's selector is its
+existing source id; member and combined selectors distinguish representations of the same
+source. Do not use a label, abbreviated hash or part index as durable member identity. File
+state and anchors must distinguish equal paths across groups, and only active groups contribute
+to progress and assistant totals. Selecting a different representation does not retarget a
+comment made in the original one.
+
+#### Resolution by source kind
+
 Every diff source resolves to concrete object IDs when a review is opened or refreshed:
 
 * `ResolvedSource { source_id, base: RevisionRef, head: RevisionRef, mode, paths, line_range,

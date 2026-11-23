@@ -190,28 +190,36 @@ impl ReviewTools<'_> {
             });
         };
         let number = name.trim_start_matches('#').parse::<u64>().ok();
-        review
+        let mut matches = review
             .resolved
             .iter()
-            .position(|resolved| {
+            .enumerate()
+            .filter(|(_, resolved)| {
                 let source = review
                     .workspace
                     .sources
                     .iter()
                     .find(|source| source.id == resolved.source_id);
-                resolved.source_id == name
+                review.matches_selector(resolved, name)
                     || source.is_some_and(|source| {
                         source.label == name
                             || number
                                 .is_some_and(|number| source_number(&source.kind) == Some(number))
                     })
             })
-            .ok_or_else(|| {
-                AssistantError::NotFound(format!(
-                    "no source of this review is named {name}; sources: {}",
-                    source_names(review).join(", ")
-                ))
-            })
+            .map(|(index, _)| index);
+        let index = matches.next().ok_or_else(|| {
+            AssistantError::NotFound(format!(
+                "no source of this review is named {name}; sources: {}",
+                source_names(review).join(", ")
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(AssistantError::Invalid(format!(
+                "ambiguous source {name}; pass an active group selector"
+            )));
+        }
+        Ok(index)
     }
 
     fn hunks_of(
@@ -339,7 +347,7 @@ impl ReviewTools<'_> {
         };
         Ok(SearchView {
             revision: revision_label(&revision, &label_of(review, index), search.side),
-            source: resolved.source_id.clone(),
+            source: review.group_key(resolved).selector(),
             hits,
             truncated,
             note,
@@ -448,8 +456,11 @@ impl ReviewTools<'_> {
             return Err(AssistantError::Invalid("`path` is required".to_owned()));
         }
         let index = match (source, self.find_file(review, path, None)) {
-            (Some(_), _) | (None, Err(_)) => Self::pick_source(review, source, Side::New)?,
+            (Some(_), _) | (None, Err(AssistantError::NotFound(_))) => {
+                Self::pick_source(review, source, Side::New)?
+            }
             (None, Ok((index, _))) => index,
+            (None, Err(error)) => return Err(error),
         };
         let revision = review.resolved[index].head.clone();
         let max = max.unwrap_or(DEFAULT_RELATED).clamp(1, MAX_RELATED);

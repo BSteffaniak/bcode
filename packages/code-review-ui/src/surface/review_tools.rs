@@ -115,9 +115,30 @@ impl ReviewSurface {
             layer: self.current_layer_number(),
             chip: self.assistant_place(),
             // A changed guide grant binds the session again, as a reopened review does.
-            generation: self.generation ^ self.guide.grant_epoch.rotate_left(32),
+            generation: self.assistant_binding_generation(),
             binding: binding.then(|| Box::new(self.assistant_binding(String::new()))),
         }
+    }
+
+    /// In-place grouping changes and streamed arrivals change the assistant's pinned sources
+    /// even if no new open generation was started.
+    fn assistant_binding_generation(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut generation = DefaultHasher::new();
+        self.generation.hash(&mut generation);
+        self.guide.grant_epoch.hash(&mut generation);
+        if let Some(review) = &self.review {
+            for group in review
+                .doc
+                .groups()
+                .filter(|g| !g.hidden && !g.alternate && !g.loading)
+            {
+                group.key.hash(&mut generation);
+                group.source.head.commit_oid().hash(&mut generation);
+                group.source.base.commit_oid().hash(&mut generation);
+            }
+        }
+        generation.finish()
     }
 
     /// The binding of this review for `session_id`: its workspace and the revisions its open
@@ -130,7 +151,11 @@ impl ReviewSurface {
                 let mut resolved = Vec::new();
                 let mut stacks: Vec<&bcode_code_review_models::ResolvedReviewStack> = Vec::new();
                 let mut seen = BTreeSet::new();
-                for group in review.doc.groups() {
+                for group in review
+                    .doc
+                    .groups()
+                    .filter(|g| !g.hidden && !g.alternate && !g.loading)
+                {
                     resolved.push(group.source.clone());
                     if let Some(stack) = group.stack
                         && seen.insert(stack.stack.source_id.as_str())
@@ -431,11 +456,7 @@ impl ReviewSurface {
         viewed.apply(workspace);
         let workspace = workspace.clone();
         if workspace.id == super::TRANSIENT_WORKSPACE_ID {
-            self.viewed_sync.transient = Some((
-                workspace.viewed_files.clone(),
-                workspace.viewed_marks.clone(),
-                workspace.viewed_threads.clone(),
-            ));
+            self.viewed_sync.transient = Some(viewed.clone());
         }
         if let Some(review) = self.review.as_mut() {
             review.doc.set_viewed_marks(&workspace);
@@ -489,20 +510,23 @@ impl ReviewSurface {
     ) -> Result<FileRef, String> {
         let review = self.review.as_ref().ok_or("the review is still loading")?;
         let path = path.trim().trim_start_matches("./").to_owned();
-        let mut named: Vec<&FileRef> = review
+        let named: Vec<&FileRef> = review
             .doc
-            .file_keys()
-            .filter(|file| {
-                file.path == path && source.is_none_or(|source| file.source_id == source)
+            .groups()
+            .filter(|group| !group.alternate && (!group.hidden || within.is_some()))
+            .filter(|group| {
+                [source, within]
+                    .into_iter()
+                    .flatten()
+                    .all(|id| id == group.source.source_id || id == group.key.selector())
             })
+            .flat_map(|group| review.doc.group_files(group.index))
+            .filter(|file| file.path == path)
             .collect();
         if named.is_empty() {
             return Err(format!(
-                "{path} is not a file shown in this review (code_review.list_files lists them)"
+                "{path} is not a file shown in the requested group (code_review.list_files lists them)"
             ));
-        }
-        if let Some(within) = within {
-            named.retain(|file| file.source_id == within);
         }
         named
             .first()
@@ -541,11 +565,8 @@ impl ReviewSurface {
         {
             review.note_splices();
         }
-        let key = if review.doc.index_of(&key).is_some() || line.is_none() {
-            key
-        } else {
-            ItemKey::FileHeader(file.clone())
-        };
+        // Keep the line key: jump_to_annotation unfolds the file and retains the
+        // requested line while a newly entered layer's hunks are loading.
         super::annotate::jump_to_annotation(review, &key);
         line.map_or_else(|| file.path.clone(), |line| format!("{}:{line}", file.path))
     }

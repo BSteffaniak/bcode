@@ -11,6 +11,7 @@
 //! cache of immutable (commit-to-commit) file indexes, and resolved repository roots.
 
 mod blob;
+mod commit_series;
 mod flight;
 pub(crate) mod git;
 pub(crate) mod grep;

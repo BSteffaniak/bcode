@@ -164,6 +164,7 @@ fn draft(thread: &str, path: &str, new_line: u32) -> DraftComment {
             is_file_anchor: false,
             surface_id: None,
             source_id: None,
+            group: None,
             head_oid: None,
             blob_oid: None,
             reply_to: None,

@@ -31,7 +31,7 @@ use bcode_code_review_models::{
     GuideDepth, GuideGrant, GuideHead, GuideOrigin, GuideRecord, GuideScope, GuideStatus,
     GuideStrategy, GuideVersion, GuideVersionRecord, ListGuideAreasRequest,
     ListGuideSectionMarksRequest, ListGuideThreadsRequest, ListGuideVersionsRequest,
-    ListReviewGuidesRequest, REVIEW_GUIDE_SCHEMA_VERSION, ResolvedSource, ResolvedSourceMode,
+    ListReviewGuidesRequest, REVIEW_GUIDE_SCHEMA_VERSION, ResolvedSourceMode,
     ReviewCompareBaseline, ReviewGuide, ReviewSourceKind, SaveGuideAreaRequest,
     UpdateReviewGuideRequest,
 };
@@ -201,14 +201,6 @@ fn encode<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
-/// Sources pinned to a version's heads, in review order; labels and pull request numbers by
-/// source id.
-struct Pinned {
-    sources: Vec<ResolvedSource>,
-    labels: BTreeMap<String, String>,
-    numbers: BTreeMap<String, u64>,
-}
-
 impl ReviewTools<'_> {
     /// The review's guides, most recently changed first (archived ones too).
     fn guides(&self, review: &OpenReview) -> Result<Vec<GuideRecord>, AssistantError> {
@@ -283,45 +275,12 @@ impl ReviewTools<'_> {
             })
     }
 
-    /// The review's sources pinned to `heads` (sources the review no longer has are left out).
-    fn pinned(review: &OpenReview, heads: Option<&BTreeMap<String, GuideHead>>) -> Pinned {
-        let mut seen = BTreeSet::new();
-        let sources = review
-            .resolved
-            .iter()
-            .filter(|source| seen.insert(source.source_id.clone()))
-            .filter_map(|source| {
-                heads.map_or_else(
-                    || Some(source.clone()),
-                    |heads| {
-                        heads.get(&source.source_id).map(|head| ResolvedSource {
-                            base: head.base.clone(),
-                            head: head.head.clone(),
-                            ..source.clone()
-                        })
-                    },
-                )
-            })
-            .collect();
-        let mut labels = BTreeMap::new();
-        let mut numbers = BTreeMap::new();
-        for (index, source) in review.resolved.iter().enumerate() {
-            labels.insert(source.source_id.clone(), label_of(review, index));
-            if let Some(number) = review
-                .workspace
-                .sources
-                .iter()
-                .find(|candidate| candidate.id == source.source_id)
-                .and_then(|candidate| source_number(&candidate.kind))
-            {
-                numbers.insert(source.source_id.clone(), number);
-            }
-        }
-        Pinned {
-            sources,
-            labels,
-            numbers,
-        }
+    fn active_groups(review: &OpenReview) -> crate::guide::sources::GuideSources {
+        crate::guide::sources::GuideSources::project(
+            &review.workspace.sources,
+            &review.resolved,
+            None,
+        )
     }
 
     fn check(
@@ -329,35 +288,30 @@ impl ReviewTools<'_> {
         review: &OpenReview,
         heads: Option<&BTreeMap<String, GuideHead>>,
         requests: &[CitationRequest],
-    ) -> Vec<CitationCheck> {
+    ) -> Result<Vec<CitationCheck>, AssistantError> {
         if requests.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let pinned = Self::pinned(review, heads);
-        let reader = ReviewDataReader::new(
-            self.data,
-            review.repo_root.clone(),
-            &pinned.sources,
-            &pinned.labels,
-            &pinned.numbers,
+        if let Some(heads) = heads {
+            crate::guide::sources::restore_objects(
+                self.data,
+                &review.repo_root,
+                &review.workspace.sources,
+                heads,
+            )?;
+        }
+        let groups = crate::guide::sources::GuideSources::project(
+            &review.workspace.sources,
+            &review.resolved,
+            heads,
         );
-        check_citations(&reader, requests, now_ms())
+        let reader = ReviewDataReader::grouped(self.data, review.repo_root.clone(), &groups);
+        Ok(check_citations(&reader, requests, now_ms()))
     }
 
-    /// The heads the review's sources pin now, by source id (the first part of a source that
-    /// resolves to several).
     fn heads(review: &OpenReview) -> BTreeMap<String, GuideHead> {
-        let mut heads = BTreeMap::new();
-        for (index, source) in review.resolved.iter().enumerate() {
-            heads
-                .entry(source.source_id.clone())
-                .or_insert_with(|| GuideHead {
-                    base: source.base.clone(),
-                    head: source.head.clone(),
-                    label: label_of(review, index),
-                });
-        }
-        heads
+        let groups = Self::active_groups(review);
+        crate::guide::lifecycle::heads_of(&groups.sources, &groups.labels)
     }
 
     fn without_diff(review: &OpenReview) -> bool {
@@ -393,7 +347,7 @@ impl ReviewTools<'_> {
                     })?;
                 let index = Self::pick_layer(review, name)?;
                 GuideScope::Layer {
-                    source_id: review.resolved[index].source_id.clone(),
+                    source_id: review.group_key(&review.resolved[index]).selector(),
                 }
             }
             "since" => GuideScope::Since {
@@ -410,13 +364,21 @@ impl ReviewTools<'_> {
 
     fn pick_layer(review: &OpenReview, name: &str) -> Result<usize, AssistantError> {
         let number = name.trim().trim_start_matches('#').parse::<u64>().ok();
-        review
+        let name = name.trim();
+        if let Some(index) = review
+            .resolved
+            .iter()
+            .position(|r| review.group_key(r).selector() == name)
+        {
+            return Ok(index);
+        }
+        let mut hits = review
             .resolved
             .iter()
             .enumerate()
-            .position(|(index, source)| {
-                source.source_id == name.trim()
-                    || label_of(review, index) == name.trim()
+            .filter(|(index, source)| {
+                source.source_id == name
+                    || label_of(review, *index) == name
                     || review
                         .workspace
                         .sources
@@ -424,8 +386,16 @@ impl ReviewTools<'_> {
                         .find(|candidate| candidate.id == source.source_id)
                         .and_then(|candidate| source_number(&candidate.kind))
                         .is_some_and(|found| Some(found) == number)
-            })
-            .ok_or_else(|| AssistantError::NotFound(format!("this review has no layer {name}")))
+            });
+        match (hits.next(), hits.next()) {
+            (Some((index, _)), None) => Ok(index),
+            (None, _) => Err(AssistantError::NotFound(format!(
+                "this review has no layer {name}"
+            ))),
+            _ => Err(AssistantError::Invalid(format!(
+                "{name} names several groups; use a group selector"
+            ))),
+        }
     }
 
     /// The review's stack layers stepped one at a time, bottom first.
@@ -815,7 +785,7 @@ impl ReviewTools<'_> {
             return self.write_area(review, session, &guide, &current.version, &ops);
         }
         let requests = batch_citations(&ops);
-        let checks = self.check(review, Some(&current.version.heads), &requests);
+        let checks = self.check(review, Some(&current.version.heads), &requests)?;
         if strict
             && checks
                 .iter()
@@ -932,11 +902,16 @@ impl ReviewTools<'_> {
         if checks.is_empty() {
             return Ok(Vec::new());
         }
-        let numbers = Self::pinned(review, None).numbers;
+        let pinned = crate::guide::sources::GuideSources::project(
+            &review.workspace.sources,
+            &review.resolved,
+            Some(heads),
+        );
+        let numbers = pinned.numbers;
         let pairs = crate::guide::lifecycle::pairs_at(pairs, heads, &numbers);
         let since = SinceDelta::compute(self.data, &review.repo_root, &pairs, &numbers)?;
-        let primary = review
-            .resolved
+        let primary = pinned
+            .sources
             .first()
             .map(|source| source.source_id.as_str());
         let mut errors = Vec::new();
@@ -1034,7 +1009,7 @@ impl ReviewTools<'_> {
             ));
         }
         let requests = batch_citations(ops);
-        let checks = self.check(review, Some(&version.heads), &requests);
+        let checks = self.check(review, Some(&version.heads), &requests)?;
         let now = now_ms();
         let (mut area, expected) = self.area(review, session, version, area_id, now)?;
         let prefix = area_citation_prefix(area_id);
@@ -1202,7 +1177,19 @@ impl ReviewTools<'_> {
         let repo = &review.repo_root;
         let id = &version.guide_id;
         if include.contains(&GuideInclude::Freshness) {
-            answer["freshness"] = match assess_version(self.data, repo, version, &review.resolved) {
+            let current = crate::guide::sources::with_legacy_pairs(
+                Self::active_groups(review).sources,
+                &review.workspace.sources,
+                &version.heads,
+            );
+            answer["freshness"] = match crate::guide::sources::restore_objects(
+                self.data,
+                repo,
+                &review.workspace.sources,
+                &version.heads,
+            )
+            .and_then(|()| assess_version(self.data, repo, version, &current))
+            {
                 Ok(freshness) => encode(&freshness),
                 Err(error) => json!({"error": error.to_string()}),
             };
@@ -1312,12 +1299,12 @@ impl ReviewTools<'_> {
         let heads = pinned.as_ref().map(|record| &record.version.heads);
         let mut answer = json!({
             "pinned_to": heads.map_or_else(|| encode(&Self::heads(review)), encode),
-            "citations": numbered_checks(&self.check(review, heads, citations)),
+            "citations": numbered_checks(&self.check(review, heads, citations)?),
         });
         if let Some(section) = section {
             let op = GuideOp::PutSection(section);
             let requests = batch_citations(std::slice::from_ref(&op));
-            let checks = self.check(review, heads, &requests);
+            let checks = self.check(review, heads, &requests)?;
             let mut scratch = pinned.map_or_else(
                 || new_version("check", Self::heads(review), GuideOrigin::default(), 0),
                 |record| record.version,
@@ -1411,7 +1398,7 @@ impl ReviewTools<'_> {
             .iter()
             .map(|(index, entry)| PlanFile {
                 path: entry.path.clone(),
-                source_id: review.resolved[*index].source_id.clone(),
+                source_id: review.group_key(&review.resolved[*index]).selector(),
                 changed_lines: u64::from(entry.additions) + u64::from(entry.deletions),
             })
             .collect();

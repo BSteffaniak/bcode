@@ -688,7 +688,19 @@ fn a_stack_of_three_layers_gets_one_layer_guide_each_linked_from_the_stack_guide
         }
         settled(&mut scenario);
     }
-    let (stack_id, generation) = started(&scenario).expect("a stack guide fans out per layer");
+    let (stack_id, generation) = started(&scenario).unwrap_or_else(|| {
+        let screen = scenario.frame();
+        let review = scenario.surface().review().expect("review");
+        panic!(
+            "a stack guide fans out per layer; status={:?}, phase={:?}, guide={:?}\n{}",
+            review.status(),
+            review.fan_out_phase(),
+            review
+                .guide()
+                .map(|active| (&active.guide.scope, &active.version.generation)),
+            screen.text(),
+        );
+    });
     assert!(generation.areas.len() >= 3, "{generation:?}");
     let repo = fixture.root().to_path_buf();
     for area in &generation.areas {

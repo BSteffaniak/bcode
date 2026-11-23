@@ -284,6 +284,7 @@ fn step_through(root: &Path, first: u64) -> OpenRequest {
         first: Some(format!("layer-{first}")),
         max_layers: None,
         cancel: crate::provider::Cancel::default(),
+        series_views: std::collections::BTreeMap::new(),
         browse: bcode_code_review_models::BrowseOptions::default(),
     }
 }

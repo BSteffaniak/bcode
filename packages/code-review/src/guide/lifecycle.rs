@@ -20,8 +20,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// The heads `sources` pin now, by source id (the first part of a source that resolves to
-/// several), labelled from `labels` (else the source id).
+/// The heads of guide-local resolutions, keyed by selector. Project workspace pairs with
+/// [`super::sources::GuideSources::project`] before calling for a series review.
 #[must_use]
 pub fn heads_of(
     sources: &[ResolvedSource],
@@ -73,7 +73,6 @@ pub fn refresh_fork(
     now_ms: u64,
 ) -> (GuideVersion, Vec<String>) {
     let heads = heads_of(current, labels);
-    let primary = current.first().map(|source| source.source_id.as_str());
     let mut citations = base.citations.clone();
     for (id, citation) in &mut citations {
         let lines = match freshness.citations.get(id) {
@@ -81,14 +80,12 @@ pub fn refresh_fork(
             Some(Freshness::Moved { lines }) => *lines,
             _ => continue,
         };
-        let Some(head) = citation
-            .source_id
-            .as_deref()
-            .or(primary)
-            .and_then(|source| heads.get(source))
+        let Some((selector, head)) = super::sources::citation_selector(citation, &base.heads)
+            .and_then(|source| heads.get_key_value(source))
         else {
             continue;
         };
+        citation.source_id = Some(selector.clone());
         let revision = match citation.side {
             ReviewLineSide::New => head.head.clone(),
             ReviewLineSide::Old => head.base.clone(),

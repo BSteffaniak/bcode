@@ -84,6 +84,7 @@ fn anchor(
         is_file_anchor: false,
         surface_id: None,
         source_id: source.map(str::to_string),
+        group: None,
         head_oid: None,
         blob_oid: None,
         reply_to: None,

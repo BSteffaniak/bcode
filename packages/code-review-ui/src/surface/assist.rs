@@ -589,13 +589,18 @@ impl ReviewSurface {
         let Some(review) = self.review.as_ref() else {
             return;
         };
-        let identities: Vec<_> = review
+        let files: Vec<_> = review
             .doc
-            .file_keys()
-            .filter_map(|file| review.doc.viewed_identity(file))
+            .groups()
+            .filter(|group| !group.hidden && !group.alternate)
+            .flat_map(|group| review.doc.group_files(group.index))
+            .cloned()
+            .collect();
+        let identities: Vec<_> = files
+            .iter()
+            .filter_map(|file| super::viewed_sync::identity(&review.doc, file))
             .collect();
         let count = identities.len();
-        let files: Vec<_> = review.doc.file_keys().cloned().collect();
         if let Some(review) = self.review.as_mut() {
             for file in &files {
                 review
@@ -604,20 +609,7 @@ impl ReviewSurface {
             }
         }
         let workspace = self.workspace_mut();
-        if viewed {
-            let files: Vec<_> = identities
-                .iter()
-                .map(|(identity, patch)| identity.with_patch(patch.as_deref()))
-                .collect();
-            bcode_code_review::viewed::mark_all_viewed(workspace, &files);
-        } else {
-            for (identity, patch) in &identities {
-                bcode_code_review::viewed::unmark_viewed(
-                    workspace,
-                    &identity.with_patch(patch.as_deref()),
-                );
-            }
-        }
+        super::viewed_sync::set_batch(workspace, &identities, viewed);
         self.apply_viewed();
         self.set_status(
             format!(
@@ -894,7 +886,9 @@ impl ReviewSurface {
             let _ = writeln!(out, "Viewed: {}/{} files", progress.viewed, progress.total);
             let unviewed: Vec<String> = review
                 .doc
-                .file_keys()
+                .groups()
+                .filter(|group| !group.hidden && !group.alternate)
+                .flat_map(|group| review.doc.group_files(group.index))
                 .filter(|file| {
                     !review
                         .doc
