@@ -420,3 +420,33 @@ fn stepping_and_changing_stack_views_neither_rereads_the_guide_nor_narrows_progr
     assert!(total > 0);
     assert_eq!(viewed, total, "every layer and source counts");
 }
+
+#[test]
+fn an_unsaved_sparse_selection_computes_its_combined_diff_when_asked() {
+    let repo = fixture();
+    let first = commit(&repo, "a.txt", "a1\n");
+    commit(&repo, "skipped.txt", "not selected\n");
+    let second = commit(&repo, "a.txt", "a2\n");
+    let backend = Arc::new(TestBackend::default());
+    let (mut app, _) = super::app::open(
+        &repo,
+        &backend,
+        crate::entry::Entry::Sources {
+            title: None,
+            sources: vec![ReviewSourceKind::Commits {
+                revs: vec![first, second],
+            }],
+        },
+        160,
+        48,
+    );
+    assert_eq!(series_view(&app), Some(ReviewSeriesView::AllMembers));
+    key(&mut app, "shift+o");
+    assert_eq!(series_view(&app), Some(ReviewSeriesView::Combined));
+    let doc = app.surface().review().unwrap().document().unwrap();
+    assert!(
+        doc.groups()
+            .any(|g| matches!(g.key, ReviewGroupKey::Combined { .. }) && !g.alternate),
+        "the combined diff shows"
+    );
+}
