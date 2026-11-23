@@ -2,7 +2,7 @@
 //!
 //! Each side of a visible, resident text file is read whole and highlighted on the blocking
 //! pool with BMUX's incremental whole-text highlighter, a bounded number of lines per step, and
-//! cached by blob identity and palette. The lines highlighted after the first step are published
+//! cached by blob identity. The lines highlighted after the first step are published
 //! at once, so the top of a large file colors before the rest is done. Work for a blob whose file
 //! leaves the screen is cancelled between steps (and a blob read that arrives after cancellation
 //! is dropped), so fast scrolling never keeps a core busy with files already scrolled past.
@@ -11,12 +11,17 @@
 //! blob yields no tokens rather than wrong ones. Lines render unhighlighted until their blob's
 //! tokens arrive; highlighting never changes geometry. Rows cache by a per-blob stamp
 //! ([`SyntaxStore::stamp`]), so a highlight landing for one file leaves other files' rows cached.
+//!
+//! Tokens keep their semantic roles, and rows color them with the current palette
+//! ([`SyntaxStore::paint`]), so a palette change (a theme switch or a contrast adjustment)
+//! recolors cached highlights at once instead of discarding and re-parsing them.
 
 use bcode_code_review_models::{ReviewBlobRef, ReviewBlobSelector, RevisionRef};
-use bcode_syntax_render::{HighlightedText, SyntaxHighlighter, SyntaxPalette};
+use bcode_syntax_render::{HighlightedText, SyntaxHighlighter, SyntaxPalette, SyntaxStyle};
+use bmux_tui::style::Style;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,13 +66,11 @@ impl BlobId {
     }
 }
 
-/// Cache key: a blob and the palette it was highlighted with.
+/// Cache key: a blob. Highlights do not depend on the palette; rows color their roles.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SyntaxKey {
     /// Blob.
     pub blob: BlobId,
-    /// Palette fingerprint.
-    pub palette: u64,
 }
 
 #[derive(Debug)]
@@ -104,7 +107,6 @@ impl JobToken {
 #[derive(Debug)]
 pub struct SyntaxStore {
     palette: SyntaxPalette,
-    palette_hash: u64,
     entries: BTreeMap<SyntaxKey, Entry>,
     pending: BTreeMap<SyntaxKey, JobToken>,
     total_lines: usize,
@@ -123,10 +125,8 @@ pub struct SyntaxStore {
 
 impl Default for SyntaxStore {
     fn default() -> Self {
-        let palette = SyntaxPalette::default();
         Self {
-            palette,
-            palette_hash: palette_hash(palette),
+            palette: SyntaxPalette::default(),
             entries: BTreeMap::new(),
             pending: BTreeMap::new(),
             total_lines: 0,
@@ -141,25 +141,28 @@ impl Default for SyntaxStore {
     }
 }
 
-fn palette_hash(palette: SyntaxPalette) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    palette.hash(&mut hasher);
-    hasher.finish()
-}
-
 impl SyntaxStore {
-    /// Use `palette` for new highlights. Returns whether it changed (rows must be rebuilt).
+    /// Color tokens with `palette` from now on. Cached highlights are kept; returns whether it
+    /// changed (rows must be rebuilt to recolor).
     pub fn set_palette(&mut self, palette: SyntaxPalette) -> bool {
         if palette == self.palette {
             return false;
         }
         self.palette = palette;
-        self.palette_hash = palette_hash(palette);
         self.epoch += 1;
         self.palette_epoch += 1;
-        self.object_stamps.clear();
-        self.tree_stamps.clear();
         true
+    }
+
+    /// The terminal style of a highlighted token in the current palette: its role's color and
+    /// its font emphasis.
+    #[must_use]
+    pub const fn paint(&self, style: SyntaxStyle) -> Style {
+        SyntaxStyle {
+            foreground: self.palette.resolve(style.role, style.base_role),
+            ..style
+        }
+        .to_tui()
     }
 
     /// Current palette.
@@ -222,10 +225,7 @@ impl SyntaxStore {
             },
             ReviewBlobRef::Absent => return None,
         };
-        Some(SyntaxKey {
-            blob,
-            palette: self.palette_hash,
-        })
+        Some(SyntaxKey { blob })
     }
 
     /// Ready highlight of `key`.
@@ -285,7 +285,7 @@ impl SyntaxStore {
         self.pending.len()
     }
 
-    /// A highlighter for the current palette.
+    /// A highlighter (tokens carry roles; [`Self::paint`] colors them).
     #[must_use]
     pub const fn highlighter(&self) -> SyntaxHighlighter {
         SyntaxHighlighter::with_palette(self.palette)
@@ -316,9 +316,6 @@ impl SyntaxStore {
             })
         {
             self.pending.remove(&key);
-        }
-        if key.palette != self.palette_hash {
-            return;
         }
         let lines = text.as_ref().map_or(0, |text| text.line_count());
         let key_blob = key.blob.clone();
@@ -418,7 +415,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_is_bounded_and_keys_follow_palette_and_generation() {
+    fn cache_is_bounded_and_keys_follow_generation_not_palette() {
         let mut store = SyntaxStore::default();
         let object = ReviewBlobRef::Object { oid: "a".into() };
         let key = store.key(&object, "x.rs").unwrap();
@@ -455,7 +452,47 @@ mod tests {
         palette.keyword = bcode_syntax_render::SyntaxColor::rgb(1, 2, 3);
         assert!(store.set_palette(palette));
         assert!(store.epoch() > epoch);
-        assert_ne!(store.key(&object, "x.rs").unwrap(), key);
+        assert_eq!(
+            store.key(&object, "x.rs").unwrap(),
+            key,
+            "highlights outlive palette changes"
+        );
+    }
+
+    #[test]
+    fn a_palette_change_recolors_cached_highlights_without_highlighting_again() {
+        use bcode_syntax_render::{SyntaxColor, SyntaxRole};
+        let mut store = SyntaxStore::default();
+        let blob = ReviewBlobRef::Object { oid: "a".into() };
+        let key = store.key(&blob, "x.rs").unwrap();
+        let text = store.highlighter().highlight_text("x.rs", "fn main() {}\n");
+        store.finish(key.clone(), Some(Arc::new(text)));
+        let keyword = |store: &SyntaxStore| {
+            let tokens = store
+                .get(&key)
+                .unwrap()
+                .line_matching(1, "fn main() {}")
+                .unwrap();
+            let token = tokens
+                .iter()
+                .find(|token| token.style.base_role == SyntaxRole::Keyword)
+                .expect("a keyword token");
+            store.paint(token.style)
+        };
+        let before = keyword(&store);
+        let stamp = store.stamp(&blob, "x.rs");
+
+        let mut palette = store.palette();
+        palette.keyword = SyntaxColor::rgb(1, 2, 3);
+        assert!(store.set_palette(palette));
+        // The highlight is still there, and no job is needed to show it.
+        assert!(store.known(&key), "the cached highlight is kept");
+        assert_eq!(store.pending_jobs(), 0);
+        let after = keyword(&store);
+        assert_ne!(after, before);
+        assert_eq!(after.fg, Some(SyntaxColor::rgb(1, 2, 3).to_tui()));
+        // Rows built from the old colors are rebuilt.
+        assert_ne!(store.stamp(&blob, "x.rs"), stamp);
     }
 
     fn object(store: &SyntaxStore, oid: &str) -> SyntaxKey {

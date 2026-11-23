@@ -1289,7 +1289,9 @@ impl RowContext<'_> {
             .map(|tokens| {
                 tokens
                     .iter()
-                    .map(|token| DiffSyntaxRange::new(token.start, token.end, token.style.to_tui()))
+                    .map(|token| {
+                        DiffSyntaxRange::new(token.start, token.end, self.syntax.paint(token.style))
+                    })
                     .collect()
             })
             .unwrap_or_default()
