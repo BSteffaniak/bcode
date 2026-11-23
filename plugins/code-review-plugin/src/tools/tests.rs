@@ -1660,3 +1660,267 @@ fn create_review_can_list_ignored_files_and_find_paths_flags_weak_matches() {
 
 mod guide;
 mod guide_templates;
+
+/// A saved review of the selected commits `revs`, with its stored workspace changed by `edit`.
+fn commits_review(
+    harness: &mut Harness,
+    revs: &[&str],
+    edit: impl FnOnce(&mut ReviewWorkspace),
+) -> (String, String) {
+    let review = created(harness, &json!({"sources": [{"kind": "last_commit"}]}));
+    let id = review["id"].as_str().expect("id").to_owned();
+    let root = harness.fixture.root().to_path_buf();
+    let mut workspace = stored(harness, &root, &id);
+    workspace.sources[0].kind = bcode_code_review_models::ReviewSourceKind::Commits {
+        revs: revs.iter().map(|rev| (*rev).to_owned()).collect(),
+    };
+    edit(&mut workspace);
+    let source_id = workspace.sources[0].id.clone();
+    harness
+        .store()
+        .update_workspace(bcode_code_review_models::UpdateReviewWorkspaceRequest {
+            repo_path: root,
+            workspace,
+            base: None,
+        })
+        .expect("save sources");
+    (id, source_id)
+}
+
+fn listed_files(harness: &mut Harness, id: &str) -> Vec<(String, bool, Option<String>)> {
+    let listed = harness.json("code_review.list_files", &json!({"review": id}), SESSION);
+    listed["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().expect("path").to_owned(),
+                file["viewed"] == true,
+                file["source"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_selection_whose_aliases_pin_one_commit_is_an_ordinary_source() {
+    let mut harness = Harness::new();
+    let head = harness
+        .fixture
+        .git(&["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let (id, source_id) = commits_review(&mut harness, &["HEAD", &head], |_| {});
+    let summary = harness.json("code_review.summary", &json!({"review": id}), SESSION);
+    let sources = summary["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "{summary}");
+    assert_eq!(sources[0]["selector"], source_id.as_str());
+    let path = GitFixture::modified_path(0);
+    let files = listed_files(&mut harness, &id);
+    assert!(
+        files.iter().all(|(_, _, source)| source.is_none()),
+        "{files:?}"
+    );
+    harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "paths": [path]}),
+        SESSION,
+    );
+    harness.json(
+        "code_review.add_comment",
+        &json!({"review": id, "path": path, "body": "Plain source"}),
+        SESSION,
+    );
+    let root = harness.fixture.root().to_path_buf();
+    let workspace = stored(&harness, &root, &id);
+    assert!(workspace.viewed_files.contains(&path));
+    assert!(workspace.group_viewed_marks.is_empty(), "{workspace:?}");
+    let (target, scope) = bcode_code_review::scope::annotation_scope(&workspace);
+    let drafts = harness
+        .store()
+        .list_drafts(&ListDraftsRequest {
+            repo_path: root,
+            target,
+            scope: Some(scope),
+        })
+        .expect("drafts")
+        .drafts;
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].anchor.group, None);
+    assert_eq!(
+        drafts[0].anchor.source_id.as_deref(),
+        Some(source_id.as_str())
+    );
+}
+
+#[test]
+fn marks_saved_before_a_selection_was_a_series_carry_over_once() {
+    let mut harness = Harness::new();
+    let path = GitFixture::modified_path(0);
+    // Saved in the ungrouped format of a contiguous selection: one diff, workspace-wide marks.
+    let legacy = path.clone();
+    let (id, source_id) = commits_review(&mut harness, &["HEAD~1", "HEAD"], move |workspace| {
+        workspace.viewed_files.insert(legacy);
+    });
+    let combined = bcode_code_review_models::ReviewGroupKey::Combined { source_id }.selector();
+    let files = listed_files(&mut harness, &id);
+    let file = files
+        .iter()
+        .find(|(listed, _, _)| *listed == path)
+        .expect("combined lists the file");
+    assert!(file.1, "a legacy mark still shows viewed: {files:?}");
+    assert_eq!(file.2.as_deref(), Some(combined.as_str()));
+
+    harness.json(
+        "code_review.mark_viewed",
+        &json!({"review": id, "paths": [path], "viewed": false}),
+        SESSION,
+    );
+    let root = harness.fixture.root().to_path_buf();
+    let workspace = stored(&harness, &root, &id);
+    assert!(workspace.group_viewed_marks.contains_key(&combined));
+    // The legacy mark is still there for ordinary sources, yet is not adopted again.
+    assert!(workspace.viewed_files.contains(&path));
+    let files = listed_files(&mut harness, &id);
+    assert!(
+        files
+            .iter()
+            .all(|(listed, viewed, _)| *listed != path || !viewed),
+        "{files:?}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_stack_representation_stays_addressable_whichever_view_is_saved() {
+    use bcode_code_review_models::{
+        PullRequestSummary, ReviewSource, ReviewSourceKind, ReviewStack, ReviewStackLayer,
+        ReviewStackSnapshot, ReviewStackView,
+    };
+    let mut harness = Harness::new();
+    let fixture = &harness.fixture;
+    let oid = |rev: &str| fixture.git(&["rev-parse", rev]).trim().to_owned();
+    let branches = bcode_code_review::testing::fixture::STACK_BRANCHES;
+    let layers: Vec<ReviewStackLayer> = branches
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| ReviewStackLayer {
+            pull: PullRequestSummary {
+                number: 101 + index as u64,
+                title: format!("Layer {}", index + 1),
+                author: None,
+                base_branch: if index == 0 {
+                    "main".to_owned()
+                } else {
+                    branches[index - 1].to_owned()
+                },
+                head_branch: (*branch).to_owned(),
+                head_oid: oid(branch),
+                base_oid: (index == 0).then(|| oid("main")),
+                review_requested_from_me: false,
+                draft: false,
+                updated: None,
+                url: None,
+            },
+            parent: (index > 0).then(|| 100 + index as u64),
+        })
+        .collect();
+    let review = created(
+        &mut harness,
+        &json!({"sources": [{"kind": "stack_layers", "layers": [101, 102, 103], "repository": "acme/widgets"}]}),
+    );
+    let id = review["id"].as_str().expect("id").to_owned();
+    let root = harness.fixture.root().to_path_buf();
+    let mut workspace = stored(&harness, &root, &id);
+    let ReviewSourceKind::StackLayer {
+        provider,
+        repository,
+        ..
+    } = workspace.sources[0].kind.clone()
+    else {
+        panic!("layer source");
+    };
+    let middle = workspace.sources[1].id.clone();
+    workspace.sources.push(ReviewSource {
+        id: "whole-stack".to_owned(),
+        label: "Whole stack".to_owned(),
+        kind: ReviewSourceKind::Stack {
+            provider: provider.clone(),
+            repository: repository.clone(),
+            top: 103,
+        },
+        included: true,
+    });
+    workspace.stack_snapshots = vec![ReviewStackSnapshot {
+        provider,
+        repository,
+        stack: ReviewStack {
+            trunk: "main".to_owned(),
+            rooted_at_default_branch: true,
+            layers,
+            requested: 103,
+            siblings: Vec::new(),
+            warnings: Vec::new(),
+        },
+        confirmed_at_ms: 1,
+    }];
+    let mut presentation = bcode_code_review_models::ReviewPresentationState::default();
+    presentation.set_stack_view(ReviewStackView::Whole);
+    workspace.presentation = Some(presentation);
+    let save = |harness: &Harness, workspace: ReviewWorkspace| {
+        harness
+            .store()
+            .update_workspace(bcode_code_review_models::UpdateReviewWorkspaceRequest {
+                repo_path: harness.fixture.root().to_path_buf(),
+                workspace,
+                base: None,
+            })
+            .expect("save");
+    };
+    save(&harness, workspace.clone());
+    let active = |harness: &mut Harness| -> Vec<(String, bool)> {
+        let summary = harness.json("code_review.summary", &json!({"review": id}), SESSION);
+        summary["sources"]
+            .as_array()
+            .expect("sources")
+            .iter()
+            .map(|source| {
+                (
+                    source["selector"].as_str().expect("selector").to_owned(),
+                    source["active"] == true,
+                )
+            })
+            .collect()
+    };
+    let whole_view = active(&mut harness);
+    assert!(
+        whole_view.contains(&("whole-stack".to_owned(), true)),
+        "{whole_view:?}"
+    );
+    assert!(
+        whole_view.contains(&(middle.clone(), false)),
+        "{whole_view:?}"
+    );
+    // A layer the whole-stack view leaves out is still read by name.
+    let layer_path = GitFixture::stack_layer_path(2);
+    let diff = harness.call(
+        "code_review.file_diff",
+        &json!({"review": id, "path": layer_path, "source": middle}),
+        SESSION,
+    );
+    assert!(!diff.is_error, "{}", diff.output);
+
+    // The legacy all-layers flag shows the layers and leaves out the whole-stack diff.
+    workspace.presentation = Some(bcode_code_review_models::ReviewPresentationState {
+        all_stack_layers: true,
+        ..Default::default()
+    });
+    save(&harness, workspace);
+    let layers_view = active(&mut harness);
+    assert!(
+        layers_view.contains(&("whole-stack".to_owned(), false)),
+        "{layers_view:?}"
+    );
+    assert!(layers_view.contains(&(middle, true)), "{layers_view:?}");
+}

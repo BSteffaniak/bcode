@@ -278,16 +278,65 @@ pub fn mark_group_viewed(
 }
 
 /// Remove matching marks only in this group, leaving legacy and other group marks alone.
+///
+/// The group keeps its (possibly empty) entry: it records that the group's viewed state is its
+/// own, so workspace-wide marks are never adopted into it again.
 pub fn unmark_group_viewed(
     workspace: &mut ReviewWorkspace,
     group: &bcode_code_review_models::ReviewGroupKey,
     file: &ViewedIdentity<'_>,
 ) {
-    let key = group.selector();
-    if let Some(marks) = workspace.group_viewed_marks.get_mut(&key) {
+    if let Some(marks) = workspace.group_viewed_marks.get_mut(&group.selector()) {
         marks.retain(|mark| match_mark(mark, file, ViewedReset::Diff) == ViewedState::Unviewed);
-        if marks.is_empty() {
-            workspace.group_viewed_marks.remove(&key);
+    }
+}
+
+/// Viewed state of a file in `group`: a standalone group reads the workspace-wide marks, a
+/// series group only its own (see [`group_viewed_state`]).
+#[must_use]
+pub fn state_in_group(
+    workspace: &ReviewWorkspace,
+    group: &bcode_code_review_models::ReviewGroupKey,
+    file: &ViewedIdentity<'_>,
+    reset: ViewedReset,
+) -> ViewedState {
+    if matches!(
+        group,
+        bcode_code_review_models::ReviewGroupKey::Standalone { .. }
+    ) {
+        viewed_state(workspace, file, reset)
+    } else {
+        group_viewed_state(workspace, group, file, reset)
+    }
+}
+
+/// Mark (`viewed`) or unmark `files` of one group.
+///
+/// Marks are workspace-wide for a standalone group and group-scoped for a member or combined
+/// group. The single writer of group-aware viewed
+/// state; marks are sorted once per call.
+pub fn set_in_group(
+    workspace: &mut ReviewWorkspace,
+    group: &bcode_code_review_models::ReviewGroupKey,
+    files: &[ViewedIdentity<'_>],
+    viewed: bool,
+) {
+    let standalone = matches!(
+        group,
+        bcode_code_review_models::ReviewGroupKey::Standalone { .. }
+    );
+    match (standalone, viewed) {
+        (true, true) => mark_all_viewed(workspace, files),
+        (false, true) => mark_group_viewed(workspace, group, files),
+        (true, false) => {
+            for file in files {
+                unmark_viewed(workspace, file);
+            }
+        }
+        (false, false) => {
+            for file in files {
+                unmark_group_viewed(workspace, group, file);
+            }
         }
     }
 }
@@ -406,7 +455,10 @@ mod tests {
         );
         mark_group_viewed(&mut ws, &combined, &[file]);
         unmark_group_viewed(&mut ws, &member, &file);
-        assert!(!ws.group_viewed_marks.contains_key(&member.selector()));
+        assert_eq!(
+            ws.group_viewed_marks.get(&member.selector()),
+            Some(&Vec::new())
+        );
         assert_eq!(
             group_viewed_state(&ws, &combined, &file, DIFF),
             ViewedState::Viewed

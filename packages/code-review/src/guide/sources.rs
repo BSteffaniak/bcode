@@ -21,14 +21,17 @@ pub struct GuideSources {
 }
 
 impl GuideSources {
-    /// Project active groups when starting a guide, or restore the exact revision pairs of a
-    /// saved guide. `resolved` supplies the active resolution(s) for each workspace source;
-    /// a commits source's other pinned representations need no replay. A legacy plain id
-    /// addresses its saved base/head, not whichever commit happens to be visible now.
+    /// Project resolved groups when starting a guide, or restore the exact revision pairs of
+    /// a saved guide. `resolved` supplies the resolution(s) for each workspace source and
+    /// `series` the commits sources that resolved as multi-member series (group identity is
+    /// [`ReviewGroupKey::for_resolved`]); a commits source's other pinned representations need
+    /// no replay. A legacy plain id addresses its saved base/head, not whichever commit
+    /// happens to be visible now.
     #[must_use]
     pub fn project(
         workspace: &[ReviewSource],
         resolved: &[ResolvedSource],
+        series: &BTreeSet<String>,
         pins: Option<&BTreeMap<String, GuideHead>>,
     ) -> Self {
         let mut out = Self::default();
@@ -37,18 +40,8 @@ impl GuideSources {
             let Some(source) = workspace.iter().find(|s| s.id == template.source_id) else {
                 continue;
             };
-            let commits =
-                matches!(&source.kind, ReviewSourceKind::Commits { revs } if revs.len() > 1);
-            let key = if commits && template.part.is_some() {
-                let Some(oid) = template.head.commit_oid() else {
-                    continue;
-                };
-                member(&source.id, oid)
-            } else if commits {
-                combined(&source.id)
-            } else {
-                source.id.clone()
-            };
+            let key =
+                ReviewGroupKey::for_resolved(template, series.contains(&source.id)).selector();
             let pin = match pins {
                 Some(heads) => match heads.get(&key) {
                     Some(head) => Some(head),
@@ -189,7 +182,7 @@ pub fn restore_objects(
     heads: &BTreeMap<String, GuideHead>,
 ) -> Result<(), crate::data::DataError> {
     for source in sources {
-        if !matches!(&source.kind, ReviewSourceKind::Commits { revs } if revs.len() > 1) {
+        if !crate::session::may_be_commit_series(source) {
             continue;
         }
         let Some(pin) = heads.get(&combined(&source.id)) else {
@@ -213,6 +206,32 @@ pub fn restore_objects(
         }
     }
     Ok(())
+}
+
+/// Selector a citation reads: its own source id, else a legacy fallback.
+///
+/// For a legacy citation without a source id, the `primary` group when that is an ordinary source (as such citations were always read), else
+/// the one saved pin whose cited side has the citation's revision. A legacy citation is never
+/// mapped to a series group by position.
+#[must_use]
+pub fn citation_selector_or_primary<'a>(
+    citation: &'a Citation,
+    heads: &'a BTreeMap<String, GuideHead>,
+    primary: Option<&'a str>,
+) -> Option<&'a str> {
+    if citation.source_id.is_none()
+        && let Some(primary) = primary.filter(|primary| !is_series_selector(primary))
+    {
+        return Some(primary);
+    }
+    citation_selector(citation, heads)
+}
+
+/// Whether `selector` names a member or the combined group of a series rather than an
+/// ordinary source.
+#[must_use]
+pub fn is_series_selector(selector: &str) -> bool {
+    ReviewGroupKey::source_id_of_selector(selector) != selector
 }
 
 /// Exact selector of a citation. Legacy repository-context citations lacked a source id;

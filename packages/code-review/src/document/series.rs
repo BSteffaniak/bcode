@@ -3,22 +3,61 @@
 use super::anchors::DocAnchor;
 use super::keys::ItemKey;
 use super::review::{BlockKind, Group, ReviewDocument};
-use bcode_code_review_models::{ResolvedSource, ReviewGroupKey};
-use std::collections::BTreeSet;
+use crate::session::CommitSeriesState;
+use bcode_code_review_models::{DraftAnchor, ResolvedSource, ReviewGroupKey};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn group_key(source: &ResolvedSource, combined: &BTreeSet<String>) -> ReviewGroupKey {
-    let source_id = source.source_id.clone();
-    match (&source.part, source.head.commit_oid()) {
-        (Some(_), Some(oid)) => ReviewGroupKey::Member {
-            source_id,
-            member: oid.to_owned(),
-        },
-        (None, _) if combined.contains(&source_id) => ReviewGroupKey::Combined { source_id },
-        _ => ReviewGroupKey::Standalone { source_id },
-    }
+pub(super) fn group_key(
+    source: &ResolvedSource,
+    series: &BTreeMap<String, CommitSeriesState>,
+) -> ReviewGroupKey {
+    ReviewGroupKey::for_resolved(source, series.contains_key(&source.source_id))
 }
 
 impl ReviewDocument {
+    /// Record that a commits source resolved as a multi-member series (for example when its
+    /// description arrives after the document was built), re-identifying its groups. Returns
+    /// whether any group's identity changed.
+    pub fn set_commit_series(&mut self, state: CommitSeriesState) -> bool {
+        let source_id = state.source_id.clone();
+        if self.series.get(&source_id) == Some(&state) {
+            return false;
+        }
+        self.series.insert(source_id.clone(), state);
+        let mut changed = false;
+        for index in 0..self.groups.len() {
+            if self.groups[index].source.source_id != source_id {
+                continue;
+            }
+            let key = group_key(&self.groups[index].source, &self.series);
+            if self.groups[index].key != key {
+                self.groups[index].key = key;
+                changed = true;
+                for file in self.groups[index].files.clone() {
+                    self.refresh_viewed(file);
+                }
+                self.rebuild_group(index);
+            }
+        }
+        if changed && let Some(annotations) = self.annotations_input.clone() {
+            self.set_annotations(&annotations);
+        }
+        changed
+    }
+
+    /// The group a persisted anchor belongs to: the group it names, or for an anchor of a
+    /// series written before it had groups, the group that representation became (see
+    /// [`CommitSeriesState::legacy_group`]). `None` for anchors outside any series group.
+    #[must_use]
+    pub fn anchor_group(&self, anchor: &DraftAnchor) -> Option<ReviewGroupKey> {
+        if let Some(group) = &anchor.group {
+            return Some(group.clone());
+        }
+        self.series
+            .get(anchor.source_id.as_deref()?)?
+            .legacy_group(anchor)
+    }
+
     /// Persist a file or line anchor with its exact series group. Standalone and review-level
     /// anchors keep their legacy shape. Callers that persist a series anchor should use this
     /// instead of the context-free [`DocAnchor::to_draft_anchor`].

@@ -283,8 +283,28 @@ fn location(citation: &Citation, version: &GuideVersion, options: &ExportOptions
     };
     match (options.links, citation.revision.commit_oid()) {
         (LinkStyle::Permalink, Some(oid)) => {
-            let repository = super::sources::citation_selector(citation, &version.heads)
-                .and_then(|source| options.repositories.get(source));
+            let selector = super::sources::citation_selector(citation, &version.heads);
+            let repository = selector
+                .and_then(|source| options.repositories.get(source))
+                .or_else(|| {
+                    // Repository context outside the sources links through the only forge
+                    // repository the review has, when it has one. A review with a series
+                    // never attributes its context to an unrelated forge repository.
+                    if citation.source_id.is_some()
+                        || selector.is_some_and(super::sources::is_series_selector)
+                        || version
+                            .heads
+                            .keys()
+                            .any(|key| super::sources::is_series_selector(key))
+                    {
+                        return None;
+                    }
+                    let mut all = options.repositories.values();
+                    match (all.next(), all.next()) {
+                        (Some(only), None) => Some(only),
+                        _ => None,
+                    }
+                });
             repository.map_or_else(
                 || format!("`{text}` @ {}", short(oid)),
                 |web| format!("[{text}]({web}/blob/{oid}/{}{anchor})", citation.path),

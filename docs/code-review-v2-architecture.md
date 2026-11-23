@@ -360,9 +360,10 @@ sources retain their source ids and forge metadata. A `Commits` series remains o
 source; its groups do not create additional workspace sources or borrow PR identities.
 
 `ReviewData::commit_series(root, source, combined)` returns `CommitSeriesResolution` with
-`members`, optional `combined`, optional `unavailable` diagnostic and `contiguous`. The cheap
-description (`combined = false`) does not replay sparse commits; the explicit combined request
-returns the exact diff or a reason it is unavailable. Never approximate a sparse selection
+`members`, optional `combined`, optional `unavailable` diagnostic and `contiguous`. A contiguous
+chain always includes its combined diff, which needs no replay. The cheap description
+(`combined = false`) does not replay sparse commits; the explicit combined request returns the
+exact diff or a reason it is unavailable. Never approximate a sparse selection
 with an endpoint range. This planner is separate from legacy `review.sources.resolve` below.
 
 The adapter consults the canonical source kind. For a commits source a resolved member has a
@@ -371,8 +372,13 @@ The adapter consults the canonical source kind. For a commits source a resolved 
 existing source id; member and combined selectors distinguish representations of the same
 source. Do not use a label, abbreviated hash or part index as durable member identity. File
 state and anchors must distinguish equal paths across groups, and only active groups contribute
-to progress and assistant totals. Selecting a different representation does not retarget a
-comment made in the original one.
+to progress and assistant totals; the assistant can still address every resolved group by its
+selector. A source is a series only when it resolves to more than one distinct commit
+(`session::resolve_commit_series`, the one view policy); `ReviewGroupKey::for_resolved` is the
+one identity rule. Workspace-wide viewed marks and ungrouped anchors saved before a source was a
+series belong to the groups that representation became: a contiguous chain's to the combined
+group, a sparse selection's to each member (anchors by head commit), adopted once per series.
+Selecting a different representation does not retarget a comment made in the original one.
 
 #### Resolution by source kind
 

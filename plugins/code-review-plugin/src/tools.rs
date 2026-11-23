@@ -86,6 +86,9 @@ pub enum Access {
 struct Spec {
     name: &'static str,
     access: Access,
+    /// Whether the tool takes a request-local series grouping (`series`, `series_view`,
+    /// `member`).
+    series: bool,
     description: &'static str,
     schema: fn() -> Value,
 }
@@ -149,6 +152,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.list_reviews",
         access: Access::Read,
+        series: false,
         description: "List the saved code reviews of this repository, most recently updated first: id, title, kind (stack_step_through, whole_stack, pull_request, branch, current_branch, range, commits, working_tree, ...), source labels, pull request numbers, viewed files, archived, created and updated times. Pass `query` to find one by title, label or pull request number.",
         schema: || {
             object(
@@ -163,18 +167,21 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.summary",
         access: Access::Read,
+        series: true,
         description: "Summarize the code review: title, sources and the revisions they resolve to, stack layers, changed files and lines, viewed files, threads and suggestions.",
         schema: || with_review(json!({}), &[]),
     },
     Spec {
         name: "code_review.list_files",
         access: Access::Read,
+        series: true,
         description: "List the review's changed files with status, added and removed lines, and whether the reviewer marked each viewed. `truncated` says which folder, glob or repository sources were cut to their file limit (files.max_files) and how many files they select in all.",
         schema: || with_review(json!({}), &[]),
     },
     Spec {
         name: "code_review.file_diff",
         access: Access::Read,
+        series: true,
         description: "Show one file's diff in the review as numbered lines (old line, new line, +/- marker, text) with hunk headers.",
         schema: || {
             with_review(
@@ -191,6 +198,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.file_content",
         access: Access::Read,
+        series: true,
         description: "Read a file of the review at its head (new side) or base (old side) revision, or at an earlier version the review knows (`revision`: a commit id of a recorded pull request version or a guide's pinned head), as numbered lines.",
         schema: || {
             with_review(
@@ -209,6 +217,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.list_threads",
         access: Access::Read,
+        series: false,
         description: "List the review's comment threads: its own local threads (location, kind, severity, resolved, comments), pending suggested changes, and a page of its pull requests' threads on the forge (origin pull_request: author, comments, resolved, outdated, where each was written and where the review shows it now), as the review app last read them. Pass a thread_id to code_review.get_thread to read one in full.",
         schema: || {
             with_review(
@@ -225,6 +234,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.get_thread",
         access: Access::Read,
+        series: false,
         description: "Read one thread in full: a local thread, or a pull request thread with every comment and reply in order, its authors, resolved and outdated state, where it was written (path, original lines, commit), where the review shows it now, and the diff hunk it was written on.",
         schema: || {
             with_review(
@@ -236,18 +246,21 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.pull_request",
         access: Access::Read,
+        series: false,
         description: "Show the pull request behind the review (title, state, branches, review decision, CI checks), found by the review's pull request sources or its branch. Uses the GitHub CLI.",
         schema: || with_review(json!({}), &[]),
     },
     Spec {
         name: "code_review.navigate",
         access: Access::Read,
+        series: false,
         description: "Move the reviewer's view in the review app to a file or line, to show them what you are talking about.",
         schema: || object(location_properties(), &[]),
     },
     Spec {
         name: "code_review.add_comment",
         access: Access::Write,
+        series: true,
         description: "Draft a review comment on lines, a file, or the whole review. Drafts stay local until the reviewer publishes.",
         schema: || {
             let mut properties = location_properties();
@@ -263,6 +276,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.reply",
         access: Access::Write,
+        series: false,
         description: "Reply in one of the review's local threads with a draft comment. Pull request threads cannot be replied to with this tool.",
         schema: || {
             with_review(
@@ -277,6 +291,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.resolve_thread",
         access: Access::Write,
+        series: false,
         description: "Resolve one of the review's local threads, or reopen it. Pull request threads cannot be resolved with this tool.",
         schema: || {
             with_review(
@@ -291,6 +306,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.mark_viewed",
         access: Access::Write,
+        series: false,
         description: "Mark many files viewed (or not viewed) at their current content in one call, as the reviewer's `v` does. Select files with any of: `paths` (exact paths), `glob` (e.g. src/**/*.rs), `layers` (stack layers by pull request number, or source ids), `all` (every file of the selected layers, or of the review), `unchanged_since_look` (files whose change is the same as when the reviewer last looked at their layer). Selectors narrow each other. Returns the files changed, those already in that state, and named paths not in the review.",
         schema: || {
             with_review(
@@ -309,6 +325,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.add_comments",
         access: Access::Write,
+        series: true,
         description: "Draft several review comments in one call, each like code_review.add_comment. Drafts stay local until the reviewer publishes. Returns each comment's thread id or why it failed.",
         schema: || {
             let mut comment = location_properties();
@@ -339,6 +356,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.resolve_threads",
         access: Access::Write,
+        series: false,
         description: "Resolve (or reopen) several of the review's local threads in one call. Pull request threads cannot be resolved with this tool. Returns each thread's result.",
         schema: || {
             with_review(
@@ -353,6 +371,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.create_review",
         access: Access::Write,
+        series: false,
         description: "Create a saved review and return its id, title, kind and sources. Kinds: a pull request (number or url), a stack stepped through one pull request at a time (stack_layers, bottom first) or as one diff (stack), a branch against a base, the current branch, a commit range, commits, one commit, uncommitted changes (working_tree, staged, unstaged) optionally limited to `paths` or to `directory`, code as it is now (files: files, folders, globs or line ranges; a folder is listed again whenever the review opens), and the whole repository or some of its folders as it is now (repository). With `directory`, the review is created in that directory's repository, and uncommitted changes, files and repository reviews without `paths` are limited to it. To find a folder, package or file the user names, call code_review.find_paths first; to find the user's pull requests and stacks, call bcode.code-review.find_pull_requests first; to show the new review, call bcode.code-review.open_review. Every kind of review the app's wizard creates can be created here; never run the bcode command line instead.",
         schema: || {
             object(
@@ -369,6 +388,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.find_paths",
         access: Access::Read,
+        series: false,
         description: "Find repository paths by what the user calls them: a folder name, a package or crate name (Cargo.toml, package.json, pyproject.toml), a file name, or a path ending (\"the hello plugin\", \"bcode-git\", \"Cargo.toml\", \"plugin/src\"). Files git ignores are left out unless `include_ignored`. Returns matches best first with their kind, files under each folder now, and how they matched; folders and packages end with `/` and can be passed as they are in the `paths` of a code_review.create_review files or repository source. `ambiguous` is true when the two best matches are equally likely, and `weak` when the best match only partly matches the name (part of a word or scattered letters, as \"auth\" in \"oauth-client\"): ask the user only then (which one, or whether the weak match is meant), or when nothing matched. Read-only.",
         schema: || {
             object(
@@ -386,6 +406,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.update_review",
         access: Access::Write,
+        series: false,
         description: "Rename, archive or restore saved reviews: `review` for one or `reviews` for many.",
         schema: || {
             object(
@@ -402,6 +423,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.delete_review",
         access: Access::Write,
+        series: false,
         description: "Delete saved reviews for good (their comments are no longer reachable). Prefer archiving (code_review.update_review) unless the user asked to delete. `review` for one or `reviews` for many.",
         schema: || {
             object(
@@ -416,6 +438,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.suggest_change",
         access: Access::Write,
+        series: true,
         description: "Suggest a review comment the reviewer can accept as a draft, optionally replacing the lines with new code (shown as a suggestion block).",
         schema: || {
             let mut properties = location_properties();
@@ -437,60 +460,70 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "code_review.search_code",
         access: Access::Read,
+        series: false,
         description: "Search the code at the revisions the review shows (a pull request's head, a commit; filesystem.grep reads the working tree instead): text, whole word, regular expression, or symbol (definitions in Rust, Python, JavaScript/TypeScript and Go, then other uses). Each match says whether its file is in the review and how the line relates to it (changed, hunk_context, unchanged, in_review, outside_review). Bounded; says when cut.",
         schema: guide::search_schema,
     },
     Spec {
         name: "code_review.diff_hunks",
         access: Access::Read,
+        series: true,
         description: "Show only the hunks of one file's diff that overlap a line range (all hunks without one), as numbered lines: the precise companion of code_review.file_diff for checking and citing lines.",
         schema: guide::hunks_schema,
     },
     Spec {
         name: "code_review.related_files",
         access: Access::Read,
+        series: false,
         description: "Find files related to one file at the review's head: its tests (by naming convention), callers (files that import or use its module), configuration and docs that mention it; each with why it matched and whether it is in the review.",
         schema: guide::related_schema,
     },
     Spec {
         name: "code_review.guide.start",
         access: Access::Guide,
+        series: false,
         description: "Start a guided walkthrough of the review (a guide), a new version of one, or resume writing a version. Pins the revisions the review shows now; an `outline` appears at once as planned sections. Returns the guide id, version, revision, the template's required sections, and the repository's guide context (configured files and notes). Then write sections with code_review.guide.write. Call code_review.guide.plan first to size the review.",
         schema: guide::start_schema,
     },
     Spec {
         name: "code_review.guide.write",
         access: Access::Guide,
+        series: false,
         description: "Write a guide version in one atomic batch of operations (set_outline, put_section, add_expansion, promote, discard, remove_section, move_section, record_checks, area_result, set_status). Cite lines with inline citations carrying a `quote`: each is checked at the guide's pinned revisions and assigned an id (or adjusted when the quote is found once elsewhere); citations with problems are kept and reported (with `strict`, nothing is written). Operations outside this conversation's grant are refused with outside_grant and nothing is written. Returns the new revision, sections written, each citation's status and problems, and lint.",
         schema: guide::write_schema,
     },
     Spec {
         name: "code_review.guide.get",
         access: Access::Read,
+        series: false,
         description: "Read a guide: outline, section bodies, citations, and on request freshness (whether each citation still holds at the review's current revisions, and the stale sections), fan-out areas, ask threads, versions, reviewed marks. Without guide_id, uses the review's only guide or lists its guides. Bounded; names what was cut.",
         schema: guide::get_schema,
     },
     Spec {
         name: "code_review.guide.check",
         access: Access::Read,
+        series: false,
         description: "Check citations, or a whole section as put_section would write it, against a guide's pinned revisions without writing anything: each citation's status, problems with a fix (moved quote, close match, path suggestions, symbol definitions), and the section's lint. Use it to self-correct before writing.",
         schema: guide::check_schema,
     },
     Spec {
         name: "code_review.guide.plan",
         access: Access::Read,
+        series: false,
         description: "Plan a guide of the review: size (files, changed lines, layers, packages), the recommended strategy (one agent, per layer, or areas) with its partition and cost estimate inputs, what the depth asks for, the template's sections, and the repository's guide context. Deterministic.",
         schema: guide::plan_schema,
     },
     Spec {
         name: "code_review.guide.export",
         access: Access::Read,
+        series: false,
         description: "Render a guide version as markdown with numbered citations: pull request sources as permalinks, others as path:lines @ short sha, verification as text. To write it to a file, use code_review.publish or the review app.",
         schema: guide::export_schema,
     },
     Spec {
         name: "code_review.publish",
         access: Access::Publish,
+        series: false,
         description: "Preview or publish the review's comments with a built-in publisher: local_markdown (default), markdown_file, or json_file. Publishing to a forge such as GitHub is done from the review app.",
         schema: || {
             with_review(
@@ -515,7 +548,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             description: spec.description.to_owned(),
             input_schema: {
                 let mut schema = (spec.schema)();
-                if matches!(spec.name, "code_review.summary" | "code_review.list_files" | "code_review.file_diff" | "code_review.file_content" | "code_review.diff_hunks" | "code_review.add_comment" | "code_review.add_comments" | "code_review.suggest_change") {
+                if spec.series {
                     schema["properties"]["series"] = json!({"type":"string", "description":"Canonical series source id to project for this call only. Requires series_view."});
                     schema["properties"]["series_view"] = json!({"type":"string", "enum":["one_member", "all_members", "combined"], "description":"Request-local grouping; does not change the saved review."});
                     schema["properties"]["member"] = json!({"type":"string", "description":"Full commit oid or PR layer source id for one_member."});
@@ -1062,7 +1095,7 @@ fn run(
     let reference = review_ref(arguments, descriptor)?;
     let review = tools.open_with_series(repo, &reference, arguments.series_selection()?)?;
     match name {
-        "code_review.summary" => encode(&tools.summary(&review)?),
+        "code_review.summary" => encode(&tools.summary(&review, reset)?),
         "code_review.list_files" => encode(&tools.files(&review, reset)?),
         "code_review.file_diff" => tools.file_diff(
             &review,

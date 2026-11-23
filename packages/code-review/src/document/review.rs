@@ -687,7 +687,9 @@ pub struct ReviewDocument {
     /// its whole-stack diff is shown, or the other way round): hidden, and not counted in
     /// totals or viewed progress.
     pub(super) alternates: BTreeSet<String>,
-    pub(super) combined_sources: BTreeSet<String>,
+    /// Commit series by canonical source id: the one source of group identity for their
+    /// resolved diffs and of the group a legacy ungrouped anchor belongs to.
+    pub(super) series: BTreeMap<String, crate::session::CommitSeriesState>,
     pub(super) source_focus: Option<String>,
     pub(super) hidden_groups: BTreeSet<ReviewGroupKey>,
     pub(super) group_focus: BTreeMap<String, ReviewGroupKey>,
@@ -707,19 +709,21 @@ impl ReviewDocument {
     /// content is loaded until requested through [`Self::take_needs`].
     #[must_use]
     pub fn new(repo_path: PathBuf, sources: Vec<SourceInput>, config: DocumentConfig) -> Self {
-        Self::new_with_combined_sources(repo_path, sources, config, BTreeSet::new())
+        Self::new_with_series(repo_path, sources, config, BTreeMap::new())
     }
 
-    /// Build a document with part-less aggregate groups explicitly identified by canonical
-    /// workspace source id. Without registration a part-less source is standalone.
+    /// Build a document knowing which commits sources resolved as multi-member series (the
+    /// session's [`crate::session::CommitSeriesState`]s, by source id). Their diffs are
+    /// members or the combined group; every other diff, including a commits source whose
+    /// selection pins to one commit, is standalone.
     #[must_use]
-    pub fn new_with_combined_sources(
+    pub fn new_with_series(
         repo_path: PathBuf,
         sources: Vec<SourceInput>,
         config: DocumentConfig,
-        combined_sources: BTreeSet<String>,
+        series: BTreeMap<String, crate::session::CommitSeriesState>,
     ) -> Self {
-        let mut doc = Self::structure(repo_path, sources, config, combined_sources);
+        let mut doc = Self::structure(repo_path, sources, config, series);
         doc.build_all();
         doc
     }
@@ -729,7 +733,7 @@ impl ReviewDocument {
         repo_path: PathBuf,
         sources: Vec<SourceInput>,
         config: DocumentConfig,
-        combined_sources: BTreeSet<String>,
+        series: BTreeMap<String, crate::session::CommitSeriesState>,
     ) -> Self {
         let show_headers = sources.len() > 1 || sources.iter().any(|input| input.stack.is_some());
         let mut doc = Self {
@@ -773,7 +777,7 @@ impl ReviewDocument {
             revealed_hunks: BTreeSet::new(),
             filtered: BTreeSet::new(),
             alternates: BTreeSet::new(),
-            combined_sources,
+            series,
             source_focus: None,
             hidden_groups: BTreeSet::new(),
             group_focus: BTreeMap::new(),
@@ -843,7 +847,7 @@ impl ReviewDocument {
             self.file_annotations.push(Vec::new());
         }
         self.groups.push(Group {
-            key: super::series::group_key(&input.source, &self.combined_sources),
+            key: super::series::group_key(&input.source, &self.series),
             source: input.source,
             label: input.label,
             stack: input.stack,
@@ -1916,7 +1920,7 @@ impl ReviewDocument {
                     // exists. If the group hasn't streamed in yet, upsert places it later.
                     Some(group)
                         if annotation.target == AnchorTarget::Review
-                            || annotation.anchor.group.is_some() =>
+                            || self.anchor_group(&annotation.anchor).is_some() =>
                     {
                         self.source_annotations
                             .entry(group)
@@ -1924,7 +1928,9 @@ impl ReviewDocument {
                             .push(index);
                         groups.insert(group);
                     }
-                    _ if annotation.anchor.group.is_none() => self.review_annotations.push(index),
+                    _ if self.anchor_group(&annotation.anchor).is_none() => {
+                        self.review_annotations.push(index);
+                    }
                     _ => {}
                 },
             }
@@ -1961,8 +1967,8 @@ impl ReviewDocument {
     /// The group a review-level anchor naming a source belongs to: that source's (first part's)
     /// group.
     fn source_group(&self, anchor: &bcode_code_review_models::DraftAnchor) -> Option<usize> {
-        if let Some(key) = &anchor.group {
-            return self.groups.iter().position(|group| &group.key == key);
+        if let Some(key) = self.anchor_group(anchor) {
+            return self.groups.iter().position(|group| group.key == key);
         }
         let source = anchor.source_id.as_deref()?;
         self.groups.iter().position(|group| {
@@ -1975,18 +1981,26 @@ impl ReviewDocument {
         })
     }
 
-    /// The file a persisted anchor refers to: same source and path, else the first file with
-    /// that path.
+    /// The file a persisted anchor refers to: the path in the anchor's group (its own, or the
+    /// one a legacy anchor of a series belongs to), else same source and path, else the first
+    /// file with that path. An anchor of a series never lands in another of its groups.
     fn match_file(&self, anchor: &bcode_code_review_models::DraftAnchor) -> Option<usize> {
         if anchor.kind == bcode_code_review_models::ReviewAnchorKind::Review {
             return None;
         }
         let candidates = self.paths.get(&anchor.file_path)?;
-        if let Some(key) = &anchor.group {
+        if let Some(key) = self.anchor_group(anchor) {
             return candidates
                 .iter()
                 .copied()
-                .find(|&index| &self.groups[self.files[index].group].key == key);
+                .find(|&index| self.groups[self.files[index].group].key == key);
+        }
+        if anchor
+            .source_id
+            .as_ref()
+            .is_some_and(|source| self.series.contains_key(source))
+        {
+            return None;
         }
         anchor
             .source_id

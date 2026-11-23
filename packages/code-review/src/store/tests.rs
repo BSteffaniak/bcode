@@ -2580,3 +2580,90 @@ fn a_markdown_document_is_written_only_inside_the_repository() {
         "{fallback:?}"
     );
 }
+
+#[test]
+fn group_viewed_marks_and_draft_groups_round_trip_through_the_database() {
+    use bcode_code_review_models::{ReviewGroupKey, ViewedMark};
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join("repo")).expect("repo dir");
+    let (store, repo, created) = store_with_review(temp.path());
+    let member = ReviewGroupKey::Member {
+        source_id: "last".to_owned(),
+        member: "8dfce61a83e6c65e7b4d6a5ce0aa59e84ee3acfb".to_owned(),
+    };
+    let mut workspace = created.clone();
+    workspace.group_viewed_marks.insert(
+        member.selector(),
+        vec![ViewedMark {
+            path: "file.txt".to_owned(),
+            old_oid: Some("a".to_owned()),
+            new_oid: Some("b".to_owned()),
+            patch_id: Some("2:p".to_owned()),
+        }],
+    );
+    workspace.group_viewed_marks.insert(
+        ReviewGroupKey::Combined {
+            source_id: "last".to_owned(),
+        }
+        .selector(),
+        Vec::new(),
+    );
+    store
+        .update_workspace(UpdateReviewWorkspaceRequest {
+            repo_path: repo.clone(),
+            workspace: workspace.clone(),
+            base: None,
+        })
+        .expect("update");
+    let read = stored(&store, &repo, &created.id).expect("saved");
+    assert_eq!(read.group_viewed_marks, workspace.group_viewed_marks);
+
+    let config = CodeReviewConfig {
+        state_location: CodeReviewStateLocation::User,
+        state_dir: Some(temp.path().join("state")),
+    };
+    let anchor = DraftAnchor {
+        group: Some(member),
+        kind: ReviewAnchorKind::File,
+        file_path: "file.txt".to_string(),
+        diff_row: 0,
+        start_diff_row: None,
+        end_diff_row: None,
+        old_start: None,
+        old_end: None,
+        new_start: None,
+        new_end: None,
+        old_line: None,
+        new_line: None,
+        line_kind: ReviewLineKind::Context,
+        is_file_anchor: false,
+        surface_id: None,
+        source_id: Some("last".to_owned()),
+        head_oid: None,
+        blob_oid: None,
+        reply_to: None,
+    };
+    save_draft_for_request(
+        SaveDraftRequest {
+            repo_path: repo.clone(),
+            target: ReviewTarget::Repository,
+            scope: None,
+            anchor: anchor.clone(),
+            body: "In one member".to_string(),
+        },
+        &config,
+    )
+    .expect("save draft");
+    let drafts = list_drafts_for_request(
+        &ListDraftsRequest {
+            repo_path: repo,
+            target: ReviewTarget::Repository,
+            scope: None,
+        },
+        &config,
+    )
+    .expect("list")
+    .drafts;
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].anchor, anchor);
+}

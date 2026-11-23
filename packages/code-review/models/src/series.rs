@@ -78,6 +78,22 @@ impl ReviewGroupKey {
         }
     }
 
+    /// Workspace source id a [`Self::selector`] belongs to: the id inside a member or combined
+    /// selector, else the selector itself (a standalone source id).
+    #[must_use]
+    pub fn source_id_of_selector(selector: &str) -> &str {
+        if let Some(source_id) = selector.strip_prefix("series:combined:") {
+            return source_id;
+        }
+        selector
+            .strip_prefix("series:member:")
+            .and_then(|rest| {
+                let (len, rest) = rest.split_once(':')?;
+                rest.get(..len.parse::<usize>().ok()?)
+            })
+            .unwrap_or(selector)
+    }
+
     /// Stable selector for commands and keyed state. Standalone sources retain their id;
     /// `series:member:` and `series:combined:` are reserved selector namespaces. The member
     /// form length-prefixes the UTF-8 source id so delimiters in either id are unambiguous.

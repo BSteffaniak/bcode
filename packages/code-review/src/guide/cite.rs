@@ -308,16 +308,12 @@ impl<'a> Check<'a> {
         if let Some(name) = named {
             let name = name.trim();
             let exact = sources.iter().find(|s| s.source_id == name);
-            let mut aliases = sources
+            let aliases: Vec<&CiteSource> = sources
                 .iter()
-                .filter(|s| s.named(name) || reader.owns_alias(&s.source_id, name));
-            let first = aliases.next();
-            if exact.is_none() && aliases.next().is_some() {
-                let candidates: Vec<_> = sources
-                    .iter()
-                    .filter(|s| s.named(name) || reader.owns_alias(&s.source_id, name))
-                    .map(|s| &s.source_id)
-                    .collect();
+                .filter(|s| s.named(name) || reader.owns_alias(&s.source_id, name))
+                .collect();
+            if exact.is_none() && aliases.len() > 1 {
+                let candidates: Vec<&String> = aliases.iter().map(|s| &s.source_id).collect();
                 self.problem(
                     GUIDE_CITE_AMBIGUOUS_SOURCE,
                     format!("{name} names several groups; name an exact selector"),
@@ -325,7 +321,7 @@ impl<'a> Check<'a> {
                 );
                 return None;
             }
-            let Some(source) = exact.or(first) else {
+            let Some(source) = exact.or_else(|| aliases.first().copied()) else {
                 let layers: Vec<String> = sources.iter().map(label_of).collect();
                 self.citation.revision = primary.revision(self.request.side).clone();
                 self.problem(
@@ -396,7 +392,7 @@ impl<'a> Check<'a> {
                 .into_iter()
                 .find(|file| file.path == path || file.old_path.as_deref() == Some(path)),
             Err(message) => {
-                self.problem(
+                self.warn(
                     GUIDE_CITE_UNREADABLE,
                     format!(
                         "the files of {} could not be listed: {message}",
@@ -885,11 +881,8 @@ impl<'a> ReviewDataReader<'a> {
                 new_blob: entry.new_blob.oid().map(str::to_owned),
             }));
             cursor = page.next_cursor;
-            if cursor.is_none() {
+            if cursor.is_none() || files.len() >= MAX_DIFF_FILES {
                 return Ok(files);
-            }
-            if files.len() >= MAX_DIFF_FILES {
-                return Err(format!("diff listing exceeds {MAX_DIFF_FILES} files"));
             }
         }
     }

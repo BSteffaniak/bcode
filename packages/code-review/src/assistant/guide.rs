@@ -275,11 +275,19 @@ impl ReviewTools<'_> {
             })
     }
 
-    fn active_groups(review: &OpenReview) -> crate::guide::sources::GuideSources {
+    /// The review's groups as the guide addresses them: pinned to `heads` when given (with
+    /// the pins of groups the view leaves out restored), else as resolved now. Every group
+    /// the review can address takes part, whichever of them the view shows.
+    fn guide_groups(
+        review: &OpenReview,
+        heads: Option<&BTreeMap<String, GuideHead>>,
+    ) -> crate::guide::sources::GuideSources {
+        let series: BTreeSet<String> = review.series.keys().cloned().collect();
         crate::guide::sources::GuideSources::project(
             &review.workspace.sources,
             &review.resolved,
-            None,
+            &series,
+            heads,
         )
     }
 
@@ -300,17 +308,13 @@ impl ReviewTools<'_> {
                 heads,
             )?;
         }
-        let groups = crate::guide::sources::GuideSources::project(
-            &review.workspace.sources,
-            &review.resolved,
-            heads,
-        );
+        let groups = Self::guide_groups(review, heads);
         let reader = ReviewDataReader::grouped(self.data, review.repo_root.clone(), &groups);
         Ok(check_citations(&reader, requests, now_ms()))
     }
 
     fn heads(review: &OpenReview) -> BTreeMap<String, GuideHead> {
-        let groups = Self::active_groups(review);
+        let groups = Self::guide_groups(review, None);
         crate::guide::lifecycle::heads_of(&groups.sources, &groups.labels)
     }
 
@@ -365,19 +369,13 @@ impl ReviewTools<'_> {
     fn pick_layer(review: &OpenReview, name: &str) -> Result<usize, AssistantError> {
         let number = name.trim().trim_start_matches('#').parse::<u64>().ok();
         let name = name.trim();
-        if let Some(index) = review
-            .resolved
-            .iter()
-            .position(|r| review.group_key(r).selector() == name)
-        {
-            return Ok(index);
-        }
-        let mut hits = review
+        let hits: Vec<usize> = review
             .resolved
             .iter()
             .enumerate()
             .filter(|(index, source)| {
-                source.source_id == name
+                review.group_key(source).selector() == name
+                    || source.source_id == name
                     || label_of(review, *index) == name
                     || review
                         .workspace
@@ -386,14 +384,17 @@ impl ReviewTools<'_> {
                         .find(|candidate| candidate.id == source.source_id)
                         .and_then(|candidate| source_number(&candidate.kind))
                         .is_some_and(|found| Some(found) == number)
-            });
-        match (hits.next(), hits.next()) {
-            (Some((index, _)), None) => Ok(index),
-            (None, _) => Err(AssistantError::NotFound(format!(
+            })
+            .map(|(index, _)| index)
+            .collect();
+        match review.narrow(hits, name).as_slice() {
+            [index] => Ok(*index),
+            [] => Err(AssistantError::NotFound(format!(
                 "this review has no layer {name}"
             ))),
-            _ => Err(AssistantError::Invalid(format!(
-                "{name} names several groups; use a group selector"
+            several => Err(AssistantError::Invalid(format!(
+                "{name} names several groups; use one of these group selectors: {}",
+                review.selectors_of(several).join(", ")
             ))),
         }
     }
@@ -902,11 +903,7 @@ impl ReviewTools<'_> {
         if checks.is_empty() {
             return Ok(Vec::new());
         }
-        let pinned = crate::guide::sources::GuideSources::project(
-            &review.workspace.sources,
-            &review.resolved,
-            Some(heads),
-        );
+        let pinned = Self::guide_groups(review, Some(heads));
         let numbers = pinned.numbers;
         let pairs = crate::guide::lifecycle::pairs_at(pairs, heads, &numbers);
         let since = SinceDelta::compute(self.data, &review.repo_root, &pairs, &numbers)?;
@@ -1177,8 +1174,10 @@ impl ReviewTools<'_> {
         let repo = &review.repo_root;
         let id = &version.guide_id;
         if include.contains(&GuideInclude::Freshness) {
+            // The same pinned groups citations are checked against, so a citation in a group
+            // the view leaves out is assessed rather than reported gone.
             let current = crate::guide::sources::with_legacy_pairs(
-                Self::active_groups(review).sources,
+                Self::guide_groups(review, Some(&version.heads)).sources,
                 &review.workspace.sources,
                 &version.heads,
             );

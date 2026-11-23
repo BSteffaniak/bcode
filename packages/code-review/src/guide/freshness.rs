@@ -199,14 +199,16 @@ pub fn assess_version(
         .iter()
         .map(|source| (source.source_id.as_str(), source))
         .collect();
+    let primary = current.first().map(|source| source.source_id.as_str());
     let deltas = layer_deltas(data, repo_path, version, &by_id)?;
     let disk = data.disk();
     let mut contents: BTreeMap<(RevisionRef, String), Option<Vec<String>>> = BTreeMap::new();
     let mut marks: BTreeMap<(String, String), Option<Vec<LineSpan>>> = BTreeMap::new();
     let mut citations = BTreeMap::new();
     for (id, citation) in &version.citations {
-        let source = super::sources::citation_selector(citation, &version.heads)
-            .and_then(|key| by_id.get(key).copied());
+        let source =
+            super::sources::citation_selector_or_primary(citation, &version.heads, primary)
+                .and_then(|key| by_id.get(key).copied());
         let Some(source) = source else {
             citations.insert(id.clone(), Freshness::Gone);
             continue;

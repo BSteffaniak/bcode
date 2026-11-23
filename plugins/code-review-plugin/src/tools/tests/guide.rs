@@ -1147,3 +1147,54 @@ fn a_layer_child_of_a_second_fan_out_writes_the_current_version_it_is_granted() 
     );
     assert!(output.contains("version 2"), "{output}");
 }
+
+#[test]
+fn a_citation_in_a_series_member_the_view_leaves_out_is_assessed_not_gone() {
+    let mut harness = Harness::new();
+    harness.bind(SESSION);
+    let (review, source_id) = super::commits_review(&mut harness, &["HEAD~1", "HEAD"], |_| {});
+    let head = harness
+        .fixture
+        .git(&["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let member = bcode_code_review_models::ReviewGroupKey::Member {
+        source_id,
+        member: head,
+    }
+    .selector();
+    let path = GitFixture::modified_path(0);
+    let line = harness.added_line(&path);
+    let quote = line_text(&harness, &path, line);
+    let started = harness.json(
+        "code_review.guide.start",
+        &json!({"review": review, "outline": [
+            {"id": "s1", "kind": "purpose", "title": "Purpose"}
+        ]}),
+        SESSION,
+    );
+    let guide = started["guide_id"].as_str().expect("guide").to_owned();
+    let written = harness.json(
+        "code_review.guide.write",
+        &json!({"review": review, "guide_id": guide, "ops": [
+            {"op": "put_section", "id": "s1", "body": "The newest commit [[1]].",
+             "citations": [{"path": path, "start_line": line, "end_line": line, "quote": quote, "source": member}]}
+        ]}),
+        SESSION,
+    );
+    assert_eq!(written["citations"][0]["status"], "verified", "{written}");
+    let read = harness.json(
+        "code_review.guide.get",
+        &json!({"review": review, "guide_id": guide, "include": ["citations", "freshness"]}),
+        SESSION,
+    );
+    assert_eq!(
+        read["citations"]["c1"]["source_id"],
+        member.as_str(),
+        "{read}"
+    );
+    assert_eq!(
+        read["freshness"]["citations"]["c1"]["kind"], "fresh",
+        "{read}"
+    );
+}

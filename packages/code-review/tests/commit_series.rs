@@ -127,11 +127,8 @@ fn reversed_contiguous_selection_preserves_first_occurrences_and_real_endpoints(
         let series = repo.series(&selection, combined);
         assert!(series.contiguous);
         assert_members(&series, &[&newer, &older]);
-        if combined {
-            assert_eq!(combined_head(&series, &base), newer);
-        } else {
-            assert!(series.combined.is_none());
-        }
+        // A contiguous chain's aggregate needs no replay, so it is always included.
+        assert_eq!(combined_head(&series, &base), newer);
     }
 }
 
@@ -297,4 +294,46 @@ fn merge_member_is_the_delta_from_its_first_parent() {
     assert_eq!(series.members[1].base.commit_oid(), Some(main.as_str()));
     assert!(series.contiguous);
     assert_eq!(combined_head(&series, &base), merge);
+}
+
+#[test]
+fn a_selection_reached_only_through_a_merge_is_not_one_first_parent_line() {
+    let repo = Repo::new();
+    repo.commit("base", "start\n");
+    repo.git(&["checkout", "-b", "topic"]);
+    let side = repo.commit("topic-file", "topic\n");
+    repo.git(&["checkout", "main"]);
+    repo.commit("main-file", "main\n");
+    repo.git(&["merge", "--no-ff", "-m", "merge topic", "topic"]);
+    repo.commit("skipped", "between\n");
+    let tip = repo.commit("after", "after merge\n");
+    let series = repo.series(&[&side, &tip], true);
+    assert!(!series.contiguous);
+    assert_members(&series, &[&side, &tip]);
+    assert!(series.combined.is_none());
+    assert!(
+        series
+            .unavailable
+            .as_deref()
+            .is_some_and(|why| why.contains("first-parent")),
+        "{:?}",
+        series.unavailable
+    );
+}
+
+#[test]
+fn a_sparse_selection_after_a_merge_on_the_line_still_combines() {
+    let repo = Repo::new();
+    let base = repo.commit("base", "start\n");
+    let first = repo.commit("a", "selected\n");
+    repo.git(&["checkout", "-b", "topic"]);
+    repo.commit("topic-file", "topic\n");
+    repo.git(&["checkout", "main"]);
+    repo.commit("skipped", "between\n");
+    repo.git(&["merge", "--no-ff", "-m", "merge topic", "topic"]);
+    let last = repo.commit("b", "also selected\n");
+    let series = repo.series(&[&first, &last], true);
+    assert!(!series.contiguous);
+    let head = combined_head(&series, &base);
+    assert_eq!(repo.git(&["diff", "--name-only", &base, head]), "a\nb");
 }

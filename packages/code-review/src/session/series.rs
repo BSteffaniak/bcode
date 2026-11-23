@@ -3,8 +3,10 @@
 use super::{OpenRequest, ReviewData};
 use crate::data::DataError;
 use bcode_code_review_models::{
-    ResolvedSource, ReviewGroupKey, ReviewSeriesView, ReviewSource, ReviewSourceKind,
+    DraftAnchor, ResolvedSource, ReviewGroupKey, ReviewSeriesPresentation, ReviewSeriesView,
+    ReviewSource, ReviewSourceKind, ReviewWorkspace,
 };
+use std::path::Path;
 
 /// Description of a multi-commit source. Members are in selected order, even when their
 /// comparisons aren't loaded. An absent `unavailable` need not mean a sparse replay was tried.
@@ -22,70 +24,189 @@ pub struct CommitSeriesState {
     pub unavailable: Option<String>,
 }
 
-pub(super) const fn is_series(source: &ReviewSource) -> bool {
+/// A commits source resolved for presentation: every group it can show without further
+/// work, and its series description when it has more than one distinct commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedCommitSeries {
+    /// Series description; `None` when the selection pins to a single commit, which is an
+    /// ordinary standalone source.
+    pub state: Option<CommitSeriesState>,
+    /// Members in selected order. A single-commit selection has one part-less entry.
+    pub members: Vec<ResolvedSource>,
+    /// Exact combined diff, when the chain is contiguous or the combined view asked for it.
+    pub combined: Option<ResolvedSource>,
+    /// Index into `members` shown by the one-member view.
+    pub current: usize,
+}
+
+impl ResolvedCommitSeries {
+    /// The groups the effective view shows, in display order.
+    #[must_use]
+    pub fn visible(&self) -> Vec<ResolvedSource> {
+        let Some(state) = &self.state else {
+            return self.members.clone();
+        };
+        match state.view {
+            ReviewSeriesView::AllMembers => self.members.clone(),
+            ReviewSeriesView::Combined => self.combined.iter().cloned().collect(),
+            ReviewSeriesView::OneMember => self
+                .members
+                .get(self.current)
+                .cloned()
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Every resolved group (members first, then the combined diff), whether shown or not.
+    #[must_use]
+    pub fn all(&self) -> Vec<ResolvedSource> {
+        self.members
+            .iter()
+            .chain(self.combined.as_ref())
+            .cloned()
+            .collect()
+    }
+}
+
+/// Whether `source` may resolve as a series: a commits source naming several revisions. The
+/// resolved [`ResolvedCommitSeries::state`] decides whether it actually is one.
+pub const fn is_series(source: &ReviewSource) -> bool {
     matches!(&source.kind, ReviewSourceKind::Commits { revs } if revs.len() > 1)
 }
 
 pub(super) fn owns_selector(source: &ReviewSource, selector: &str) -> bool {
-    if source.id == selector {
-        return true;
-    }
-    if !is_series(source) {
-        return false;
-    }
-    let source_id = source.id.clone();
-    selector
-        == (ReviewGroupKey::Combined {
-            source_id: source_id.clone(),
-        })
-        .selector()
-        || selector.starts_with(
-            &(ReviewGroupKey::Member {
-                source_id,
-                member: String::new(),
-            })
-            .selector(),
-        )
+    source.id == selector || (is_series(source) && owns_group_selector(&source.id, selector))
 }
 
-pub(super) fn group_selector(source: &ResolvedSource, series: bool) -> String {
-    if !series {
-        return source.source_id.clone();
+/// Whether `selector` names a member or the combined group of series `source_id`.
+fn owns_group_selector(source_id: &str, selector: &str) -> bool {
+    let combined = ReviewGroupKey::Combined {
+        source_id: source_id.to_owned(),
+    };
+    let member_prefix = ReviewGroupKey::Member {
+        source_id: source_id.to_owned(),
+        member: String::new(),
     }
-    let source_id = source.source_id.clone();
-    match (source.part.as_ref(), source.head.commit_oid()) {
-        (Some(_), Some(oid)) => ReviewGroupKey::Member {
-            source_id,
-            member: oid.to_owned(),
-        },
-        _ => ReviewGroupKey::Combined { source_id },
-    }
-    .selector()
+    .selector();
+    selector == combined.selector() || selector.starts_with(&member_prefix)
 }
 
 impl CommitSeriesState {
+    /// Identity of a resolved group, applying [`ReviewGroupKey::for_resolved`] with this
+    /// series as the only one.
+    #[must_use]
+    pub fn group_key(&self, source: &ResolvedSource) -> ReviewGroupKey {
+        ReviewGroupKey::for_resolved(source, source.source_id == self.source_id)
+    }
+
     /// Stable selector for a resolved group belonging to this series.
     #[must_use]
     pub fn selector(&self, source: &ResolvedSource) -> String {
-        group_selector(source, source.source_id == self.source_id)
+        self.group_key(source).selector()
+    }
+
+    /// Groups that correspond to how this source resolved before it was a series: a
+    /// contiguous chain was one diff (now the combined group), and a sparse selection was one
+    /// part per commit (now the members).
+    #[must_use]
+    pub fn legacy_groups(&self) -> Vec<ReviewGroupKey> {
+        if self.contiguous {
+            vec![ReviewGroupKey::Combined {
+                source_id: self.source_id.clone(),
+            }]
+        } else {
+            self.members
+                .iter()
+                .map(|(oid, _)| ReviewGroupKey::Member {
+                    source_id: self.source_id.clone(),
+                    member: oid.clone(),
+                })
+                .collect()
+        }
+    }
+
+    /// The group an anchor written without one belongs to. A contiguous chain was one diff
+    /// whose head was the newest commit, so its anchors belong to the combined group; a sparse
+    /// selection's anchors name their member by head commit. `None` when the anchor is for
+    /// another source, already names a group, or names no member of this series.
+    #[must_use]
+    pub fn legacy_group(&self, anchor: &DraftAnchor) -> Option<ReviewGroupKey> {
+        if anchor.group.is_some() || anchor.source_id.as_deref() != Some(&self.source_id) {
+            return None;
+        }
+        if self.contiguous {
+            return Some(ReviewGroupKey::Combined {
+                source_id: self.source_id.clone(),
+            });
+        }
+        let head = anchor.head_oid.as_deref()?;
+        self.members
+            .iter()
+            .find(|(oid, _)| oid == head)
+            .map(|(oid, _)| ReviewGroupKey::Member {
+                source_id: self.source_id.clone(),
+                member: oid.clone(),
+            })
+    }
+
+    /// Carry the workspace-wide viewed marks of a review saved before this source was a
+    /// series into its [`Self::legacy_groups`], once. Each group receives the marks as they
+    /// were, so a file shows viewed exactly when its identity matched before. A series that
+    /// already has group-scoped state (even an empty list) is left alone, which makes this
+    /// idempotent and keeps later standalone marks out of the series. Returns whether the
+    /// workspace changed.
+    pub fn adopt_legacy_marks(&self, workspace: &mut ReviewWorkspace) -> bool {
+        let groups = self.legacy_groups();
+        let owned = workspace
+            .group_viewed_marks
+            .keys()
+            .any(|selector| owns_group_selector(&self.source_id, selector));
+        if owned || groups.is_empty() {
+            return false;
+        }
+        let marks = crate::viewed::effective_marks(workspace);
+        for group in groups {
+            workspace
+                .group_viewed_marks
+                .insert(group.selector(), marks.clone());
+        }
+        true
     }
 }
 
-pub(super) fn resolve(
+/// Resolve a commits source for presentation with its saved view.
+///
+/// This is the one rule for series views: no saved view opens a contiguous chain combined and a sparse selection with every
+/// member; a combined view without an exact aggregate falls back to every member; a
+/// one-member view restores the saved member (by full OID or member selector), else the first.
+///
+/// # Errors
+///
+/// * The source is not a commits source, selects nothing, or names a revision that cannot be
+///   pinned.
+/// * The repository cannot be read.
+pub fn resolve_commit_series(
     data: &ReviewData,
-    request: &OpenRequest,
+    repo_path: &Path,
     source: &ReviewSource,
-) -> Result<(Option<CommitSeriesState>, Vec<ResolvedSource>), DataError> {
-    let saved = request.series_views.get(&source.id);
+    saved: Option<&ReviewSeriesPresentation>,
+) -> Result<ResolvedCommitSeries, DataError> {
     let wants_combined = saved.is_some_and(|p| p.view == ReviewSeriesView::Combined);
-    let mut plan = data.commit_series(&request.repo_path, source, wants_combined)?;
-    if plan.members.len() < 2 {
+    let plan = data.commit_series(repo_path, source, wants_combined)?;
+    let mut members = plan.members;
+    if members.len() < 2 {
         // Aliases may pin to the same commit. It is an ordinary, untoggled source,
         // including for file identity and saved fingerprints.
-        for member in &mut plan.members {
+        for member in &mut members {
             member.part = None;
         }
-        return Ok((None, plan.members));
+        return Ok(ResolvedCommitSeries {
+            state: None,
+            members,
+            combined: None,
+            current: 0,
+        });
     }
     let mut view = saved.map_or_else(
         || {
@@ -97,29 +218,28 @@ pub(super) fn resolve(
         },
         |p| p.view,
     );
-    if view == ReviewSeriesView::Combined
-        && !wants_combined
-        && plan.combined.is_none()
-        && plan.unavailable.is_none()
-    {
-        // Pin the description we just chose, even if one of the requested refs moves.
-        let mut pinned = source.clone();
-        pinned.kind = ReviewSourceKind::Commits {
-            revs: plan
-                .members
-                .iter()
-                .filter_map(|member| member.head.commit_oid().map(str::to_owned))
-                .collect(),
-        };
-        plan = data.commit_series(&request.repo_path, &pinned, true)?;
-    }
     if view == ReviewSeriesView::Combined && plan.combined.is_none() {
         view = ReviewSeriesView::AllMembers;
     }
+    let selected = saved.and_then(|p| p.last_member.as_deref());
+    let current = selected
+        .and_then(|selected| {
+            members.iter().position(|member| {
+                member.head.commit_oid().is_some_and(|oid| {
+                    oid == selected
+                        || ReviewGroupKey::Member {
+                            source_id: source.id.clone(),
+                            member: oid.to_owned(),
+                        }
+                        .selector()
+                            == selected
+                })
+            })
+        })
+        .unwrap_or(0);
     let state = CommitSeriesState {
         source_id: source.id.clone(),
-        members: plan
-            .members
+        members: members
             .iter()
             .filter_map(|m| {
                 Some((
@@ -132,18 +252,25 @@ pub(super) fn resolve(
         unavailable: plan.unavailable,
         view,
     };
-    let visible = match view {
-        ReviewSeriesView::AllMembers => plan.members,
-        ReviewSeriesView::Combined => plan.combined.into_iter().collect(),
-        ReviewSeriesView::OneMember => {
-            let selected = saved.and_then(|p| p.last_member.as_deref());
-            let index = plan
-                .members
-                .iter()
-                .position(|m| m.head.commit_oid() == selected)
-                .unwrap_or(0);
-            vec![plan.members.swap_remove(index)]
-        }
-    };
-    Ok((Some(state), visible))
+    Ok(ResolvedCommitSeries {
+        state: Some(state),
+        members,
+        combined: plan.combined,
+        current,
+    })
+}
+
+pub(super) fn resolve(
+    data: &ReviewData,
+    request: &OpenRequest,
+    source: &ReviewSource,
+) -> Result<(Option<CommitSeriesState>, Vec<ResolvedSource>), DataError> {
+    let resolved = resolve_commit_series(
+        data,
+        &request.repo_path,
+        source,
+        request.series_views.get(&source.id),
+    )?;
+    let visible = resolved.visible();
+    Ok((resolved.state, visible))
 }

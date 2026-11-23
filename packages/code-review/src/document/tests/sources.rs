@@ -112,11 +112,11 @@ fn series_focus_and_alternates_do_not_hide_or_count_the_wrong_group() {
     let aggregate = ReviewGroupKey::Combined {
         source_id: "commits".into(),
     };
-    let mut doc = ReviewDocument::new_with_combined_sources(
+    let mut doc = ReviewDocument::new_with_series(
         PathBuf::from("/repo"),
         vec![member, fake.input("commits"), fake.input("other")],
         DocumentConfig::default(),
-        ["commits".to_owned()].into(),
+        series("commits", &["a".repeat(40)], false),
     );
     let file = |source: &str, part| ItemKey::FileHeader(FileKey::new(source, part, "s.rs").into());
     let member_file = file("commits", Some(7));
@@ -169,11 +169,11 @@ fn presentation_focus_survives_streaming_without_hiding_unrelated_sources() {
         source_id: "commits".into(),
         member: "a".repeat(40),
     };
-    let mut doc = ReviewDocument::new_with_combined_sources(
+    let mut doc = ReviewDocument::new_with_series(
         PathBuf::from("/repo"),
         vec![member, fake.input("commits")],
         DocumentConfig::default(),
-        ["commits".to_owned()].into(),
+        series("commits", &["a".repeat(40)], false),
     );
     assert!(doc.set_hidden_groups([member_key.clone()].into()));
     assert_eq!(doc.focus(), Some("commits"));
@@ -592,4 +592,184 @@ fn a_thread_on_a_source_as_a_whole_shows_with_that_source_only() {
     assert!(doc.close_composer().is_some());
     assert_eq!(doc.index_of(&ItemKey::Composer), None);
     doc.assert_consistent("composer closed");
+}
+
+/// The session's description of a series of `members` (full object ids).
+fn series(
+    source_id: &str,
+    members: &[String],
+    contiguous: bool,
+) -> std::collections::BTreeMap<String, crate::session::CommitSeriesState> {
+    [(
+        source_id.to_owned(),
+        crate::session::CommitSeriesState {
+            source_id: source_id.to_owned(),
+            members: members
+                .iter()
+                .map(|oid| (oid.clone(), format!("{oid} subject")))
+                .collect(),
+            view: bcode_code_review_models::ReviewSeriesView::AllMembers,
+            contiguous,
+            unavailable: None,
+        },
+    )]
+    .into()
+}
+
+/// A file comment written before the source was a series: no group, its source and head.
+fn legacy_draft(thread: &str, head: Option<&str>) -> bcode_code_review_models::DraftComment {
+    let anchor: bcode_code_review_models::DraftAnchor = serde_json::from_value(serde_json::json!({
+        "kind": "file", "file_path": "s.rs", "diff_row": 0, "line_kind": "context",
+        "source_id": "commits", "head_oid": head,
+    }))
+    .expect("legacy anchor");
+    bcode_code_review_models::DraftComment {
+        comment_id: format!("{thread}-1"),
+        thread_id: thread.to_owned(),
+        anchor,
+        body: "body".into(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        session_id: None,
+        resolved_at_ms: None,
+        thread_kind: bcode_code_review_models::ReviewThreadKind::Note,
+        severity: bcode_code_review_models::ReviewThreadSeverity::Info,
+    }
+}
+
+fn thread_block(doc: &ReviewDocument, thread: &str) -> Option<usize> {
+    doc.annotation_blocks
+        .get(&ItemKey::Thread {
+            thread_id: thread.to_owned(),
+        })
+        .copied()
+}
+
+fn file_block(doc: &ReviewDocument, group: &bcode_code_review_models::ReviewGroupKey) -> usize {
+    let index = doc
+        .groups()
+        .find(|info| info.key == group)
+        .expect("group")
+        .index;
+    let file = doc.group_files(index).next().expect("file").clone();
+    doc.block_of_key(&ItemKey::FileHeader(file))
+        .expect("file block")
+}
+
+#[test]
+fn legacy_anchors_and_marks_of_a_sparse_series_belong_to_their_member() {
+    use bcode_code_review_models::{ReviewGroupKey, ReviewWorkspace, RevisionRef};
+
+    let fake = one_file();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let member = |oid: &str, index: u32| {
+        let mut input = fake.input("commits");
+        input.source.head = RevisionRef::commit(oid.to_owned());
+        input.source.part = Some(ResolvedSourcePart {
+            index,
+            count: 2,
+            label: oid[..7].to_owned(),
+        });
+        input
+    };
+    let series = series("commits", &[a.clone(), b.clone()], false);
+    let state = series["commits"].clone();
+    let mut doc = ReviewDocument::new_with_series(
+        PathBuf::from("/repo"),
+        vec![member(&a, 0), member(&b, 1)],
+        DocumentConfig::default(),
+        series,
+    );
+    let key = |oid: &str| ReviewGroupKey::Member {
+        source_id: "commits".into(),
+        member: oid.to_owned(),
+    };
+    doc.set_annotations(&crate::document::Annotations {
+        drafts: vec![
+            legacy_draft("second", Some(&b)),
+            legacy_draft("unknown", Some(&"c".repeat(40))),
+        ],
+        exchanges: Vec::new(),
+        suggestions: Vec::new(),
+    });
+    assert_eq!(
+        doc.anchor_group(&legacy_draft("second", Some(&b)).anchor),
+        Some(key(&b))
+    );
+    assert_eq!(
+        thread_block(&doc, "second"),
+        Some(file_block(&doc, &key(&b)))
+    );
+    // A head that is no member is not attached to a member by position.
+    assert_eq!(thread_block(&doc, "unknown"), Some(0));
+
+    // The ungrouped format: workspace-wide marks only, no group state.
+    let mut workspace: ReviewWorkspace = serde_json::from_str(
+        r#"{"id": "w", "title": "t", "repo_root": "/repo", "sources": [], "viewed_files": ["s.rs"]}"#,
+    )
+    .expect("old workspace");
+    doc.set_viewed_marks(&workspace);
+    assert_eq!(doc.groups().map(|g| g.viewed).collect::<Vec<_>>(), [0, 0]);
+    assert!(state.adopt_legacy_marks(&mut workspace));
+    doc.set_viewed_marks(&workspace);
+    assert_eq!(doc.groups().map(|g| g.viewed).collect::<Vec<_>>(), [1, 1]);
+    // Adopted once: a later ordinary mark stays out of the series.
+    crate::viewed::unmark_group_viewed(
+        &mut workspace,
+        &key(&a),
+        &crate::viewed::ViewedIdentity {
+            path: "s.rs",
+            old_path: None,
+            old_oid: None,
+            new_oid: None,
+            patch_id: None,
+        },
+    );
+    assert!(!state.adopt_legacy_marks(&mut workspace));
+    doc.set_viewed_marks(&workspace);
+    assert_eq!(doc.groups().map(|g| g.viewed).collect::<Vec<_>>(), [0, 1]);
+}
+
+#[test]
+fn legacy_anchors_of_a_contiguous_series_belong_to_the_combined_diff_only() {
+    use bcode_code_review_models::{ReviewGroupKey, RevisionRef};
+
+    let fake = one_file();
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let mut newest = fake.input("commits");
+    newest.source.head = RevisionRef::commit(b.clone());
+    newest.source.part = Some(ResolvedSourcePart {
+        index: 1,
+        count: 2,
+        label: "newest".into(),
+    });
+    let combined = ReviewGroupKey::Combined {
+        source_id: "commits".into(),
+    };
+    let annotations = crate::document::Annotations {
+        drafts: vec![legacy_draft("old", Some(&b))],
+        exchanges: Vec::new(),
+        suggestions: Vec::new(),
+    };
+    let series = series("commits", &[a, b], true);
+    let mut shown = ReviewDocument::new_with_series(
+        PathBuf::from("/repo"),
+        vec![fake.input("commits")],
+        DocumentConfig::default(),
+        series.clone(),
+    );
+    shown.set_annotations(&annotations);
+    assert_eq!(
+        thread_block(&shown, "old"),
+        Some(file_block(&shown, &combined))
+    );
+    // While only the newest member is shown, the comment is not retargeted to it.
+    let mut member = ReviewDocument::new_with_series(
+        PathBuf::from("/repo"),
+        vec![newest],
+        DocumentConfig::default(),
+        series,
+    );
+    member.set_annotations(&annotations);
+    assert_eq!(thread_block(&member, "old"), None);
 }

@@ -141,7 +141,9 @@ pub struct OpenReview {
     pub repo_root: PathBuf,
     /// The review's workspace (with its current viewed state).
     pub workspace: ReviewWorkspace,
-    /// Its resolved sources, in review order.
+    /// Every group it resolved, in review order: each stack layer and whole-stack diff, and
+    /// each member and combined diff of a commit series that resolves without replay (or
+    /// that its view shows), whether or not the current view shows it.
     pub resolved: Vec<ResolvedSource>,
     /// Stacks its sources resolved into.
     pub stacks: Vec<ResolvedReviewStack>,
@@ -149,9 +151,31 @@ pub struct OpenReview {
     pub session_id: Option<String>,
     /// What the session's binding lets it change in a guided-review guide.
     pub guide_grant: Option<bcode_code_review_models::GuideGrant>,
+    /// Commit series by source id: the commits sources that resolved to more than one
+    /// distinct commit. The only source of series-ness for [`Self::group_key`].
+    pub series: BTreeMap<String, crate::session::CommitSeriesState>,
+    /// Groups of `resolved` the review's view leaves out: still addressable by selector, but
+    /// not counted in totals or listed by default.
+    pub hidden: std::collections::BTreeSet<bcode_code_review_models::ReviewGroupKey>,
+}
+
+/// What resolving a review's sources gives an [`OpenReview`].
+struct Resolution {
+    resolved: Vec<ResolvedSource>,
+    stacks: Vec<ResolvedReviewStack>,
+    series: BTreeMap<String, crate::session::CommitSeriesState>,
+    hidden: std::collections::BTreeSet<bcode_code_review_models::ReviewGroupKey>,
 }
 
 impl OpenReview {
+    /// Carry viewed marks saved before a commit source was a series into its groups (see
+    /// [`crate::session::CommitSeriesState::adopt_legacy_marks`]).
+    pub(crate) fn adopt_legacy_marks(&self, workspace: &mut ReviewWorkspace) {
+        for state in self.series.values() {
+            state.adopt_legacy_marks(workspace);
+        }
+    }
+
     /// Whether the review is unsaved.
     #[must_use]
     pub fn is_transient(&self) -> bool {
@@ -207,8 +231,11 @@ pub struct ReviewListing {
 pub struct SourceSummary {
     /// Source id.
     pub id: String,
-    /// Stable selector of the active group.
+    /// Stable selector of the group (pass it as `source`).
     pub selector: String,
+    /// Whether the review's current view shows the group; other groups are not counted in
+    /// totals but stay addressable by their selector.
+    pub active: bool,
     /// Label.
     pub label: String,
     /// Base side (`index`, `working_tree`, `empty_tree`, or a commit id).
@@ -545,36 +572,27 @@ impl<'a> ReviewTools<'a> {
         if selection.is_some() && session_id.is_some() && !resolved.is_empty() {
             return Err(AssistantError::Invalid("the attached session uses the on-screen grouping; use set_comparison, or name the saved review for a request-local grouping".into()));
         }
-        let explicit = selection.is_some();
         let requested = selection
             .map(|(series, preference)| Self::series_projection(&workspace, series, preference))
             .transpose()?;
         let projection = requested.as_ref().unwrap_or(&workspace);
-        let (mut resolved, stacks) = if resolved.is_empty() || explicit {
+        let resolution = if resolved.is_empty() || requested.is_some() {
             self.resolve_sources(projection)?
         } else {
-            (resolved, stacks)
+            self.complete_binding(projection, &resolved, stacks)
         };
-        let stack_sources = series::stack_sources(projection)?;
-        resolved.retain(|part| {
-            projection
-                .sources
-                .iter()
-                .find(|s| s.id == part.source_id)
-                .is_none_or(|source| {
-                    !matches!(
-                        source.kind,
-                        ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
-                    ) || stack_sources.contains(&source.id)
-                })
-        });
+        for state in resolution.series.values() {
+            state.adopt_legacy_marks(&mut workspace);
+        }
         Ok(OpenReview {
             repo_root: workspace.repo_root.clone(),
             workspace,
-            resolved,
-            stacks,
+            resolved: resolution.resolved,
+            stacks: resolution.stacks,
             session_id,
             guide_grant,
+            series: resolution.series,
+            hidden: resolution.hidden,
         })
     }
 
@@ -588,12 +606,7 @@ impl<'a> ReviewTools<'a> {
             .iter()
             .find(|source| source.id == series && source.included)
             .ok_or_else(|| AssistantError::Invalid(format!("unknown series {series}")))?;
-        if !series::is_commit_series(source)
-            && !matches!(
-                source.kind,
-                ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
-            )
-        {
+        if !crate::session::may_be_commit_series(source) && !series::is_stack(source) {
             return Err(AssistantError::Invalid(format!("{series} is not a series")));
         }
         let owner = match &source.kind {
@@ -645,43 +658,24 @@ impl<'a> ReviewTools<'a> {
             .workspace)
     }
 
-    fn resolve_sources(
-        &self,
-        workspace: &ReviewWorkspace,
-    ) -> Result<(Vec<ResolvedSource>, Vec<ResolvedReviewStack>), AssistantError> {
-        let stack_sources = series::stack_sources(workspace)?;
-        let active_source = |source: &bcode_code_review_models::ReviewSource| {
-            !matches!(
-                source.kind,
-                ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
-            ) || stack_sources.contains(&source.id)
-        };
+    /// Resolve every included source of `workspace` into all the groups the assistant can
+    /// address, and the groups its view leaves out.
+    fn resolve_sources(&self, workspace: &ReviewWorkspace) -> Result<Resolution, AssistantError> {
         let needs_provider = workspace.sources.iter().any(|source| {
-            source.included
-                && active_source(source)
-                && bcode_code_review_models::source_kind_requires_provider(&source.kind)
+            source.included && bcode_code_review_models::source_kind_requires_provider(&source.kind)
         });
         let provider_resolutions = if needs_provider {
             offline::resolutions(workspace, self.providers)
         } else {
             Vec::new()
         };
-        // Ignored files are listed as the review lists them in the app.
-        let include_ignored = workspace
-            .presentation
-            .as_ref()
-            .and_then(|presentation| presentation.show_ignored)
-            .unwrap_or(false);
         let response = self.data.resolve_sources(&ResolveReviewSourcesRequest {
-            browse: bcode_code_review_models::BrowseOptions {
-                include_ignored,
-                ..bcode_code_review_models::BrowseOptions::default()
-            },
+            browse: Self::browse_options(workspace),
             repo_path: workspace.repo_root.clone(),
             sources: workspace
                 .sources
                 .iter()
-                .filter(|source| active_source(source) && !series::is_commit_series(source))
+                .filter(|source| !crate::session::may_be_commit_series(source))
                 .cloned()
                 .collect(),
             provider_resolutions,
@@ -699,12 +693,17 @@ impl<'a> ReviewTools<'a> {
                 diagnostic.message
             )));
         }
-        let mut active = Vec::new();
+        let mut resolution = Resolution {
+            resolved: Vec::new(),
+            stacks: response.stacks,
+            series: BTreeMap::new(),
+            hidden: std::collections::BTreeSet::new(),
+        };
         for source in workspace.sources.iter().filter(|source| source.included) {
-            if series::is_commit_series(source) {
-                active.extend(series::active_commits(self.data, workspace, source)?);
+            if crate::session::may_be_commit_series(source) {
+                self.add_commit_series(workspace, source, &mut resolution, None)?;
             } else {
-                active.extend(
+                resolution.resolved.extend(
                     response
                         .sources
                         .iter()
@@ -713,7 +712,7 @@ impl<'a> ReviewTools<'a> {
                 );
             }
         }
-        if active.is_empty()
+        if resolution.resolved.is_empty()
             && let Some(diagnostic) = response.diagnostics.first()
         {
             return Err(AssistantError::Invalid(format!(
@@ -721,10 +720,121 @@ impl<'a> ReviewTools<'a> {
                 diagnostic.message
             )));
         }
-        Ok((active, response.stacks))
+        resolution
+            .hidden
+            .extend(series::stack_hidden(workspace, &resolution.resolved));
+        Ok(resolution)
     }
 
-    /// Index entries of every source, in review order, with their source.
+    /// Ignored files are listed as the review lists them in the app.
+    fn browse_options(workspace: &ReviewWorkspace) -> bcode_code_review_models::BrowseOptions {
+        bcode_code_review_models::BrowseOptions {
+            include_ignored: workspace
+                .presentation
+                .as_ref()
+                .and_then(|presentation| presentation.show_ignored)
+                .unwrap_or(false),
+            ..bcode_code_review_models::BrowseOptions::default()
+        }
+    }
+
+    /// Resolve one commits source with the shared series policy
+    /// ([`crate::session::resolve_commit_series`]) and add its groups. With `bound`, groups the
+    /// binding already pinned are kept as they are and only the others are added.
+    fn add_commit_series(
+        &self,
+        workspace: &ReviewWorkspace,
+        source: &bcode_code_review_models::ReviewSource,
+        resolution: &mut Resolution,
+        bound: Option<&[ResolvedSource]>,
+    ) -> Result<(), AssistantError> {
+        let saved = workspace
+            .presentation
+            .as_ref()
+            .and_then(|state| state.series_views.get(&source.id));
+        let resolved =
+            crate::session::resolve_commit_series(self.data, &workspace.repo_root, source, saved)?;
+        let (groups, hidden) = series::commit_groups(&resolved);
+        if let Some(state) = resolved.state {
+            resolution.series.insert(source.id.clone(), state);
+        }
+        resolution.hidden.extend(hidden);
+        let key = |group: &ResolvedSource| {
+            bcode_code_review_models::ReviewGroupKey::for_resolved(
+                group,
+                resolution.series.contains_key(&group.source_id),
+            )
+        };
+        let pinned: std::collections::BTreeSet<_> = bound
+            .unwrap_or_default()
+            .iter()
+            .filter(|group| group.source_id == source.id)
+            .map(key)
+            .collect();
+        let missing: Vec<ResolvedSource> = groups
+            .into_iter()
+            .filter(|group| !pinned.contains(&key(group)))
+            .collect();
+        resolution.resolved.extend(missing);
+        Ok(())
+    }
+
+    /// A binding's pinned groups, completed with the groups the review can also address but
+    /// the binding did not record (commit series members and combined diffs, stack layers or
+    /// whole-stack diffs the view left out). Completion is best effort: a source that cannot
+    /// be resolved now keeps only what the binding recorded.
+    fn complete_binding(
+        &self,
+        workspace: &ReviewWorkspace,
+        bound: &[ResolvedSource],
+        stacks: Vec<ResolvedReviewStack>,
+    ) -> Resolution {
+        let mut resolution = Resolution {
+            resolved: bound.to_vec(),
+            stacks,
+            series: BTreeMap::new(),
+            hidden: std::collections::BTreeSet::new(),
+        };
+        for source in workspace.sources.iter().filter(|source| source.included) {
+            if crate::session::may_be_commit_series(source) {
+                // An unresolvable selection keeps the binding's groups, as standalone ones.
+                let _ = self.add_commit_series(workspace, source, &mut resolution, Some(bound));
+            }
+        }
+        let missing: Vec<_> = workspace
+            .sources
+            .iter()
+            .filter(|source| source.included && series::is_stack(source))
+            .filter(|source| !bound.iter().any(|group| group.source_id == source.id))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let provider_resolutions = offline::resolutions(workspace, self.providers);
+            if let Ok(response) = self.data.resolve_sources(&ResolveReviewSourcesRequest {
+                browse: Self::browse_options(workspace),
+                repo_path: workspace.repo_root.clone(),
+                sources: missing,
+                provider_resolutions,
+            }) {
+                resolution.resolved.extend(response.sources);
+                for stack in response.stacks {
+                    if !resolution
+                        .stacks
+                        .iter()
+                        .any(|known| known.source_id == stack.source_id)
+                    {
+                        resolution.stacks.push(stack);
+                    }
+                }
+            }
+        }
+        resolution
+            .hidden
+            .extend(series::stack_hidden(workspace, &resolution.resolved));
+        resolution
+    }
+
+    /// Index entries of every active group, in review order, with their group's index.
     fn entries(
         &self,
         review: &OpenReview,
@@ -732,11 +842,32 @@ impl<'a> ReviewTools<'a> {
         self.listed(review).map(|(entries, _)| entries)
     }
 
-    /// [`Self::entries`], and what each source cut to its file limit says.
+    /// [`Self::entries`], and what each group cut to its file limit says.
     fn listed(&self, review: &OpenReview) -> Result<Listed, AssistantError> {
+        self.listed_where(review, |index| review.is_active(index))
+    }
+
+    /// Index entries of the groups whose index `wanted` accepts, active or not.
+    fn entries_where(
+        &self,
+        review: &OpenReview,
+        wanted: impl Fn(usize) -> bool,
+    ) -> Result<Vec<(usize, ReviewIndexEntry)>, AssistantError> {
+        self.listed_where(review, wanted)
+            .map(|(entries, _)| entries)
+    }
+
+    fn listed_where(
+        &self,
+        review: &OpenReview,
+        wanted: impl Fn(usize) -> bool,
+    ) -> Result<Listed, AssistantError> {
         let mut entries = Vec::new();
         let mut truncated = Vec::new();
         for (index, source) in review.resolved.iter().enumerate() {
+            if !wanted(index) {
+                continue;
+            }
             let mut cursor = None;
             let mut read = 0;
             loop {
@@ -780,7 +911,11 @@ impl<'a> ReviewTools<'a> {
     ///
     /// * [`AssistantError::Store`] / [`AssistantError::Data`] when state or the repository
     ///   cannot be read.
-    pub fn summary(&mut self, review: &OpenReview) -> Result<ReviewSummaryView, AssistantError> {
+    pub fn summary(
+        &mut self,
+        review: &OpenReview,
+        reset: ViewedReset,
+    ) -> Result<ReviewSummaryView, AssistantError> {
         let entries = self.entries(review)?;
         let threads = self.threads(
             review,
@@ -796,9 +931,11 @@ impl<'a> ReviewTools<'a> {
         let sources = review
             .resolved
             .iter()
-            .map(|source| SourceSummary {
+            .enumerate()
+            .map(|(index, source)| SourceSummary {
                 id: source.source_id.clone(),
                 selector: review.group_key(source).selector(),
+                active: review.is_active(index),
                 label: review
                     .workspace
                     .sources
@@ -841,21 +978,10 @@ impl<'a> ReviewTools<'a> {
                 .iter()
                 .map(|(_, entry)| u64::from(entry.deletions))
                 .sum(),
-            viewed: entries
-                .iter()
-                .filter(|(index, entry)| {
-                    let group = review.group_key(&review.resolved[*index]);
-                    match group {
-                        bcode_code_review_models::ReviewGroupKey::Standalone { .. } => {
-                            review.workspace.viewed_files.contains(&entry.path)
-                        }
-                        _ => review
-                            .workspace
-                            .group_viewed_marks
-                            .get(&group.selector())
-                            .is_some_and(|marks| marks.iter().any(|m| m.path == entry.path)),
-                    }
-                })
+            viewed: self
+                .viewed_flags(review, &entries, reset)
+                .into_iter()
+                .filter(|viewed| *viewed)
                 .count(),
             open_threads: threads
                 .threads
@@ -883,36 +1009,27 @@ impl<'a> ReviewTools<'a> {
         reset: ViewedReset,
     ) -> Result<FilesView, AssistantError> {
         let (entries, truncated) = self.listed(review)?;
-        let fingerprints = self.fingerprints(review, &entries);
-        let several = review.resolved.len() > 1;
+        let several = (0..review.resolved.len())
+            .filter(|&index| review.is_active(index))
+            .nth(1)
+            .is_some();
         let omitted = entries.len().saturating_sub(MAX_FILES);
-        let files = entries
+        let shown = &entries[..entries.len().min(MAX_FILES)];
+        let viewed = self.viewed_flags(review, shown, reset);
+        let files = shown
             .iter()
-            .take(MAX_FILES)
-            .map(|(source, entry)| {
-                let (patch, content) = fingerprints
-                    .get(&(*source, entry.path.clone()))
-                    .cloned()
-                    .unwrap_or_default();
-                let identity = EntryIdentity::from_entry(entry).with_content(content.as_deref());
-                let viewed = series::viewed_state(
-                    &review.workspace,
-                    &review.group_key(&review.resolved[*source]),
-                    &identity.with_patch(patch.as_deref()),
-                    reset,
-                ) != ViewedState::Unviewed;
-                FileView {
-                    path: entry.path.clone(),
-                    old_path: entry.old_path.clone().filter(|old| old != &entry.path),
-                    status: entry.status,
-                    additions: entry.additions,
-                    deletions: entry.deletions,
-                    viewed,
-                    source: (several
-                        || review.group_key(&review.resolved[*source]).selector()
-                            != review.resolved[*source].source_id)
-                        .then(|| review.group_key(&review.resolved[*source]).selector()),
-                }
+            .zip(viewed)
+            .map(|((source, entry), viewed)| FileView {
+                path: entry.path.clone(),
+                old_path: entry.old_path.clone().filter(|old| old != &entry.path),
+                status: entry.status,
+                additions: entry.additions,
+                deletions: entry.deletions,
+                viewed,
+                source: (several
+                    || review.group_key(&review.resolved[*source]).selector()
+                        != review.resolved[*source].source_id)
+                    .then(|| review.group_key(&review.resolved[*source]).selector()),
             })
             .collect();
         Ok(FilesView {
@@ -920,6 +1037,33 @@ impl<'a> ReviewTools<'a> {
             files,
             omitted,
         })
+    }
+
+    /// Whether each of `entries` shows viewed in its group, with the same identities (and
+    /// fingerprints) everywhere viewed state is reported.
+    fn viewed_flags(
+        &self,
+        review: &OpenReview,
+        entries: &[(usize, ReviewIndexEntry)],
+        reset: ViewedReset,
+    ) -> Vec<bool> {
+        let fingerprints = self.fingerprints(review, entries);
+        entries
+            .iter()
+            .map(|(source, entry)| {
+                let (patch, content) = fingerprints
+                    .get(&(*source, entry.path.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                let identity = EntryIdentity::from_entry(entry).with_content(content.as_deref());
+                crate::viewed::state_in_group(
+                    &review.workspace,
+                    &review.group_key(&review.resolved[*source]),
+                    &identity.with_patch(patch.as_deref()),
+                    reset,
+                ) != ViewedState::Unviewed
+            })
+            .collect()
     }
 
     /// Diff fingerprints and working-tree content ids of the files that have viewed marks. Files
@@ -978,24 +1122,37 @@ impl<'a> ReviewTools<'a> {
         source: Option<&str>,
     ) -> Result<(usize, ReviewIndexEntry), AssistantError> {
         let path = path.trim().trim_start_matches("./");
-        let entries = self.entries(review)?;
-        let mut matches = entries.into_iter().filter(|(index, entry)| {
-            source.is_none_or(|id| review.matches_selector(&review.resolved[*index], id))
-                && (entry.path == path || entry.old_path.as_deref() == Some(path))
-        });
-        let first = matches.next().ok_or_else(|| {
-            AssistantError::NotFound(format!(
+        // A named group is found whether or not the view shows it; otherwise only the
+        // active groups are searched.
+        let entries = match source {
+            Some(name) => {
+                let groups = review.narrow(
+                    (0..review.resolved.len())
+                        .filter(|&index| review.matches_selector(&review.resolved[index], name))
+                        .collect(),
+                    name,
+                );
+                self.entries_where(review, |index| groups.contains(&index))?
+            }
+            None => self.entries(review)?,
+        };
+        let matches: Vec<(usize, ReviewIndexEntry)> = entries
+            .into_iter()
+            .filter(|(_, entry)| entry.path == path || entry.old_path.as_deref() == Some(path))
+            .collect();
+        match matches.len() {
+            0 => Err(AssistantError::NotFound(format!(
                 "{path} is not a file of this review (code_review.list_files lists them)"
-            ))
-        })?;
-        if let Some(second) = matches.next() {
-            return Err(AssistantError::Invalid(format!(
-                "{path} occurs in multiple groups; pass a source selector (such as {} or {})",
-                review.group_key(&review.resolved[first.0]).selector(),
-                review.group_key(&review.resolved[second.0]).selector(),
-            )));
+            ))),
+            1 => Ok(matches.into_iter().next().unwrap_or_else(|| unreachable!())),
+            _ => {
+                let indices: Vec<usize> = matches.iter().map(|(index, _)| *index).collect();
+                Err(AssistantError::Invalid(format!(
+                    "{path} occurs in multiple groups; pass one of these as `source`: {}",
+                    review.selectors_of(&indices).join(", ")
+                )))
+            }
         }
-        Ok(first)
     }
 
     /// The diff of one file as numbered lines: `old new marker content`, with hunk headers.
@@ -1616,6 +1773,8 @@ impl<'a> ReviewTools<'a> {
         let fingerprints = self.fingerprints_of(review, &files)?;
         let base = self.current_viewed_record(review)?;
         let mut record = base.clone();
+        // Adopted legacy marks are part of this write, so they are adopted only once.
+        review.adopt_legacy_marks(&mut record);
         let mut identities = Vec::new();
         for (index, entry) in &files {
             let (patch, content) = fingerprints
@@ -1632,7 +1791,7 @@ impl<'a> ReviewTools<'a> {
         for (group, entry, patch, content) in &identities {
             let identity = entry.clone().with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
-            series::set_viewed(&mut record, group, &identity, viewed);
+            crate::viewed::set_in_group(&mut record, group, &[identity], viewed);
         }
         let written = self
             .store
@@ -1647,8 +1806,9 @@ impl<'a> ReviewTools<'a> {
         for (group, entry, patch, content) in &identities {
             let identity = entry.clone().with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
-            let is_viewed = series::viewed_state(&written, group, &identity, ViewedReset::Diff)
-                != ViewedState::Unviewed;
+            let is_viewed =
+                crate::viewed::state_in_group(&written, group, &identity, ViewedReset::Diff)
+                    != ViewedState::Unviewed;
             let path = identity.path.to_string();
             if is_viewed == viewed {
                 done.push(path);

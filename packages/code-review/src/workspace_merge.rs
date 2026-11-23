@@ -7,12 +7,15 @@
 //! store (**stored**). A merge keeps what the writer changed from its base and takes everything
 //! else from the store, so no writer undoes another's change:
 //!
-//! * Whole fields (title, sources, archived, review pass, presentation, stack snapshots): the
-//!   local value when it differs from the base, else the stored one.
+//! * Whole fields (title, sources, archived, presentation, stack snapshots): the local value
+//!   when it differs from the base, else the stored one. A presentation's series views merge
+//!   per series.
+//! * Review pass revisions, per source or group: the local entry where it differs from the
+//!   base, else the stored one; entries of sources the review no longer has are dropped.
 //! * Viewed state, per file and per thread: the local state where it differs from the base, else
 //!   the stored state.
 
-use bcode_code_review_models::{ReviewWorkspace, ThreadViewMark, ViewedMark};
+use bcode_code_review_models::{ReviewGroupKey, ReviewWorkspace, ThreadViewMark, ViewedMark};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A workspace's viewed state: viewed paths, viewed marks and viewed threads.
@@ -127,6 +130,14 @@ pub fn merge_viewed(base: &ViewedSet, local: &ViewedSet, stored: &ViewedSet) -> 
             .or_default()
             .extend(marks.into_iter().cloned());
     }
+    // A group's entry outlives its marks: an empty list still records that the group keeps
+    // its own viewed state.
+    let presence = |set: &ViewedSet| -> BTreeMap<String, bool> {
+        set.groups.keys().map(|key| (key.clone(), true)).collect()
+    };
+    for key in merge_map(&presence(base), &presence(local), &presence(stored)).into_keys() {
+        merged.groups.entry(key).or_default();
+    }
     for path in paths {
         let mine = local.path(path);
         let (listed, marks) = if mine == base.path(path) {
@@ -200,11 +211,9 @@ pub fn merge_workspace(
         group_viewed_marks: BTreeMap::new(),
         viewed_marks: Vec::new(),
         viewed_threads: Vec::new(),
-        reviewed_revisions: merge_map(
-            &base.reviewed_revisions,
-            &local.reviewed_revisions,
-            &stored.reviewed_revisions,
-        ),
+        // Per key: a review records only the groups it shows, so another writer's entries
+        // for other groups survive. Entries of sources the review no longer has are dropped.
+        reviewed_revisions: BTreeMap::new(),
         presentation: pick(
             &base.presentation,
             &local.presentation,
@@ -216,6 +225,17 @@ pub fn merge_workspace(
             &stored.stack_snapshots,
         ),
     };
+    merged.reviewed_revisions = merge_map(
+        &base.reviewed_revisions,
+        &local.reviewed_revisions,
+        &stored.reviewed_revisions,
+    )
+    .into_iter()
+    .filter(|(key, _)| {
+        let owner = ReviewGroupKey::source_id_of_selector(key);
+        merged.sources.iter().any(|source| source.id == owner)
+    })
+    .collect();
     if let Some(state) = &mut merged.presentation {
         let empty = BTreeMap::new();
         state.series_views = merge_map(
@@ -375,5 +395,115 @@ mod tests {
         let local = workspace("Mine", &[]);
         let stored = workspace("Theirs", &[]);
         assert_eq!(merge_workspace(&base, &local, &stored).title, "Mine");
+    }
+
+    fn source(id: &str) -> bcode_code_review_models::ReviewSource {
+        bcode_code_review_models::ReviewSource {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            kind: bcode_code_review_models::ReviewSourceKind::Commits {
+                revs: vec!["a".to_owned(), "b".to_owned()],
+            },
+            included: true,
+        }
+    }
+
+    #[test]
+    fn pass_revisions_merge_per_group_and_drop_sources_the_review_no_longer_has() {
+        use bcode_code_review_models::ReviewedRevision;
+        let revision = |head: &str| ReviewedRevision {
+            reviewed_base_oid: None,
+            reviewed_head_oid: Some(head.to_owned()),
+            recorded_at_ms: None,
+        };
+        let member = ReviewGroupKey::Member {
+            source_id: "kept".into(),
+            member: "m".into(),
+        }
+        .selector();
+        let combined = ReviewGroupKey::Combined {
+            source_id: "kept".into(),
+        }
+        .selector();
+        let mut base = workspace("t", &[]);
+        base.sources = vec![source("kept"), source("gone")];
+        base.reviewed_revisions
+            .insert("gone".to_owned(), revision("old"));
+        let mut local = base.clone();
+        local.sources = vec![source("kept")];
+        local.reviewed_revisions.remove("gone");
+        local
+            .reviewed_revisions
+            .insert(member.clone(), revision("m"));
+        let mut stored = base.clone();
+        stored
+            .reviewed_revisions
+            .insert(combined.clone(), revision("c"));
+        stored
+            .reviewed_revisions
+            .insert("gone".to_owned(), revision("newer"));
+        let merged = merge_workspace(&base, &local, &stored);
+        let expected: BTreeSet<String> = [member, combined].into();
+        assert_eq!(
+            merged
+                .reviewed_revisions
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn series_views_and_group_marks_written_on_either_side_are_kept() {
+        use bcode_code_review_models::{
+            ReviewPresentationState, ReviewSeriesPresentation, ReviewSeriesView,
+        };
+        let view = |view| ReviewSeriesPresentation {
+            view,
+            last_member: None,
+        };
+        let mut base = workspace("t", &[]);
+        base.presentation = Some(ReviewPresentationState::default());
+        let mut local = base.clone();
+        let local_state = local.presentation.as_mut().expect("presentation");
+        local_state
+            .series_views
+            .insert("mine".to_owned(), view(ReviewSeriesView::OneMember));
+        local_state.hide_viewed_files = true;
+        local.group_viewed_marks.insert(
+            "series:combined:mine".to_owned(),
+            vec![ViewedMark::legacy("a.rs")],
+        );
+        let mut stored = base.clone();
+        stored
+            .presentation
+            .as_mut()
+            .expect("presentation")
+            .series_views
+            .insert("theirs".to_owned(), view(ReviewSeriesView::Combined));
+        stored.group_viewed_marks.insert(
+            "series:combined:theirs".to_owned(),
+            vec![ViewedMark::legacy("b.rs")],
+        );
+        stored
+            .group_viewed_marks
+            .insert("series:combined:empty".to_owned(), Vec::new());
+        let merged = merge_workspace(&base, &local, &stored);
+        let views = &merged.presentation.expect("presentation").series_views;
+        assert_eq!(views["mine"].view, ReviewSeriesView::OneMember);
+        assert_eq!(views["theirs"].view, ReviewSeriesView::Combined);
+        assert_eq!(
+            merged.group_viewed_marks["series:combined:mine"],
+            [ViewedMark::legacy("a.rs")]
+        );
+        assert_eq!(
+            merged.group_viewed_marks["series:combined:theirs"],
+            [ViewedMark::legacy("b.rs")]
+        );
+        assert_eq!(
+            merged.group_viewed_marks.get("series:combined:empty"),
+            Some(&Vec::new()),
+            "a group's own state survives without marks"
+        );
     }
 }

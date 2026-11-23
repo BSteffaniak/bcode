@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 impl ReviewData {
-    /// Pin the members of a `Commits` source. Only an explicit combined request may replay
-    /// sparse deltas. A failed combination retains the separately reviewable members.
+    /// Pin the members of a `Commits` source. A contiguous chain always includes its combined
+    /// diff, which needs no replay; only an explicit combined request may replay sparse
+    /// deltas. A failed combination retains the separately reviewable members.
     ///
     /// # Errors
     ///
@@ -80,7 +81,7 @@ impl ReviewData {
         };
         // Part positions belong to the original selection. Only the private replay plan
         // follows ancestry; otherwise changing views could silently renumber the members.
-        if combined {
+        if combined || chain.is_some() {
             let ordered = match chain {
                 Some((_, newest)) => Ok(contiguous_order(&infos, &newest)),
                 None => sparse_order(&root, &oids, &seen),
@@ -108,8 +109,13 @@ fn contiguous_order(infos: &BTreeMap<String, CommitInfo>, newest: &str) -> Vec<S
     ordered
 }
 
-/// An independent tip is necessary but not sufficient: a merge's second parent must not be
-/// mistaken for part of the selected first-parent line. Walk only until the oldest selection.
+/// Most first-parent commits walked between the newest and oldest selections.
+const SPARSE_WALK_LIMIT: usize = 51_200;
+
+/// Order a sparse selection along one first-parent line, oldest first. An independent tip is
+/// necessary but not sufficient: a commit reachable only through a merge's second parent is
+/// not on the line. On one line the octopus merge base of the selection is its oldest commit,
+/// so a single walk from the tip that stops at that commit sees every other selection.
 fn sparse_order(
     root: &Path,
     oids: &[String],
@@ -117,48 +123,67 @@ fn sparse_order(
 ) -> Result<Vec<String>, DataError> {
     let ambiguous =
         || DataError::InvalidRequest("selected commits are not on one first-parent line".into());
+    let single = |args: &[&str]| -> Result<String, DataError> {
+        let output = git::output(root, args)?;
+        let mut words = std::str::from_utf8(&output)
+            .map_err(|_| ambiguous())?
+            .split_whitespace();
+        let first = words.next().ok_or_else(ambiguous)?.to_owned();
+        if words.next().is_some() {
+            return Err(ambiguous());
+        }
+        Ok(first)
+    };
     let mut args = vec!["merge-base", "--independent"];
     args.extend(oids.iter().map(String::as_str));
-    let tips = git::output(root, &args)?;
-    let mut tips = std::str::from_utf8(&tips)
-        .map_err(|_| ambiguous())?
-        .split_whitespace();
-    let mut cursor = tips.next().ok_or_else(ambiguous)?.to_owned();
-    if tips.next().is_some() {
+    let tip = single(&args)?;
+    let mut args = vec!["merge-base", "--octopus"];
+    args.extend(oids.iter().map(String::as_str));
+    let oldest = single(&args)?;
+    if !selected.contains(&oldest) {
         return Err(ambiguous());
     }
-    let mut ordered = Vec::with_capacity(oids.len());
-    // Page bounded output and do not walk an entire unrelated history on every refresh.
-    for _ in 0..200 {
-        let page = git::output(
-            root,
-            &[
-                "rev-list",
-                "--first-parent",
-                "--max-count=256",
-                "--parents",
-                &cursor,
-                "--",
-            ],
-        )?;
-        let mut next = None;
-        for line in std::str::from_utf8(&page).map_err(|_| ambiguous())?.lines() {
-            let mut fields = line.split_whitespace();
-            let oid = fields.next().ok_or_else(ambiguous)?;
-            if selected.contains(oid) {
-                ordered.push(oid.to_owned());
-                if ordered.len() == selected.len() {
-                    ordered.reverse();
-                    return Ok(ordered);
-                }
-            }
-            next = fields.next();
-        }
-        next.ok_or_else(ambiguous)?.clone_into(&mut cursor);
+    let limit = format!("--max-count={}", SPARSE_WALK_LIMIT + 1);
+    let not_oldest = format!("^{oldest}");
+    let walk = git::output(
+        root,
+        &[
+            "rev-list",
+            "--first-parent",
+            "--parents",
+            &limit,
+            &tip,
+            &not_oldest,
+            "--",
+        ],
+    )?;
+    let walked: Vec<Vec<&str>> = std::str::from_utf8(&walk)
+        .map_err(|_| ambiguous())?
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    if walked.len() > SPARSE_WALK_LIMIT {
+        return Err(DataError::TooLarge(
+            "selected first-parent history exceeds the series walk limit".into(),
+        ));
     }
-    Err(DataError::TooLarge(
-        "selected first-parent history exceeds the series walk limit".into(),
-    ))
+    // The walk must end on the oldest selection; otherwise that commit was reached only
+    // through a merge's other parents.
+    if walked.last().and_then(|fields| fields.get(1)) != Some(&oldest.as_str()) {
+        return Err(ambiguous());
+    }
+    let mut ordered: Vec<String> = walked
+        .iter()
+        .filter_map(|fields| fields.first())
+        .filter(|oid| selected.contains(**oid))
+        .map(|oid| (*oid).to_owned())
+        .collect();
+    ordered.push(oldest);
+    if ordered.len() != selected.len() {
+        return Err(ambiguous());
+    }
+    ordered.reverse();
+    Ok(ordered)
 }
 
 fn aggregate(

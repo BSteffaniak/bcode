@@ -470,6 +470,8 @@ impl ReviewTools<'_> {
         let fingerprints = self.fingerprints_of(review, &selected)?;
         let base = self.current_viewed_record(review)?;
         let mut record = base.clone();
+        // Adopted legacy marks are part of this write, so they are adopted only once.
+        review.adopt_legacy_marks(&mut record);
         // The public report counts display paths, not marks: if any selected
         // group changed, report that path as changed rather than unchanged.
         let mut outcomes = BTreeMap::new();
@@ -481,11 +483,11 @@ impl ReviewTools<'_> {
             let identity = EntryIdentity::from_entry(entry).with_content(content.as_deref());
             let identity = identity.with_patch(patch.as_deref());
             let group = review.group_key(&review.resolved[*index]);
-            let is_viewed = super::series::viewed_state(&record, &group, &identity, reset)
+            let is_viewed = crate::viewed::state_in_group(&record, &group, &identity, reset)
                 != crate::viewed::ViewedState::Unviewed;
             let changed = outcomes.entry(entry.path.clone()).or_insert(false);
             if is_viewed != viewed {
-                super::series::set_viewed(&mut record, &group, &identity, viewed);
+                crate::viewed::set_in_group(&mut record, &group, &[identity], viewed);
                 *changed = true;
             }
         }
@@ -550,11 +552,12 @@ impl ReviewTools<'_> {
             })
             .transpose()?;
         let layers = Self::selected_sources(review, &selection.layers)?;
-        let entries: Vec<(usize, ReviewIndexEntry)> = self
-            .entries(review)?
-            .into_iter()
-            .filter(|(index, _)| layers.as_ref().is_none_or(|layers| layers.contains(index)))
-            .collect();
+        // Named layers are found whether or not the view shows them; otherwise only the
+        // active groups are selected.
+        let entries: Vec<(usize, ReviewIndexEntry)> = match &layers {
+            Some(layers) => self.entries_where(review, |index| layers.contains(&index))?,
+            None => self.entries(review)?,
+        };
         let named: BTreeSet<String> = selection
             .paths
             .iter()
@@ -625,6 +628,7 @@ impl ReviewTools<'_> {
                 })
                 .map(|(index, _)| index)
                 .collect();
+            let found = review.narrow(found, wanted);
             if found.is_empty() {
                 return Err(AssistantError::Invalid(format!(
                     "{layer} is not a layer or source of this review (code_review.summary lists them)"

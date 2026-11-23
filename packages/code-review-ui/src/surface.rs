@@ -409,7 +409,7 @@ impl Review {
     fn new(
         repo_path: PathBuf,
         opened: Opened,
-        combined_sources: BTreeSet<String>,
+        commit_series: BTreeMap<String, bcode_code_review::session::CommitSeriesState>,
         config: DocumentConfig,
         theme: &ReviewTheme,
         view: FilePanelView,
@@ -429,8 +429,7 @@ impl Review {
                 )
             })
         });
-        let doc =
-            ReviewDocument::new_with_combined_sources(repo_path, inputs, config, combined_sources);
+        let doc = ReviewDocument::new_with_series(repo_path, inputs, config, commit_series);
         let recorded_at = Some(annotate::now_ms());
         let revisions = doc
             .groups()
@@ -2183,6 +2182,9 @@ impl ReviewSurface {
             }
             Message::Opened(opened) => self.finish_open(*opened, host),
             Message::CommitSeries(state) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.doc.set_commit_series(state.clone());
+                }
                 self.commit_series.insert(state.source_id.clone(), state);
             }
             Message::Arrived(arrived) => self.apply_arrived(*arrived),
@@ -2373,7 +2375,7 @@ impl ReviewSurface {
         let mut review = Review::new(
             self.repo_path.clone(),
             opened,
-            self.sources.iter().filter(|s| matches!(&s.kind, bcode_code_review_models::ReviewSourceKind::Commits { revs } if revs.len() > 1)).map(|s| s.id.clone()).collect(),
+            self.commit_series.clone(),
             DocumentConfig {
                 uncommitted_marks: self.uncommitted_marks(),
                 ..self.document_config

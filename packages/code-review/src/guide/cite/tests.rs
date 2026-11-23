@@ -578,10 +578,11 @@ fn restored_member_citations_use_exact_listings_and_reject_ambiguous_paths() {
     let mut combined = first.clone();
     combined.part = None;
     combined.head = second.head.clone();
-    let active = GuideSources::project(&workspace, &[first, second], None);
+    let series = std::collections::BTreeSet::from(["range".to_owned()]);
+    let active = GuideSources::project(&workspace, &[first, second], &series, None);
     let pins = lifecycle::heads_of(&active.sources, &active.labels);
     assert_eq!(pins.len(), 2);
-    let restored = GuideSources::project(&workspace, &[combined], Some(&pins));
+    let restored = GuideSources::project(&workspace, &[combined], &series, Some(&pins));
     let reader = ReviewDataReader::grouped(&data, root.to_owned(), &restored);
     for (index, expected) in ["fn two() {}", "fn three() {}"].into_iter().enumerate() {
         let key = &active.sources[index].source_id;
@@ -655,11 +656,12 @@ fn sparse_combined_pin_recreates_its_own_content_after_collection() {
     let plan = data.commit_series(root, &source, true).unwrap();
     let combined = plan.combined.unwrap();
     let workspace = [source];
-    let groups = GuideSources::project(&workspace, &[combined], None);
+    let series = std::collections::BTreeSet::from(["picked".to_owned()]);
+    let groups = GuideSources::project(&workspace, &[combined], &series, None);
     let pins = heads_of(&groups.sources, &groups.labels);
     git(&["prune", "--expire=now"]);
     restore_objects(&data, root, &workspace, &pins).expect("recreate exact pin");
-    let restored = GuideSources::project(&workspace, &plan.members, Some(&pins));
+    let restored = GuideSources::project(&workspace, &plan.members, &series, Some(&pins));
     let reader = ReviewDataReader::grouped(&data, root.to_owned(), &restored);
     let selector = &groups.sources[0].source_id;
     let paths: Vec<_> = reader

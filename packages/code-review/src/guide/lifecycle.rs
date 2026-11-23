@@ -73,6 +73,7 @@ pub fn refresh_fork(
     now_ms: u64,
 ) -> (GuideVersion, Vec<String>) {
     let heads = heads_of(current, labels);
+    let primary = current.first().map(|source| source.source_id.as_str());
     let mut citations = base.citations.clone();
     for (id, citation) in &mut citations {
         let lines = match freshness.citations.get(id) {
@@ -80,12 +81,15 @@ pub fn refresh_fork(
             Some(Freshness::Moved { lines }) => *lines,
             _ => continue,
         };
-        let Some((selector, head)) = super::sources::citation_selector(citation, &base.heads)
-            .and_then(|source| heads.get_key_value(source))
+        let Some((selector, head)) =
+            super::sources::citation_selector_or_primary(citation, &base.heads, primary)
+                .and_then(|source| heads.get_key_value(source))
         else {
             continue;
         };
-        citation.source_id = Some(selector.clone());
+        if citation.source_id.is_some() || super::sources::is_series_selector(selector) {
+            citation.source_id = Some(selector.clone());
+        }
         let revision = match citation.side {
             ReviewLineSide::New => head.head.clone(),
             ReviewLineSide::Old => head.base.clone(),

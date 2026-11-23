@@ -1,224 +1,160 @@
-//! Assistant projection of the active review groups. Source ids always remain workspace ids.
+//! Assistant projection of review groups. Every resolved group stays addressable by its
+//! selector; the review's view only decides which groups are active (counted in totals and
+//! listed by default). Source ids always remain workspace ids.
 
-use super::{AssistantError, OpenReview};
-use crate::ReviewData;
+use super::OpenReview;
+use crate::session::ResolvedCommitSeries;
 use bcode_code_review_models::{
     ResolvedSource, ReviewGroupKey, ReviewSeriesView, ReviewSource, ReviewSourceKind,
-    ReviewWorkspace,
+    ReviewStackView, ReviewWorkspace,
 };
-
-pub(super) const fn is_commit_series(source: &ReviewSource) -> bool {
-    matches!(&source.kind, ReviewSourceKind::Commits { revs } if revs.len() > 1)
-}
+use std::collections::{BTreeMap, BTreeSet};
 
 impl OpenReview {
-    /// Identity of an active resolved group in the canonical workspace.
+    /// Identity of a resolved group: [`ReviewGroupKey::for_resolved`], with series-ness taken
+    /// from how the review resolved the group's source.
     #[must_use]
     pub fn group_key(&self, resolved: &ResolvedSource) -> ReviewGroupKey {
-        let source_id = resolved.source_id.clone();
-        if self
-            .workspace
-            .sources
-            .iter()
-            .any(|source| source.id == source_id && is_commit_series(source))
-        {
-            if resolved.part.is_none() {
-                return ReviewGroupKey::Combined { source_id };
-            }
-            if let Some(oid) = resolved.head.commit_oid() {
-                return ReviewGroupKey::Member {
-                    source_id,
-                    member: oid.to_owned(),
-                };
-            }
-        }
-        ReviewGroupKey::Standalone { source_id }
+        ReviewGroupKey::for_resolved(resolved, self.series.contains_key(&resolved.source_id))
+    }
+
+    /// Whether resolved group `index` is shown by the review's current view.
+    #[must_use]
+    pub fn is_active(&self, index: usize) -> bool {
+        self.resolved
+            .get(index)
+            .is_some_and(|resolved| !self.hidden.contains(&self.group_key(resolved)))
     }
 
     pub(super) fn matches_selector(&self, resolved: &ResolvedSource, selector: &str) -> bool {
         resolved.source_id == selector || self.group_key(resolved).selector() == selector
     }
-}
 
-pub(super) fn active_commits(
-    data: &ReviewData,
-    workspace: &ReviewWorkspace,
-    source: &ReviewSource,
-) -> Result<Vec<ResolvedSource>, AssistantError> {
-    let preference = workspace
-        .presentation
-        .as_ref()
-        .and_then(|state| state.series_views.get(&source.id));
-    let description = data.commit_series(&workspace.repo_root, source, false)?;
-    let mode = preference.map_or_else(
-        || {
-            if description.contiguous {
-                ReviewSeriesView::Combined
-            } else {
-                ReviewSeriesView::AllMembers
-            }
-        },
-        |state| state.view,
-    );
-    match mode {
-        ReviewSeriesView::AllMembers => Ok(description.members),
-        ReviewSeriesView::OneMember => {
-            let last = preference.and_then(|state| state.last_member.as_deref());
-            let member = description
-                .members
-                .into_iter()
-                .find(|member| {
-                    last.is_none_or(|id| {
-                        member.head.commit_oid().is_some_and(|oid| {
-                            oid == id
-                                || (ReviewGroupKey::Member {
-                                    source_id: source.id.clone(),
-                                    member: oid.to_owned(),
-                                })
-                                .selector()
-                                    == id
-                        })
-                    })
-                })
-                .ok_or_else(|| {
-                    AssistantError::Invalid(format!("selected member is not in {}", source.label))
-                })?;
-            Ok(vec![member])
+    /// Narrow several groups a name matched: an exact group selector wins, then the active
+    /// ones. One group is returned unchanged.
+    pub(super) fn narrow(&self, mut found: Vec<usize>, name: &str) -> Vec<usize> {
+        if found.len() < 2 {
+            return found;
         }
-        ReviewSeriesView::Combined => {
-            let plan = data.commit_series(&workspace.repo_root, source, true)?;
-            plan.combined.map(|group| vec![group]).ok_or_else(|| {
-                AssistantError::Invalid(
-                    plan.unavailable
-                        .unwrap_or_else(|| format!("{} has no exact combined diff", source.label)),
-                )
-            })
-        }
-    }
-}
-
-/// Project existing stack sources without creating forge identities. Without an explicit
-/// grouping, a headless layer review exposes every layer; a whole-stack review shows its diff.
-pub(super) fn stack_sources(
-    workspace: &ReviewWorkspace,
-) -> Result<std::collections::BTreeSet<String>, AssistantError> {
-    use ReviewSourceKind::{Stack, StackLayer};
-    let mut families = std::collections::BTreeMap::new();
-    for source in workspace.sources.iter().filter(|source| source.included) {
-        match &source.kind {
-            Stack {
-                provider,
-                repository,
-                ..
-            }
-            | StackLayer {
-                provider,
-                repository,
-                ..
-            } => {
-                families
-                    .entry((provider, repository))
-                    .or_insert_with(Vec::new)
-                    .push(source);
-            }
-            _ => {}
-        }
-    }
-    let mut included = std::collections::BTreeSet::new();
-    for sources in families.into_values() {
-        let whole = sources
+        if let Some(&exact) = found
             .iter()
-            .copied()
-            .find(|s| matches!(s.kind, Stack { .. }));
-        let layers: Vec<_> = sources
+            .find(|&&index| self.group_key(&self.resolved[index]).selector() == name)
+        {
+            return vec![exact];
+        }
+        if found.iter().any(|&index| self.is_active(index)) {
+            found.retain(|&index| self.is_active(index));
+        }
+        found
+    }
+
+    /// Selectors of resolved groups, for messages that ask for one.
+    pub(super) fn selectors_of(&self, indices: &[usize]) -> Vec<String> {
+        let mut out: Vec<String> = indices
+            .iter()
+            .map(|&index| self.group_key(&self.resolved[index]).selector())
+            .collect();
+        out.dedup();
+        out
+    }
+}
+
+/// Groups of one commit series resolution, and the ones its view hides.
+pub(super) fn commit_groups(
+    resolved: &ResolvedCommitSeries,
+) -> (Vec<ResolvedSource>, BTreeSet<ReviewGroupKey>) {
+    let Some(state) = &resolved.state else {
+        return (resolved.members.clone(), BTreeSet::new());
+    };
+    let shown: BTreeSet<ReviewGroupKey> = resolved
+        .visible()
+        .iter()
+        .map(|group| state.group_key(group))
+        .collect();
+    let all = resolved.all();
+    let hidden = all
+        .iter()
+        .map(|group| state.group_key(group))
+        .filter(|key| !shown.contains(key))
+        .collect();
+    (all, hidden)
+}
+
+pub(super) const fn is_stack(source: &ReviewSource) -> bool {
+    matches!(
+        source.kind,
+        ReviewSourceKind::Stack { .. } | ReviewSourceKind::StackLayer { .. }
+    )
+}
+
+/// The stack groups the review's view leaves out of totals, with the review app's policy:
+/// the saved series view of the stack (keyed by its whole-stack source, else its first
+/// layer), else [`bcode_code_review_models::ReviewPresentationState::stack_view`], which
+/// defaults to one layer at a time. The whole-stack view leaves out the layers; the layer
+/// views leave out the whole-stack diff (one-layer view only moves between layers, which all
+/// still count). A stack missing one representation keeps the other.
+pub(super) fn stack_hidden(
+    workspace: &ReviewWorkspace,
+    resolved: &[ResolvedSource],
+) -> BTreeSet<ReviewGroupKey> {
+    use ReviewSourceKind::{Stack, StackLayer};
+    let present = |source: &&ReviewSource| resolved.iter().any(|r| r.source_id == source.id);
+    let mut families = BTreeMap::<_, Vec<&ReviewSource>>::new();
+    for source in workspace
+        .sources
+        .iter()
+        .filter(|s| s.included)
+        .filter(present)
+    {
+        if let Stack {
+            provider,
+            repository,
+            ..
+        }
+        | StackLayer {
+            provider,
+            repository,
+            ..
+        } = &source.kind
+        {
+            families
+                .entry((provider, repository))
+                .or_default()
+                .push(source);
+        }
+    }
+    let presentation = workspace.presentation.clone().unwrap_or_default();
+    let standalone = |source: &ReviewSource| ReviewGroupKey::Standalone {
+        source_id: source.id.clone(),
+    };
+    let mut hidden = BTreeSet::new();
+    for sources in families.into_values() {
+        let whole = sources.iter().find(|s| matches!(s.kind, Stack { .. }));
+        let layers: Vec<&ReviewSource> = sources
             .iter()
             .copied()
             .filter(|s| matches!(s.kind, StackLayer { .. }))
             .collect();
-        let owner = whole.unwrap_or(sources[0]);
-        let presentation = workspace.presentation.as_ref();
-        let pref = presentation.and_then(|p| p.series_views.get(&owner.id));
-        let mode = pref
-            .map(|p| p.view)
-            .or_else(|| {
-                presentation
-                    .and_then(|p| p.stack_view)
-                    .map(|view| match view {
-                        bcode_code_review_models::ReviewStackView::Whole => {
-                            ReviewSeriesView::Combined
-                        }
-                        bcode_code_review_models::ReviewStackView::OneLayer => {
-                            ReviewSeriesView::OneMember
-                        }
-                        bcode_code_review_models::ReviewStackView::AllLayers => {
-                            ReviewSeriesView::AllMembers
-                        }
-                    })
-            })
-            .unwrap_or_else(|| {
-                if matches!(sources[0].kind, Stack { .. }) {
-                    ReviewSeriesView::Combined
-                } else {
-                    ReviewSeriesView::AllMembers
-                }
-            });
-        if pref.is_some()
-            && ((mode == ReviewSeriesView::Combined && whole.is_none())
-                || (mode != ReviewSeriesView::Combined && layers.is_empty()))
-        {
-            return Err(AssistantError::Invalid(format!(
-                "{} has no locally recorded sources for {mode:?}",
-                owner.label
-            )));
-        }
-        match mode {
-            ReviewSeriesView::Combined if whole.is_some() => {
-                included.insert(owner.id.clone());
-            }
-            _ if layers.is_empty() => {
-                included.insert(owner.id.clone());
-            }
-            ReviewSeriesView::OneMember => {
-                let last = pref.and_then(|p| p.last_member.as_deref());
-                let layer = layers
-                    .iter()
-                    .find(|s| last.is_none_or(|id| id == s.id))
-                    .ok_or_else(|| {
-                        AssistantError::Invalid(
-                            "selected stack member is no longer in the review".into(),
-                        )
-                    })?;
-                included.insert(layer.id.clone());
-            }
-            _ => included.extend(layers.iter().map(|s| s.id.clone())),
+        let (Some(whole), Some(first)) = (whole, layers.first()) else {
+            continue;
+        };
+        let view = presentation
+            .series_views
+            .get(&whole.id)
+            .or_else(|| presentation.series_views.get(&first.id))
+            .map_or_else(
+                || match presentation.stack_view() {
+                    ReviewStackView::Whole => ReviewSeriesView::Combined,
+                    ReviewStackView::AllLayers => ReviewSeriesView::AllMembers,
+                    ReviewStackView::OneLayer => ReviewSeriesView::OneMember,
+                },
+                |saved| saved.view,
+            );
+        if view == ReviewSeriesView::Combined {
+            hidden.extend(layers.iter().map(|s| standalone(s)));
+        } else {
+            hidden.insert(standalone(whole));
         }
     }
-    Ok(included)
-}
-
-pub(super) fn viewed_state(
-    workspace: &ReviewWorkspace,
-    group: &ReviewGroupKey,
-    file: &crate::viewed::ViewedIdentity<'_>,
-    reset: crate::viewed::ViewedReset,
-) -> crate::viewed::ViewedState {
-    if matches!(group, ReviewGroupKey::Standalone { .. }) {
-        crate::viewed::viewed_state(workspace, file, reset)
-    } else {
-        crate::viewed::group_viewed_state(workspace, group, file, reset)
-    }
-}
-
-pub(super) fn set_viewed(
-    workspace: &mut ReviewWorkspace,
-    group: &ReviewGroupKey,
-    file: &crate::viewed::ViewedIdentity<'_>,
-    viewed: bool,
-) {
-    match (group, viewed) {
-        (ReviewGroupKey::Standalone { .. }, true) => crate::viewed::mark_viewed(workspace, file),
-        (ReviewGroupKey::Standalone { .. }, false) => crate::viewed::unmark_viewed(workspace, file),
-        (_, true) => crate::viewed::mark_group_viewed(workspace, group, std::slice::from_ref(file)),
-        (_, false) => crate::viewed::unmark_group_viewed(workspace, group, file),
-    }
+    hidden
 }

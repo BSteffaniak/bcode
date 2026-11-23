@@ -178,19 +178,22 @@ impl ReviewTools<'_> {
         name: Option<&str>,
         side: Side,
     ) -> Result<usize, AssistantError> {
-        if review.resolved.is_empty() {
+        let active: Vec<usize> = (0..review.resolved.len())
+            .filter(|&index| review.is_active(index))
+            .collect();
+        let (Some(&first), Some(&last)) = (active.first(), active.last()) else {
             return Err(AssistantError::Invalid(
                 "the review has no resolved sources".to_owned(),
             ));
-        }
+        };
         let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
             return Ok(match side {
-                Side::New => review.resolved.len() - 1,
-                Side::Old => 0,
+                Side::New => last,
+                Side::Old => first,
             });
         };
         let number = name.trim_start_matches('#').parse::<u64>().ok();
-        let mut matches = review
+        let found: Vec<usize> = review
             .resolved
             .iter()
             .enumerate()
@@ -207,19 +210,19 @@ impl ReviewTools<'_> {
                                 .is_some_and(|number| source_number(&source.kind) == Some(number))
                     })
             })
-            .map(|(index, _)| index);
-        let index = matches.next().ok_or_else(|| {
-            AssistantError::NotFound(format!(
+            .map(|(index, _)| index)
+            .collect();
+        match review.narrow(found, name).as_slice() {
+            [] => Err(AssistantError::NotFound(format!(
                 "no source of this review is named {name}; sources: {}",
                 source_names(review).join(", ")
-            ))
-        })?;
-        if matches.next().is_some() {
-            return Err(AssistantError::Invalid(format!(
-                "ambiguous source {name}; pass an active group selector"
-            )));
+            ))),
+            [index] => Ok(*index),
+            several => Err(AssistantError::Invalid(format!(
+                "ambiguous source {name}; pass one of these group selectors: {}",
+                review.selectors_of(several).join(", ")
+            ))),
         }
-        Ok(index)
     }
 
     fn hunks_of(

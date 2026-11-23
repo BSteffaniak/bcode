@@ -22,7 +22,8 @@
 //! `docs/review-loading-architecture.md`.
 
 mod series;
-pub use series::CommitSeriesState;
+pub(crate) use series::is_series as may_be_commit_series;
+pub use series::{CommitSeriesState, ResolvedCommitSeries, resolve_commit_series};
 
 use crate::data::{DataError, ReviewData};
 use crate::provider::{Freshness, ProviderRegistry, gather_provider_resolutions, quick_layer};
@@ -505,10 +506,11 @@ fn resolve_and_list(
                         .cloned(),
                 }),
                 None => OpenEvent::Failed(ReviewSourceDiagnostic {
-                    source_id: series::group_selector(
+                    source_id: bcode_code_review_models::ReviewGroupKey::for_resolved(
                         source,
                         multi.contains(source.source_id.as_str()),
-                    ),
+                    )
+                    .selector(),
                     severity: bcode_code_review_models::ReviewSourceDiagnosticSeverity::Error,
                     code: outcome.error_code.unwrap_or_default(),
                     message: outcome.error_message.unwrap_or_default(),

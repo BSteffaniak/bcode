@@ -246,6 +246,7 @@ impl ReviewSurface {
             .as_ref()
             .map(|w| w.sources.clone())
             .unwrap_or_default();
+        let series: BTreeSet<String> = self.commit_series.keys().cloned().collect();
         let inbox = self.inbox.clone();
         let repo = scope.repo_path;
         host.spawn(Box::pin(async move {
@@ -278,6 +279,7 @@ impl ReviewSurface {
                     let groups = bcode_code_review::guide::sources::GuideSources::project(
                         &workspace,
                         &sources,
+                        &series,
                         Some(&version.heads),
                     );
                     Ok(files_to_view(

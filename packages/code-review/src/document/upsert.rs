@@ -34,7 +34,7 @@ impl ReviewDocument {
             self.repo_path.clone(),
             regrouped.inputs,
             self.config,
-            std::mem::take(&mut self.combined_sources),
+            std::mem::take(&mut self.series),
         );
         rebuilt.source_focus = self.source_focus.take();
         rebuilt.hidden_groups = std::mem::take(&mut self.hidden_groups);
