@@ -464,6 +464,9 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
             .store
             .retention_context(owner, &target, previous_after.as_deref())
             .await?;
+        let had_retention = retention.as_ref().is_some_and(|context| {
+            context.acknowledgment.is_some() || !context.hydration.is_empty()
+        });
         let (_, request) = self
             .request(
                 owner,
@@ -497,7 +500,12 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         // the retention digest, so strip it before canonical commit. It is reattached only to
         // the in-memory result, where daemon ingestion publishes it as session live events.
         let live = std::mem::take(&mut page.live);
-        if self.unchanged_idle_page(owner.session_id, &page) {
+        if self.unchanged_idle_page(
+            owner.session_id,
+            previous_after.as_deref(),
+            had_retention,
+            &page,
+        ) {
             // Nothing to record: the canonical cursor stays where it was, and so does the
             // caller's.
             page.next_after.clone_from(&previous_after);
@@ -520,17 +528,23 @@ impl<S: ManagedHarnessStore, T: ManagedHarnessTransport> ManagedHarnessRuntime<S
         Ok(page)
     }
 
-    /// Whether `page` carries nothing durable and reports the status last committed: an idle
-    /// poll result, which history does not need.
+    /// Whether `page` carries nothing durable, keeps the exact same cursor without clearing a
+    /// pending retention acknowledgment, and reports the status last committed: an idle poll
+    /// result, which history does not need.
     fn unchanged_idle_page(
         &self,
         session: SessionId,
+        previous_after: Option<&str>,
+        had_retention: bool,
         page: &bcode_harness_models::HarnessObservationPage,
     ) -> bool {
         page.observations.is_empty()
             && page.hydration_requests.is_empty()
             && page.retention.is_none()
             && page.inventory_page.is_none()
+            && page.completeness != bcode_harness_models::HarnessCompleteness::Gap
+            && !had_retention
+            && page.next_after.as_deref() == previous_after
             && self
                 .committed_status
                 .lock()

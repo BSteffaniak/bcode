@@ -662,3 +662,207 @@ async fn session_configuration_view_resolves_the_live_owner_of_a_local_snapshot(
             .same_config_view(&view)
     );
 }
+
+struct CursorResetTransport {
+    expected_after: std::sync::Mutex<Option<String>>,
+    step: std::sync::atomic::AtomicUsize,
+    owner: ExternalHarnessOwner,
+}
+
+impl CursorResetTransport {
+    fn next_page(
+        &self,
+        expected: &mut Option<String>,
+        step: usize,
+        idle: HarnessExecutionStatus,
+    ) -> HarnessObservationPage {
+        let text_obs = |id: &str, text: &str, seg: &str| HarnessObservation {
+            observation_id: id.into(),
+            session_id: self.owner.session_id.to_string(),
+            generation: 1,
+            native_correlations: Vec::new(),
+            completeness: HarnessCompleteness::Complete,
+            kind: HarnessObservationKind::Text {
+                text: text.into(),
+                segment_id: Some(seg.into()),
+            },
+        };
+        match step {
+            0 => {
+                // First turn completes and sets a successor cursor while already idle.
+                let observations = vec![text_obs("turn-1-text", "first reply", "seg-1")];
+                let retention = bcode_harness_models::HarnessRetentionPage {
+                    connection_id: "conn-1".into(),
+                    page_id: "page-1".into(),
+                    observations_digest: bcode_harness_models::harness_observations_digest(
+                        &observations,
+                    )
+                    .unwrap(),
+                };
+                *expected = Some("cursor-1".into());
+                HarnessObservationPage {
+                    live: Vec::new(),
+                    retention: Some(retention),
+                    hydration_requests: Vec::new(),
+                    inventory_page: None,
+                    observations,
+                    next_after: Some("cursor-1".into()),
+                    completeness: HarnessCompleteness::Complete,
+                    status: idle,
+                }
+            }
+            1 | 2 => {
+                // Empty idle poll resets cursor to None while keeping identical Idle status.
+                *expected = None;
+                HarnessObservationPage {
+                    live: Vec::new(),
+                    retention: None,
+                    hydration_requests: Vec::new(),
+                    inventory_page: None,
+                    observations: Vec::new(),
+                    next_after: None,
+                    completeness: HarnessCompleteness::Complete,
+                    status: idle,
+                }
+            }
+            _ => {
+                // Follow-up turn arrives after the cursor reset.
+                *expected = Some("cursor-2".into());
+                HarnessObservationPage {
+                    live: Vec::new(),
+                    retention: None,
+                    hydration_requests: Vec::new(),
+                    inventory_page: None,
+                    observations: vec![text_obs("turn-2-text", "followup reply", "seg-2")],
+                    next_after: Some("cursor-2".into()),
+                    completeness: HarnessCompleteness::Complete,
+                    status: idle,
+                }
+            }
+        }
+    }
+}
+
+impl super::ManagedHarnessTransport for CursorResetTransport {
+    fn invoke(
+        &self,
+        request: &HarnessRequest,
+    ) -> impl std::future::Future<
+        Output = Result<HarnessServiceResponse, super::ManagedHarnessError>,
+    > + Send {
+        let result = (|| {
+            let HarnessRequestKind::Observe(observe) = &request.kind else {
+                return Err(super::ManagedHarnessError::Unsupported);
+            };
+            let mut expected = self.expected_after.lock().unwrap();
+            if observe.after != *expected {
+                return Ok(HarnessServiceResponse {
+                    schema_version: HARNESS_SCHEMA_VERSION,
+                    request_id: request.request_id.clone(),
+                    operation: HarnessOperation::Observe,
+                    kind: HarnessServiceResponseKind::Failure(
+                        bcode_harness_models::HarnessFailure::Uncertain,
+                    ),
+                });
+            }
+            let idle = HarnessExecutionStatus {
+                connectivity: HarnessConnectivity::Connected,
+                activity: HarnessActivity::Idle,
+                attention: HarnessAttention::None,
+                continuation: HarnessContinuation::Unknown,
+                completeness: HarnessCompleteness::Complete,
+            };
+            let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let page = self.next_page(&mut expected, step, idle);
+            drop(expected);
+            Ok(HarnessServiceResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                operation: HarnessOperation::Observe,
+                kind: HarnessServiceResponseKind::Observations(page),
+            })
+        })();
+        std::future::ready(result)
+    }
+}
+
+#[tokio::test]
+async fn idle_page_that_resets_cursor_commits_so_followup_observations_stay_in_sync() {
+    let (_root, sessions, durable, opening, _) = Box::pin(prepared_observation_fixture()).await;
+    let mut state = std::sync::Arc::new(crate::tests::test_server_state(sessions.clone()));
+    {
+        let state = std::sync::Arc::get_mut(&mut state).unwrap();
+        state
+            .daemon_status
+            .instance_id
+            .clone_from(&durable.daemon_id);
+        state
+            .daemon_status
+            .build_fingerprint
+            .clone_from(&durable.artifact_id);
+        state.daemon_status.artifact_id = Some(bcode_ipc::ArtifactId::current());
+    }
+    let store = super::CanonicalHarnessStore::new(&state);
+    let owner = store.current_owner(durable.session_id).await.unwrap();
+    drop(store);
+    let transport = CursorResetTransport {
+        expected_after: std::sync::Mutex::new(None),
+        step: std::sync::atomic::AtomicUsize::new(0),
+        owner: durable.clone(),
+    };
+    let runtime =
+        super::ManagedHarnessRuntime::new(super::CanonicalHarnessStore::new(&state), transport);
+    let app = super::ManagedHarnessApplication::with_owner(
+        &state,
+        bcode_session_models::ClientId::new(),
+        &runtime,
+        owner.clone(),
+    );
+    let query = bcode_ipc::harness::ManagedSessionPollRequest {
+        session_id: durable.session_id,
+        instance_id: opening.instance.instance_id,
+        generation: 1,
+        limit: 16,
+    };
+
+    // Poll 0: turn 1 completes with cursor-1 and Idle status.
+    assert_eq!(app.poll_observations(&query, 0).await.unwrap(), 1);
+    assert_eq!(
+        sessions
+            .external_harness_state(&durable)
+            .await
+            .unwrap()
+            .observation_after
+            .as_deref(),
+        Some("cursor-1")
+    );
+
+    // Poll 1: empty idle poll clears cursor-1 -> None; must commit despite unchanged Idle status.
+    assert_eq!(app.poll_observations(&query, 0).await.unwrap(), 0);
+    assert_eq!(
+        sessions
+            .external_harness_state(&durable)
+            .await
+            .unwrap()
+            .observation_after,
+        None
+    );
+
+    // Poll 2: steady-state idle poll (None -> None) stays in sync without failing.
+    assert_eq!(app.poll_observations(&query, 0).await.unwrap(), 0);
+
+    // Poll 3: follow-up turn observations are received and committed.
+    assert_eq!(app.poll_observations(&query, 0).await.unwrap(), 1);
+    assert_eq!(
+        sessions
+            .external_harness_state(&durable)
+            .await
+            .unwrap()
+            .observation_after
+            .as_deref(),
+        Some("cursor-2")
+    );
+    drop(app);
+    drop(runtime);
+    drop(state);
+}
