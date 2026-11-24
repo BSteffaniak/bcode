@@ -14,6 +14,7 @@ version     = { workspace = true }
 toml = { workspace = true }
 
 [dependencies]
+bcode_antigravity_harness_plugin        = { workspace = true, optional = true }
 bcode_auth_broker_plugin                = { workspace = true, optional = true }
 bcode_auth_broker_provider_plugin       = { workspace = true, optional = true }
 bcode_bedrock_provider_plugin           = { workspace = true, optional = true }
@@ -99,6 +100,9 @@ bundled-ocr-tesseract-v5-5-2 = [
 default = []
 fail-on-warnings = []
 git-ui = ["static-bundled-git-plugin", "bcode_git_plugin/git-ui"]
+static-bundled-antigravity-harness-plugin = [
+    "dep:bcode_antigravity_harness_plugin",
+]
 static-bundled-auth-broker-plugin = ["dep:bcode_auth_broker_plugin"]
 static-bundled-auth-broker-provider-plugin = [
     "dep:bcode_auth_broker_provider_plugin",
@@ -152,6 +156,7 @@ static-bundled-opencode-session-import-plugin = [
 ]
 static-bundled-pi-session-import-plugin = ["dep:bcode_pi_session_import_plugin"]
 static-bundled-plugins = [
+    "static-bundled-antigravity-harness-plugin",
     "static-bundled-claude-code-plugin",
     "static-bundled-codex-harness-plugin",
     "static-bundled-harness-plugin",

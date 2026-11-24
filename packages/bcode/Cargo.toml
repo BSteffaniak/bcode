@@ -183,6 +183,10 @@ fail-on-warnings = []
 metrics = ["dep:bcode_metrics", "dep:tracing-subscriber"]
 openai-compatible-provider = ["dep:bcode_openai_compatible_provider_plugin"]
 opentelemetry = ["dep:tracing-opentelemetry"]
+static-bundled-antigravity-harness-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-antigravity-harness-plugin",
+]
 static-bundled-auth-broker-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-auth-broker-plugin",
@@ -290,6 +294,7 @@ static-bundled-pi-session-import-plugin = [
     "bcode_bundled_plugins/static-bundled-pi-session-import-plugin",
 ]
 static-bundled-plugins = [
+    "static-bundled-antigravity-harness-plugin",
     "static-bundled-claude-code-plugin",
     "static-bundled-codex-harness-plugin",
     "static-bundled-harness-plugin",

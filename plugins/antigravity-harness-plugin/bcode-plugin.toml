@@ -1,0 +1,126 @@
+id      = "bcode.antigravity-harness"
+name    = "Bcode Antigravity Harness"
+version = "0.0.1"
+
+[[services]]
+class        = "service"
+description  = "Native Antigravity ACP managed session backend"
+interface_id = "bcode.harness/v3"
+name         = "Antigravity managed sessions"
+
+[[services]]
+class        = "query"
+description  = "Bounded non-mutating installed Antigravity CLI candidates with native account readiness"
+interface_id = "bcode.harness.candidates/v1"
+name         = "Antigravity setup candidates"
+
+[[services]]
+class        = "service"
+description  = "Native agy models discovery and exact selected session start"
+interface_id = "bcode.harness.models/v1"
+name         = "Antigravity model selection"
+
+[[services]]
+class        = "service"
+description  = "Exact session resume preflight and physical ACP process release evidence; Close acknowledgement alone never proves release"
+interface_id = "bcode.harness.recovery/v1"
+name         = "Antigravity recovery evidence"
+
+[[services]]
+class        = "query"
+description  = "Namespace-bound client-terminal agy acp --login plan; declaration is not readiness or permission"
+interface_id = "bcode.harness.terminal-auth/v1"
+name         = "Antigravity native terminal login preparation"
+
+# Native tool rows show their main argument in the transcript.
+[[presentation.tools]]
+target_fields = ["CommandLine", "command"]
+tool_name     = "run_command"
+
+[[presentation.tools]]
+target_fields = ["Path", "path", "file_path"]
+tool_name     = "read_file"
+
+[[presentation.tools]]
+target_fields = ["Path", "path", "file_path"]
+tool_name     = "write_file"
+
+[[presentation.tools]]
+target_fields = ["Path", "path", "file_path"]
+tool_name     = "edit_file"
+
+[[presentation.tools]]
+target_fields = ["Query", "pattern", "SearchPath"]
+tool_name     = "grep_search"
+
+[[presentation.tools]]
+target_fields = ["Pattern", "SearchDirectory"]
+tool_name     = "find_by_name"
+
+[[presentation.tools]]
+target_fields = ["DirectoryPath", "path"]
+tool_name     = "list_dir"
+
+[[presentation.tools]]
+target_fields = ["query"]
+tool_name     = "search_web"
+
+[[presentation.tools]]
+target_fields = ["Url", "url"]
+tool_name     = "read_url_content"
+
+# Map native Antigravity tools onto Bcode's tool policy for agent-governed approvals.
+[[native_tools]]
+fields    = ["CommandLine", "command"]
+operation = "command"
+tool_name = "run_command"
+
+[[native_tools]]
+fields    = ["Path", "path", "file_path"]
+operation = "read"
+tool_name = "read_file"
+
+[[native_tools]]
+fields    = ["SearchPath", "path"]
+operation = "read"
+tool_name = "grep_search"
+
+[[native_tools]]
+fields    = ["SearchDirectory", "path"]
+operation = "read"
+tool_name = "find_by_name"
+
+[[native_tools]]
+fields    = ["DirectoryPath", "path"]
+operation = "read"
+tool_name = "list_dir"
+
+[[native_tools]]
+fields    = ["Path", "path", "file_path"]
+operation = "write"
+tool_name = "write_file"
+
+[[native_tools]]
+fields    = ["Path", "path", "file_path"]
+operation = "write"
+tool_name = "edit_file"
+
+[[native_tools]]
+fields    = ["Url", "url"]
+operation = "web"
+tool_name = "read_url_content"
+
+[[native_tools]]
+fields    = []
+operation = "read_only"
+tool_name = "search_web"
+
+[concurrency]
+# Operations serialize on retained plugin state; only a waiting observe releases that lock
+# while it waits for native output.
+type = "concurrent"
+
+[runtime]
+abi_version = 5
+library     = "libbcode_antigravity_harness_plugin.dylib"
+type        = "native"

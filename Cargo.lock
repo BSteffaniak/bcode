@@ -1633,6 +1633,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_antigravity_harness_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_harness_models",
+ "bcode_plugin_sdk",
+ "bcode_provider_auth_models",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "bcode_auth_broker_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -1736,6 +1751,7 @@ dependencies = [
 name = "bcode_bundled_plugins"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_antigravity_harness_plugin",
  "bcode_auth_broker_plugin",
  "bcode_auth_broker_provider_plugin",
  "bcode_bedrock_provider_plugin",

@@ -16,7 +16,7 @@ application operation explicitly creates an independently controlled Bcode child
 Portable contracts live in `bcode_harness_models`, plugin registration/routing in the
 plugin domains, and canonical external evidence in session models and persistence.
 `bcode_claude_code` is a protocol/process library independent of Bcode's application,
-persistence and workflow implementations. Claude Code and Codex integrations are
+persistence and workflow implementations. Antigravity, Claude Code and Codex integrations are
 separately disableable plugins, as is the generic managed-session tool plugin.
 
 ## Identity and evidence
@@ -408,6 +408,16 @@ It walks a selected-model open, a turn with a native approval, a later `NextTurn
 completion, a mid-session model switch, a graceful daemon restart, recovery of the exact native
 thread and resumed native context. Codex never reports authoritative settlement, so turns end at
 the exact attempt's `SubmissionTerminal`. See `plugins/codex-harness-plugin/README.md`.
+
+For Antigravity (installed `agy` on `PATH`, existing native Google OAuth login in `~/.gemini`):
+
+```sh
+cargo test -p bcode_antigravity_harness_plugin --test native_subscription -- --ignored --nocapture
+```
+
+Antigravity speaks ACP over stdio (`agy acp --stdio --disable-telemetry`), uses native Google OAuth
+via `agy acp --login` (`bcode.harness.terminal-auth/v1`), discovers models via `agy models`, and
+completes foreground turns at `SubmissionTerminal`. See `plugins/antigravity-harness-plugin/README.md`.
 
 Observation clients must use the exact returned `next_after`, including `None` on
 an empty page, and adopt confirmed session bindings. Canonical history has a

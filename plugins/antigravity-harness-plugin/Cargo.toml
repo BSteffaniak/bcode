@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Managed Antigravity ACP session backend for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "antigravity", "acp", "harness", "plugin"]
+license     = { workspace = true }
+name        = "bcode_antigravity_harness_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `dynamic-backend`/`dynamic-frontend` are packaging roles: the packager builds one
+# component with one of them; workspace builds never select them.
+default          = []
+dynamic-backend  = []
+dynamic-frontend = []
+fail-on-warnings = []
+
+[dependencies]
+bcode_harness_models       = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+thiserror                  = { workspace = true }
+uuid                       = { workspace = true, features = ["v4"] }
+zeroize                    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

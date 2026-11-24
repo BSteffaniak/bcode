@@ -413,6 +413,10 @@ fn system_text(item: &TranscriptViewItem) -> Option<&str> {
 
 #[test]
 fn display_label_is_derived_generically_from_the_plugin_identity() {
+    assert_eq!(
+        harness_display_label("bcode.antigravity-harness"),
+        "Antigravity"
+    );
     assert_eq!(harness_display_label("bcode.claude-code"), "Claude Code");
     assert_eq!(harness_display_label("codex-harness-plugin"), "Codex");
     assert_eq!(harness_display_label("vendor/agent_cli"), "Agent Cli");

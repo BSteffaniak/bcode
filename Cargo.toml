@@ -3,6 +3,7 @@ members = [
     "packages/path-display",
     "packages/harness/models",
     "packages/claude-code",
+    "plugins/antigravity-harness-plugin",
     "plugins/claude-code-plugin",
     "plugins/codex-harness-plugin",
     "plugins/harness-plugin",
@@ -197,6 +198,7 @@ repository = "https://github.com/BSteffaniak/bcode"
 version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
+bcode_antigravity_harness_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/antigravity-harness-plugin" }
 bcode_claude_code = { version = "0.0.1-alpha.0", default-features = false, path = "packages/claude-code" }
 bcode_claude_code_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/claude-code-plugin" }
 bcode_codex_harness_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/codex-harness-plugin" }
@@ -348,8 +350,8 @@ bcode_server                            = { version = "0.0.1-alpha.0", default-f
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_bridge                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge" }
 bcode_session_bridge_embedded           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/embedded" }
-bcode_session_bridge_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/runtime" }
 bcode_session_bridge_models             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/models" }
+bcode_session_bridge_runtime            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/runtime" }
 bcode_session_bridge_server             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-bridge/server" }
 bcode_session_derivation_plugin         = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/session-derivation-plugin" }
 bcode_session_feed                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/feed" }
@@ -416,7 +418,9 @@ bmux_plugin = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_runtime = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_schema = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_plugin_sdk = { default-features = false, version = "0.0.1-alpha.4" }
-bmux_pty = { default-features = false, features = ["native"], version = "0.0.1-alpha.4" }
+bmux_pty = { default-features = false, features = [
+    "native",
+], version = "0.0.1-alpha.4" }
 bmux_syntax_render = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal = { default-features = false, version = "0.0.1-alpha.4" }
 bmux_terminal_grid = { default-features = false, version = "0.0.1-alpha.4" }

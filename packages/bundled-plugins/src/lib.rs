@@ -130,6 +130,8 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
 // One feature-gated line per bundled plugin; splitting the list would only scatter it.
 #[allow(clippy::too_many_lines)]
 fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPlugin>) {
+    #[cfg(feature = "static-bundled-antigravity-harness-plugin")]
+    plugins.push(antigravity_harness_plugin());
     #[cfg(feature = "static-bundled-claude-code-plugin")]
     plugins.push(claude_code_plugin());
     #[cfg(feature = "static-bundled-codex-harness-plugin")]
@@ -262,6 +264,14 @@ fn xray_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::from_definition(
         include_str!("../../../plugins/xray-plugin/bcode-plugin.toml"),
         bcode_xray_plugin::plugin_definition,
+    )
+}
+
+#[cfg(feature = "static-bundled-antigravity-harness-plugin")]
+fn antigravity_harness_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::from_definition(
+        include_str!("../../../plugins/antigravity-harness-plugin/bcode-plugin.toml"),
+        bcode_antigravity_harness_plugin::plugin_definition,
     )
 }
 
@@ -1264,6 +1274,7 @@ mod tests {
     }
 
     #[cfg(all(
+        feature = "static-bundled-antigravity-harness-plugin",
         feature = "static-bundled-claude-code-plugin",
         feature = "static-bundled-codex-harness-plugin",
         feature = "static-bundled-harness-plugin"
@@ -1273,7 +1284,12 @@ mod tests {
         let plugins = super::static_bundled_plugins();
         let defaults = bcode_plugin::static_bundled_default_plugin_ids(&plugins)
             .expect("bundled manifests parse");
-        let ids = ["bcode.claude-code", "bcode.codex-harness", "bcode.harness"];
+        let ids = [
+            "bcode.antigravity-harness",
+            "bcode.claude-code",
+            "bcode.codex-harness",
+            "bcode.harness",
+        ];
         let selection = bcode_config::plugin_selection_with_default_plugin_ids(
             &bcode_config::BcodeConfig::default(),
             &defaults,
