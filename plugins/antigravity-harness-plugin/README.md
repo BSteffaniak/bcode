@@ -18,7 +18,25 @@ contract, not a model provider. Verified against Antigravity CLI `1.5.15`.
   * `bcode.harness.terminal-auth/v1` — client-terminal `agy acp --login` preparation.
 * Native tools (`run_command`, `read_file`, `write_file`, `edit_file`, `grep_search`,
   `find_by_name`, `list_dir`, `read_url_content`, `search_web`) are declared via `[[native_tools]]`
-  and `[[presentation.tools]]`.
+  and `[[presentation.tools]]`. Standard ACP tool calls carry only a coarse `kind`; when no
+  explicit name is supplied (top-level `name` or `_meta` `toolName`), the ACP kind (`execute`,
+  `read`, `search`, `edit`, `delete`, `move`, `fetch`) is the tool name and has its own rows.
+
+## Native protocol behaviour
+
+* Interrupt sends `session/cancel` and answers every pending `session/request_permission` with
+  the `cancelled` outcome, as ACP requires.
+* Approvals use only one-shot (`allow_once` / `reject_once`) options; `*_always` options are
+  never selected on the user's behalf.
+* Permission modes are matched against the session's advertised `modes.availableModes`.
+* `session/resume` and `session/close` are used only when advertised in `initialize`.
+* Native process loss reports a completeness gap after every frame received before the loss is
+  normalized; no terminal outcome is invented for an in-flight turn.
+* An open that fails before any native session could exist (spawn, handshake, version or
+  capability mismatch, `session/new` rejection, resume) can be retried; otherwise it stays
+  uncertain until a later generation supersedes it.
+* Native processes receive only a non-credential environment allowlist (locale, user
+  directories, proxy and trust-store selection, session bus); API-key variables are dropped.
 
 ## Configuration
 
@@ -35,6 +53,7 @@ exact_version = "1.5.15"
 
 * `cargo test -p bcode_antigravity_harness_plugin` — unit tests and offline fake ACP server
   (`tests/fixtures/acp_server.py`) covering open, resume, turn submission, streaming chunks,
-  permission callbacks, cancellation, mid-session model/mode switching, overflow fencing, and
-  physical reap recovery.
+  permission callbacks, cancellation (the fixture only ends a cancelled turn once its pending
+  permission is answered), mid-session model/mode switching, process loss mid-turn, output
+  ordering at exit, and physical reap recovery.
 * `tests/native_subscription.rs` (`#[ignore]`) — live opt-in turn against installed `agy`.

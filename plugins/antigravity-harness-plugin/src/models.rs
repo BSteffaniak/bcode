@@ -1,12 +1,13 @@
 //! Optional `bcode.harness.models/v1` service: `agy models` discovery and exact selected open.
-//! Advertised models are not entitlement or proof of successful inference.
+//! Advertised models are not entitlement or proof of successful inference. Discovery and the
+//! native open run without holding plugin state.
 use crate::transport::{AcpError, probe_version, run_bounded_cli};
-use crate::{PLUGIN_ID, PluginState, config::Config, failure, launch};
+use crate::{AntigravityHarnessPlugin, PLUGIN_ID, config::Config, failure, launch};
 use bcode_harness_models::{
     HARNESS_SCHEMA_VERSION, HarnessModel, HarnessModelEvidence, HarnessModelsRequest,
     HarnessModelsRequestKind, HarnessModelsResponse, HarnessModelsResponseKind,
-    HarnessServiceResponseKind, HarnessSessionTarget, MAX_HARNESS_ID_BYTES, MAX_HARNESS_MODELS,
-    MAX_HARNESS_TEXT_BYTES, MAX_HARNESS_WIRE_BYTES,
+    HarnessSessionTarget, MAX_HARNESS_ID_BYTES, MAX_HARNESS_MODELS, MAX_HARNESS_TEXT_BYTES,
+    MAX_HARNESS_WIRE_BYTES,
 };
 use bcode_plugin_sdk::prelude::{NativeServiceContext, ServiceResponse};
 use std::collections::BTreeSet;
@@ -51,8 +52,8 @@ pub fn parse_agy_models_output(output: &str) -> Vec<HarnessModel> {
     models
 }
 
-impl PluginState {
-    pub(crate) fn models_service(&mut self, context: &NativeServiceContext) -> ServiceResponse {
+impl AntigravityHarnessPlugin {
+    pub(crate) fn models_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.payload.len() > MAX_HARNESS_WIRE_BYTES {
             return ServiceResponse::error("invalid_request", "Model request exceeds bound");
         }
@@ -85,7 +86,7 @@ impl PluginState {
     }
 
     fn invoke_models(
-        &mut self,
+        &self,
         request: &HarnessModelsRequest,
         context: &NativeServiceContext,
     ) -> Result<HarnessModelsResponseKind, AcpError> {
@@ -110,14 +111,8 @@ impl PluginState {
                 })
             }
             HarnessModelsRequestKind::OpenSelected { open, selection } => {
-                let opened = self.handle_open(&request.instance, open, Some(selection))?;
-                let HarnessServiceResponseKind::Opened(binding) = opened else {
-                    return Err(AcpError::Protocol);
-                };
-                let effective_model_id = self
-                    .owners
-                    .get(&open.session_id)
-                    .and_then(|owner| owner.effective_model.clone());
+                let (binding, effective_model_id) =
+                    self.open(&request.instance, open, Some(selection))?;
                 Ok(HarnessModelsResponseKind::Selected {
                     target: HarnessSessionTarget::Confirmed(binding),
                     evidence: HarnessModelEvidence {

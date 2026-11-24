@@ -7,10 +7,11 @@ use bcode_antigravity_harness_plugin::transport::{
     AcpError, Launch, probe_version, run_bounded_cli,
 };
 use bcode_harness_models::{
-    HARNESS_SCHEMA_VERSION, HarnessAuthBinding, HarnessAuthCustody, HarnessExecutionEvent,
-    HarnessObservation, HarnessObservationKind, HarnessPermissionMode, HarnessPlacement,
-    HarnessResponse, HarnessResponseValue, HarnessSessionBinding, HarnessSessionSetting,
-    HarnessSubmission, HarnessTerminalDisposition,
+    HARNESS_SCHEMA_VERSION, HarnessActivity, HarnessAuthBinding, HarnessAuthCustody,
+    HarnessCompleteness, HarnessConnectivity, HarnessExecutionEvent, HarnessObservation,
+    HarnessObservationKind, HarnessPermissionMode, HarnessPlacement, HarnessResponse,
+    HarnessResponseValue, HarnessSessionBinding, HarnessSessionSetting, HarnessSubmission,
+    HarnessTerminalDisposition,
 };
 use bcode_provider_auth_models::managed::AuthReadiness;
 use std::os::unix::fs::PermissionsExt;
@@ -284,4 +285,127 @@ fn open_streaming_configure_permission_cancel_and_resume_lifecycle() {
         resume_binding.native_session_id
     );
     assert_eq!(resumed.binding().generation, 2);
+}
+
+fn submission(id: &str, text: &str) -> HarnessSubmission {
+    HarnessSubmission {
+        submission_id: id.into(),
+        attempt_id: format!("att-{id}"),
+        session_id: "bcode-sess-1".into(),
+        generation: 1,
+        text: text.into(),
+        placement: HarnessPlacement::NextTurn,
+    }
+}
+
+fn is_disconnect_status(observation: &HarnessObservation) -> bool {
+    matches!(
+        &observation.kind,
+        HarnessObservationKind::Status { status }
+            if status.connectivity == HarnessConnectivity::Disconnected
+    )
+}
+
+/// Observe until the disconnect status arrives, recording every page's completeness.
+fn drain_until_disconnect(
+    session: &mut AcpSession,
+) -> (Vec<HarnessObservation>, Vec<HarnessCompleteness>) {
+    let mut all = Vec::new();
+    let mut completeness = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let (batch, page) = session.observe(8).expect("observe");
+        completeness.push(page);
+        all.extend(batch);
+        if all.iter().any(is_disconnect_status) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (all, completeness)
+}
+
+#[test]
+fn process_loss_mid_turn_reports_a_gap_and_no_invented_outcome() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let launch = test_launch(tmp.path());
+    let mut session =
+        AcpSession::open_with_model(&launch, initial_binding(), false, None).expect("open");
+    session
+        .submit(&submission("crash", "TRIGGER_CRASH"))
+        .expect("submit");
+
+    let (observations, completeness) = drain_until_disconnect(&mut session);
+    assert!(observations.iter().any(is_disconnect_status));
+    assert!(completeness.contains(&HarnessCompleteness::Gap));
+    assert!(!observations.iter().any(|o| matches!(
+        &o.kind,
+        HarnessObservationKind::Execution {
+            event: HarnessExecutionEvent::SubmissionTerminal { .. }
+        }
+    )));
+    let status = session.status();
+    assert_eq!(status.connectivity, HarnessConnectivity::Disconnected);
+    assert_eq!(status.activity, HarnessActivity::Unknown);
+}
+
+#[test]
+fn output_received_before_exit_is_normalized_before_the_disconnect() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let launch = test_launch(tmp.path());
+    let mut session =
+        AcpSession::open_with_model(&launch, initial_binding(), false, None).expect("open");
+    session
+        .submit(&submission("burst", "TRIGGER_BURST_EXIT"))
+        .expect("submit");
+
+    let (observations, _) = drain_until_disconnect(&mut session);
+    let terminal = observations
+        .iter()
+        .position(|o| {
+            matches!(
+                &o.kind,
+                HarnessObservationKind::Execution {
+                    event: HarnessExecutionEvent::SubmissionTerminal {
+                        disposition: HarnessTerminalDisposition::Completed,
+                        ..
+                    }
+                }
+            )
+        })
+        .expect("terminal outcome survives the exit");
+    let disconnect = observations
+        .iter()
+        .position(is_disconnect_status)
+        .expect("disconnect");
+    assert!(terminal < disconnect);
+    let expected = "x".repeat(200);
+    assert!(observations.iter().any(|o| matches!(
+        &o.kind,
+        HarnessObservationKind::Text { text, .. } if *text == expected
+    )));
+}
+
+#[test]
+fn acp_tool_kind_names_native_tools_without_an_explicit_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let launch = test_launch(tmp.path());
+    let mut session =
+        AcpSession::open_with_model(&launch, initial_binding(), false, None).expect("open");
+    session
+        .submit(&submission("perm", "TRIGGER_PERMISSION"))
+        .expect("submit");
+    let observations = drain_until(&mut session, |all| {
+        all.iter()
+            .any(|o| matches!(&o.kind, HarnessObservationKind::Interaction { .. }))
+    });
+    assert!(observations.iter().any(|o| matches!(
+        &o.kind,
+        HarnessObservationKind::Tool { name, .. } if name == "execute"
+    )));
+    assert!(observations.iter().any(|o| matches!(
+        &o.kind,
+        HarnessObservationKind::Interaction { interaction }
+            if interaction.tool_name.as_deref() == Some("execute")
+    )));
 }

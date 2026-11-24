@@ -2,9 +2,11 @@
 //!
 //! Translates `bcode.harness/v3` operations onto a single `agy acp --stdio --disable-telemetry`
 //! process bound to one confirmed ACP `sessionId`.
-use crate::display::{Display, bounded_id, extract_chunk_text, format_permission_preview};
+use crate::display::{
+    Display, bounded_id, extract_chunk_text, format_permission_preview, native_tool_name,
+};
 use crate::retention::Retention;
-use crate::transport::{AcpError, AcpServer, InboundEvent, Launch, Readiness, Wake};
+use crate::transport::{AcpError, AcpServer, InboundEvent, Launch, PendingCall, Readiness, Wake};
 use bcode_harness_models::{
     HARNESS_SCHEMA_VERSION, HarnessActivity, HarnessAttemptIdentity, HarnessAttention,
     HarnessChoice, HarnessCompleteness, HarnessConnectivity, HarnessContinuation,
@@ -52,6 +54,48 @@ pub struct AcpSession {
     reported_disconnect: bool,
     gap_pending: bool,
     fenced: bool,
+    /// Mode ids the native session advertised in `modes.availableModes`, when reported.
+    available_modes: Option<BTreeSet<String>>,
+}
+
+/// Failure to open a native session, with whether a native session may already exist.
+///
+/// `native_session_possible` is `false` only when the failure provably happened before any
+/// native session was created (spawn, handshake, version/capability checks, an explicit
+/// `session/new` rejection) or when the request was an exact resume, which a retry repeats
+/// without creating anything new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenFailure {
+    /// Error category reported to the host.
+    pub error: AcpError,
+    /// Whether a retry could duplicate a native session that was already created.
+    pub native_session_possible: bool,
+}
+
+impl OpenFailure {
+    const fn definite(error: AcpError) -> Self {
+        Self {
+            error,
+            native_session_possible: false,
+        }
+    }
+}
+
+/// Model change to record once a pending `session/set_model` is acknowledged.
+pub struct PendingConfigure {
+    call: PendingCall,
+    model: Option<String>,
+}
+
+impl PendingConfigure {
+    /// Wait for the native acknowledgement without access to the session.
+    ///
+    /// # Errors
+    /// * Returns `Rejected` if the native agent refuses, or transport errors.
+    pub fn wait(self) -> Result<Option<String>, AcpError> {
+        self.call.wait()?;
+        Ok(self.model)
+    }
 }
 
 impl AcpSession {
@@ -63,43 +107,66 @@ impl AcpSession {
     ///   errors.
     pub fn open_with_model(
         launch: &Launch,
-        mut binding: HarnessSessionBinding,
+        binding: HarnessSessionBinding,
         resume: bool,
         selected_model: Option<&str>,
     ) -> Result<Self, AcpError> {
-        let mut server = AcpServer::spawn(launch)?;
-        let native_version = server.initialize(launch)?;
-        if resume && binding.native_version != native_version {
-            return Err(AcpError::Unsupported);
+        Self::open_tracked(launch, binding, resume, selected_model).map_err(|failure| failure.error)
+    }
+
+    /// Like [`Self::open_with_model`], also reporting whether a native session may exist.
+    ///
+    /// # Errors
+    /// * Same conditions as [`Self::open_with_model`].
+    pub fn open_tracked(
+        launch: &Launch,
+        mut binding: HarnessSessionBinding,
+        resume: bool,
+        selected_model: Option<&str>,
+    ) -> Result<Self, OpenFailure> {
+        let mut server = AcpServer::spawn(launch).map_err(OpenFailure::definite)?;
+        let native_version = server.initialize(launch).map_err(OpenFailure::definite)?;
+        if resume && (binding.native_version != native_version || !server.capabilities().resume) {
+            return Err(OpenFailure::definite(AcpError::Unsupported));
         }
         let cwd = launch
             .working_directory
             .to_str()
-            .ok_or(AcpError::Configuration)?;
+            .ok_or(OpenFailure::definite(AcpError::Configuration))?;
+        // Only an unresumed open can create a native session; an explicit JSON-RPC rejection
+        // of `session/new` proves none was created.
+        let created = |error: AcpError| OpenFailure {
+            error,
+            native_session_possible: !resume && error != AcpError::Rejected,
+        };
 
         let open_result = if resume {
-            server.call(
-                "session/resume",
-                &json!({
-                    "sessionId": binding.native_session_id,
-                    "cwd": cwd,
-                    "mcpServers": [],
-                }),
-            )?
+            server
+                .call(
+                    "session/resume",
+                    &json!({
+                        "sessionId": binding.native_session_id,
+                        "cwd": cwd,
+                        "mcpServers": [],
+                    }),
+                )
+                .map_err(OpenFailure::definite)?
         } else {
-            server.call(
-                "session/new",
-                &json!({
-                    "cwd": cwd,
-                    "mcpServers": [],
-                }),
-            )?
+            server
+                .call(
+                    "session/new",
+                    &json!({
+                        "cwd": cwd,
+                        "mcpServers": [],
+                    }),
+                )
+                .map_err(created)?
         };
 
         let native_session_id =
-            bounded_id(open_result.get("sessionId")).ok_or(AcpError::Protocol)?;
+            bounded_id(open_result.get("sessionId")).ok_or_else(|| created(AcpError::Protocol))?;
         if resume && native_session_id != binding.native_session_id {
-            return Err(AcpError::Protocol);
+            return Err(OpenFailure::definite(AcpError::Protocol));
         }
 
         binding.schema_version = HARNESS_SCHEMA_VERSION;
@@ -112,15 +179,28 @@ impl AcpSession {
             .and_then(|m| m.get("currentModelId"))
             .and_then(Value::as_str);
         display.set_model(current_model);
+        let available_modes = open_result
+            .get("modes")
+            .and_then(|modes| modes.get("availableModes"))
+            .and_then(Value::as_array)
+            .map(|modes| {
+                modes
+                    .iter()
+                    .take(MAX_HARNESS_ITEMS)
+                    .filter_map(|mode| bounded_id(mode.get("id")))
+                    .collect::<BTreeSet<_>>()
+            });
 
         if let Some(model_id) = selected_model {
-            server.call(
-                "session/set_model",
-                &json!({
-                    "sessionId": binding.native_session_id,
-                    "modelId": model_id,
-                }),
-            )?;
+            server
+                .call(
+                    "session/set_model",
+                    &json!({
+                        "sessionId": binding.native_session_id,
+                        "modelId": model_id,
+                    }),
+                )
+                .map_err(created)?;
             display.set_model(Some(model_id));
         }
 
@@ -139,6 +219,7 @@ impl AcpSession {
             reported_disconnect: false,
             gap_pending: false,
             fenced: false,
+            available_modes,
         })
     }
 
@@ -335,6 +416,8 @@ impl AcpSession {
                 })
             }
             HarnessResponseValue::Approval { approved: false } => {
+                // ACP can only express a denial through a reject option; without one the
+                // closest native answer is the `cancelled` outcome.
                 pending.deny_option_id.as_deref().map_or_else(
                     || json!({ "outcome": { "outcome": "cancelled" } }),
                     |option_id| {
@@ -366,7 +449,8 @@ impl AcpSession {
         Ok(())
     }
 
-    /// Send ACP `session/cancel` for the currently active turn.
+    /// Send ACP `session/cancel` for the currently active turn and answer every pending
+    /// `session/request_permission` with the `cancelled` outcome, as ACP requires after a cancel.
     ///
     /// # Errors
     /// * Rejects stale generation or disconnected transport.
@@ -385,44 +469,84 @@ impl AcpSession {
             &json!({
                 "sessionId": self.binding.native_session_id,
             }),
-        )
+        )?;
+        self.cancel_pending_permissions();
+        Ok(())
     }
 
     /// Apply a mid-session model or permission-mode change via ACP RPC.
     ///
     /// # Errors
-    /// * Returns `Rejected` if the native agent refuses the setting, or `Disconnected` if closed.
+    /// * Returns `Rejected` if the native agent refuses the setting, `Unsupported` for a mode
+    ///   the session does not offer, or `Disconnected` if closed.
     pub fn configure(&mut self, setting: &HarnessSessionSetting) -> Result<(), AcpError> {
+        let pending = self.begin_configure(setting)?;
+        let model = pending.wait()?;
+        self.finish_configure(model.as_deref());
+        Ok(())
+    }
+
+    /// Write a model or permission-mode change; the acknowledgement is awaited separately so
+    /// callers need not hold shared state while the native agent answers.
+    ///
+    /// # Errors
+    /// * Returns `Unsupported` for a mode the session does not offer, or `Disconnected`.
+    pub fn begin_configure(
+        &mut self,
+        setting: &HarnessSessionSetting,
+    ) -> Result<PendingConfigure, AcpError> {
         if self.fenced || self.server.is_closed() {
             return Err(AcpError::Disconnected);
         }
         match setting {
-            HarnessSessionSetting::Model { model_id } => {
-                self.server.call(
+            HarnessSessionSetting::Model { model_id } => Ok(PendingConfigure {
+                call: self.server.begin_call(
                     "session/set_model",
                     &json!({
                         "sessionId": self.binding.native_session_id,
                         "modelId": model_id,
                     }),
-                )?;
-                self.display.set_model(Some(model_id));
-            }
+                )?,
+                model: Some(model_id.clone()),
+            }),
             HarnessSessionSetting::PermissionMode { mode } => {
-                let mode_id = match mode {
-                    HarnessPermissionMode::Default => "default",
-                    HarnessPermissionMode::AcceptEdits => "accept-edits",
-                    HarnessPermissionMode::Plan => "plan",
-                };
-                self.server.call(
-                    "session/set_mode",
-                    &json!({
-                        "sessionId": self.binding.native_session_id,
-                        "modeId": mode_id,
-                    }),
-                )?;
+                let mode_id = self.resolve_mode(*mode)?;
+                Ok(PendingConfigure {
+                    call: self.server.begin_call(
+                        "session/set_mode",
+                        &json!({
+                            "sessionId": self.binding.native_session_id,
+                            "modeId": mode_id,
+                        }),
+                    )?,
+                    model: None,
+                })
             }
         }
-        Ok(())
+    }
+
+    /// Record an acknowledged configuration change.
+    pub fn finish_configure(&mut self, model: Option<&str>) {
+        if let Some(model_id) = model {
+            self.display.set_model(Some(model_id));
+        }
+    }
+
+    /// Native mode id for a Bcode permission mode, checked against the advertised modes.
+    fn resolve_mode(&self, mode: HarnessPermissionMode) -> Result<String, AcpError> {
+        let candidates: &[&str] = match mode {
+            HarnessPermissionMode::Default => &["default"],
+            HarnessPermissionMode::AcceptEdits => &["accept-edits", "acceptEdits", "accept_edits"],
+            HarnessPermissionMode::Plan => &["plan"],
+        };
+        match &self.available_modes {
+            Some(available) if !available.is_empty() => candidates
+                .iter()
+                .find(|candidate| available.contains(**candidate))
+                .map(|candidate| (*candidate).to_owned())
+                .ok_or(AcpError::Unsupported),
+            _ => Ok(candidates[0].to_owned()),
+        }
     }
 
     /// Drain inbound ACP events and return up to `limit` normalized observations.
@@ -466,22 +590,20 @@ impl AcpSession {
         } else {
             HarnessConnectivity::Connected
         };
-        let activity = self.active_turn.as_ref().map_or_else(
-            || {
-                if connectivity == HarnessConnectivity::Connected {
-                    HarnessActivity::Idle
-                } else {
-                    HarnessActivity::Unknown
-                }
-            },
-            |turn| {
-                if turn.interrupted {
-                    HarnessActivity::Interrupted
-                } else {
-                    HarnessActivity::Running
-                }
-            },
-        );
+        let activity = if connectivity == HarnessConnectivity::Connected {
+            self.active_turn
+                .as_ref()
+                .map_or(HarnessActivity::Idle, |turn| {
+                    if turn.interrupted {
+                        HarnessActivity::Interrupted
+                    } else {
+                        HarnessActivity::Running
+                    }
+                })
+        } else {
+            // Without the native process nothing proves what an in-flight turn did.
+            HarnessActivity::Unknown
+        };
         let attention = if self.pending_permissions.is_empty() {
             HarnessAttention::None
         } else {
@@ -509,10 +631,12 @@ impl AcpSession {
         Ok(self.status())
     }
 
-    /// Gracefully send `session/close` before dropping the transport.
+    /// Send `session/close` (an ACP request, when advertised) and close the transport. The
+    /// reply is not awaited: stdin closes next and the supervisor grants the native process a
+    /// bounded grace before forcing termination.
     pub fn send_close(&mut self) {
-        if !self.server.is_closed() {
-            let _ = self.server.notify(
+        if self.server.capabilities().close && !self.server.is_closed() {
+            let _ = self.server.send_request_detached(
                 "session/close",
                 &json!({
                     "sessionId": self.binding.native_session_id,
@@ -523,27 +647,40 @@ impl AcpSession {
     }
 
     fn pump_transport(&mut self, max_events: usize) {
-        let events = self.server.drain_events(max_events);
-        for event in events {
-            match event {
-                InboundEvent::Notification { method, params } => {
-                    self.handle_notification(&method, &params);
+        if self.fenced {
+            // A fenced transport never normalizes further native output.
+            let _ = self.server.drain_events(usize::MAX);
+        } else {
+            for event in self.server.drain_events(max_events) {
+                if self.fenced {
+                    break;
                 }
-                InboundEvent::ServerRequest { id, method, params } => {
-                    self.handle_server_request(id, &method, &params);
+                match event {
+                    InboundEvent::Notification { method, params } => {
+                        self.handle_notification(&method, &params);
+                    }
+                    InboundEvent::ServerRequest { id, method, params } => {
+                        self.handle_server_request(id, &method, &params);
+                    }
+                    InboundEvent::AsyncReply { id, message } => {
+                        self.handle_async_reply(id, &message);
+                    }
+                    InboundEvent::MalformedFrame(code) => {
+                        self.stage_notice_once(code, "Skipped malformed native ACP frame");
+                    }
                 }
-                InboundEvent::AsyncReply { id, message } => {
-                    self.handle_async_reply(id, &message);
-                }
-                InboundEvent::MalformedFrame(code) => {
-                    self.stage_notice_once(code, "Skipped malformed native ACP frame");
-                }
+            }
+            // Frames received before the loss must be normalized before the loss is reported,
+            // so final text and terminal results are never ordered after the disconnect.
+            if self.server.has_queued_events() {
+                return;
             }
         }
 
         if self.server.is_overflowed() && !self.fenced {
             self.fenced = true;
             self.gap_pending = true;
+            self.active_turn = None;
             self.withdraw_all_permissions();
             self.display.clear();
             self.stage_notice_once(
@@ -554,6 +691,10 @@ impl AcpSession {
 
         if self.server.is_closed() && !self.reported_disconnect {
             self.reported_disconnect = true;
+            // Native output after the last received frame is lost; never claim completeness,
+            // and never synthesize a terminal outcome for an in-flight turn.
+            self.gap_pending = true;
+            self.active_turn = None;
             self.withdraw_all_permissions();
             if let Some(flushed) = self.display.flush_active() {
                 self.push_observation(flushed, Vec::new());
@@ -645,8 +786,7 @@ impl AcpSession {
         }
 
         let tool_call = params.get("toolCall").unwrap_or(&Value::Null);
-        let tool_name =
-            bounded_id(tool_call.get("name")).or_else(|| bounded_id(tool_call.get("kind")));
+        let tool_name = native_tool_name(tool_call);
         let input_preview = format_permission_preview(tool_call);
         let title = tool_call
             .get("title")
@@ -669,13 +809,17 @@ impl AcpSession {
                     .unwrap_or(&option_id)
                     .to_owned();
                 let kind = opt.get("kind").and_then(Value::as_str).unwrap_or_default();
-                if allow_option_id.is_none()
-                    && (kind == "allow_once" || option_id.eq_ignore_ascii_case("allow"))
-                {
+                // Only one-shot options answer one approval; `*_always` options would persist
+                // a native rule the user never chose. Ids are a fallback only without a kind.
+                let is_allow_once = kind == "allow_once"
+                    || (kind.is_empty() && option_id.eq_ignore_ascii_case("allow"));
+                let is_reject_once = kind == "reject_once"
+                    || (kind.is_empty()
+                        && (option_id.eq_ignore_ascii_case("deny")
+                            || option_id.eq_ignore_ascii_case("reject")));
+                if allow_option_id.is_none() && is_allow_once {
                     allow_option_id = Some(option_id.clone());
-                } else if deny_option_id.is_none()
-                    && (kind == "reject_once" || option_id.eq_ignore_ascii_case("deny"))
-                {
+                } else if deny_option_id.is_none() && is_reject_once {
                     deny_option_id = Some(option_id.clone());
                 }
                 choices.push(HarnessChoice {
@@ -729,7 +873,9 @@ impl AcpSession {
             return;
         }
         let turn = self.active_turn.take().expect("checked above");
-        self.withdraw_all_permissions();
+        // The prompt is over; answer any leftover permission requests so none stay open
+        // natively, and withdraw them from the host.
+        self.cancel_pending_permissions();
 
         if let Some(flushed) = self.display.flush_active() {
             self.push_observation(flushed, Vec::new());
@@ -803,10 +949,28 @@ impl AcpSession {
         );
     }
 
+    /// Withdraw pending permission interactions without answering them natively (the
+    /// transport is gone or fenced).
     fn withdraw_all_permissions(&mut self) {
         let keys: Vec<String> = self.pending_permissions.keys().cloned().collect();
         for request_id in keys {
             self.pending_permissions.remove(&request_id);
+            self.push_observation(
+                HarnessObservationKind::InteractionWithdrawn { request_id },
+                Vec::new(),
+            );
+        }
+    }
+
+    /// Answer every pending permission request with the ACP `cancelled` outcome and withdraw
+    /// the matching host interactions.
+    fn cancel_pending_permissions(&mut self) {
+        let pending = std::mem::take(&mut self.pending_permissions);
+        for (request_id, permission) in pending {
+            let _ = self.server.reply_result(
+                &permission.rpc_id,
+                &json!({ "outcome": { "outcome": "cancelled" } }),
+            );
             self.push_observation(
                 HarnessObservationKind::InteractionWithdrawn { request_id },
                 Vec::new(),

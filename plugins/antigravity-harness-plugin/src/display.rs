@@ -178,14 +178,7 @@ impl Display {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("in_progress");
-        let name = update
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| update.get("kind").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && s.len() <= MAX_HARNESS_ID_BYTES)
-            .unwrap_or("tool")
-            .to_owned();
+        let name = native_tool_name(update).unwrap_or_else(|| "tool".to_owned());
 
         let already_started = self.started_tools.iter().any(|id| id == &tool_id);
         if !already_started {
@@ -339,6 +332,29 @@ pub fn bounded_id(value: Option<&Value>) -> Option<String> {
     Some(s.to_owned())
 }
 
+/// Native tool name of an ACP `ToolCall` / `ToolCallUpdate`.
+///
+/// Standard ACP carries no tool name, only a coarse `kind` (`execute`, `read`, `edit`, …), so
+/// an explicit name is preferred when the agent supplies one: a top-level `name`, or a
+/// `toolName`/`tool_name`/`name` in `_meta` (directly or under one vendor key). The ACP `kind`
+/// is the fallback; the manifest declares policy for both spellings.
+#[must_use]
+pub fn native_tool_name(tool_call: &Value) -> Option<String> {
+    const NAME_KEYS: [&str; 3] = ["toolName", "tool_name", "name"];
+    let named = |object: &Value| NAME_KEYS.iter().find_map(|key| bounded_id(object.get(key)));
+    bounded_id(tool_call.get("name"))
+        .or_else(|| {
+            let meta = tool_call.get("_meta")?;
+            named(meta).or_else(|| {
+                meta.as_object()?
+                    .values()
+                    .filter(|value| value.is_object())
+                    .find_map(named)
+            })
+        })
+        .or_else(|| bounded_id(tool_call.get("kind")))
+}
+
 fn bounded_tool_input(value: &Value) -> Option<String> {
     if value.is_null() {
         return None;
@@ -403,4 +419,34 @@ fn prefix_at_char_boundary(text: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_name_prefers_explicit_names_and_falls_back_to_acp_kind() {
+        assert_eq!(
+            native_tool_name(&json!({"name": "run_command", "kind": "execute"})).as_deref(),
+            Some("run_command")
+        );
+        assert_eq!(
+            native_tool_name(&json!({"kind": "execute", "_meta": {"toolName": "run_command"}}))
+                .as_deref(),
+            Some("run_command")
+        );
+        assert_eq!(
+            native_tool_name(
+                &json!({"kind": "read", "_meta": {"antigravity": {"tool_name": "view_file"}}})
+            )
+            .as_deref(),
+            Some("view_file")
+        );
+        assert_eq!(
+            native_tool_name(&json!({"kind": "execute", "title": "echo hi"})).as_deref(),
+            Some("execute")
+        );
+        assert_eq!(native_tool_name(&json!({"title": "untitled"})), None);
+    }
 }

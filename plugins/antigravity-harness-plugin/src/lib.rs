@@ -27,11 +27,11 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_provider_auth_models::managed::{
     AuthCustodyMode, AuthNamespace, AuthReadiness, ManagedAuthStatus, SensitiveAuthInteraction,
 };
-use session::AcpSession;
+use session::{AcpSession, OpenFailure, PendingConfigure};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use transport::{AcpError, Launch, Readiness};
 
@@ -44,11 +44,17 @@ const OBSERVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 const LIVE_COALESCE: Duration = Duration::from_millis(40);
 /// Retained configure replies per owner (identical retries return the recorded outcome).
 const MAX_RETAINED_CONFIGURES: usize = 64;
+/// Retained owners (live, opening, or released) before released ones are evicted.
+const MAX_OWNERS: usize = 32;
+/// Concurrent client-terminal login flows.
+const MAX_TERMINAL_FLOWS: usize = 32;
 
 struct Owner {
     instance: HarnessInstance,
     open: HarnessOpenRequest,
     session: Option<AcpSession>,
+    /// A native open for this owner is in progress outside the state lock.
+    opening: bool,
     page_number: u64,
     next: Option<String>,
     previous: Option<(Option<String>, HarnessObservationPage)>,
@@ -67,6 +73,7 @@ impl Owner {
             instance: instance.clone(),
             open: open.clone(),
             session: None,
+            opening: false,
             page_number: 0,
             next: None,
             previous: None,
@@ -79,13 +86,22 @@ impl Owner {
     }
 }
 
-/// Retained plugin state. Operations serialize on it; only a waiting `observe` releases the
-/// lock while it waits for native output.
+/// Retained plugin state. Bookkeeping serializes on it; native process launches, account
+/// inspection, model discovery, configuration acknowledgements, reap waits and waiting
+/// `observe` calls all run with the lock released.
 #[derive(Default)]
 pub(crate) struct PluginState {
     owners: BTreeMap<String, Owner>,
     /// Client-terminal `agy acp --login` flows prepared through terminal-auth; never replayed.
     terminal_flows: BTreeMap<String, HarnessInstance>,
+}
+
+/// What an open request needs after the state lock is released.
+enum OpenPlan {
+    /// The exact open already completed.
+    Existing(HarnessSessionBinding, Option<String>),
+    /// Launch the native session, then call [`PluginState::finish_open`].
+    Spawn(Launch, HarnessSessionBinding),
 }
 
 /// Native plugin service owner. Host must admit/retain mutations and suppress sensitive traces
@@ -118,10 +134,7 @@ impl ConcurrentRustPlugin for AntigravityHarnessPlugin {
         if let Some((request, wait)) = observe_wait(&context) {
             self.wait_for_observations(&request, wait, &context.cancellation);
         }
-        self.state.lock().map_or_else(
-            |_| ServiceResponse::error("unavailable", "Antigravity harness state unavailable"),
-            |mut state| state.invoke_service(&context),
-        )
+        self.invoke(&context)
     }
 }
 
@@ -142,6 +155,65 @@ fn observe_wait(context: &NativeServiceContext) -> Option<(HarnessRequest, Durat
     (!wait.is_zero()).then_some((request, wait))
 }
 
+/// Decode and admit one `bcode.harness/v3` request, or the service error to return.
+fn decode_harness_request(
+    context: &NativeServiceContext,
+) -> Result<HarnessRequest, ServiceResponse> {
+    if context.plugin_id != PLUGIN_ID || context.request.interface_id != HARNESS_INTERFACE_ID {
+        return Err(ServiceResponse::error(
+            "unsupported_interface",
+            "Antigravity harness interface mismatch",
+        ));
+    }
+    if context.request.payload.len() > MAX_HARNESS_WIRE_BYTES {
+        return Err(ServiceResponse::error(
+            "invalid_request",
+            "Antigravity harness request exceeds bounds",
+        ));
+    }
+    let Ok(request) = context.request.payload_json::<HarnessRequest>() else {
+        return Err(ServiceResponse::error(
+            "invalid_request",
+            "Invalid typed Antigravity harness request",
+        ));
+    };
+    if request.validate().is_err()
+        || request.instance.plugin_id != PLUGIN_ID
+        || context.request.operation != request.kind.operation().as_str()
+        || context.cancellation.is_cancelled()
+    {
+        return Err(ServiceResponse::error(
+            "invalid_request",
+            "Antigravity harness admission mismatch or cancelled invocation",
+        ));
+    }
+    Ok(request)
+}
+
+fn encode_harness_response(
+    request: &HarnessRequest,
+    kind: HarnessServiceResponseKind,
+) -> ServiceResponse {
+    let response = HarnessServiceResponse {
+        schema_version: HARNESS_SCHEMA_VERSION,
+        request_id: request.request_id.clone(),
+        operation: request.kind.operation(),
+        kind,
+    };
+    if response.validate_for(request).is_err() {
+        return ServiceResponse::error(
+            "invalid_response",
+            "Antigravity harness response failed contract validation",
+        );
+    }
+    ServiceResponse::json(&response).unwrap_or_else(|_| {
+        ServiceResponse::error(
+            "encode_failed",
+            "Antigravity harness response encoding failed",
+        )
+    })
+}
+
 enum ObservationReadiness {
     Run,
     LiveOnly(transport::Wake, u64),
@@ -149,6 +221,10 @@ enum ObservationReadiness {
 }
 
 impl AntigravityHarnessPlugin {
+    fn lock(&self) -> Result<MutexGuard<'_, PluginState>, AcpError> {
+        self.state.lock().map_err(|_| AcpError::Disconnected)
+    }
+
     fn wait_for_observations(
         &self,
         request: &HarnessRequest,
@@ -191,6 +267,190 @@ impl AntigravityHarnessPlugin {
             }
         }
     }
+
+    fn invoke(&self, context: &NativeServiceContext) -> ServiceResponse {
+        if context.plugin_id == PLUGIN_ID {
+            match context.request.interface_id.as_str() {
+                bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID => {
+                    return candidates::candidates_service(context);
+                }
+                bcode_harness_models::HARNESS_MODELS_INTERFACE_ID => {
+                    return self.models_service(context);
+                }
+                bcode_harness_models::HARNESS_RECOVERY_INTERFACE_ID => {
+                    return self.recovery_service(context);
+                }
+                bcode_harness_models::TERMINAL_AUTH_INTERFACE_ID => {
+                    return terminal_auth::prepare_login_service(context);
+                }
+                _ => {}
+            }
+        }
+        let request = match decode_harness_request(context) {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+        let kind = self
+            .handle(&request, context)
+            .unwrap_or_else(|error| HarnessServiceResponseKind::Failure(failure(error)));
+        encode_harness_response(&request, kind)
+    }
+
+    fn handle(
+        &self,
+        request: &HarnessRequest,
+        context: &NativeServiceContext,
+    ) -> Result<HarnessServiceResponseKind, AcpError> {
+        let instance = &request.instance;
+        let configuration = config::Config::from_context(context)?;
+        configuration.validate_instance(instance)?;
+        match &request.kind {
+            HarnessRequestKind::Inspect => {
+                let launch = launch(instance, configuration.auth_working_directory(instance))?;
+                let mut server = transport::AcpServer::spawn(&launch)?;
+                let native_version = server.initialize(&launch)?;
+                Ok(HarnessServiceResponseKind::Inspection(HarnessInspection {
+                    native_version,
+                    executable_identity: instance.executable.clone(),
+                    config_namespace: instance.config_namespace.clone(),
+                    capabilities: capabilities(),
+                }))
+            }
+            HarnessRequestKind::Open(open) => self
+                .open(instance, open, None)
+                .map(|(binding, _)| HarnessServiceResponseKind::Opened(binding)),
+            HarnessRequestKind::Configure(configure) => self.configure(instance, configure),
+            HarnessRequestKind::AuthStatus { verify } => {
+                if *verify {
+                    return Err(AcpError::Unsupported);
+                }
+                let launch = launch(instance, configuration.auth_working_directory(instance))?;
+                Ok(HarnessServiceResponseKind::AuthStatus(
+                    auth::inspect_status(&launch, &instance.auth)?,
+                ))
+            }
+            HarnessRequestKind::AuthBegin(auth_req)
+            | HarnessRequestKind::AuthContinue(auth_req)
+            | HarnessRequestKind::AuthCancel(auth_req)
+                if auth_req.method_id == terminal_auth::NATIVE_LOGIN_METHOD =>
+            {
+                self.terminal_login_step(instance, &request.kind, auth_req, &configuration)
+            }
+            kind => self.lock()?.handle_locked(instance, kind),
+        }
+    }
+
+    /// Open (or return the completed exact open of) a native session. The native launch runs
+    /// with the state lock released; the owner is retained as `opening` meanwhile so identical
+    /// retries never spawn twice.
+    pub(crate) fn open(
+        &self,
+        instance: &HarnessInstance,
+        open: &HarnessOpenRequest,
+        selection: Option<&bcode_harness_models::HarnessModelSelection>,
+    ) -> Result<(HarnessSessionBinding, Option<String>), AcpError> {
+        let plan = self.lock()?.prepare_open(instance, open, selection)?;
+        let (launch, binding) = match plan {
+            OpenPlan::Existing(binding, model) => return Ok((binding, model)),
+            OpenPlan::Spawn(launch, binding) => (launch, binding),
+        };
+        let result = AcpSession::open_tracked(
+            &launch,
+            binding,
+            open.resume.is_some(),
+            selection.map(|selected| selected.model_id.as_str()),
+        );
+        self.lock()?.finish_open(open, result)
+    }
+
+    /// Apply a configuration change, waiting for the native acknowledgement unlocked.
+    fn configure(
+        &self,
+        instance: &HarnessInstance,
+        configure: &HarnessConfigureRequest,
+    ) -> Result<HarnessServiceResponseKind, AcpError> {
+        let acknowledged = HarnessServiceResponseKind::Acknowledged {
+            mutation_id: configure.mutation_id.clone(),
+        };
+        let Some(pending) = self.lock()?.begin_configure(instance, configure)? else {
+            return Ok(acknowledged);
+        };
+        let result = pending.wait();
+        self.lock()?.finish_configure(configure, &result)?;
+        Ok(acknowledged)
+    }
+
+    fn terminal_login_step(
+        &self,
+        instance: &HarnessInstance,
+        kind: &HarnessRequestKind,
+        auth_req: &bcode_harness_models::HarnessAuthRequest,
+        configuration: &config::Config,
+    ) -> Result<HarnessServiceResponseKind, AcpError> {
+        if auth_req.input.is_some() || instance.auth.custody != AuthCustodyMode::NativeManaged {
+            return Err(AcpError::Unsupported);
+        }
+        {
+            let mut state = self.lock()?;
+            match kind {
+                HarnessRequestKind::AuthBegin(_) => {
+                    if let Some(retained) = state.terminal_flows.get(&auth_req.flow_id) {
+                        if retained != instance {
+                            return Err(AcpError::Stale);
+                        }
+                    } else {
+                        if state.terminal_flows.len() >= MAX_TERMINAL_FLOWS {
+                            return Err(AcpError::Bounds);
+                        }
+                        state
+                            .terminal_flows
+                            .insert(auth_req.flow_id.clone(), instance.clone());
+                    }
+                }
+                HarnessRequestKind::AuthCancel(_) => {
+                    if state.terminal_flows.get(&auth_req.flow_id) != Some(instance) {
+                        return Err(AcpError::Stale);
+                    }
+                    state.terminal_flows.remove(&auth_req.flow_id);
+                    return Ok(HarnessServiceResponseKind::AuthStep(HarnessAuthStep {
+                        flow_id: auth_req.flow_id.clone(),
+                        complete: true,
+                        interaction: None,
+                        status: ManagedAuthStatus {
+                            namespace: AuthNamespace {
+                                plugin_id: PLUGIN_ID.to_owned(),
+                                credential_namespace: instance.auth.credential_namespace.clone(),
+                            },
+                            custody: AuthCustodyMode::NativeManaged,
+                            readiness: AuthReadiness::Unknown,
+                        },
+                    }));
+                }
+                _ => {
+                    if state.terminal_flows.get(&auth_req.flow_id) != Some(instance) {
+                        return Err(AcpError::Stale);
+                    }
+                }
+            }
+        }
+        let launch = launch(instance, configuration.auth_working_directory(instance))?;
+        let status = auth::inspect_status(&launch, &instance.auth)?;
+        let complete = status.readiness == AuthReadiness::Ready;
+        if complete {
+            let mut state = self.lock()?;
+            if state.terminal_flows.get(&auth_req.flow_id) == Some(instance) {
+                state.terminal_flows.remove(&auth_req.flow_id);
+            }
+        }
+        Ok(HarnessServiceResponseKind::AuthStep(HarnessAuthStep {
+            flow_id: auth_req.flow_id.clone(),
+            status,
+            complete,
+            interaction: (!complete).then(|| SensitiveAuthInteraction::NativeHandoff {
+                request_id: auth_req.flow_id.clone(),
+            }),
+        }))
+    }
 }
 
 impl PluginState {
@@ -228,96 +488,13 @@ impl PluginState {
         }
     }
 
-    fn invoke_service(&mut self, context: &NativeServiceContext) -> ServiceResponse {
-        if context.plugin_id == PLUGIN_ID {
-            match context.request.interface_id.as_str() {
-                bcode_harness_models::HARNESS_CANDIDATES_INTERFACE_ID => {
-                    return candidates::candidates_service(context);
-                }
-                bcode_harness_models::HARNESS_MODELS_INTERFACE_ID => {
-                    return self.models_service(context);
-                }
-                bcode_harness_models::HARNESS_RECOVERY_INTERFACE_ID => {
-                    return self.recovery_service(context);
-                }
-                bcode_harness_models::TERMINAL_AUTH_INTERFACE_ID => {
-                    return terminal_auth::prepare_login_service(context);
-                }
-                _ => {}
-            }
-        }
-        if context.plugin_id != PLUGIN_ID || context.request.interface_id != HARNESS_INTERFACE_ID {
-            return ServiceResponse::error(
-                "unsupported_interface",
-                "Antigravity harness interface mismatch",
-            );
-        }
-        if context.request.payload.len() > MAX_HARNESS_WIRE_BYTES {
-            return ServiceResponse::error(
-                "invalid_request",
-                "Antigravity harness request exceeds bounds",
-            );
-        }
-        let Ok(request) = context.request.payload_json::<HarnessRequest>() else {
-            return ServiceResponse::error(
-                "invalid_request",
-                "Invalid typed Antigravity harness request",
-            );
-        };
-        if request.validate().is_err()
-            || request.instance.plugin_id != PLUGIN_ID
-            || context.request.operation != request.kind.operation().as_str()
-            || context.cancellation.is_cancelled()
-        {
-            return ServiceResponse::error(
-                "invalid_request",
-                "Antigravity harness admission mismatch or cancelled invocation",
-            );
-        }
-        let kind = self
-            .handle(&request, context)
-            .unwrap_or_else(|error| HarnessServiceResponseKind::Failure(failure(error)));
-        let response = HarnessServiceResponse {
-            schema_version: HARNESS_SCHEMA_VERSION,
-            request_id: request.request_id.clone(),
-            operation: request.kind.operation(),
-            kind,
-        };
-        if response.validate_for(&request).is_err() {
-            return ServiceResponse::error(
-                "invalid_response",
-                "Antigravity harness response failed contract validation",
-            );
-        }
-        ServiceResponse::json(&response).unwrap_or_else(|_| {
-            ServiceResponse::error(
-                "encode_failed",
-                "Antigravity harness response encoding failed",
-            )
-        })
-    }
-
-    fn handle(
+    /// Operations that only touch retained state and write to an already-running transport.
+    fn handle_locked(
         &mut self,
-        request: &HarnessRequest,
-        context: &NativeServiceContext,
+        instance: &HarnessInstance,
+        kind: &HarnessRequestKind,
     ) -> Result<HarnessServiceResponseKind, AcpError> {
-        let instance = &request.instance;
-        let configuration = config::Config::from_context(context)?;
-        configuration.validate_instance(instance)?;
-        match &request.kind {
-            HarnessRequestKind::Inspect => {
-                let launch = launch(instance, configuration.auth_working_directory(instance))?;
-                let mut server = transport::AcpServer::spawn(&launch)?;
-                let native_version = server.initialize(&launch)?;
-                Ok(HarnessServiceResponseKind::Inspection(HarnessInspection {
-                    native_version,
-                    executable_identity: instance.executable.clone(),
-                    config_namespace: instance.config_namespace.clone(),
-                    capabilities: capabilities(),
-                }))
-            }
-            HarnessRequestKind::Open(open) => self.handle_open(instance, open, None),
+        match kind {
             HarnessRequestKind::Submit { target, submission } => {
                 Ok(HarnessServiceResponseKind::Receipt(
                     self.session(instance, confirmed(target)?)?
@@ -333,7 +510,6 @@ impl PluginState {
             }
             HarnessRequestKind::Interrupt(control) => self.handle_interrupt(instance, control),
             HarnessRequestKind::Close(control) => self.handle_close(instance, control),
-            HarnessRequestKind::Configure(configure) => self.handle_configure(instance, configure),
             HarnessRequestKind::Observe(observe) => self.handle_observe(instance, observe),
             HarnessRequestKind::Reconcile(reconcile) => {
                 let Some(binding) = &reconcile.binding else {
@@ -355,125 +531,44 @@ impl PluginState {
                     },
                 ))
             }
-            kind => self.handle_auth(instance, kind, &configuration),
-        }
-    }
-
-    fn handle_auth(
-        &mut self,
-        instance: &HarnessInstance,
-        kind: &HarnessRequestKind,
-        configuration: &config::Config,
-    ) -> Result<HarnessServiceResponseKind, AcpError> {
-        match kind {
-            HarnessRequestKind::AuthStatus { verify } => {
-                if *verify {
-                    return Err(AcpError::Unsupported);
-                }
-                let launch = launch(instance, configuration.auth_working_directory(instance))?;
-                Ok(HarnessServiceResponseKind::AuthStatus(
-                    auth::inspect_status(&launch, &instance.auth)?,
-                ))
-            }
-            HarnessRequestKind::AuthBegin(auth_req)
-            | HarnessRequestKind::AuthContinue(auth_req)
-            | HarnessRequestKind::AuthCancel(auth_req)
-                if auth_req.method_id == terminal_auth::NATIVE_LOGIN_METHOD =>
-            {
-                self.terminal_login_step(instance, kind, auth_req, configuration)
-            }
             _ => Err(AcpError::Unsupported),
         }
     }
 
-    fn terminal_login_step(
-        &mut self,
-        instance: &HarnessInstance,
-        kind: &HarnessRequestKind,
-        auth_req: &bcode_harness_models::HarnessAuthRequest,
-        configuration: &config::Config,
-    ) -> Result<HarnessServiceResponseKind, AcpError> {
-        if auth_req.input.is_some() || instance.auth.custody != AuthCustodyMode::NativeManaged {
-            return Err(AcpError::Unsupported);
-        }
-        match kind {
-            HarnessRequestKind::AuthBegin(_) => {
-                if let Some(retained) = self.terminal_flows.get(&auth_req.flow_id) {
-                    if retained != instance {
-                        return Err(AcpError::Stale);
-                    }
-                } else {
-                    if self.terminal_flows.len() >= 32 {
-                        return Err(AcpError::Bounds);
-                    }
-                    self.terminal_flows
-                        .insert(auth_req.flow_id.clone(), instance.clone());
-                }
-            }
-            HarnessRequestKind::AuthCancel(_) => {
-                if self.terminal_flows.get(&auth_req.flow_id) != Some(instance) {
-                    return Err(AcpError::Stale);
-                }
-                self.terminal_flows.remove(&auth_req.flow_id);
-                return Ok(HarnessServiceResponseKind::AuthStep(HarnessAuthStep {
-                    flow_id: auth_req.flow_id.clone(),
-                    complete: true,
-                    interaction: None,
-                    status: ManagedAuthStatus {
-                        namespace: AuthNamespace {
-                            plugin_id: PLUGIN_ID.to_owned(),
-                            credential_namespace: instance.auth.credential_namespace.clone(),
-                        },
-                        custody: AuthCustodyMode::NativeManaged,
-                        readiness: AuthReadiness::Unknown,
-                    },
-                }));
-            }
-            _ => {
-                if self.terminal_flows.get(&auth_req.flow_id) != Some(instance) {
-                    return Err(AcpError::Stale);
-                }
-            }
-        }
-        let launch = launch(instance, configuration.auth_working_directory(instance))?;
-        let status = auth::inspect_status(&launch, &instance.auth)?;
-        let complete = status.readiness == AuthReadiness::Ready;
-        if complete {
-            self.terminal_flows.remove(&auth_req.flow_id);
-        }
-        Ok(HarnessServiceResponseKind::AuthStep(HarnessAuthStep {
-            flow_id: auth_req.flow_id.clone(),
-            status,
-            complete,
-            interaction: (!complete).then(|| SensitiveAuthInteraction::NativeHandoff {
-                request_id: auth_req.flow_id.clone(),
-            }),
-        }))
-    }
-
-    pub(crate) fn handle_open(
+    fn prepare_open(
         &mut self,
         instance: &HarnessInstance,
         open: &HarnessOpenRequest,
         selection: Option<&bcode_harness_models::HarnessModelSelection>,
-    ) -> Result<HarnessServiceResponseKind, AcpError> {
+    ) -> Result<OpenPlan, AcpError> {
         if let Some(owner) = self.owners.get(&open.session_id) {
-            if owner.instance != *instance
-                || owner.open != *open
-                || owner.selection.as_ref() != selection
-            {
-                return Err(AcpError::Stale);
+            // A later generation may replace an owner without a live or in-progress native
+            // session (released by Close, or left uncertain by a failed open).
+            let superseded = owner.instance == *instance
+                && owner.session.is_none()
+                && !owner.opening
+                && open.generation > owner.open.generation;
+            if !superseded {
+                if owner.instance != *instance
+                    || owner.open != *open
+                    || owner.selection.as_ref() != selection
+                {
+                    return Err(AcpError::Stale);
+                }
+                return owner
+                    .session
+                    .as_ref()
+                    .map(|session| {
+                        OpenPlan::Existing(session.binding().clone(), owner.effective_model.clone())
+                    })
+                    .ok_or(AcpError::Uncertain);
             }
-            return owner
-                .session
-                .as_ref()
-                .map(|session| HarnessServiceResponseKind::Opened(session.binding().clone()))
-                .ok_or(AcpError::Uncertain);
+            self.owners.remove(&open.session_id);
         }
-        if self.owners.len() >= 32 {
+        if self.owners.len() >= MAX_OWNERS {
             self.owners
                 .retain(|_, owner| owner.session.is_some() || owner.released.is_none());
-            if self.owners.len() >= 32 {
+            if self.owners.len() >= MAX_OWNERS {
                 return Err(AcpError::Bounds);
             }
         }
@@ -489,24 +584,45 @@ impl PluginState {
                 native_version: "unverified-acp-v1".to_owned(),
                 generation: open.generation,
             });
-        // Retain an uncertain open before any native mutation; identical retry never spawns again.
+        // Retain the open before any native mutation; identical retries never spawn again.
         let mut owner = Owner::new(instance, open);
         owner.selection = selection.cloned();
+        owner.opening = true;
         self.owners.insert(open.session_id.clone(), owner);
-        let session = AcpSession::open_with_model(
-            &launch,
-            binding,
-            open.resume.is_some(),
-            selection.map(|s| s.model_id.as_str()),
-        )?;
-        let binding = session.binding().clone();
-        let owner = self
+        Ok(OpenPlan::Spawn(launch, binding))
+    }
+
+    fn finish_open(
+        &mut self,
+        open: &HarnessOpenRequest,
+        result: Result<AcpSession, OpenFailure>,
+    ) -> Result<(HarnessSessionBinding, Option<String>), AcpError> {
+        let Some(owner) = self
             .owners
             .get_mut(&open.session_id)
-            .ok_or(AcpError::Stale)?;
-        owner.effective_model = session.model().map(str::to_owned);
-        owner.session = Some(session);
-        Ok(HarnessServiceResponseKind::Opened(binding))
+            .filter(|owner| owner.opening && owner.open == *open)
+        else {
+            // Deactivated or replaced meanwhile; a launched session is dropped and reaped.
+            return Err(AcpError::Stale);
+        };
+        owner.opening = false;
+        match result {
+            Ok(session) => {
+                let binding = session.binding().clone();
+                let model = session.model().map(str::to_owned);
+                owner.effective_model.clone_from(&model);
+                owner.session = Some(session);
+                Ok((binding, model))
+            }
+            Err(failure) => {
+                // Only failures that provably created nothing release the owner for a retry;
+                // otherwise the open stays uncertain so a retry cannot duplicate a session.
+                if !failure.native_session_possible {
+                    self.owners.remove(&open.session_id);
+                }
+                Err(failure.error)
+            }
+        }
     }
 
     fn handle_close(
@@ -544,11 +660,13 @@ impl PluginState {
         })
     }
 
-    fn handle_configure(
+    /// Record and write a configure mutation. `None` means an identical retry already
+    /// succeeded.
+    fn begin_configure(
         &mut self,
         instance: &HarnessInstance,
         configure: &HarnessConfigureRequest,
-    ) -> Result<HarnessServiceResponseKind, AcpError> {
+    ) -> Result<Option<PendingConfigure>, AcpError> {
         let binding = confirmed(&configure.target)?;
         self.session(instance, binding)?;
         let owner = self
@@ -560,29 +678,44 @@ impl PluginState {
                 return Err(AcpError::Stale);
             }
             (*result)?;
-            return Ok(HarnessServiceResponseKind::Acknowledged {
-                mutation_id: configure.mutation_id.clone(),
-            });
+            return Ok(None);
         }
         if owner.configures.len() >= MAX_RETAINED_CONFIGURES {
             owner.configures.pop_first();
         }
-        owner.configures.insert(
-            configure.mutation_id.clone(),
-            (configure.clone(), Err(AcpError::Uncertain)),
-        );
-        let result = owner
+        let begun = owner
             .session
             .as_mut()
             .ok_or(AcpError::Uncertain)?
-            .configure(&configure.setting);
+            .begin_configure(&configure.setting);
+        // In flight until the acknowledgement is recorded; a retry meanwhile is uncertain.
+        let recorded = Err(begun.as_ref().err().copied().unwrap_or(AcpError::Uncertain));
         owner
             .configures
-            .insert(configure.mutation_id.clone(), (configure.clone(), result));
-        result?;
-        Ok(HarnessServiceResponseKind::Acknowledged {
-            mutation_id: configure.mutation_id.clone(),
-        })
+            .insert(configure.mutation_id.clone(), (configure.clone(), recorded));
+        begun.map(Some)
+    }
+
+    fn finish_configure(
+        &mut self,
+        configure: &HarnessConfigureRequest,
+        result: &Result<Option<String>, AcpError>,
+    ) -> Result<(), AcpError> {
+        let binding = confirmed(&configure.target)?;
+        let outcome = result.as_ref().map(|_| ()).map_err(|error| *error);
+        if let Some(owner) = self.owners.get_mut(&binding.session_id) {
+            if let Some(entry) = owner.configures.get_mut(&configure.mutation_id)
+                && entry.0 == *configure
+            {
+                entry.1 = outcome;
+            }
+            if let (Ok(model), Some(session)) = (result, owner.session.as_mut())
+                && session.binding() == binding
+            {
+                session.finish_configure(model.as_deref());
+            }
+        }
+        outcome
     }
 
     fn handle_interrupt(
@@ -800,6 +933,86 @@ mod tests {
             requested_native_session_id: None,
         });
         assert_eq!(confirmed(&target), Err(AcpError::Unsupported));
+    }
+
+    fn instance() -> HarnessInstance {
+        HarnessInstance {
+            instance_id: "antigravity".into(),
+            plugin_id: PLUGIN_ID.into(),
+            executable: "/bin/agy".into(),
+            config_namespace: "/home/user/.gemini".into(),
+            auth: bcode_harness_models::HarnessAuthBinding {
+                provider_id: AUTH_PROVIDER_ID.into(),
+                profile: "native".into(),
+                credential_namespace: "/home/user/.gemini".into(),
+                custody: AuthCustodyMode::NativeManaged,
+            },
+        }
+    }
+
+    fn open_request(generation: u64) -> HarnessOpenRequest {
+        HarnessOpenRequest {
+            open_id: format!("open-{generation}"),
+            session_id: "session".into(),
+            generation,
+            working_directory: "/work".into(),
+            resume: None,
+            parent_assistance: None,
+        }
+    }
+
+    #[test]
+    fn only_definite_open_failures_release_the_owner_for_a_retry() {
+        let mut state = PluginState::default();
+        let instance = instance();
+        let first = open_request(1);
+        assert!(matches!(
+            state.prepare_open(&instance, &first, None),
+            Ok(OpenPlan::Spawn(..))
+        ));
+        // An identical retry while the native open runs never spawns a second process.
+        assert!(matches!(
+            state.prepare_open(&instance, &first, None),
+            Err(AcpError::Uncertain)
+        ));
+
+        // A rejected `session/new` created nothing: the same open may be retried.
+        let rejected = OpenFailure {
+            error: AcpError::Rejected,
+            native_session_possible: false,
+        };
+        assert_eq!(
+            state.finish_open(&first, Err(rejected)),
+            Err(AcpError::Rejected)
+        );
+        assert!(matches!(
+            state.prepare_open(&instance, &first, None),
+            Ok(OpenPlan::Spawn(..))
+        ));
+
+        // A timeout may have created a native session: retries stay uncertain...
+        let timed_out = OpenFailure {
+            error: AcpError::Uncertain,
+            native_session_possible: true,
+        };
+        assert_eq!(
+            state.finish_open(&first, Err(timed_out)),
+            Err(AcpError::Uncertain)
+        );
+        assert!(matches!(
+            state.prepare_open(&instance, &first, None),
+            Err(AcpError::Uncertain)
+        ));
+        // ...until a later generation supersedes the abandoned open.
+        assert!(matches!(
+            state.prepare_open(&instance, &open_request(2), None),
+            Ok(OpenPlan::Spawn(..))
+        ));
+        // A stale generation cannot replace the newer owner.
+        assert!(matches!(
+            state.prepare_open(&instance, &first, None),
+            Err(AcpError::Stale)
+        ));
     }
 
     #[test]

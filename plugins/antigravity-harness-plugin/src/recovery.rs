@@ -2,7 +2,7 @@
 //! transport release. Never reconstructs release from a Close acknowledgement alone and never
 //! adopts a most-recent or unrelated native session.
 use crate::transport::AcpError;
-use crate::{PLUGIN_ID, PluginState, config::Config};
+use crate::{AntigravityHarnessPlugin, PLUGIN_ID, config::Config};
 use bcode_harness_models::{
     HARNESS_RECOVERY_SCHEMA_VERSION, HarnessControlRequest, HarnessInstance, HarnessOpenRequest,
     HarnessRecoveryRequest, HarnessRecoveryRequestKind, HarnessRecoveryResponse,
@@ -11,13 +11,14 @@ use bcode_harness_models::{
 };
 use bcode_plugin_sdk::prelude::{NativeServiceContext, ServiceResponse};
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Bounded wait for the supervisor to reap a just-released native process.
 const REAP_WAIT: Duration = Duration::from_secs(3);
 
-impl PluginState {
+impl AntigravityHarnessPlugin {
     pub(crate) fn recovery_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         self.recovery_evidence(context).map_or_else(
             |_| {
@@ -75,18 +76,26 @@ impl PluginState {
                 let HarnessSessionTarget::Confirmed(binding) = &control.target else {
                     return Err(AcpError::Unsupported);
                 };
-                let owner = self
-                    .owners
-                    .get(&binding.session_id)
-                    .ok_or(AcpError::Uncertain)?;
-                if owner.instance != request.instance || owner.session.is_some() {
-                    return Err(AcpError::Uncertain);
-                }
-                validate_release(owner.released.as_ref(), &control)?;
+                // Gather evidence under the lock; the bounded reap wait runs without it.
+                let (released, reap_id) = self
+                    .state
+                    .lock()
+                    .map_err(|_| AcpError::Uncertain)
+                    .and_then(|state| {
+                        let owner = state
+                            .owners
+                            .get(&binding.session_id)
+                            .ok_or(AcpError::Uncertain)?;
+                        if owner.instance != request.instance || owner.session.is_some() {
+                            return Err(AcpError::Uncertain);
+                        }
+                        Ok((owner.released.clone(), owner.open.open_id.clone()))
+                    })?;
+                validate_release(released, &control)?;
                 HarnessRecoveryResponseKind::TransportReleased {
                     target: control.target,
                     mutation_id: control.mutation_id,
-                    reap_id: owner.open.open_id.clone(),
+                    reap_id,
                 }
             }
         };
@@ -123,16 +132,13 @@ fn validate_resume(
 }
 
 fn validate_release(
-    released: Option<&(
-        HarnessControlRequest,
-        std::sync::Arc<std::sync::atomic::AtomicBool>,
-    )>,
+    released: Option<(HarnessControlRequest, Arc<AtomicBool>)>,
     requested: &HarnessControlRequest,
 ) -> Result<(), AcpError> {
     let Some((close, reaped)) = released else {
         return Err(AcpError::Uncertain);
     };
-    if close != requested {
+    if close != *requested {
         return Err(AcpError::Uncertain);
     }
     let deadline = Instant::now() + REAP_WAIT;

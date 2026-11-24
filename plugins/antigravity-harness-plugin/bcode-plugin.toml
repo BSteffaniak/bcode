@@ -69,6 +69,26 @@ tool_name     = "search_web"
 target_fields = ["Url", "url"]
 tool_name     = "read_url_content"
 
+[[presentation.tools]]
+target_fields = ["CommandLine", "command"]
+tool_name     = "execute"
+
+[[presentation.tools]]
+target_fields = ["Path", "path", "file_path", "DirectoryPath", "SearchPath"]
+tool_name     = "read"
+
+[[presentation.tools]]
+target_fields = ["Query", "pattern", "query", "SearchPath"]
+tool_name     = "search"
+
+[[presentation.tools]]
+target_fields = ["Path", "path", "file_path"]
+tool_name     = "edit"
+
+[[presentation.tools]]
+target_fields = ["Url", "url"]
+tool_name     = "fetch"
+
 # Map native Antigravity tools onto Bcode's tool policy for agent-governed approvals.
 [[native_tools]]
 fields    = ["CommandLine", "command"]
@@ -115,9 +135,53 @@ fields    = []
 operation = "read_only"
 tool_name = "search_web"
 
+# Standard ACP tool calls carry only a coarse `kind` when the agent supplies no explicit tool
+# name; these rows govern that fallback with the same argument fields.
+[[native_tools]]
+fields    = ["CommandLine", "command"]
+operation = "command"
+tool_name = "execute"
+
+[[native_tools]]
+fields = [
+    "Path",
+    "path",
+    "file_path",
+    "DirectoryPath",
+    "SearchPath",
+    "SearchDirectory",
+]
+operation = "read"
+tool_name = "read"
+
+[[native_tools]]
+fields    = ["SearchPath", "SearchDirectory", "path"]
+operation = "read"
+tool_name = "search"
+
+[[native_tools]]
+fields    = ["Path", "path", "file_path"]
+operation = "write"
+tool_name = "edit"
+
+[[native_tools]]
+fields    = ["Path", "path", "file_path"]
+operation = "write"
+tool_name = "delete"
+
+[[native_tools]]
+fields    = ["Path", "path", "file_path"]
+operation = "write"
+tool_name = "move"
+
+[[native_tools]]
+fields    = ["Url", "url"]
+operation = "web"
+tool_name = "fetch"
+
 [concurrency]
-# Operations serialize on retained plugin state; only a waiting observe releases that lock
-# while it waits for native output.
+# Bookkeeping serializes on retained plugin state; native launches, account inspection, model
+# discovery, configuration acknowledgements, reap waits and waiting observes release that lock.
 type = "concurrent"
 
 [runtime]

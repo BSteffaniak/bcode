@@ -24,8 +24,48 @@ pub const MAX_EVENT_QUEUE: usize = 512;
 pub const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum stderr bytes retained (drained continuously, never blocks child).
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-/// Non-secret host environment variables forwarded to the child process.
-const ALLOWED_ENV: [&str; 7] = ["HOME", "USER", "PATH", "TMPDIR", "LANG", "LC_ALL", "TERM"];
+/// Grace between a termination request and a forced kill, so the native CLI can finish
+/// `session/close` and flush its own state after stdin closes.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+/// After the child is reaped, how long the stdout reader may keep draining frames that were
+/// already written before the transport is marked closed.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+/// Host environment variables forwarded to native processes.
+///
+/// None of these carry Antigravity credentials: locale/terminal identity, user directories,
+/// network proxy and trust-store selection, and the session bus that platform keyrings require.
+/// API-key variables such as `GEMINI_API_KEY` and `GOOGLE_API_KEY` are never forwarded.
+pub const FORWARDED_ENV: [&str; 29] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+];
 
 /// Transport and adapter error categories; never carry raw native diagnostics or secrets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -77,7 +117,7 @@ impl Launch {
         let mut cmd = Command::new(&self.executable);
         cmd.current_dir(&self.working_directory);
         cmd.env_clear();
-        for key in ALLOWED_ENV {
+        for key in FORWARDED_ENV {
             if let Ok(value) = std::env::var(key) {
                 cmd.env(key, value);
             }
@@ -243,6 +283,35 @@ pub enum InboundEvent {
     MalformedFrame(&'static str),
 }
 
+/// ACP session capabilities advertised by the agent during `initialize`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    /// `session/resume` (restore without history replay) is supported.
+    pub resume: bool,
+    /// `session/close` is supported.
+    pub close: bool,
+}
+
+impl AgentCapabilities {
+    fn from_initialize(result: &Value) -> Self {
+        let session = result.get("agentCapabilities").and_then(|caps| {
+            caps.get("sessionCapabilities")
+                .or_else(|| caps.get("session_capabilities"))
+        });
+        let advertised = |name: &str| {
+            session
+                .and_then(|caps| caps.get(name))
+                .is_some_and(|v| !v.is_null())
+        };
+        Self {
+            resume: advertised("resume"),
+            close: advertised("close"),
+        }
+    }
+}
+
+type Shared = Arc<(Mutex<SharedState>, Condvar)>;
+
 struct SharedState {
     events: VecDeque<(InboundEvent, usize)>,
     event_bytes: usize,
@@ -250,6 +319,8 @@ struct SharedState {
     async_ids: std::collections::BTreeSet<u64>,
     closed: bool,
     overflowed: bool,
+    /// The stdout reader reached end of stream (every written frame was read).
+    reader_done: bool,
 }
 
 impl SharedState {
@@ -261,6 +332,7 @@ impl SharedState {
             async_ids: std::collections::BTreeSet::new(),
             closed: false,
             overflowed: false,
+            reader_done: false,
         }
     }
 
@@ -284,13 +356,86 @@ impl SharedState {
 /// Running `agy acp --stdio --disable-telemetry` process with bounded framing and reaping.
 pub struct AcpServer {
     stdin: Option<std::process::ChildStdin>,
-    shared: Arc<(Mutex<SharedState>, Condvar)>,
+    shared: Shared,
     wake: Wake,
     next_id: u64,
     timeout: Duration,
     reaped: Arc<AtomicBool>,
     kill_tx: Option<std::sync::mpsc::Sender<()>>,
     native_version: Option<String>,
+    capabilities: AgentCapabilities,
+}
+
+/// A synchronous JSON-RPC request that was written and awaits its reply. Waiting needs no
+/// access to the server, so callers can wait without holding plugin state.
+pub struct PendingCall {
+    id: u64,
+    shared: Shared,
+    deadline: Instant,
+    wake: Wake,
+    kill_tx: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl PendingCall {
+    /// Wait for the reply and return its `result` (mapping a JSON-RPC `error` to `Rejected`).
+    ///
+    /// # Errors
+    /// * Returns `Rejected` on JSON-RPC error, `Disconnected` on closed pipe, `Uncertain` on
+    ///   timeout or overflow.
+    pub fn wait(self) -> Result<Value, AcpError> {
+        let msg = self.wait_raw()?;
+        if msg.get("error").is_some() {
+            return Err(AcpError::Rejected);
+        }
+        msg.get("result").cloned().ok_or(AcpError::Protocol)
+    }
+
+    /// Wait for the full JSON-RPC reply object.
+    ///
+    /// # Errors
+    /// * Returns `Disconnected` on closed pipe or `Uncertain` on timeout/overflow.
+    pub fn wait_raw(self) -> Result<Value, AcpError> {
+        let mut state = self.shared.0.lock().map_err(|_| AcpError::Uncertain)?;
+        loop {
+            if let Some(Some(reply)) = state.pending_sync.get_mut(&self.id).map(Option::take) {
+                state.pending_sync.remove(&self.id);
+                return Ok(reply);
+            }
+            if state.overflowed {
+                state.pending_sync.remove(&self.id);
+                return Err(AcpError::Uncertain);
+            }
+            if state.closed {
+                state.pending_sync.remove(&self.id);
+                return Err(AcpError::Disconnected);
+            }
+            let now = Instant::now();
+            if now >= self.deadline {
+                state.pending_sync.remove(&self.id);
+                state.closed = true;
+                self.shared.1.notify_all();
+                drop(state);
+                self.wake.notify();
+                if let Some(tx) = &self.kill_tx {
+                    let _ = tx.send(());
+                }
+                return Err(AcpError::Uncertain);
+            }
+            let wait = (self.deadline - now).min(Duration::from_millis(100));
+            let Ok((next_state, _)) = self.shared.1.wait_timeout(state, wait) else {
+                return Err(AcpError::Uncertain);
+            };
+            state = next_state;
+        }
+    }
+}
+
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.shared.0.lock() {
+            state.pending_sync.remove(&self.id);
+        }
+    }
 }
 
 impl AcpServer {
@@ -352,6 +497,7 @@ impl AcpServer {
             reaped,
             kill_tx: Some(kill_tx),
             native_version: None,
+            capabilities: AgentCapabilities::default(),
         })
     }
 
@@ -382,7 +528,23 @@ impl AcpServer {
             .ok_or(AcpError::Protocol)?
             .to_owned();
         self.native_version = Some(version.clone());
+        self.capabilities = AgentCapabilities::from_initialize(&result);
         Ok(version)
+    }
+
+    /// Session capabilities advertised during `initialize`.
+    #[must_use]
+    pub const fn capabilities(&self) -> AgentCapabilities {
+        self.capabilities
+    }
+
+    /// Whether inbound frames are still queued for draining.
+    #[must_use]
+    pub fn has_queued_events(&self) -> bool {
+        self.shared
+            .0
+            .lock()
+            .is_ok_and(|state| !state.events.is_empty())
     }
 
     /// Return the native version reported during `initialize`, if any.
@@ -459,11 +621,7 @@ impl AcpServer {
     /// # Errors
     /// * Returns `Rejected` on JSON-RPC error, `Disconnected` on closed pipe, `Uncertain` on timeout.
     pub fn call(&mut self, method: &str, params: &Value) -> Result<Value, AcpError> {
-        let msg = self.call_raw(method, params)?;
-        if msg.get("error").is_some() {
-            return Err(AcpError::Rejected);
-        }
-        msg.get("result").cloned().ok_or(AcpError::Protocol)
+        self.begin_call(method, params)?.wait()
     }
 
     /// Send a synchronous JSON-RPC request and return the full JSON-RPC reply object.
@@ -471,6 +629,14 @@ impl AcpServer {
     /// # Errors
     /// * Returns `Disconnected` on closed pipe or `Uncertain` on timeout/overflow.
     pub fn call_raw(&mut self, method: &str, params: &Value) -> Result<Value, AcpError> {
+        self.begin_call(method, params)?.wait_raw()
+    }
+
+    /// Write a JSON-RPC request whose reply is awaited separately through [`PendingCall`].
+    ///
+    /// # Errors
+    /// * Returns `Disconnected` if the transport is closed or writing fails.
+    pub fn begin_call(&mut self, method: &str, params: &Value) -> Result<PendingCall, AcpError> {
         let id = self.next_rpc_id()?;
         {
             let mut state = self.shared.0.lock().map_err(|_| AcpError::Uncertain)?;
@@ -479,45 +645,34 @@ impl AcpServer {
             }
             state.pending_sync.insert(id, None);
         }
-        if let Err(err) = self.write_json(&json!({
+        let pending = PendingCall {
+            id,
+            shared: Arc::clone(&self.shared),
+            deadline: Instant::now() + self.timeout,
+            wake: self.wake.clone(),
+            kill_tx: self.kill_tx.clone(),
+        };
+        self.write_json(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params,
-        })) {
-            if let Ok(mut state) = self.shared.0.lock() {
-                state.pending_sync.remove(&id);
-            }
-            return Err(err);
-        }
-        let deadline = Instant::now() + self.timeout;
-        let mut state = self.shared.0.lock().map_err(|_| AcpError::Uncertain)?;
-        loop {
-            if let Some(Some(reply)) = state.pending_sync.get_mut(&id).map(Option::take) {
-                state.pending_sync.remove(&id);
-                return Ok(reply);
-            }
-            if state.overflowed {
-                state.pending_sync.remove(&id);
-                return Err(AcpError::Uncertain);
-            }
-            if state.closed {
-                state.pending_sync.remove(&id);
-                return Err(AcpError::Disconnected);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                state.pending_sync.remove(&id);
-                state.closed = true;
-                self.request_kill();
-                return Err(AcpError::Uncertain);
-            }
-            let wait = (deadline - now).min(Duration::from_millis(100));
-            let Ok((next_state, _)) = self.shared.1.wait_timeout(state, wait) else {
-                return Err(AcpError::Uncertain);
-            };
-            state = next_state;
-        }
+        }))?;
+        Ok(pending)
+    }
+
+    /// Send a JSON-RPC request whose reply is not awaited (it is discarded when it arrives).
+    ///
+    /// # Errors
+    /// * Returns `Disconnected` if the transport is closed or writing fails.
+    pub fn send_request_detached(&mut self, method: &str, params: &Value) -> Result<(), AcpError> {
+        let id = self.next_rpc_id()?;
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
     }
 
     /// Send an asynchronous JSON-RPC request (used for `session/prompt`); its reply arrives later
@@ -700,6 +855,7 @@ fn read_stdout(
         dispatch_inbound(msg, frame_bytes, shared, wake, kill_tx);
     }
     if let Ok(mut state) = shared.0.lock() {
+        state.reader_done = true;
         state.closed = true;
         shared.1.notify_all();
     }
@@ -837,7 +993,7 @@ fn supervise_child(
             kill_requested_at = Some(Instant::now());
         }
         if let Some(since) = kill_requested_at
-            && since.elapsed() >= Duration::from_millis(200)
+            && since.elapsed() >= KILL_GRACE
         {
             let _ = child.kill();
             let _ = child.wait();
@@ -846,10 +1002,28 @@ fn supervise_child(
         std::thread::sleep(Duration::from_millis(15));
     }
     reaped.store(true, Ordering::SeqCst);
-    if let Ok(mut state) = shared.0.lock() {
-        state.closed = true;
-        shared.1.notify_all();
+    // Frames written before exit may still sit in the pipe; let the reader drain them before
+    // the transport is closed, otherwise a final reply could be rejected as post-close input.
+    // A bounded grace covers descendants that keep the pipe open after the child exits.
+    let deadline = Instant::now() + READER_DRAIN_GRACE;
+    let Ok(mut state) = shared.0.lock() else {
+        wake.notify();
+        return;
+    };
+    while !state.reader_done && !state.closed {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Ok((next, _)) = shared.1.wait_timeout(state, deadline - now) else {
+            wake.notify();
+            return;
+        };
+        state = next;
     }
+    state.closed = true;
+    shared.1.notify_all();
+    drop(state);
     wake.notify();
 }
 

@@ -15,8 +15,10 @@ use std::path::Path;
 pub const NATIVE_LOGIN_METHOD: &str = "native-login";
 /// Service operation name shared by every terminal-auth producer.
 const PREPARE_LOGIN_OPERATION: &str = "prepare_login";
-/// Environment the client terminal may pass to native login; never credentials.
-const ALLOWED_ENVIRONMENT: [&str; 7] = ["HOME", "USER", "PATH", "TMPDIR", "LANG", "LC_ALL", "TERM"];
+/// Environment the client terminal may pass to native login; the same non-credential set the
+/// daemon forwards to `agy`.
+const ALLOWED_ENVIRONMENT: [&str; crate::transport::FORWARDED_ENV.len()] =
+    crate::transport::FORWARDED_ENV;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

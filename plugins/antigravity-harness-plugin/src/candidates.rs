@@ -1,8 +1,10 @@
 //! Plugin-owned installation discovery using the trusted host launch environment.
 //!
 //! Discovery searches absolute `PATH` entries for `agy`, probes `agy --version`, and inspects
-//! native account readiness via non-mutating `session/list` without creating a conversation,
-//! refreshing tokens, or sending any model request.
+//! native account readiness via `session/list` without creating a conversation, refreshing
+//! tokens, or sending any model request. A namespace that does not exist yet is reported as
+//! needing login without launching the ACP server, so discovery never creates it; inspecting an
+//! existing namespace lets the native CLI initialize its own bookkeeping files there.
 use crate::config::InstanceConfig;
 use crate::transport::{AcpServer, Launch};
 use crate::{AUTH_PROVIDER_ID, PLUGIN_ID};
@@ -145,6 +147,9 @@ fn executable_identity(
 }
 
 fn inspect_account(launch: &Launch) -> HarnessCandidateReadiness {
+    if !launch.gemini_dir.is_dir() {
+        return HarnessCandidateReadiness::LoginRequired;
+    }
     let result = AcpServer::spawn(launch).and_then(|mut server| {
         server.initialize(launch)?;
         Ok(crate::auth::probe_readiness(&mut server))

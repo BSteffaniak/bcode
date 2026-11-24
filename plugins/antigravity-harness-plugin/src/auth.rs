@@ -1,10 +1,14 @@
 //! Native Antigravity authentication inspection.
 //!
-//! Readiness is probed non-mutatingly via `session/list` on a short-lived ACP server:
+//! Readiness is probed via `session/list` on a short-lived ACP server:
 //! * A successful `session/list` response proves the native account is ready.
 //! * JSON-RPC error `-32000` ("Authentication required") reports `AuthenticationRequired`.
+//! * A namespace directory that does not exist holds no login; it reports `LoginRequired`
+//!   without launching anything, so inspection never scaffolds a new namespace.
 //!
-//! No session is created, no prompt is sent, and no native credentials are copied or mutated.
+//! No session is created, no prompt is sent, and no native credentials are copied or changed.
+//! Launching `agy acp` does let the native CLI initialize its own bookkeeping files (settings,
+//! installation id, logs) inside an existing namespace.
 use crate::PLUGIN_ID;
 use crate::transport::{AcpError, AcpServer, Launch, wipe_value};
 use bcode_harness_models::HarnessAuthBinding;
@@ -13,7 +17,7 @@ use bcode_provider_auth_models::managed::{
 };
 use serde_json::json;
 
-/// Inspect native account readiness without creating a session or mutating credentials.
+/// Inspect native account readiness without creating a session or touching credentials.
 ///
 /// # Errors
 /// * Returns configuration/protocol/disconnected errors if the ACP server cannot be initialized.
@@ -24,9 +28,13 @@ pub fn inspect_status(
     if binding.custody != AuthCustodyMode::NativeManaged {
         return Err(AcpError::Unsupported);
     }
-    let mut server = AcpServer::spawn(launch)?;
-    let _version = server.initialize(launch)?;
-    let readiness = probe_readiness(&mut server);
+    let readiness = if launch.gemini_dir.is_dir() {
+        let mut server = AcpServer::spawn(launch)?;
+        let _version = server.initialize(launch)?;
+        probe_readiness(&mut server)
+    } else {
+        AuthReadiness::LoginRequired
+    };
     Ok(ManagedAuthStatus {
         namespace: AuthNamespace {
             plugin_id: PLUGIN_ID.to_owned(),

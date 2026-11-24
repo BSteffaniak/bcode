@@ -36,6 +36,17 @@ def main():
     current_model = "gemini-4-neon-high"
     current_mode = "default"
     pending_perm = None  # (perm_rpc_id, prompt_rpc_id, prompt_text)
+    # Set by session/cancel while a permission is pending: like a spec-compliant ACP agent,
+    # the prompt only ends once the client answers that permission with `cancelled`.
+    cancel_requested = False
+    modes = {
+        "currentModeId": "default",
+        "availableModes": [
+            {"id": "default", "name": "Default"},
+            {"id": "accept-edits", "name": "Accept edits"},
+            {"id": "plan", "name": "Plan"},
+        ],
+    }
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -48,6 +59,11 @@ def main():
             perm_id, prompt_id, _ = pending_perm
             pending_perm = None
             outcome = msg.get("result", {}).get("outcome", {})
+            if cancel_requested:
+                cancel_requested = False
+                stop = "cancelled" if outcome.get("outcome") == "cancelled" else "refusal"
+                send({"jsonrpc": "2.0", "id": prompt_id, "result": {"stopReason": stop}})
+                continue
             approved = outcome.get("optionId") == "allow"
             send({
                 "jsonrpc": "2.0",
@@ -57,7 +73,6 @@ def main():
                     "update": {
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": "call_1",
-                        "name": "run_command",
                         "status": "completed" if approved else "failed",
                         "rawOutput": {
                             "output": "hello_acp\n" if approved else "denied",
@@ -104,7 +119,10 @@ def main():
                 "result": {
                     "protocolVersion": 1,
                     "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.15"},
-                    "agentCapabilities": {"loadSession": True},
+                    "agentCapabilities": {
+                        "loadSession": True,
+                        "sessionCapabilities": {"resume": {}, "close": {}, "list": {}},
+                    },
                 },
             })
         elif method == "session/list":
@@ -130,7 +148,7 @@ def main():
                     "result": {
                         "sessionId": session_id,
                         "models": {"currentModelId": current_model},
-                        "modes": {"currentModeId": current_mode},
+                        "modes": dict(modes, currentModeId=current_mode),
                     },
                 })
         elif method == "session/resume":
@@ -148,7 +166,7 @@ def main():
                     "result": {
                         "sessionId": session_id,
                         "models": {"currentModelId": current_model},
-                        "modes": {"currentModeId": current_mode},
+                        "modes": dict(modes, currentModeId=current_mode),
                     },
                 })
         elif method == "session/set_model":
@@ -176,7 +194,7 @@ def main():
                         "update": {
                             "sessionUpdate": "tool_call",
                             "toolCallId": "call_1",
-                            "name": "run_command",
+                            "kind": "execute",
                             "status": "in_progress",
                             "rawInput": {"CommandLine": "echo hello_acp"},
                             "title": "echo hello_acp",
@@ -192,7 +210,7 @@ def main():
                         "sessionId": session_id,
                         "toolCall": {
                             "toolCallId": "call_1",
-                            "name": "run_command",
+                            "kind": "execute",
                             "rawInput": {"CommandLine": "echo hello_acp"},
                             "title": "echo hello_acp",
                         },
@@ -212,7 +230,7 @@ def main():
                         "sessionId": session_id,
                         "toolCall": {
                             "toolCallId": "call_cancel",
-                            "name": "run_command",
+                            "kind": "execute",
                             "rawInput": {"CommandLine": "sleep 60"},
                             "title": "sleep 60",
                         },
@@ -222,6 +240,34 @@ def main():
                         ],
                     },
                 })
+            elif prompt_text == "TRIGGER_CRASH":
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "partial"},
+                        },
+                    },
+                })
+                os._exit(3)
+            elif prompt_text == "TRIGGER_BURST_EXIT":
+                for _ in range(200):
+                    send({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"type": "text", "text": "x"},
+                            },
+                        },
+                    })
+                send({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
+                os._exit(0)
             else:
                 send({
                     "jsonrpc": "2.0",
@@ -271,13 +317,7 @@ def main():
                 })
         elif method == "session/cancel":
             if pending_perm is not None:
-                _, prompt_id, _ = pending_perm
-                pending_perm = None
-                send({
-                    "jsonrpc": "2.0",
-                    "id": prompt_id,
-                    "result": {"stopReason": "cancelled"},
-                })
+                cancel_requested = True
         elif method == "session/close":
             if req_id is not None:
                 send({"jsonrpc": "2.0", "id": req_id, "result": {}})

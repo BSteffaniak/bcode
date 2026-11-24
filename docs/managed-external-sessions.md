@@ -417,7 +417,9 @@ cargo test -p bcode_antigravity_harness_plugin --test native_subscription -- --i
 
 Antigravity speaks ACP over stdio (`agy acp --stdio --disable-telemetry`), uses native Google OAuth
 via `agy acp --login` (`bcode.harness.terminal-auth/v1`), discovers models via `agy models`, and
-completes foreground turns at `SubmissionTerminal`. See `plugins/antigravity-harness-plugin/README.md`.
+completes foreground turns at `SubmissionTerminal`. Losing the native process reports a
+completeness gap without inventing a terminal outcome. See
+`plugins/antigravity-harness-plugin/README.md`.
 
 Observation clients must use the exact returned `next_after`, including `None` on
 an empty page, and adopt confirmed session bindings. Canonical history has a
