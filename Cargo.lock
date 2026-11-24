@@ -474,12 +474,12 @@ dependencies = [
 
 [[package]]
 name = "ahash"
-version = "0.8.12"
+version = "0.8.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+checksum = "0fca89247609239eeb6915e6991111866b92d7b31025e69302bbf430cc4d2c38"
 dependencies = [
  "cfg-if",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "serde",
  "version_check 0.9.5",
@@ -621,9 +621,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.104"
+version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
 name = "ar_archive_writer"
@@ -657,7 +657,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding 2.3.2",
  "windows-sys 0.61.2",
  "x11rb 0.13.2",
@@ -1209,7 +1209,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 0.4.6",
  "hyper 0.14.32",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-rustls 0.24.2",
  "hyper-rustls 0.27.10",
  "hyper-util",
@@ -1324,9 +1324,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.9.4"
+version = "1.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aff4bf014c512840b2bba80a20417b723cbd6a0a65c02e2d81f50b4268aedfc7"
+checksum = "2085f9721fb3755821f8db7611a67ed15f4d6fdba6785b4db8ed7cd18eebee0f"
 dependencies = [
  "base64-simd",
  "bytes 1.12.2",
@@ -1402,7 +1402,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-util",
  "itoa",
  "matchit 0.8.4",
@@ -4652,7 +4652,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -4662,7 +4662,7 @@ dependencies = [
 [[package]]
 name = "bmux_cell_geometry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_unicode_segmentation",
 ]
@@ -4670,7 +4670,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "lz4_flex 0.14.2",
  "serde",
@@ -4680,7 +4680,7 @@ dependencies = [
 [[package]]
 name = "bmux_color"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "serde",
 ]
@@ -4688,7 +4688,7 @@ dependencies = [
 [[package]]
 name = "bmux_config_composition"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "libc",
  "serde",
@@ -4698,7 +4698,7 @@ dependencies = [
 [[package]]
 name = "bmux_fonts"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "ab_glyph",
  "fontdb",
@@ -4707,7 +4707,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -4724,7 +4724,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -4739,7 +4739,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "serde",
 ]
@@ -4747,7 +4747,7 @@ dependencies = [
 [[package]]
 name = "bmux_markdown"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
@@ -4765,7 +4765,7 @@ dependencies = [
 [[package]]
 name = "bmux_mermaid_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_fonts",
  "cranelift-codegen",
@@ -4777,7 +4777,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "serde",
  "serde_json",
@@ -4786,7 +4786,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
@@ -4815,7 +4815,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "serde",
  "serde_json",
@@ -4828,7 +4828,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "serde",
  "sha2 0.11.1",
@@ -4839,7 +4839,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -4859,7 +4859,7 @@ dependencies = [
 [[package]]
 name = "bmux_presentation_scene"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "serde",
@@ -4868,7 +4868,7 @@ dependencies = [
 [[package]]
 name = "bmux_pty"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "switchy_pty",
  "switchy_thread",
@@ -4879,7 +4879,7 @@ dependencies = [
 [[package]]
 name = "bmux_raster"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "gif",
  "png",
@@ -4890,7 +4890,7 @@ dependencies = [
 [[package]]
 name = "bmux_syntax_render"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_tui",
  "syntect",
@@ -4900,7 +4900,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_keyboard",
  "futures-core",
@@ -4911,7 +4911,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
@@ -4926,7 +4926,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "serde",
  "switchy_time",
@@ -4935,7 +4935,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_keyboard",
@@ -4948,7 +4948,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
@@ -4969,7 +4969,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
@@ -4986,7 +4986,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_image",
  "bmux_keyboard",
@@ -5000,12 +5000,12 @@ dependencies = [
 [[package]]
 name = "bmux_unicode_segmentation"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 
 [[package]]
 name = "bmux_web_renderer"
 version = "0.0.1-alpha.4"
-source = "git+https://github.com/BSteffaniak/bmux?branch=master#5fffbd8f72974729404bc41769dc0e519e5c0a2c"
+source = "git+https://github.com/BSteffaniak/bmux?branch=master#b702e9ea7cd3bfd12fda3b0be042a0bcdb2b4090"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
@@ -5077,9 +5077,9 @@ dependencies = [
 
 [[package]]
 name = "brotli-decompressor"
-version = "6.3.2"
+version = "6.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc031cd87c6529082b0b65c604e86af0ed7744841b17ccfe60b1e31fa606179e"
+checksum = "664148598c930650998ef56df301329ffe7b4cdb02d49b2a3fca3bcaf2185bcb"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -5442,9 +5442,9 @@ dependencies = [
 
 [[package]]
 name = "bytestring"
-version = "1.6.0"
+version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca79160522b4aed4a69bab673bee78d3884d44240c78c96cb04b7557d532b4dc"
+checksum = "07acef387a61fe24ed2ee3924f1fe89ac9f4b862dfd72b110109133158d7f9f8"
 dependencies = [
  "bytes 1.12.2",
 ]
@@ -5460,7 +5460,7 @@ dependencies = [
  "cached_proc_macro_types",
  "hashbrown 0.16.1",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "thiserror 2.0.21",
  "web-time",
 ]
@@ -6100,7 +6100,7 @@ dependencies = [
  "cranelift-entity",
  "cranelift-isle",
  "gimli",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libm",
  "log 0.4.35",
  "postcard",
@@ -6162,7 +6162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39e025bb120162a1b60d010bbc3237ac1b99b466702b5ae42a974e91afcb9725"
 dependencies = [
  "cranelift-codegen",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "log 0.4.35",
  "smallvec",
  "target-lexicon",
@@ -6218,9 +6218,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.5"
+version = "1.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+checksum = "fd9ae8fcb3ea71b0b26338b4ffb13006bb175de8fd07921089a906ce7e5e6945"
 dependencies = [
  "cfg-if",
 ]
@@ -6463,9 +6463,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -7442,7 +7442,7 @@ checksum = "050a5d07359ebfac7f0b74916d94cfa30575e45fdc7e9bfbb0f76d5d4203325a"
 dependencies = [
  "compact_str 0.10.0",
  "get-size-derive2",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "ordermap",
  "smallvec",
  "thin-vec",
@@ -7588,9 +7588,9 @@ dependencies = [
 
 [[package]]
 name = "gix-config-value"
-version = "0.21.1"
+version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cdada8bd9c97dc6522505c08226d9c88f0a1286f2c06b9e1bf51c3bf7ad7b2b"
+checksum = "d7666081ef0ecc5e1dc54bc6ce16dac9d7b9490780f6c130393ef9e50c909d4a"
 dependencies = [
  "bitflags 2.13.2",
  "bstr",
@@ -7614,9 +7614,9 @@ dependencies = [
 
 [[package]]
 name = "gix-error"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d87ff4b3f3daf01234d38d176b0ec00e92de514cc0e3fb8a8898c5cb7ccd22bb"
+checksum = "50ad6c42fa50280f382026ff838a8afa7ab2ad83e92349cab4392972baae69cd"
 dependencies = [
  "bstr",
 ]
@@ -7670,8 +7670,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f66822aee11ccb28d6a2e63b587254e578fb52a138bd5806b58d8560125592b"
 dependencies = [
  "gix-hash",
- "hashbrown 0.17.1",
- "parking_lot",
+ "hashbrown 0.17.2",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -7706,23 +7706,24 @@ dependencies = [
 
 [[package]]
 name = "gix-parallel"
-version = "0.50.1"
+version = "0.50.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58e7e10f8343e05f6ad8651f97dffa1caca1531bb274bfc8e3050e80e3ed5946"
+checksum = "d3a5c86eeec0194a3444611b4762ba05cc5029408a617348b4f6a74a34c222cd"
 dependencies = [
  "gix-trace",
 ]
 
 [[package]]
 name = "gix-path"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83976e926a485e6fb4b8d9a0d7a30c53c1f607b81b5d310f06f92fd8385bf16a"
+checksum = "615e3ff75800c67022ec8065b67e0846420a88c5f484e6c4fd81c78472e4c77a"
 dependencies = [
  "bstr",
  "gix-error",
  "gix-trace",
  "gix-validate",
+ "winreg",
 ]
 
 [[package]]
@@ -7765,22 +7766,22 @@ checksum = "b8fdb135a043d6106b59bc58d59a326b277e495ec26fb9e02a1e2b6354bf4b5a"
 dependencies = [
  "gix-fs",
  "libc",
- "parking_lot",
+ "parking_lot 0.12.5",
  "tempfile",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "gix-trace"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c477c029518d3f235c26db21ff7cccc1fa13c0c31b05c005a55b7affd4ffbd81"
+checksum = "1c96f84d731a96780e6a7ad5ee70b4ecc398499946b62617945fbaeb6ab878f8"
 
 [[package]]
 name = "gix-utils"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11a9446060447e9ec58f5d333b98bed53389dfa10de5d8dd46fc76d01dfc2954"
+checksum = "b5e6d46894c7a4fd9c5e26d233a0fa836002ba0af9a11aef58923d317c486e10"
 dependencies = [
  "bstr",
  "fastrand",
@@ -7791,9 +7792,9 @@ dependencies = [
 
 [[package]]
 name = "gix-validate"
-version = "0.13.1"
+version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02b617c17754bf37ee7a9b48e33ffb806abecbbed779ba415199ac1480acf699"
+checksum = "5d6f293fd8abd9bd9bc1e0a23541f73607e932b5a2bde2246320da38edde5726"
 dependencies = [
  "bstr",
  "gix-error",
@@ -7807,9 +7808,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "globset"
-version = "0.4.21"
+version = "0.4.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f98b0d85522dc0a824cfebbc9594ff4a9b289c568bea0370319dfbdf20ccdd2d"
+checksum = "71217a07f20b48b4938c14203b77b610f8a7fa6762c3f75394a10c5f31e5aee0"
 dependencies = [
  "aho-corasick",
  "bstr",
@@ -7910,9 +7911,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 dependencies = [
  "allocator-api2 0.2.21",
  "equivalent",
@@ -7936,7 +7937,7 @@ version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -8235,9 +8236,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+checksum = "229c6ff5584df4c6becbfe00567128bac768c8cd32ebc8a8366bd81ed072e8f3"
 dependencies = [
  "atomic-waker",
  "bytes 1.12.2",
@@ -8277,7 +8278,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
 dependencies = [
  "http 1.5.0",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-util",
  "rustls 0.23.46",
  "rustls-native-certs",
@@ -8293,7 +8294,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
 dependencies = [
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -8313,7 +8314,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "httparse",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "ipnet",
  "libc",
  "percent-encoding 2.3.2",
@@ -8327,7 +8328,7 @@ dependencies = [
 [[package]]
 name = "hyperchad"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "hyperchad_actions",
  "hyperchad_app",
@@ -8349,7 +8350,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_actions"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer_models",
@@ -8364,7 +8365,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_app"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "clap",
@@ -8387,7 +8388,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_color"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "color-hex",
  "log 0.4.35",
@@ -8427,7 +8428,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_js_bundler"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "anyhow",
  "log 0.4.35",
@@ -8447,7 +8448,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_markdown"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "hyperchad_color",
  "hyperchad_transformer",
@@ -8462,7 +8463,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -8479,7 +8480,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -8507,7 +8508,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_actix"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -8531,7 +8532,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_http"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "flume",
  "http 1.5.0",
@@ -8553,7 +8554,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_lambda"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -8570,7 +8571,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_html_web_server"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -8587,7 +8588,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_vanilla_js"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "const_format",
@@ -8606,7 +8607,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_renderer_vanilla_js_hash"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "const-hex",
  "const_format",
@@ -8616,7 +8617,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_router"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "base64 0.23.1",
  "bytes 1.12.2",
@@ -8642,7 +8643,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_simulator"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "moosicbox_assert",
@@ -8656,7 +8657,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_template"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "hyperchad_actions",
  "hyperchad_color",
@@ -8672,7 +8673,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_template_actions_dsl"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "hyperchad_actions",
  "log 0.4.35",
@@ -8685,7 +8686,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_template_macros"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "hyperchad_color",
  "hyperchad_template_actions_dsl",
@@ -8702,7 +8703,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "html-escape",
  "hyperchad_actions",
@@ -8724,7 +8725,7 @@ dependencies = [
 [[package]]
 name = "hyperchad_transformer_models"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "moosicbox_assert",
@@ -8759,7 +8760,7 @@ dependencies = [
  "i18n-embed-impl",
  "intl-memoizer",
  "log 0.4.35",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rust-embed",
  "thiserror 1.0.69",
  "unic-langid",
@@ -9043,9 +9044,9 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "ignore"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "484be5657551d7868d67587df967fb4fcbe9d266a761cc855aaa148fda0b3cc7"
+checksum = "df0a7d5f105e76bda602bed0a44af048542d3c9af12ec35aaf16f106c6f34270"
 dependencies = [
  "crossbeam-deque",
  "globset",
@@ -9111,7 +9112,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "serde",
  "serde_core",
 ]
@@ -9599,7 +9600,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "lambda_runtime",
  "mime 0.3.18",
  "percent-encoding 2.3.2",
@@ -9624,7 +9625,7 @@ dependencies = [
  "http 1.5.0",
  "http-body-util",
  "http-serde",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "lambda_runtime_api_client",
  "pin-project",
  "serde",
@@ -9648,7 +9649,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-util",
  "tower",
  "tracing",
@@ -9922,6 +9923,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9992,7 +10002,7 @@ version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -10295,7 +10305,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_arb"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "moosicbox_assert",
@@ -10306,7 +10316,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_assert"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "colored",
  "moosicbox_env_utils",
@@ -10315,12 +10325,12 @@ dependencies = [
 [[package]]
 name = "moosicbox_env_utils"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 
 [[package]]
 name = "moosicbox_json_utils"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "chrono",
@@ -10332,7 +10342,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_runtime"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy_fs",
  "thiserror 2.0.21",
@@ -10344,7 +10354,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_logging"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "thiserror 2.0.21",
@@ -10353,7 +10363,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_middleware"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "actix-web",
  "futures 0.3.34",
@@ -10367,7 +10377,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_profiles"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy_async",
 ]
@@ -10956,7 +10966,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
 dependencies = [
  "crc32fast",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "memchr",
 ]
@@ -11255,8 +11265,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -11267,7 +11287,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link 0.2.1",
 ]
@@ -11837,7 +11869,7 @@ version = "31.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf52d87428247c5aa3760ac8e7d8b13ec7b3579b955a8c3f311668b6860acba5"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -11995,7 +12027,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -12033,7 +12065,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -12239,9 +12271,9 @@ dependencies = [
 
 [[package]]
 name = "rangemap"
-version = "1.8.0"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
+checksum = "f2d43a8c8c74056248124068fde0df374d1ddf9039e747d190f01c36faeaab08"
 
 [[package]]
 name = "rapidhash"
@@ -12291,6 +12323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "redox_users"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12329,10 +12370,10 @@ dependencies = [
  "ahash",
  "fluent-uri",
  "getrandom 0.3.4",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "itoa",
  "micromap",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding 2.3.2",
  "serde_json",
 ]
@@ -12357,7 +12398,7 @@ checksum = "34f923657880712029496c2e68bb40bef163806b2011adde559b28bbcedc82ea"
 dependencies = [
  "allocator-api2 0.2.21",
  "bumpalo",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "log 0.4.35",
  "rustc-hash 2.1.3",
  "serde",
@@ -12438,7 +12479,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-rustls 0.27.10",
  "hyper-util",
  "js-sys",
@@ -12482,7 +12523,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-util",
  "js-sys",
  "log 0.4.35",
@@ -12872,7 +12913,7 @@ dependencies = [
  "bstr",
  "drop_bomb",
  "get-size2",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "memchr",
  "ruff_python_ast",
  "ruff_python_trivia",
@@ -12955,7 +12996,7 @@ dependencies = [
  "genawaiter",
  "http 1.5.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-util",
  "if-addrs 0.13.4",
  "roxmltree 0.20.0",
@@ -13174,9 +13215,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "ryu-js"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+checksum = "1f232fd0249f55adbe7f15bee58bbbd3d40708000b84e6482066d2ba599e08a9"
 
 [[package]]
 name = "safemem"
@@ -13186,20 +13227,20 @@ checksum = "ef703b7cb59335eae2eb93ceb664c0eb7ea6bf567079d843e09420219668e072"
 
 [[package]]
 name = "salsa"
-version = "0.28.5"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27d2e6e19e39591cd99c01ac4141544b4d012cfd0831348629b8187fa9fe6d34"
+checksum = "71bb6122eeb456512d11ce279cbe1eb5f6e2a23f7082ef5f2fb1ad72e9c85533"
 dependencies = [
  "boxcar",
  "compact_str 0.10.0",
  "crossbeam-queue",
  "crossbeam-utils",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "hashlink 0.12.2",
  "indexmap",
  "intrusive-collections 0.10.3",
  "inventory",
- "parking_lot",
+ "parking_lot 0.13.0",
  "portable-atomic",
  "rustc-hash 2.1.3",
  "salsa-macro-rules",
@@ -13207,20 +13248,19 @@ dependencies = [
  "smallvec",
  "thin-vec",
  "tracing",
- "typeid",
 ]
 
 [[package]]
 name = "salsa-macro-rules"
-version = "0.28.5"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baf90a551c38f25ed8489111d3d5827aa18e1b85963f5e6a298505b1d1e2cb7e"
+checksum = "1bc5f7bf0901845dbf61e7f7ce586f74209a7621a7c30c453cecab9b92b15969"
 
 [[package]]
 name = "salsa-macros"
-version = "0.28.5"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69dd77f86ec10e72e314f4ddf7c44c8d349e73cdff1aad524ba9668603fb0549"
+checksum = "6d6dcd603d6a99b0aefabac0961957a9311ae7fb57db233ec631ef47526ada9b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13723,7 +13763,7 @@ dependencies = [
 [[package]]
 name = "simvar"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "simvar_harness",
 ]
@@ -13731,7 +13771,7 @@ dependencies = [
 [[package]]
 name = "simvar_harness"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "btparse",
  "color-backtrace",
@@ -13748,12 +13788,12 @@ dependencies = [
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 
 [[package]]
 name = "simvar_utils"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy",
 ]
@@ -13857,7 +13897,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -14410,7 +14450,7 @@ dependencies = [
  "lru 0.18.5",
  "normpath",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "path-clean",
  "pathdiff",
  "rustc-hash 2.1.3",
@@ -14435,7 +14475,7 @@ dependencies = [
  "once_cell",
  "par-core",
  "par-iter",
- "parking_lot",
+ "parking_lot 0.12.5",
  "phf",
  "radix_fmt",
  "rustc-hash 2.1.3",
@@ -14804,7 +14844,7 @@ dependencies = [
 [[package]]
 name = "switchy"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy_async",
  "switchy_async_macros",
@@ -14842,7 +14882,7 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "flume",
  "futures 0.3.34",
@@ -14861,7 +14901,7 @@ dependencies = [
 [[package]]
 name = "switchy_async_macros"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -14872,7 +14912,7 @@ dependencies = [
 [[package]]
 name = "switchy_database"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "chrono",
@@ -14891,7 +14931,7 @@ dependencies = [
 [[package]]
 name = "switchy_database_connection"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "rusqlite",
@@ -14904,7 +14944,7 @@ dependencies = [
 [[package]]
 name = "switchy_env"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "switchy_simulation",
@@ -14914,7 +14954,7 @@ dependencies = [
 [[package]]
 name = "switchy_fs"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "libc",
  "log 0.4.35",
@@ -14930,7 +14970,7 @@ dependencies = [
 [[package]]
 name = "switchy_http"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -14945,7 +14985,7 @@ dependencies = [
 [[package]]
 name = "switchy_http_models"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "actix-web",
  "strum 0.28.0",
@@ -14955,7 +14995,7 @@ dependencies = [
 [[package]]
 name = "switchy_mdns"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "hostname",
@@ -14967,7 +15007,7 @@ dependencies = [
 [[package]]
 name = "switchy_network"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "switchy_simulation",
@@ -14978,7 +15018,7 @@ dependencies = [
 [[package]]
 name = "switchy_pty"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -14987,7 +15027,7 @@ dependencies = [
 [[package]]
 name = "switchy_random"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "getrandom 0.4.3",
  "log 0.4.35",
@@ -14998,7 +15038,7 @@ dependencies = [
 [[package]]
 name = "switchy_schema"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -15015,12 +15055,12 @@ dependencies = [
 [[package]]
 name = "switchy_simulation"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 
 [[package]]
 name = "switchy_tcp"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-trait",
  "bytes 1.12.2",
@@ -15037,7 +15077,7 @@ dependencies = [
 [[package]]
 name = "switchy_telemetry"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "log 0.4.35",
  "moosicbox_log_runtime",
@@ -15053,7 +15093,7 @@ dependencies = [
 [[package]]
 name = "switchy_thread"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy_simulation",
  "switchy_time",
@@ -15062,7 +15102,7 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "chrono",
  "switchy_random",
@@ -15072,7 +15112,7 @@ dependencies = [
 [[package]]
 name = "switchy_upnp"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -15093,7 +15133,7 @@ dependencies = [
 [[package]]
 name = "switchy_uuid"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy_simulation",
  "uuid",
@@ -15102,7 +15142,7 @@ dependencies = [
 [[package]]
 name = "switchy_web_server"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "actix-cors",
  "actix-http",
@@ -15127,12 +15167,12 @@ dependencies = [
 [[package]]
 name = "switchy_web_server_core"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 
 [[package]]
 name = "switchy_web_server_cors"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "switchy_http_models",
 ]
@@ -15140,7 +15180,7 @@ dependencies = [
 [[package]]
 name = "switchy_web_server_simulator"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#bd295ff9ab30451a200aeeea2004164a40825f27"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#57cf1627f42d520901a257c734c77412122c0b37"
 dependencies = [
  "bytes 1.12.2",
  "log 0.4.35",
@@ -15605,7 +15645,7 @@ dependencies = [
  "bytes 1.12.2",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.5",
@@ -15813,7 +15853,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.1.0",
  "http-body-util",
- "hyper 1.12.0",
+ "hyper 1.13.0",
  "hyper-timeout",
  "hyper-util",
  "percent-encoding 2.3.2",
@@ -16186,7 +16226,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "pack1",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pastey",
  "polling",
  "rand 0.9.5",
@@ -16262,7 +16302,7 @@ checksum = "e700f313160eca7ef55dc4e5170c1cf6103c1ec8f2644e2e6c8fe2a0157f68b6"
 dependencies = [
  "bindgen",
  "env_logger",
- "parking_lot",
+ "parking_lot 0.12.5",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -16314,7 +16354,7 @@ dependencies = [
  "bindgen",
  "env_logger",
  "genawaiter",
- "parking_lot",
+ "parking_lot 0.12.5",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -16894,7 +16934,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f5fa0a054ae153606df820eb0a84213e28cda41bbe04ba2628e71b6ba100fcb"
 dependencies = [
  "bitflags 2.13.2",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "semver",
  "serde",
@@ -16960,7 +17000,7 @@ dependencies = [
  "cranelift-bitset",
  "cranelift-entity",
  "gimli",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "indexmap",
  "log 0.4.35",
  "object 0.40.0",
@@ -16990,7 +17030,7 @@ version = "51.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd7abb27d389eee2f4e477c25d40a47bb837a08571bf0262c07aebe634e28774"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "libm",
  "serde",
 ]
@@ -17531,6 +17571,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "winreg"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17877,9 +17927,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.8"
+version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+checksum = "aa76918995d776d9dd34d371030be228d021137449771493d56e29f77e4148ac"
 
 [[package]]
 name = "zmij"
