@@ -192,8 +192,17 @@ impl TerminalShell {
                     run_native_setup_in_shell(self, false).await?;
                 }
                 crate::SwitcherExit::Chose(choice) => {
-                    let instances = configured_instances().await?;
-                    return self.apply_execution(request, &choice, &instances).await;
+                    let label = switching_label(&choice);
+                    let area = self.terminal()?.area();
+                    let applied = Box::pin(self.wait(
+                        &label,
+                        Box::pin(async {
+                            let instances = configured_instances().await?;
+                            Box::pin(apply_execution(request, &choice, &instances, area)).await
+                        }),
+                    ))
+                    .await?;
+                    return Ok(applied.flatten());
                 }
             }
             if self.stop_requested() {
@@ -201,101 +210,110 @@ impl TerminalShell {
             }
         }
     }
+}
 
-    async fn apply_execution(
-        &mut self,
-        request: &ExecutionPickerRequest,
-        choice: &crate::model_switcher::Choice,
-        instances: &BTreeMap<String, HarnessInstance>,
-    ) -> Result<Option<SessionId>, TuiError> {
-        let model = &choice.entry.model;
-        let native_model_id = model.native_model_id.clone();
-        let selection = ExecutionModelSelection {
-            model_id: model.model.model_id.clone(),
-            route: Some(model.route.clone()),
-            account_reference: model.account_reference.clone(),
-        };
-        match &selection.route {
-            Some(ExecutionRoute::ModelProvider { provider_plugin_id }) => {
-                let client = bcode_client::BcodeClient::default_endpoint();
-                let managed = if let Some(id) = request.session_id {
-                    client.managed_session_binding(id).await?.is_some()
-                } else {
-                    false
-                };
-                let session_id = match (managed, request.session_id) {
-                    (false, Some(id)) => id,
-                    _ => {
-                        client
-                            .create_session_in_working_directory(
-                                None,
-                                request.working_directory.clone(),
-                            )
-                            .await?
-                            .id
-                    }
-                };
-                select_provider_choice(
-                    &client,
-                    session_id,
-                    provider_plugin_id,
-                    &selection.model_id,
-                    &choice.entry.access,
-                )
-                .await?;
-                if choice.effort.is_some() {
+/// Progress label shown while a chosen execution is applied.
+fn switching_label(choice: &crate::model_switcher::Choice) -> String {
+    match &choice.entry.model.route {
+        ExecutionRoute::ManagedHarness { plugin_id, .. } => format!(
+            "Starting {}…",
+            bcode_session_view::external_projection::harness_display_label(plugin_id)
+        ),
+        ExecutionRoute::ModelProvider { .. } => "Switching model…".to_owned(),
+    }
+}
+
+async fn apply_execution(
+    request: &ExecutionPickerRequest,
+    choice: &crate::model_switcher::Choice,
+    instances: &BTreeMap<String, HarnessInstance>,
+    area: bmux_tui::geometry::Rect,
+) -> Result<Option<SessionId>, TuiError> {
+    let model = &choice.entry.model;
+    let native_model_id = model.native_model_id.clone();
+    let selection = ExecutionModelSelection {
+        model_id: model.model.model_id.clone(),
+        route: Some(model.route.clone()),
+        account_reference: model.account_reference.clone(),
+    };
+    match &selection.route {
+        Some(ExecutionRoute::ModelProvider { provider_plugin_id }) => {
+            let client = bcode_client::BcodeClient::default_endpoint();
+            let managed = if let Some(id) = request.session_id {
+                client.managed_session_binding(id).await?.is_some()
+            } else {
+                false
+            };
+            let session_id = match (managed, request.session_id) {
+                (false, Some(id)) => id,
+                _ => {
                     client
-                        .set_session_reasoning(session_id, choice.effort.clone(), None)
-                        .await?;
+                        .create_session_in_working_directory(
+                            None,
+                            request.working_directory.clone(),
+                        )
+                        .await?
+                        .id
                 }
-                Ok(Some(session_id))
+            };
+            select_provider_choice(
+                &client,
+                session_id,
+                provider_plugin_id,
+                &selection.model_id,
+                &choice.entry.access,
+            )
+            .await?;
+            if choice.effort.is_some() {
+                client
+                    .set_session_reasoning(session_id, choice.effort.clone(), None)
+                    .await?;
             }
-            Some(ExecutionRoute::ManagedHarness { instance_id, .. }) => {
-                let instance = instances
-                    .get(instance_id)
-                    .ok_or_else(|| unavailable("Selected instance is no longer configured"))?
-                    .clone();
-                let client = bcode_client::ManagedSessionClient::default_endpoint();
-                if let Some(id) = request.session_id {
-                    // Reuse canonical attachment and configuration for same-instance model changes.
-                    if let Some(binding) = client.session_binding(id).await?
-                        && binding.instance == instance
-                    {
-                        let (connection, _) = client
-                            .attach_session_projection_window(
-                                id,
-                                crate::history_flow::initial_transcript_window_request(
-                                    self.terminal()?.area(),
-                                ),
-                            )
-                            .await?;
-                        let commands = connection.command_handle();
-                        let result = commands
-                            .managed_session_configure(
-                                binding.target.generation(),
-                                uuid::Uuid::new_v4().to_string(),
-                                bcode_harness_models::HarnessSessionSetting::Model {
-                                    model_id: native_model_id,
-                                },
-                            )
-                            .await;
-                        commands.detach_commands().await;
-                        let response = result?;
-                        if !matches!(
-                            response.kind,
-                            bcode_harness_models::HarnessServiceResponseKind::Acknowledged { .. }
-                        ) {
-                            return Err(unavailable(
-                                "Native model change was not acknowledged; no fallback",
-                            ));
-                        }
-                        return Ok(Some(id));
-                    }
-                }
-                start_managed(request, selection, instance, &client).await
-            }
-            None => Err(unavailable("Exact execution route required")),
+            Ok(Some(session_id))
         }
+        Some(ExecutionRoute::ManagedHarness { instance_id, .. }) => {
+            let instance = instances
+                .get(instance_id)
+                .ok_or_else(|| unavailable("Selected instance is no longer configured"))?
+                .clone();
+            let client = bcode_client::ManagedSessionClient::default_endpoint();
+            if let Some(id) = request.session_id {
+                // Reuse canonical attachment and configuration for same-instance model changes.
+                if let Some(binding) = client.session_binding(id).await?
+                    && binding.instance == instance
+                {
+                    let (connection, _) = client
+                        .attach_session_projection_window(
+                            id,
+                            crate::history_flow::initial_transcript_window_request(area),
+                        )
+                        .await?;
+                    let commands = connection.command_handle();
+                    let result = commands
+                        .managed_session_configure(
+                            binding.target.generation(),
+                            uuid::Uuid::new_v4().to_string(),
+                            bcode_harness_models::HarnessSessionSetting::Model {
+                                model_id: native_model_id,
+                            },
+                        )
+                        .await;
+                    commands.detach_commands().await;
+                    let response = result?;
+                    if !matches!(
+                        response.kind,
+                        bcode_harness_models::HarnessServiceResponseKind::Acknowledged { .. }
+                    ) {
+                        return Err(unavailable(
+                            "Native model change was not acknowledged; no fallback",
+                        ));
+                    }
+                    return Ok(Some(id));
+                }
+            }
+            start_managed(request, selection, instance, &client).await
+        }
+        None => Err(unavailable("Exact execution route required")),
     }
 }
 

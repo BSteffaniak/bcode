@@ -197,7 +197,8 @@ pub struct PreparedPresentation {
         Option<bcode_session_view_models::StreamingPresentationPolicy>,
         bcode_config::ConfigError,
     >,
-    presentation: Result<super::plugin_tui::PluginTuiPresentation, bcode_plugin::PluginLoadError>,
+    presentation:
+        Result<Arc<super::plugin_tui::PluginTuiPresentation>, bcode_plugin::PluginLoadError>,
     structure_rules:
         Result<Vec<bcode_presentation_policy::models::PresentationRule>, bcode_config::ConfigError>,
     appearance: SavedAppearance,
@@ -258,7 +259,8 @@ pub async fn prepare_selected_presentation(
                 visual,
                 startup.deployments,
                 startup.portable.as_deref(),
-            );
+            )
+            .map(Arc::new);
         PreparedPresentation {
             config,
             streaming_override,
@@ -270,11 +272,90 @@ pub async fn prepare_selected_presentation(
     .await?)
 }
 
+/// Plugin presentation shared by the chat screens of one terminal journey.
+///
+/// Loading a presentation discovers, loads and activates every selected plugin, so screens
+/// entered after switching sessions or execution reuse the one already loaded for the same
+/// effective configuration. A changed configuration loads a fresh one. The presentation is
+/// retained only while a [`PresentationCacheScope`] is alive, so its frontends are released
+/// when the journey that owns the terminal ends.
+struct PresentationCache {
+    scopes: usize,
+    entry: Option<(String, Arc<super::plugin_tui::PluginTuiPresentation>)>,
+}
+
+static PRESENTATION_CACHE: std::sync::Mutex<PresentationCache> =
+    std::sync::Mutex::new(PresentationCache {
+        scopes: 0,
+        entry: None,
+    });
+
+/// Keeps loaded plugin presentation available to later chat screens until dropped.
+pub struct PresentationCacheScope(());
+
+impl PresentationCacheScope {
+    /// Retain loaded plugin presentation for reuse until the returned scope is dropped.
+    #[must_use]
+    pub fn enter() -> Self {
+        if let Ok(mut cache) = PRESENTATION_CACHE.lock() {
+            cache.scopes += 1;
+        }
+        Self(())
+    }
+}
+
+impl Drop for PresentationCacheScope {
+    fn drop(&mut self) {
+        let released = PRESENTATION_CACHE.lock().ok().and_then(|mut cache| {
+            cache.scopes = cache.scopes.saturating_sub(1);
+            if cache.scopes == 0 {
+                cache.entry.take()
+            } else {
+                None
+            }
+        });
+        // Frontend shutdown runs outside the lock.
+        drop(released);
+    }
+}
+
+fn cached_presentation(key: &str) -> Option<Arc<super::plugin_tui::PluginTuiPresentation>> {
+    let cache = PRESENTATION_CACHE.lock().ok()?;
+    cache
+        .entry
+        .as_ref()
+        .filter(|(cached, _)| cached == key)
+        .map(|(_, presentation)| Arc::clone(presentation))
+}
+
+fn retain_presentation(key: String, presentation: &Arc<super::plugin_tui::PluginTuiPresentation>) {
+    let replaced = PRESENTATION_CACHE.lock().ok().and_then(|mut cache| {
+        if cache.scopes == 0 {
+            return None;
+        }
+        cache.entry.replace((key, Arc::clone(presentation)))
+    });
+    drop(replaced);
+}
+
 fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> PreparedPresentation {
     let config = bcode_config::load_config();
     let streaming_override = bcode_config::load_tui_streaming_presentation_override();
     let structure_rules = bcode_config::load_tui_presentation_rules();
     let appearance = SavedAppearance::load();
+    let key = config
+        .as_ref()
+        .ok()
+        .and_then(|config| bcode_config::encode_effective_config(config).ok());
+    if let Some(presentation) = key.as_deref().and_then(cached_presentation) {
+        return PreparedPresentation {
+            config,
+            streaming_override,
+            presentation: Ok(presentation),
+            structure_rules,
+            appearance,
+        };
+    }
     let presentation_config = config.as_ref().ok();
     let selection =
         presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
@@ -289,7 +370,11 @@ fn load_presentation(static_plugins: &[bcode_plugin::StaticBundledPlugin]) -> Pr
         &selection,
         visual,
         static_plugins,
-    );
+    )
+    .map(Arc::new);
+    if let (Some(key), Ok(presentation)) = (key, &presentation) {
+        retain_presentation(key, presentation);
+    }
     PreparedPresentation {
         config,
         streaming_override,
@@ -390,7 +475,7 @@ fn initialize_tui_with_presentation(
             .then(|| "TOOLS DISABLED".to_owned()),
     );
     match presentation {
-        Ok(presentation) => app.set_plugin_presentation(Arc::new(presentation)),
+        Ok(presentation) => app.set_plugin_presentation(presentation),
         Err(error) => app.set_status(format!("plugin presentation unavailable: {error}")),
     }
     let agents = session_flow::AgentCatalog::default();
@@ -1010,7 +1095,7 @@ async fn run_managed_chat_bound<W: Write + Send>(
                     app.apply_user_structure_rules(rules);
                 }
                 if let Ok(presentation) = presentation {
-                    app.set_plugin_presentation(Arc::new(presentation));
+                    app.set_plugin_presentation(presentation);
                 }
                 app
             },
@@ -1144,6 +1229,26 @@ where
     })
 }
 
+/// The managed reattachment for `session_id`, when it is bound to a managed harness.
+/// Binding lookup failures keep the ordinary path, which reports them.
+async fn managed_open_request(
+    client: BcodeClient,
+    session_id: Option<SessionId>,
+    draft: String,
+) -> Option<chat_loop::ManagedOpenRequest> {
+    let session_id = session_id?;
+    let binding = client.managed_session_binding(session_id).await.ok()??;
+    if binding.validate().is_err() || binding.session_id != session_id {
+        return None;
+    }
+    Some(chat_loop::ManagedOpenRequest {
+        session_id,
+        instance_id: binding.instance.instance_id.clone(),
+        generation: binding.target.generation(),
+        draft: (!draft.is_empty()).then_some(draft),
+    })
+}
+
 #[allow(clippy::future_not_send)]
 async fn run_root<W: Write + Send>(
     terminal: &mut Terminal<&mut W>,
@@ -1157,16 +1262,31 @@ async fn run_root<W: Write + Send>(
     let mut startup_action = startup_action;
     let mut publisher = publisher;
     loop {
-        let navigation = run_root_runtime(
-            terminal,
-            Box::pin(build_root_model(
-                initialized,
-                publisher.take(),
-                std::mem::replace(&mut startup_action, StartupTuiAction::None),
-            ))
-            .await?,
+        let navigation = if let Some(request) = managed_open_request(
+            initialized.client.clone(),
+            matches!(startup_action, StartupTuiAction::None)
+                .then(|| initialized.chat.app.session_id())
+                .flatten(),
+            initialized.chat.app.composer().text().to_owned(),
         )
-        .await?;
+        .await
+        {
+            // A managed conversation opens straight in the sealed managed route instead of
+            // first mounting an ordinary root that only discovers the binding and exits.
+            drop(initialized);
+            RootNavigation::Managed(Some(request))
+        } else {
+            run_root_runtime(
+                terminal,
+                Box::pin(build_root_model(
+                    initialized,
+                    publisher.take(),
+                    std::mem::replace(&mut startup_action, StartupTuiAction::None),
+                ))
+                .await?,
+            )
+            .await?
+        };
         let request = match navigation {
             RootNavigation::ExecutionPicker(request) => return Ok(Some(request)),
             RootNavigation::Managed(Some(request)) => request,

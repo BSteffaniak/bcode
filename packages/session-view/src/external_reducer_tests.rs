@@ -2076,3 +2076,116 @@ fn bounded_ledger_stays_exact_when_an_empty_page_follows_execution_evidence() {
     let idle = page_of(&mut fixture, GENERATION, &[]);
     pair.durable(&idle);
 }
+
+#[test]
+fn a_delivered_submission_names_the_composer_row_its_user_message_replaces() {
+    use crate::external_projection::{is_submission_item, projected_submission_id};
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    let mut request = fixture.submit_request("Please run the tests");
+    if let ExternalHarnessRequestKind::Submit { submission, .. } = &mut request.kind {
+        submission.submission_id = "submission-1.retry".into();
+    }
+    let claimed = fixture.operation(
+        GENERATION,
+        ExternalHarnessOperationRecord::DeliveryClaimed { request },
+    );
+    assert_eq!(projected_submission_id(&claimed), Some("submission-1"));
+    pair.durable(&claimed);
+    let user = pair
+        .items()
+        .iter()
+        .find(|item| matches!(item.kind, TranscriptViewItemKind::UserMessage { .. }))
+        .expect("the delivered submission shows as the user's message");
+    assert!(is_submission_item(user.id.get(), "submission-1"));
+    assert!(!is_submission_item(user.id.get(), "submission-2"));
+    assert!(!is_submission_item(
+        "submission:submission-1",
+        "submission-1"
+    ));
+
+    let page = full_turn_page(&mut fixture);
+    assert_eq!(projected_submission_id(&page), None);
+}
+
+#[test]
+fn native_observations_report_foreground_progress_until_the_turn_ends() {
+    use crate::external_projection::{ExternalActivity, external_activity};
+    let mut fixture = Fixture::new();
+    assert_eq!(external_activity(&fixture.configured()), None);
+    let claimed = fixture.operation(
+        GENERATION,
+        ExternalHarnessOperationRecord::DeliveryClaimed {
+            request: fixture.submit_request("Please run the tests"),
+        },
+    );
+    assert_eq!(external_activity(&claimed), Some(ExternalActivity::Working));
+    let reasoning = HarnessObservationKind::Reasoning {
+        segment_id: None,
+        text: "hmm".into(),
+        opaque: false,
+    };
+    let tool = HarnessObservationKind::Tool {
+        native_tool_id: "tool-1".into(),
+        name: "Bash".into(),
+        status: "observed".into(),
+        input_json: None,
+    };
+    let steps = [
+        (vec![("r", reasoning)], Some(ExternalActivity::Thinking)),
+        (
+            vec![("t", tool)],
+            Some(ExternalActivity::Tool {
+                name: "Bash".into(),
+            }),
+        ),
+        (
+            vec![
+                (
+                    "tr",
+                    HarnessObservationKind::ToolResult {
+                        native_tool_id: "tool-1".into(),
+                        output: "ok".into(),
+                        is_error: false,
+                        truncated: false,
+                    },
+                ),
+                (
+                    "x",
+                    HarnessObservationKind::Text {
+                        text: "Done".into(),
+                        segment_id: None,
+                    },
+                ),
+            ],
+            Some(ExternalActivity::Responding),
+        ),
+        (
+            vec![(
+                "res",
+                HarnessObservationKind::Result {
+                    text: "Done".into(),
+                },
+            )],
+            Some(ExternalActivity::Idle),
+        ),
+        // An idle snapshot alone never ends progress: it can precede the native turn start.
+        (vec![], None),
+    ];
+    for (kinds, expected) in steps {
+        let page = fixture.page(kinds);
+        assert_eq!(external_activity(&page), expected);
+    }
+
+    let mut interrupted = fixture.page(vec![]);
+    if let SessionEventKind::ExternalHarnessOperation { operation } = &mut interrupted.kind
+        && let ExternalHarnessOperationRecord::ObservationPage { page, .. } = &mut operation.record
+    {
+        page.status.activity = HarnessActivity::Interrupted;
+    }
+    assert_eq!(
+        external_activity(&interrupted),
+        Some(ExternalActivity::Idle)
+    );
+}

@@ -3521,6 +3521,21 @@ impl BmuxApp {
                     self.token_usage.absorb(usage);
                 }
             }
+            // Native executors stream only through these updates, so they are its progress.
+            SessionLiveEventKind::AssistantTextStreamUpdated { .. }
+                if self.managed_execution_session().is_some() =>
+            {
+                self.apply_external_activity(
+                    &bcode_session_view::external_projection::ExternalActivity::Responding,
+                );
+            }
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
+                if self.managed_execution_session().is_some() =>
+            {
+                self.apply_external_activity(
+                    &bcode_session_view::external_projection::ExternalActivity::Thinking,
+                );
+            }
             SessionLiveEventKind::AssistantTextStreamUpdated { .. }
             | SessionLiveEventKind::AssistantReasoningDelta { .. }
             | SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
@@ -3557,6 +3572,20 @@ impl BmuxApp {
             | SessionEventKind::ExternalObservationRecorded { .. } => {
                 if let Some(model) = reported_native_model(event) {
                     self.managed_composer.settings.observed_model = Some(model);
+                }
+                // The canonical user message replaces the composer's pending row in the same
+                // update, so the two are never drawn together.
+                if let Some(id) =
+                    bcode_session_view::external_projection::projected_submission_id(event)
+                {
+                    self.pending_submissions
+                        .remove_id(&bcode_session_models::SubmissionId(id.to_owned()));
+                }
+                if application.live_activity()
+                    && let Some(activity) =
+                        bcode_session_view::external_projection::external_activity(event)
+                {
+                    self.apply_external_activity(&activity);
                 }
                 // Native history identifies the backend, not execution authority. Default Send
                 // explicitly queues a follow-up; steering requires a user-selected native turn.
@@ -4147,14 +4176,42 @@ impl BmuxApp {
     }
 
     /// Activity after a tool finishes or a permission resolves: an ordinary turn prepares its
-    /// follow-up model request, while a managed executor continues natively, so the attached
-    /// view returns to idle and native output reports any further activity.
+    /// follow-up model request, while a managed executor continues its native turn.
     fn set_follow_up_activity(&mut self) {
         if self.managed_execution_session().is_some() {
-            self.set_activity(ActivityState::Idle);
+            self.apply_external_activity(
+                &bcode_session_view::external_projection::ExternalActivity::Working,
+            );
         } else {
             self.set_activity(ActivityState::PreparingFollowUpRequest);
         }
+    }
+
+    /// Show a managed native turn's foreground progress through the shared activity surface.
+    fn apply_external_activity(
+        &mut self,
+        activity: &bcode_session_view::external_projection::ExternalActivity,
+    ) {
+        use bcode_session_view::external_projection::ExternalActivity;
+        let label = self.managed_label().unwrap_or("native agent");
+        let state = match activity {
+            ExternalActivity::Working => ActivityState::WaitingForProvider {
+                provider: label.to_owned(),
+                round: None,
+            },
+            ExternalActivity::Thinking => ActivityState::ProviderStream {
+                detail: format!("{label} thinking"),
+            },
+            ExternalActivity::Responding => ActivityState::ProviderStream {
+                detail: format!("{label} responding"),
+            },
+            ExternalActivity::Tool { name } => ActivityState::RunningTool { name: name.clone() },
+            ExternalActivity::Attention => ActivityState::ProviderStream {
+                detail: "waiting for your answer".to_owned(),
+            },
+            ExternalActivity::Idle => ActivityState::Idle,
+        };
+        self.set_activity(state);
     }
 
     /// Name the native executor in chrome (header, composer prompt).
@@ -4220,10 +4277,9 @@ impl BmuxApp {
         let rows: Vec<_> = held
             .iter()
             .map(|input| {
-                let mut id = input.submission_id.as_str();
-                while let Some(original) = id.strip_suffix(".retry") {
-                    id = original;
-                }
+                let id = bcode_session_view::external_projection::original_submission_id(
+                    &input.submission_id,
+                );
                 (
                     bcode_session_models::SubmissionId(id.to_owned()),
                     bcode_session_view::external_projection::split_agent_block(&input.text)
@@ -4517,7 +4573,11 @@ impl BmuxApp {
                 format!("running {count} tools")
             };
             self.set_activity(ActivityState::RuntimeWork { detail });
-        } else {
+        } else if self.managed_execution_session().is_none()
+            || matches!(self.activity, ActivityState::RuntimeWork { .. })
+        {
+            // A managed executor's foreground progress comes from native observations, which
+            // end it themselves; absent Bcode runtime work says nothing about the native turn.
             self.set_activity(ActivityState::Idle);
         }
     }

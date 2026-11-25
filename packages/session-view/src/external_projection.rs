@@ -278,6 +278,140 @@ impl Builder<'_> {
     }
 }
 
+/// The composer submission whose canonical user message `event` projects, with native resend
+/// suffixes removed so it names the identity the composer staged.
+///
+/// Malformed envelopes project nothing and therefore name no submission.
+#[must_use]
+pub fn projected_submission_id(event: &SessionEvent) -> Option<&str> {
+    let submission = match &event.kind {
+        SessionEventKind::ExternalHarnessOperation { operation } => match &operation.record {
+            Record::DeliveryClaimed { request } => match &request.kind {
+                ExternalHarnessRequestKind::Submit { submission, .. } => submission,
+                _ => return None,
+            },
+            _ => return None,
+        },
+        SessionEventKind::ExternalSubmissionAccepted { submission, .. } => submission,
+        _ => return None,
+    };
+    Some(original_submission_id(&submission.submission_id))
+}
+
+/// Foreground progress of a managed native turn, as display evidence only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalActivity {
+    /// Input was delivered or the native turn is running without more specific evidence.
+    Working,
+    /// The native model is reasoning.
+    Thinking,
+    /// The native model is writing its reply.
+    Responding,
+    /// The native harness is running one of its own tools.
+    Tool {
+        /// Native tool name.
+        name: String,
+    },
+    /// The native harness is waiting for the user to answer a prompt.
+    Attention,
+    /// The foreground native turn ended or the native process stopped.
+    Idle,
+}
+
+/// The foreground progress `event` reports for a managed native turn, if any.
+///
+/// Within an observation page the latest observation wins. The page's own status snapshot ends
+/// foreground progress when the native process disconnected or the turn was interrupted, and
+/// otherwise only fills in for a page without progress evidence: an idle snapshot can be
+/// taken between delivery and the native turn starting, so it never overrides observations.
+#[must_use]
+pub fn external_activity(event: &SessionEvent) -> Option<ExternalActivity> {
+    let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind else {
+        return None;
+    };
+    match &operation.record {
+        Record::DeliveryClaimed { request } => {
+            matches!(request.kind, ExternalHarnessRequestKind::Submit { .. })
+                .then_some(ExternalActivity::Working)
+        }
+        Record::DeliveryCompleted { request, response } => {
+            let failed = matches!(response.kind, Response::Failure(_));
+            (failed && matches!(request.kind, ExternalHarnessRequestKind::Submit { .. }))
+                .then_some(ExternalActivity::Idle)
+        }
+        Record::TransportReleased { .. } => Some(ExternalActivity::Idle),
+        Record::ObservationPage { page, .. } => {
+            use bcode_harness_models::{HarnessActivity, HarnessConnectivity};
+            let status = &page.status;
+            if status.connectivity == HarnessConnectivity::Disconnected
+                || status.activity == HarnessActivity::Interrupted
+            {
+                return Some(ExternalActivity::Idle);
+            }
+            page.observations
+                .iter()
+                .rev()
+                .find_map(|observation| observation_activity(&observation.kind))
+                .or_else(|| {
+                    (status.activity == HarnessActivity::Running)
+                        .then_some(ExternalActivity::Working)
+                })
+        }
+        Record::Configured { .. } | Record::RecoveryPrepared { .. } => None,
+    }
+}
+
+fn observation_activity(kind: &HarnessObservationKind) -> Option<ExternalActivity> {
+    use bcode_harness_models::HarnessActivity;
+    match kind {
+        HarnessObservationKind::SubmissionAccepted { .. }
+        | HarnessObservationKind::SubmissionConsumed { .. }
+        | HarnessObservationKind::ToolResult { .. }
+        | HarnessObservationKind::InteractionWithdrawn { .. } => Some(ExternalActivity::Working),
+        HarnessObservationKind::Reasoning { .. } => Some(ExternalActivity::Thinking),
+        HarnessObservationKind::Text { .. } => Some(ExternalActivity::Responding),
+        HarnessObservationKind::Tool { name, .. } => {
+            Some(ExternalActivity::Tool { name: name.clone() })
+        }
+        HarnessObservationKind::Interaction { .. } => Some(ExternalActivity::Attention),
+        HarnessObservationKind::Result { .. }
+        | HarnessObservationKind::SubmissionResultObserved { .. }
+        | HarnessObservationKind::NativeTurnTerminal { .. }
+        | HarnessObservationKind::Settlement { .. } => Some(ExternalActivity::Idle),
+        HarnessObservationKind::Status { status } => match status.activity {
+            HarnessActivity::Running => Some(ExternalActivity::Working),
+            HarnessActivity::Idle | HarnessActivity::Settled | HarnessActivity::Interrupted => {
+                Some(ExternalActivity::Idle)
+            }
+            HarnessActivity::Unknown => None,
+        },
+        HarnessObservationKind::Execution { .. }
+        | HarnessObservationKind::BindingConfirmed { .. }
+        | HarnessObservationKind::Usage { .. }
+        | HarnessObservationKind::Subagent { .. }
+        | HarnessObservationKind::Diagnostic { .. }
+        | HarnessObservationKind::Vendor { .. } => None,
+    }
+}
+
+/// A native resend's submission identity without its resend suffixes.
+#[must_use]
+pub fn original_submission_id(mut id: &str) -> &str {
+    while let Some(original) = id.strip_suffix(".retry") {
+        id = original;
+    }
+    id
+}
+
+/// Whether `item_id` is the canonical user message of composer submission `submission_id`.
+#[must_use]
+pub fn is_submission_item(item_id: &str, submission_id: &str) -> bool {
+    item_id
+        .strip_prefix("external-submission:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(_, id)| original_submission_id(id) == submission_id)
+}
+
 /// Project one canonical external event into native-like effects.
 ///
 /// # Errors

@@ -212,7 +212,13 @@ impl TranscriptV2Host {
                 .transcript
                 .items
                 .iter()
-                .find(|item| item.id == canonical)
+                .find(|item| {
+                    item.id == canonical
+                        || bcode_session_view::external_projection::is_submission_item(
+                            item.id.get(),
+                            id,
+                        )
+                })
                 .and_then(|item| item.sequence)
             {
                 handed_off.push(HandedOffSubmission { row, sequence });

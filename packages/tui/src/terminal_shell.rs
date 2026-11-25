@@ -30,6 +30,9 @@ pub enum TerminalRecoveryAction {
 /// Screens borrow its writer sequentially and await input shutdown before returning.
 /// Dropping the shell restores the terminal, including on errors.
 pub struct TerminalShell {
+    // Declared before the terminal guard: loaded plugin frontends are released before the
+    // terminal is restored.
+    presentation_cache: Option<crate::runtime::PresentationCacheScope>,
     guard: Option<TerminalGuard<Stdout>>,
     stop_requested: bool,
     // Retain a failed wait's presentation/cleanup independently from its operation result.
@@ -94,6 +97,7 @@ impl TerminalShell {
     /// Returns terminal setup errors.
     pub fn enter() -> Result<Self, TuiError> {
         Ok(Self {
+            presentation_cache: Some(crate::runtime::PresentationCacheScope::enter()),
             guard: Some(TerminalGuard::enter(io::stdout())?),
             stop_requested: false,
             screen_error: None,
@@ -162,8 +166,7 @@ impl TerminalShell {
         plugins: &[bcode_plugin::StaticBundledPlugin],
         options: TuiLaunchOptions,
     ) -> Result<(), TuiError> {
-        self.run_chat_with_draft(session_id, plugins, options, None)
-            .await
+        Box::pin(self.run_chat_with_draft(session_id, plugins, options, None)).await
     }
 
     #[allow(clippy::future_not_send)]
@@ -176,9 +179,8 @@ impl TerminalShell {
     ) -> Result<(), TuiError> {
         let mut session_id = session_id;
         loop {
-            let result = self
-                .run_chat_screen(session_id, plugins, options, draft.take())
-                .await;
+            let result =
+                Box::pin(self.run_chat_screen(session_id, plugins, options, draft.take())).await;
             let request = complete_runtime_screen(&mut self.handoff_blocked, result)?;
             let Some(request) = request else {
                 return Ok(());
@@ -222,18 +224,6 @@ impl TerminalShell {
         options: TuiLaunchOptions,
         draft: Option<String>,
     ) -> Result<Option<crate::ExecutionPickerRequest>, TuiError> {
-        let Some(connection) = self
-            .wait(
-                "Connecting to the session…",
-                crate::runtime::prepare_connection(session_id),
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        if self.stop_requested() {
-            return Ok(None);
-        }
         // An explicit selection is one launch's executable authority; a later chat
         // screen in this shell (for example after switching sessions) must not
         // silently substitute bundled frontends for it.
@@ -254,7 +244,18 @@ impl TerminalShell {
                 }
             }
         };
-        let Some(presentation) = self.wait("Loading chat interface…", preparation).await? else {
+        // Connecting and loading the presentation are independent; neither waits on the other.
+        let Some((connection, presentation)) = Box::pin(self.wait(
+            "Opening the conversation…",
+            Box::pin(async {
+                tokio::try_join!(
+                    Box::pin(crate::runtime::prepare_connection(session_id)),
+                    Box::pin(preparation)
+                )
+            }),
+        ))
+        .await?
+        else {
             return Ok(None);
         };
         if self.stop_requested() {
@@ -694,6 +695,7 @@ impl TerminalShell {
     /// Returns terminal restoration errors.
     pub fn finish(mut self) -> Result<(), TuiError> {
         let result = self.screen_error.take().map_or(Ok(()), Err);
+        self.presentation_cache.take();
         let cleanup = self.guard.take().map_or(Ok(()), |guard| {
             guard.leave().map(|_| ()).map_err(Into::into)
         });
@@ -768,21 +770,28 @@ const fn managed_auth_outcome(
 
 // The production and offline-test paths share the exact input/drain loop. No terminal guard
 // is created here: all frames belong to the caller's existing terminal lifetime.
+/// How long an operation may run before its progress screen replaces the previous screen.
+const WAIT_SCREEN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 async fn wait_operation<T, W: std::io::Write>(
     terminal: &mut Terminal<&mut W>,
     input: &mut bmux_tui_runtime::ManagedTerminalInput,
     label: &str,
     future: impl Future<Output = Result<T, TuiError>>,
 ) -> (Result<T, TuiError>, bool, Option<TuiError>) {
-    let mut presentation_error = paint_text(terminal, label).err().map(TuiError::from);
-    let initial_paint_failed = presentation_error.is_some();
+    let mut presentation_error = None;
     let mut future = std::pin::pin!(future);
-    let mut ticks = tokio::time::interval(std::time::Duration::from_millis(100));
+    // A quick operation never paints: the previous screen stays until the next one replaces
+    // it, so no progress screen flashes between them.
+    let mut ticks = tokio::time::interval_at(
+        tokio::time::Instant::now() + WAIT_SCREEN_GRACE,
+        std::time::Duration::from_millis(100),
+    );
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut phase = 0_usize;
-    let mut stop = initial_paint_failed;
+    let mut stop = false;
     let mut input_open = true;
-    let mut paint = !initial_paint_failed;
+    let mut paint = true;
     let result = loop {
         tokio::select! {
             result = &mut future => {
@@ -1092,6 +1101,8 @@ mod tests {
         let (result, stopped, screen_error) =
             wait_operation(&mut terminal, &mut input, "Loading…", async {
                 attempts.set(attempts.get() + 1);
+                // Outlast the grace period so the progress screen paints.
+                tokio::time::sleep(WAIT_SCREEN_GRACE * 2).await;
                 Ok(17)
             })
             .await;
@@ -1232,6 +1243,28 @@ mod tests {
                     .any(|window| window == b"\x1b[?1049l")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_quick_operation_leaves_the_previous_screen_in_place() {
+        let mut bytes = Vec::new();
+        let mut terminal = Terminal::new(&mut bytes, Rect::new(0, 0, 40, 4));
+        let mut input = bmux_tui_runtime::ManagedTerminalInput::from_events([]);
+        let (result, _stopped, screen_error) =
+            wait_operation(&mut terminal, &mut input, "Loading chat", async {
+                tokio::time::sleep(WAIT_SCREEN_GRACE / 5).await;
+                Ok(5)
+            })
+            .await;
+        assert_eq!(result.unwrap(), 5);
+        assert!(screen_error.is_none());
+        drop(terminal);
+        assert!(
+            !bytes
+                .windows(b"Loading chat".len())
+                .any(|window| window == b"Loading chat"),
+            "no progress screen flashes for a quick operation"
+        );
     }
 
     #[tokio::test]
