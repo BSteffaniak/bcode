@@ -826,6 +826,7 @@ async fn consumer(client: bcode_client::BcodeClient, effective_config: String) {
     .await
     .unwrap();
     let request = bcode_session_models::SessionSpawnRequest {
+        delegation: None,
         managed: None,
         version: 1,
         creation: bcode_session_models::SessionChildCreateRequest {
@@ -1840,6 +1841,7 @@ async fn independent_cancel_and_spawn(
     let child = SessionApplication::spawn_session(
         client,
         bcode_session_models::SessionSpawnRequest {
+            delegation: None,
             managed: None,
             version: 1,
             creation: bcode_session_models::SessionChildCreateRequest {

@@ -1221,6 +1221,7 @@ mod tests {
             working_directory: std::env::current_dir().unwrap(),
         };
         let original = bcode_session_models::SessionSpawnRequest {
+            delegation: None,
             version: 1,
             creation: creation.clone(),
             worktree_directory: None,

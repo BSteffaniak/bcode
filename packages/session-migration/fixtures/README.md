@@ -54,6 +54,17 @@ projection; released selections carry no explicit account, so the projected refe
 Historical inputs at schema 58 or earlier that carry an account reference are rejected rather than
 guessed.
 
+## Writer-28 delegation catch-up
+
+Writer 28 emitted event schema 59. Schema 60 / writer 29 adds the optional native delegation
+intent retained in `child_session_created` at `spawning.delegation`, and the `always_ask` turn
+permission mode in persisted admission execution options. Neither adds a projection column.
+`stores/epoch-28-schema-59-events.jsonl` reconstructs the released schema-59 event representation
+from the schema-58 family matrix by changing only the outer schema. The explicit
+`session-writer-epoch-28-to-29` edge preserves canonical payloads and rebuilds every current
+projection. Historical inputs at schema 59 or earlier that carry a delegation intent or an
+`always_ask` admission are rejected rather than guessed.
+
 ## Confirmed schema-28 incident family
 
 Read-only inspection of the retained epoch-2 backup for incident session

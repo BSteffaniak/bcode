@@ -21,11 +21,13 @@ pub use bcode_tool_models::{
 pub use contracts::{
     OP_AUTHORIZE_PROCESS, OP_AUTHORIZE_WEB, PROCESS_ADMISSION_INTERFACE_ID, PreparedToolInvocation,
     TOOL_ARTIFACT_CONTEXT_SCHEMA, TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+    TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA, TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA_VERSION,
     TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA, TOOL_WORKSPACE_CONTEXT_SCHEMA,
     TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
-    ToolAuthorizationFact, ToolExecutionOptions, ToolHostContextEntry, ToolInvocationDescriptor,
-    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolInvocationServiceRoute,
-    ToolPreparationRequest, ToolPreparationResponse, WEB_ADMISSION_INTERFACE_ID,
+    ToolAuthorizationFact, ToolBcodeRuntimeContext, ToolExecutionOptions, ToolHostContextEntry,
+    ToolInvocationDescriptor, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
+    ToolInvocationServiceRoute, ToolPreparationRequest, ToolPreparationResponse,
+    WEB_ADMISSION_INTERFACE_ID,
 };
 
 pub use interaction::{

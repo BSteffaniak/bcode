@@ -2176,6 +2176,7 @@ mod tests {
         };
         let spawning = spawned.then(|| {
             Box::new(bcode_session_models::SessionSpawnRequest {
+                delegation: None,
                 version: 1,
                 creation: request.clone(),
                 worktree_directory: Some("/tmp".into()),

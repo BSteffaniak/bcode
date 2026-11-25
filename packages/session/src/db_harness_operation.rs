@@ -6341,6 +6341,7 @@ mod migration_key_tests {
             unreachable!()
         };
         bcode_session_models::SessionSpawnRequest {
+            delegation: None,
             version: 2,
             creation: bcode_session_models::SessionChildCreateRequest {
                 child_id: owner.session_id,

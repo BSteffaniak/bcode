@@ -62,17 +62,59 @@ pub enum SimpleInvocation {
     Respond(RespondInput),
     /// Simplified `harness.interrupt`.
     Interrupt(InterruptInput),
+    /// `harness.wait` (Bcode children only).
+    Wait(crate::native::WaitInput),
+    /// `harness.context`.
+    Context(crate::native::ContextInput),
 }
 
-/// Delegate a self-contained task to a configured external coding agent.
+/// Delegate a self-contained task to a Bcode child or a configured external coding agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegateInput {
-    /// Configured instance reference; the configured default when absent.
+    /// `bcode` for a native Bcode child, or a configured external instance reference; the
+    /// configured default external instance, else a Bcode child, when absent.
     #[serde(default)]
     pub instance_id: Option<String>,
     /// First turn submitted to the new child session.
     pub prompt: String,
+    /// Bcode child only: title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Bcode child only: agent profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Bcode child only: model reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Bcode child only: absolute working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Bcode child only: whether `cwd` is a registered worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<bool>,
+    /// Bcode child only: authorization policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<bcode_session_models::delegation::SessionDelegationPermissions>,
+    /// Bcode child only: whether interrupting the delegating turn interrupts the child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_with_turn: Option<bool>,
+}
+
+impl DelegateInput {
+    /// Native-only options supplied with this input.
+    #[must_use]
+    pub fn native_options(&self) -> crate::native::NativeDelegateOptions {
+        crate::native::NativeDelegateOptions {
+            title: self.title.clone(),
+            agent: self.agent.clone(),
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            worktree: self.worktree,
+            permissions: self.permissions,
+            cancel_with_turn: self.cancel_with_turn,
+        }
+    }
 }
 
 /// Submit the next turn to an existing delegated child.
@@ -153,6 +195,12 @@ impl SimpleInvocation {
             "harness.interrupt" => {
                 Self::Interrupt(serde_json::from_value(arguments.clone()).map_err(invalid)?)
             }
+            crate::native::WAIT_TOOL => {
+                Self::Wait(serde_json::from_value(arguments.clone()).map_err(invalid)?)
+            }
+            crate::native::CONTEXT_TOOL => {
+                Self::Context(serde_json::from_value(arguments.clone()).map_err(invalid)?)
+            }
             _ => return Err("unknown harness tool".into()),
         };
         invocation.validate()?;
@@ -195,6 +243,8 @@ impl SimpleInvocation {
                 }
             }
             Self::Interrupt(input) => session(&input.session_id),
+            Self::Wait(input) => input.validate(),
+            Self::Context(_) => Ok(()),
         }
     }
 
@@ -211,13 +261,15 @@ impl SimpleInvocation {
             Self::Result(_) => &[MANAGED_DELEGATION_HISTORY_OPERATION],
             Self::Respond(_) => &[MANAGED_DELEGATION_BINDING_OPERATION, "respond"],
             Self::Interrupt(_) => &[MANAGED_DELEGATION_BINDING_OPERATION, "interrupt"],
+            // Native-only invocations need no external managed-session route.
+            Self::Wait(_) | Self::Context(_) => &[],
         }
     }
 
     /// Whether this invocation only reads (and drains observations); all others mutate.
     #[must_use]
     pub const fn read_only(&self) -> bool {
-        matches!(self, Self::Result(_))
+        matches!(self, Self::Result(_) | Self::Wait(_) | Self::Context(_))
     }
 }
 
@@ -358,14 +410,14 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    const fn ok(output: Value) -> Self {
+    pub(crate) const fn ok(output: Value) -> Self {
         Self {
             output,
             is_error: false,
         }
     }
 
-    const fn error(output: Value) -> Self {
+    pub(crate) const fn error(output: Value) -> Self {
         Self {
             output,
             is_error: true,
@@ -405,6 +457,11 @@ fn derived_uuid(parts: &[&str]) -> uuid::Uuid {
 
 fn derived_id(kind: &str, parts: &[&str]) -> String {
     format!("{kind}-{}", hex(&digest(parts)[..16]))
+}
+
+/// Retry-stable identity of `kind` derived from `parts`.
+pub fn derived_key(kind: &str, parts: &[&str]) -> String {
+    derived_id(kind, parts)
 }
 
 /// Retained identities for one delegation invocation.
@@ -611,6 +668,9 @@ pub fn execute(
         SimpleInvocation::Result(input) => result(app, input),
         SimpleInvocation::Respond(input) => respond(app, scope, invocation_id, input),
         SimpleInvocation::Interrupt(input) => interrupt(app, scope, invocation_id, input),
+        SimpleInvocation::Wait(_) | SimpleInvocation::Context(_) => Outcome::error(
+            json!({"status":"failed","reason":"native_delegation_unavailable","hint":"Bcode child delegation is disabled."}),
+        ),
     }
 }
 

@@ -227,6 +227,9 @@ struct Settings {
     #[serde(default)]
     default_instance: Option<String>,
     instances: BTreeMap<String, InstanceSettings>,
+    /// Native Bcode child settings, validated by [`crate::native::settings`].
+    #[serde(default, rename = "native")]
+    _native: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

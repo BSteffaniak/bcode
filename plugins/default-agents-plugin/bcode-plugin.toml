@@ -44,12 +44,15 @@ build_tools = [
     "ocr.status",
     "question",
     "ask",
-    # Offered by the harness plugin only when an external agent instance is configured.
+    # Offered by the harness plugin when Bcode child delegation is enabled (the default) or an
+    # external agent instance is configured.
     "harness.delegate",
     "harness.continue",
     "harness.result",
     "harness.respond",
     "harness.interrupt",
+    "harness.wait",
+    "harness.context",
     # Offered by the code review plugin: reads, navigation, review changes, publishing, code
     # reads at pinned revisions, and guided-review guides.
     "code_review.list_reviews",

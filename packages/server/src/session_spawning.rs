@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use bcode_session_models::{
-    ClientId, SessionApplicationFailure, SessionSpawnFailure, SessionSpawnRequest,
-    SessionSpawnResult, SessionSpawnStage, TurnAdmission, TurnOrigin, TurnPriority,
+    ClientId, SessionSpawnFailure, SessionSpawnRequest, SessionSpawnResult, SessionSpawnStage,
+    TurnAdmission, TurnOrigin, TurnPriority,
 };
 
 use crate::{ServerState, session_operations};
@@ -93,14 +93,16 @@ fn resolve_provider_context(
 /// Malformed client configuration never falls back to daemon configuration. Clients without
 /// runtime context use the same startup configuration policy as direct ordinary turn admission.
 /// Model catalog negotiation remains owned by ordinary turn admission.
-pub async fn session_spawn_runtime_context(
+#[cfg(test)]
+async fn session_spawn_runtime_context(
     state: &ServerState,
     client_id: ClientId,
     request: &SessionSpawnRequest,
-) -> Result<Option<crate::ClientRuntimeContext>, SessionApplicationFailure> {
-    prepare_runtime_context(state, client_id, request)
+) -> Result<Option<crate::ClientRuntimeContext>, bcode_session_models::SessionApplicationFailure> {
+    let runtime = state.client_runtime_context(client_id).await;
+    prepare_runtime_context(state, runtime, request)
         .await
-        .map_err(|message| SessionApplicationFailure {
+        .map_err(|message| bcode_session_models::SessionApplicationFailure {
             code: "session_spawn_selection_unavailable".into(),
             message: message.into(),
         })
@@ -108,10 +110,9 @@ pub async fn session_spawn_runtime_context(
 
 async fn prepare_runtime_context(
     state: &ServerState,
-    client_id: ClientId,
+    runtime: Option<crate::ClientRuntimeContext>,
     request: &SessionSpawnRequest,
 ) -> Result<Option<crate::ClientRuntimeContext>, &'static str> {
-    let runtime = state.client_runtime_context(client_id).await;
     let config = match runtime.as_ref() {
         Some(context) => {
             let contents = context
@@ -222,6 +223,45 @@ pub async fn spawn(
     client_id: ClientId,
     request: SessionSpawnRequest,
 ) -> SessionSpawnResult {
+    if request.delegation.is_some() {
+        // Delegation intent is host-derived from an authenticated tool invocation; a client
+        // cannot assert one.
+        return failed(
+            SessionSpawnStage::Preparation,
+            "session_spawn_delegation_unauthorized",
+            "delegated children are created only by the host's delegation operation",
+        );
+    }
+    let runtime = state.client_runtime_context(client_id).await;
+    Box::pin(spawn_with_runtime(state, client_id, runtime, request)).await
+}
+
+/// Create a delegated child under the delegating parent's runtime context.
+///
+/// The caller authenticated the delegating tool invocation and derived `request.delegation`
+/// from it. Work is admitted under a fresh host client identity, as for other host-initiated
+/// turns, and the child's interactions are routed to its parent.
+pub async fn spawn_delegated(
+    state: &Arc<ServerState>,
+    runtime: Option<crate::ClientRuntimeContext>,
+    request: SessionSpawnRequest,
+) -> SessionSpawnResult {
+    if request.delegation.is_none() {
+        return failed(
+            SessionSpawnStage::Preparation,
+            "session_spawn_delegation_missing",
+            "delegated spawning requires a delegation intent",
+        );
+    }
+    Box::pin(spawn_with_runtime(state, ClientId::new(), runtime, request)).await
+}
+
+async fn spawn_with_runtime(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    runtime: Option<crate::ClientRuntimeContext>,
+    request: SessionSpawnRequest,
+) -> SessionSpawnResult {
     if request.version != 1 {
         return failed(
             SessionSpawnStage::Preparation,
@@ -241,12 +281,16 @@ pub async fn spawn(
         .execution
         .interaction_route
         .as_ref()
-        .is_some_and(|route| route.destination_session_id != request.creation.child_id)
+        .is_some_and(|route| {
+            route.destination_session_id != request.creation.child_id
+                && (request.delegation.is_none()
+                    || route.destination_session_id != request.creation.parent_id)
+        })
     {
         return failed(
             SessionSpawnStage::Preparation,
             "session_spawn_interaction_route_invalid",
-            "ordinary child interactions must target the child session",
+            "child interactions must target the child or, when delegated, its parent",
         );
     }
     if request.admission.execution.request_context_id.is_some()
@@ -292,12 +336,13 @@ pub async fn spawn(
             "child is active for an incompatible client",
         );
     }
-    Box::pin(spawn_in_directory(state, client_id, request)).await
+    Box::pin(spawn_in_directory(state, client_id, runtime, request)).await
 }
 
 async fn spawn_in_directory(
     state: &Arc<ServerState>,
     client_id: ClientId,
+    runtime: Option<crate::ClientRuntimeContext>,
     mut request: SessionSpawnRequest,
 ) -> SessionSpawnResult {
     if !request.creation.working_directory.is_absolute() {
@@ -360,18 +405,23 @@ async fn spawn_in_directory(
             }
         }
     }
-    Box::pin(spawn_with_admission(state, client_id, request)).await
+    Box::pin(spawn_with_admission(state, client_id, runtime, request)).await
 }
 
 async fn spawn_with_admission(
     state: &Arc<ServerState>,
     client_id: ClientId,
+    runtime: Option<crate::ClientRuntimeContext>,
     mut request: SessionSpawnRequest,
 ) -> SessionSpawnResult {
     request.admission.activity = None;
     if request.admission.origin.is_none() {
         request.admission.origin = Some(TurnOrigin {
-            producer: "bcode.session.spawn".into(),
+            producer: if request.delegation.is_some() {
+                crate::native_delegation::TURN_PRODUCER.into()
+            } else {
+                "bcode.session.spawn".into()
+            },
             correlation_id: None,
             display_label: None,
         });
@@ -388,9 +438,15 @@ async fn spawn_with_admission(
     }
     // Resolves configured auth references through the existing provider-owned context path.
     // Credentials are request-scoped and never enter the retained canonical envelope.
-    let runtime_context = match session_spawn_runtime_context(state, client_id, &request).await {
+    let runtime_context = match prepare_runtime_context(state, runtime, &request).await {
         Ok(context) => context,
-        Err(error) => return failed(SessionSpawnStage::Preparation, &error.code, &error.message),
+        Err(message) => {
+            return failed(
+                SessionSpawnStage::Preparation,
+                "session_spawn_selection_unavailable",
+                message,
+            );
+        }
     };
     let Ok(session) = Box::pin(state.sessions.create_spawning_session(request.clone())).await
     else {
@@ -621,6 +677,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(crate::tests::test_server_state_with_fake_provider(sessions));
         let request = SessionSpawnRequest {
+            delegation: None,
             version: 1,
             creation: SessionChildCreateRequest {
                 child_id: SessionId::new(),

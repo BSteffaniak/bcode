@@ -397,6 +397,7 @@ async fn direct_consumer<A: SessionApplication>(
             .any(|session| session.id == note_session.id)
     );
     let spawn_request = bcode_session_models::SessionSpawnRequest {
+        delegation: None,
         managed: None,
         version: 99,
         creation: bcode_session_models::SessionChildCreateRequest {

@@ -10,12 +10,24 @@ active authenticated invocation of a child's canonical parent has delegated cont
 Mutation correlation must equal the retained open/submission/response/control ID.
 No auth secrets or native login inputs are accepted by these model-facing operations.
 
+## Native Bcode children
+
+`harness.delegate` with `instance_id: "bcode"` (or without `instance_id` when no default external
+instance is configured) creates a native Bcode child of the calling session through the host's
+`bcode.native-delegation/v1` interface instead of an external agent. `harness.wait` and
+`harness.context` are offered with it; `harness.continue`, `harness.result` and
+`harness.interrupt` try the native interface first and fall back to the managed-session path for
+external children. Native delegation is enabled by default and configured under
+`[plugins.config."bcode.harness".native]` (`enabled`, `max_depth`, `max_active_children`). See
+[`docs/native-delegation.md`](../../docs/native-delegation.md).
+
 ## Model-facing delegation shapes
 
-When the plugin configuration has at least one enabled instance, three more tools are offered
-(`harness.delegate`, `harness.continue`, `harness.result`), and `harness.respond` /
-`harness.interrupt` additionally accept a simple form. These map onto the same managed-session
-application operations; workflow blocks and commands keep the `request_json` form only.
+When native delegation is enabled or the plugin configuration has at least one enabled instance,
+three more tools are offered (`harness.delegate`, `harness.continue`, `harness.result`), and
+`harness.respond` / `harness.interrupt` additionally accept a simple form. For external instances
+these map onto the same managed-session application operations; workflow blocks and commands keep
+the `request_json` form only.
 
 * `harness.delegate { instance_id?, prompt }` resolves the instance from this plugin's catalog
   (the configured default when omitted), opens an ordinary child of the calling session in its

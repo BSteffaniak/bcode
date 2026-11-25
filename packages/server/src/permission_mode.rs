@@ -51,7 +51,8 @@ pub fn stamp(state: &ServerState, session_id: SessionId, execution: &mut TurnExe
 pub fn starts_revoked(state: &ServerState, session_id: SessionId, recovering: bool) -> bool {
     match set_mode(state, session_id) {
         Some(TurnPermissionMode::Bypass) => false,
-        Some(TurnPermissionMode::Enforce) => true,
+        // `always_ask` is never a session mode; treat it as stepped out.
+        Some(TurnPermissionMode::Enforce | TurnPermissionMode::AlwaysAsk) => true,
         None => recovering,
     }
 }
@@ -96,6 +97,15 @@ pub async fn set(
     {
         revoke_running_turn(state, session_id).await;
     }
+    if mode != TurnPermissionMode::Bypass {
+        // A delegated child inheriting its parent's bypass never keeps more authority than
+        // the parent: stepping the parent out steps those children out too.
+        for child in crate::native_delegation::inherited_children(state, session_id) {
+            if current(state, child) == TurnPermissionMode::Bypass {
+                Box::pin(set(state, child, TurnPermissionMode::Enforce)).await;
+            }
+        }
+    }
     tracing::info!(%session_id, ?mode, "session permission mode set");
     let _ = state
         .sessions
@@ -132,4 +142,5 @@ pub fn forget(state: &ServerState, session_id: SessionId) {
     if let Ok(mut modes) = state.session_permission_modes.lock() {
         modes.remove(&session_id);
     }
+    crate::native_delegation::forget(state, session_id);
 }

@@ -13,7 +13,9 @@ mod account_lifecycle;
 pub(crate) mod account_routing;
 pub(crate) mod artifact_operations;
 mod auxiliary_generation;
+mod bcode_cli;
 mod external_auth;
+mod native_delegation;
 #[cfg(test)]
 use bcode_plugin_config::{
     redact_plugin_config_value, resolve_invocation_secrets,
@@ -45,6 +47,8 @@ mod model_check;
 mod model_evidence;
 mod model_ignores;
 mod model_request_target;
+#[cfg(test)]
+mod native_delegation_tests;
 mod permission_mode;
 pub use command_application::CommandApplicationHandle;
 mod activity_changes;
@@ -471,6 +475,9 @@ pub struct ServerState {
     locations: Option<bcode_config::StateLocationSet>,
     state_root: PathBuf,
     bcode_runtime_context: Box<str>,
+    /// Exact CLI offered to commands tools start; `None` when no verified Bcode executable
+    /// serves this daemon (in-process hosts and isolated tests).
+    bcode_cli: Option<bcode_cli::ServerBcodeCli>,
     pub sessions: SessionManager,
     storage_worker: storage_maintenance_worker::StorageMaintenanceWorker,
     storage_tracking_failed: std::sync::atomic::AtomicBool,
@@ -605,6 +612,13 @@ pub struct ServerState {
     /// without one has none set since the daemon started). See [`permission_mode`].
     session_permission_modes:
         StdMutex<BTreeMap<SessionId, bcode_session_models::TurnPermissionMode>>,
+    /// Inherit-mode delegated children whose runtime bypass narrows with their parent (daemon
+    /// memory only, like the modes themselves). See [`native_delegation`].
+    delegated_inherit_children: StdMutex<BTreeMap<SessionId, BTreeSet<SessionId>>>,
+    /// Children delegated with `cancel_with_turn`, by delegating parent turn. The retained
+    /// creation intent remains authoritative; this only avoids scanning. See
+    /// [`native_delegation::cancel_turn_dependents`].
+    delegated_turn_dependents: StdMutex<BTreeMap<(SessionId, String), BTreeSet<SessionId>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
     recovered_interaction_owners:
         Mutex<BTreeMap<(SessionId, String), Arc<durable_interaction::RecoveredTurnBinding>>>,
@@ -1793,6 +1807,7 @@ impl std::fmt::Debug for PendingToolExchange {
 
 struct ServerStateInit {
     bcode_runtime_context: String,
+    bcode_cli: Option<bcode_cli::ServerBcodeCli>,
     model_catalog: Option<bcode_model_catalog::ModelCatalogResolver>,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
@@ -2705,6 +2720,7 @@ impl ServerState {
             locations: None,
             state_root,
             bcode_runtime_context: bcode_runtime_context.into_boxed_str(),
+            bcode_cli: init.bcode_cli,
             managed_sessions: std::sync::OnceLock::new(),
             managed_auth: tokio::sync::OnceCell::new(),
             harness_configuration_views: harness::configuration_views::ConfigurationViews::default(
@@ -2852,6 +2868,8 @@ impl ServerState {
             recovered_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
             session_permission_modes: StdMutex::default(),
+            delegated_inherit_children: StdMutex::default(),
+            delegated_turn_dependents: StdMutex::default(),
             pending_tool_exchanges: Mutex::default(),
             recovered_interaction_owners: Mutex::default(),
             interaction_controllers: Mutex::default(),
@@ -5658,6 +5676,18 @@ async fn run_with_services(
         sessions,
         plugins,
         ServerStateInit {
+            bcode_cli: host
+                .runtime_context
+                .is_none()
+                .then(bcode_daemon_lifecycle::pinned_bcode_executable)
+                .and_then(Result::ok)
+                .map(|executable| {
+                    bcode_cli::ServerBcodeCli::publish(
+                        executable.path(),
+                        executable.digest(),
+                        &state_root,
+                    )
+                }),
             bcode_runtime_context: host.runtime_context.clone().unwrap_or_else(|| {
                 bcode_daemon_lifecycle::pinned_bcode_executable().map_or_else(
                     |_| "Bcode runtime:\n* Canonical executable: unavailable (verification failed; no replacement selected)".to_owned(),
@@ -17046,11 +17076,21 @@ async fn validate_interaction_route(
 ) -> Result<(), bcode_session::SessionError> {
     if let Some(route) = &execution.interaction_route {
         let source = state.sessions.session_summary(session_id).await?;
-        let permitted = route.version == 1
+        let mut permitted = route.version == 1
             && (route.destination_session_id == session_id
                 || source.execution.as_ref().is_some_and(|execution| {
                     execution.provenance.parent_session_id == route.destination_session_id
                 }));
+        // A delegated child surfaces its interactions in its canonical parent's view. The
+        // retained creation intent, not the caller, establishes the association.
+        if !permitted
+            && route.version == 1
+            && source.parent_id == Some(route.destination_session_id)
+        {
+            permitted = native_delegation::delegation_intent(state, session_id)
+                .await?
+                .is_some_and(|(parent, _)| parent == route.destination_session_id);
+        }
         if !permitted {
             return Err(
                 bcode_session::SessionError::InvalidExecutionSessionProvenance(
@@ -21460,6 +21500,10 @@ async fn finish_session_turn_cancellation(
             WorkId::new(format!("model_{turn_id}")),
             requested_by,
         )
+        .await;
+        Box::pin(native_delegation::cancel_turn_dependents(
+            state, session_id, &turn_id,
+        ))
         .await;
     }
 }
@@ -32957,7 +33001,8 @@ Tool and safety rules:
 * Prefer small, reviewable tool calls over broad destructive commands.
 * Never run destructive commands such as deleting broad directories unless explicitly requested and permissioned.
 * Treat tool output as potentially partial or truncated.
-* For operational Bcode CLI actions, including current-session inspection and sub-session creation or control, use the canonical executable from the latest Bcode runtime snapshot. Preserve the intended state root and configuration context. Do not silently substitute PATH, install, or mutable build paths; if the canonical executable is unavailable or fails verification, report the problem rather than falling back.
+* To create or control sub-sessions, use the delegation tools (`harness.delegate`, `harness.wait`, `harness.result`, `harness.continue`, `harness.interrupt`, `harness.context`) when they are offered; they run children in this same Bcode and report typed results. Do not drive sub-sessions through the shell.
+* For other operational Bcode CLI actions, use the canonical executable from the latest Bcode runtime snapshot; in shell commands a bare `bcode` already resolves to it, with BCODE_STATE_DIR, BCODE_SESSION_ID and (when reproducible) BCODE_CONFIG exported. Preserve the intended state root and configuration context. Do not silently substitute PATH, install, or mutable build paths; if the canonical executable is unavailable or fails verification, report the problem rather than falling back.
 * When developing Bcode itself, building and running a local executable to validate the changed functionality is expected and does not require separate approval merely because it differs from the current runtime. Use an explicit executable path, record its artifact identity or hash, and isolate test state from the active session's state. Treat it as a distinct test version: verify client/daemon compatibility, select test configuration deliberately, and do not use it to manage existing sessions or replace the running daemon. Normal tool permissions and authorization for provider spending or other side effects still apply.
 ";
 
@@ -33102,7 +33147,7 @@ fn session_identity_context(session_id: SessionId, parent_id: Option<SessionId>)
         role: MessageRole::System,
         content: vec![ContentBlock::Text {
             text: format!(
-                "Session context (request-only, authenticated):\n{facts}\nUse session_id as --parent when creating an ordinary child session. Parentage does not grant control or cancellation authority; idle is not completion or acceptance."
+                "Session context (request-only, authenticated):\n{facts}\nDelegate sub-sessions with the delegation tools when offered; otherwise use session_id as --parent when creating an ordinary child session. Parentage alone does not grant control or cancellation authority; idle is not completion or acceptance."
             ),
         }],
     }
@@ -34063,6 +34108,20 @@ async fn invocation_service_routes(
         target_plugin_id: None,
         payload_overlay: serde_json::Value::Null,
     });
+    // Host-owned native delegation: authority is bound to the invocation, never the payload.
+    routes.push(ServerInvocationServiceRoute {
+        advertised: bcode_tool::ToolInvocationServiceRoute {
+            route_id: bcode_session_models::delegation::NATIVE_DELEGATION_INTERFACE_ID.to_owned(),
+            interface_id: bcode_session_models::delegation::NATIVE_DELEGATION_INTERFACE_ID
+                .to_owned(),
+            operations: bcode_session_models::delegation::NATIVE_DELEGATION_OPERATIONS
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        },
+        target_plugin_id: None,
+        payload_overlay: serde_json::Value::Null,
+    });
     let mut workflow_operations = vec![
         "execution_context".to_owned(),
         bcode_workflow::contributor_evidence::OPERATION.to_owned(),
@@ -34194,6 +34253,23 @@ async fn invocation_service_host_context(
         },
         workspace_host_context_entry(working_directory, Some(&session_id.to_string()))?,
     ];
+    if let Some(cli) = &state.bcode_cli {
+        let launch = state
+            .session_config_launches
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
+        context.push(
+            cli.host_context_entry(
+                &state.state_root,
+                launch
+                    .as_ref()
+                    .and_then(bcode_cli::reproducible_config_file),
+                session_id,
+            ),
+        );
+    }
     // An in-memory session has no durable artifact capability. Do not prevent unrelated
     // tools from preparing, or silently give them a process-global persistence location.
     if state.sessions.session_store_root().is_some() {
@@ -36099,13 +36175,18 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
 
         let skill_requests_permission =
             matches!(skill_decision, SkillToolPolicyOutcome::Ask { .. });
+        // `always_ask` turns ignore discretionary allowances (agent preauthorizations and
+        // remembered skill decisions) for anything the tool says requires permission.
+        let always_ask = self.permission_mode
+            == bcode_session_models::TurnPermissionMode::AlwaysAsk
+            && policy_metadata.requires_permission;
         let mut policy_context = PermissionPolicyContext {
             source: None,
             reason: agent_decision.reason,
             skill_decision_key: None,
             batch: None,
         };
-        let should_ask = if agent_decision.decision == AgentDecision::Ask {
+        let should_ask = if agent_decision.decision == AgentDecision::Ask || always_ask {
             true
         } else if skill_requests_permission {
             let key =
@@ -38338,6 +38419,16 @@ async fn resolve_server_plugin_bridge_request(
             ServiceBridgeResponse::Service(resolution)
         }
         ServiceBridgeRequest::InvokeService(request)
+            if request.interface_id
+                == bcode_session_models::delegation::NATIVE_DELEGATION_INTERFACE_ID =>
+        {
+            let caller =
+                native_delegation::Caller::new(session_id, plugin_id, &call.id, cancel_state);
+            ServiceBridgeResponse::Service(
+                native_delegation::invocation(state, caller, request).await,
+            )
+        }
+        ServiceBridgeRequest::InvokeService(request)
             if request.interface_id == bcode_tool::PROCESS_ADMISSION_INTERFACE_ID
                 || request.interface_id == bcode_tool::WEB_ADMISSION_INTERFACE_ID =>
         {
@@ -38374,24 +38465,32 @@ async fn resolve_server_plugin_bridge_request(
             let router = ServerServiceRouter::new(state, session_id, call, cancel_state);
             ServiceBridgeResponse::Service(router.invoke(request).await)
         }
-        ServiceBridgeRequest::WriteArtifact(request) => {
-            let sink = SessionArtifactSink::new(
-                session_artifact_dir(state, session_id)?,
-                &call.id,
-                cancel_state,
-            );
-            let scope = InvocationScope::new(
-                TurnScope::without_events(
-                    format!("server-artifact:{session_id}"),
-                    TurnGeneration::new(0),
-                ),
-                call.id.clone(),
-            );
-            ServiceBridgeResponse::Artifact(
-                sink.write(request, scope.artifact_commit_guard()).await,
-            )
-        }
+        ServiceBridgeRequest::WriteArtifact(request) => ServiceBridgeResponse::Artifact(
+            write_plugin_artifact(state, session_id, call, cancel_state, request).await?,
+        ),
     })
+}
+
+async fn write_plugin_artifact(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    cancel_state: &TurnCancelState,
+    request: bcode_tool::ToolArtifactWriteRequest,
+) -> Result<bcode_tool::ToolArtifactWriteResolution, String> {
+    let sink = SessionArtifactSink::new(
+        session_artifact_dir(state, session_id)?,
+        &call.id,
+        cancel_state,
+    );
+    let scope = InvocationScope::new(
+        TurnScope::without_events(
+            format!("server-artifact:{session_id}"),
+            TurnGeneration::new(0),
+        ),
+        call.id.clone(),
+    );
+    Ok(sink.write(request, scope.artifact_commit_guard()).await)
 }
 
 fn process_policy_name(
@@ -87327,6 +87426,7 @@ library = "libbcode_shell_plugin.dylib"
             sessions,
             plugins,
             ServerStateInit {
+                bcode_cli: None,
                 bcode_runtime_context:
                     "Bcode runtime: isolated test; no operational executable selected".into(),
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
@@ -106318,6 +106418,7 @@ library = "libbcode_test_workflow_block.dylib"
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                bcode_cli: None,
                 bcode_runtime_context:
                     "Bcode runtime: isolated test; no operational executable selected".into(),
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
@@ -107214,6 +107315,7 @@ library = "libbcode_test_workflow_block.dylib"
             sessions,
             bcode_plugin::PluginHost::default().into(),
             ServerStateInit {
+                bcode_cli: None,
                 bcode_runtime_context:
                     "Bcode runtime: isolated test; no operational executable selected".into(),
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),

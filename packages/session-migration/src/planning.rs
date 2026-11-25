@@ -389,7 +389,10 @@ mod tests {
             source_writer_epoch: 27,
             target_writer_epoch: 28,
         };
-        for source in RELEASED_HISTORICAL_WRITER_EPOCHS {
+        for source in RELEASED_HISTORICAL_WRITER_EPOCHS
+            .iter()
+            .filter(|source| **source < 28)
+        {
             let plan = plan_writer_epoch_migration_with_registry(*source, 28, &MIGRATION_STEPS)
                 .expect("supported source reaches account-reference writer");
             assert_eq!(plan.steps.last(), Some(&account));
@@ -402,6 +405,30 @@ mod tests {
         );
         assert!(matches!(
             plan_writer_epoch_migration_with_registry(28, 27, &MIGRATION_STEPS),
+            Err(MigrationPlanError::FutureWriter { .. })
+        ));
+    }
+
+    #[test]
+    fn delegation_edge_extends_every_released_source() {
+        let delegation = MigrationStepDescriptor {
+            id: "session-writer-epoch-28-to-29",
+            source_writer_epoch: 28,
+            target_writer_epoch: 29,
+        };
+        for source in RELEASED_HISTORICAL_WRITER_EPOCHS {
+            let plan = plan_writer_epoch_migration_with_registry(*source, 29, &MIGRATION_STEPS)
+                .expect("supported source reaches delegation writer");
+            assert_eq!(plan.steps.last(), Some(&delegation));
+        }
+        assert_eq!(
+            plan_writer_epoch_migration_with_registry(28, 29, &MIGRATION_STEPS)
+                .unwrap()
+                .steps,
+            [delegation]
+        );
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(29, 28, &MIGRATION_STEPS),
             Err(MigrationPlanError::FutureWriter { .. })
         ));
     }
@@ -551,7 +578,7 @@ mod tests {
         let plan = plan_writer_epoch_migration(4).expect("epoch 4 corrective plan");
         let expected_edges = (4..23)
             .map(|source| (source, source + 1))
-            .chain([(23, 25), (25, 26), (26, 27), (27, 28)])
+            .chain([(23, 25), (25, 26), (26, 27), (27, 28), (28, 29)])
             .collect::<Vec<_>>();
         assert_eq!(
             plan.steps
@@ -627,6 +654,11 @@ mod tests {
                     id: "session-writer-epoch-27-to-28",
                     source_writer_epoch: 27,
                     target_writer_epoch: 28,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-28-to-29",
+                    source_writer_epoch: 28,
+                    target_writer_epoch: 29,
                 }
             ]
         );
@@ -696,6 +728,11 @@ mod tests {
                     id: "session-writer-epoch-27-to-28",
                     source_writer_epoch: 27,
                     target_writer_epoch: 28,
+                },
+                MigrationStepDescriptor {
+                    id: "session-writer-epoch-28-to-29",
+                    source_writer_epoch: 28,
+                    target_writer_epoch: 29,
                 },
             ]
         );

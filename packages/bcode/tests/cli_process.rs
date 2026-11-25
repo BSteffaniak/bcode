@@ -4040,6 +4040,7 @@ fn session_spawn_prints_live_preparation_failure_receipt() {
     );
     let child_id = bcode_session_models::SessionId::new();
     let request = bcode_session_models::SessionSpawnRequest {
+        delegation: None,
         version: 99,
         creation: bcode_session_models::SessionChildCreateRequest {
             child_id,
@@ -4221,6 +4222,7 @@ fn session_spawn_live_child_retry_and_changed_request_conflict() {
     );
     let child_id = bcode_session_models::SessionId::new();
     let mut request = bcode_session_models::SessionSpawnRequest {
+        delegation: None,
         version: 1,
         creation: bcode_session_models::SessionChildCreateRequest {
             child_id,

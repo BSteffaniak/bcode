@@ -242,6 +242,7 @@ impl HistoricalEnvelope {
                 reason: "explicit account references require event schema 59".into(),
             });
         }
+        self.validate_delegation_compatibility(event_kind, payload)?;
         if self.schema_version <= 55
             && event_kind == "external_harness_operation"
             && payload
@@ -256,6 +257,34 @@ impl HistoricalEnvelope {
             });
         }
         self.validate_legacy_observation_variants(event_kind, payload)
+    }
+
+    /// Reject native delegation intents and `always_ask` admissions before schema 60.
+    fn validate_delegation_compatibility(
+        &self,
+        event_kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), HistoricalSessionEventError> {
+        if self.schema_version <= 59
+            && event_kind == "child_session_created"
+            && payload
+                .pointer("/spawning/delegation")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "native delegation intents require event schema 60".into(),
+            });
+        }
+        if self.schema_version <= 59 && carries_always_ask_permission_mode(payload) {
+            return Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: self.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "always-ask turn permission mode requires event schema 60".into(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_legacy_observation_variants(
@@ -355,6 +384,20 @@ fn source_kind(
     }
     let (event_kind, payload) = kind.iter().next().expect("kind length was validated");
     Ok((event_kind, payload))
+}
+
+/// Persisted turn admission metadata locations whose execution options carry a permission mode.
+const ADMISSION_PERMISSION_MODE_POINTERS: [&str; 3] = [
+    "/admission/execution/permission_mode",
+    "/submission/admission/execution/permission_mode",
+    "/spawning/admission/execution/permission_mode",
+];
+
+/// Whether any persisted turn admission in this event payload selects `always_ask`.
+fn carries_always_ask_permission_mode(payload: &serde_json::Value) -> bool {
+    ADMISSION_PERMISSION_MODE_POINTERS.iter().any(|pointer| {
+        payload.pointer(pointer).and_then(serde_json::Value::as_str) == Some("always_ask")
+    })
 }
 
 /// Frozen codecs for released tool-result and context-usage event families.

@@ -93,7 +93,9 @@ pub trait SessionCompactionRecoveryDiscoveryApplication: Sync {
 /// Epoch 27 (schema 58) folds native harness usage into the required session usage projection;
 /// an epoch-26 writer would append native usage without maintaining that projection.
 /// Epoch 28 (schema 59) fences explicit account references and their required state projection.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 28;
+/// Epoch 29 (schema 60) fences native delegation intents in child creation and the
+/// `always_ask` turn permission mode, which older writers would misread or drop.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 29;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -171,6 +173,8 @@ pub use application::*;
 
 pub mod spawning;
 pub use spawning::*;
+
+pub mod delegation;
 
 pub mod observation;
 
@@ -1546,7 +1550,9 @@ mod checked_tool_projection_tests {
 /// Current persisted session event schema version.
 ///
 /// Schema 59 persists the exact account reference accompanying an explicit model selection.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 59;
+/// Schema 60 retains native delegation intents in child creation and admits the `always_ask`
+/// turn permission mode.
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 60;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -2814,6 +2820,9 @@ pub enum TurnPermissionMode {
     Enforce,
     /// Bypass discretionary agent and skill permission policy after structural authorization.
     Bypass,
+    /// Ask before every action that requires permission, ignoring discretionary allowances
+    /// such as agent preauthorizations and remembered skill decisions. Denials still apply.
+    AlwaysAsk,
 }
 
 /// Exact same-session canonical history reference for optional request-only evidence.

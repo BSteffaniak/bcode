@@ -1472,7 +1472,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 58;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 59;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -2286,7 +2286,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 26] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 27] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-28-to-29",
+        source_writer_epoch: 28,
+        target_writer_epoch: 29,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-27-to-28",
         source_writer_epoch: 27,
@@ -2542,13 +2547,19 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 27,
         event_schema: 58,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 28,
+        event_schema: 59,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
 ///
 /// Writer 24 is reserved and was never released. Writers 26 and 27 both emitted event schema 58.
+/// Writer 28 emitted event schema 59.
 pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27,
+    28,
 ];
 
 /// Released historical event schemas currently evidenced by Git history.
@@ -2558,11 +2569,12 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change. Schema 55
 /// remains supported for released writers 20 through 23; reserved schema 56 is never input.
 /// Schema 57 is the selected-model representation emitted by writer 25. Schema 58 is the
-/// native-parity representation emitted by writers 26 and 27.
+/// native-parity representation emitted by writers 26 and 27. Schema 59 is the account-reference
+/// representation emitted by writer 28.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
-    54, 55, 57, 58,
+    54, 55, 57, 58, 59,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -3149,7 +3161,8 @@ mod tests {
                 (23, 55),
                 (25, 57),
                 (26, 58),
-                (27, 58)
+                (27, 58),
+                (28, 59)
             ]
         );
     }

@@ -198,7 +198,7 @@ pub fn apply_result(
             );
             waiting_prompts(chat, settings.permissions().bypass_waiting_prompts);
         }
-        Some(TurnPermissionMode::Enforce) => {
+        Some(TurnPermissionMode::Enforce | TurnPermissionMode::AlwaysAsk) => {
             chat.app
                 .set_status("Permission bypass off: tools ask again".to_owned());
         }

@@ -626,6 +626,14 @@ Same-plugin transient client defaults cannot overwrite the explicit account or i
 route. An unavailable account remains selected on resume so the next dispatch reports failure
 rather than silently using configured credentials.
 
+## Native delegation intents
+
+Event schema 60 adds the optional `child_session_created.spawning.delegation` intent and the
+`always_ask` turn permission mode; writer epoch 29 fences older writers that would drop the intent
+or misread the mode. No projection column is added: delegation checks read only a child's first
+canonical event. Historical inputs at schema 59 or earlier carrying either are rejected rather
+than guessed. See [native delegation](native-delegation.md).
+
 ## Catalog discovery
 
 Catalog discovery is best-effort, bounded, and non-mutating:

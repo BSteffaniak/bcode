@@ -1348,6 +1348,13 @@ impl SessionApplication for SessionApplicationHandle<'_> {
         session_id: SessionId,
         mode: bcode_session_models::TurnPermissionMode,
     ) -> Result<bcode_session_models::TurnPermissionMode, SessionApplicationFailure> {
+        if mode == bcode_session_models::TurnPermissionMode::AlwaysAsk {
+            // `always_ask` is a per-turn delegation policy, not a session runtime mode.
+            return Err(failure(
+                "unsupported_permission_mode",
+                "a session's runtime permission mode is either enforce or bypass",
+            ));
+        }
         self.selected_location(session_id).await?;
         Ok(crate::permission_mode::set(self.state, session_id, mode).await)
     }
@@ -2137,6 +2144,7 @@ mod tests {
             let child_id = SessionId::new();
             let result = application(&state)
                 .spawn_session(bcode_session_models::SessionSpawnRequest {
+                    delegation: None,
                     version: 1,
                     creation: bcode_session_models::SessionChildCreateRequest {
                         child_id,

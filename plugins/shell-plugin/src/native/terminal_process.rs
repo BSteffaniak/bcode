@@ -70,6 +70,8 @@ pub struct TerminalSpawn<'a> {
     pub cwd: Option<&'a Path>,
     /// Inherited environment variables the process must not see.
     pub remove_env: Vec<&'a str>,
+    /// Variables set for the process after inherited private variables are removed.
+    pub set_env: &'a [(&'static str, std::ffi::OsString)],
     pub columns: u16,
     pub rows: u16,
 }
@@ -294,6 +296,9 @@ mod platform {
         }
         for name in &spec.remove_env {
             command = command.env_remove(name);
+        }
+        for (name, value) in spec.set_env {
+            command = command.env(name, value);
         }
         let process = command
             .spawn(PtySize::new(spec.columns, spec.rows))

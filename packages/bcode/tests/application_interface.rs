@@ -588,6 +588,7 @@ where
         .await
         .unwrap();
     let mut request = SessionSpawnRequest {
+        delegation: None,
         managed: None,
         version: 1,
         creation: SessionChildCreateRequest {

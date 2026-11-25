@@ -27,6 +27,15 @@ This inventory classifies Bcode operational limits so hardcoded defaults do not 
 | `model.tool_output.context_chars` | Model context | 4,000 chars | Configurable bounded default | Bounds normal tool-result projection. |
 | `model.tool_output.fallback_argument_chars` | Model context | 6,000 chars | Configurable bounded default | Bounds plain-text fallback for malformed or duplicate historical tool calls. |
 
+## Native delegation limits
+
+`[plugins.config."bcode.harness".native]` (see [native delegation](native-delegation.md)):
+
+| Limit | Owner | Default | Classification | Behavior |
+| --- | --- | ---: | --- | --- |
+| `max_depth` | Harness plugin | Unlimited | Optional policy limit | Rejects delegation below the configured depth. |
+| `max_active_children` | Harness plugin | 32 | Configurable bounded default | Rejects delegation while the parent has this many active children. |
+
 ## Tool host preparation retries
 
 `[tools.execution]` controls retries of side-effect-free host preparation:

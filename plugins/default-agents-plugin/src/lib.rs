@@ -25,9 +25,10 @@ use std::path::PathBuf;
 use toml::{Table, Value};
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
-/// Delegation tool advertised by the harness plugin only when an external agent is configured.
+/// Delegation tool advertised by the harness plugin when Bcode children or an external agent
+/// are available.
 const DELEGATE_TOOL: &str = "harness.delegate";
-const DELEGATION_GUIDANCE: &str = "\n\nConfigured external coding agents are available. For a self-contained coding task, call `harness.delegate` with a complete standalone prompt; it returns a child session_id immediately while the agent works. Poll `harness.result` with that session_id (pass its cursor as `after`) until activity is settled; answer pending approvals or questions with `harness.respond`, send follow-ups with `harness.continue`, and review the result before reporting it.";
+const DELEGATION_GUIDANCE: &str = "\n\nSub-sessions: to run a self-contained task in a child session, call `harness.delegate` with a complete standalone prompt (the child does not see this conversation). It returns a child session_id immediately while the child works in the background. Children are Bcode sessions served by this same Bcode unless you choose a configured external agent; never run `bcode` through the shell to create or drive sub-sessions. Use `harness.context` to see this session's depth, agents, models and existing children. Block on children with `harness.wait` rather than polling, read results with `harness.result`, send follow-ups with `harness.continue` and stop a child with `harness.interrupt`. Bcode children's permission prompts and questions are shown to the user, who answers them; external agents' pending approvals or questions are answered with `harness.respond`. Review each child's result before reporting it.";
 
 #[derive(Debug, Deserialize)]
 struct DefaultAgentsManifestExtension {
@@ -1344,6 +1345,8 @@ command = { "python3 *" = "allow" }
             "harness.delegate",
             "harness.continue",
             "harness.result",
+            "harness.wait",
+            "harness.context",
             "question",
         ];
         let build = context(BUILD_AGENT, &delegation);
@@ -1354,7 +1357,13 @@ command = { "python3 *" = "allow" }
                 .contains("harness.delegate")
         );
         let enabled = build.enabled_tools.unwrap();
-        for tool in ["harness.delegate", "harness.continue", "harness.result"] {
+        for tool in [
+            "harness.delegate",
+            "harness.continue",
+            "harness.result",
+            "harness.wait",
+            "harness.context",
+        ] {
             assert!(enabled.iter().any(|name| name == tool), "{tool}");
         }
         let unconfigured = context(BUILD_AGENT, &["question"]);
@@ -1374,6 +1383,9 @@ command = { "python3 *" = "allow" }
         let plan_tools = plan.enabled_tools.unwrap();
         assert!(!plan_tools.iter().any(|name| name == "harness.delegate"));
         assert!(plan_tools.iter().any(|name| name == "harness.result"));
+        // Observing children stays available to the read-only plan agent.
+        assert!(plan_tools.iter().any(|name| name == "harness.wait"));
+        assert!(plan_tools.iter().any(|name| name == "harness.context"));
     }
 
     #[test]

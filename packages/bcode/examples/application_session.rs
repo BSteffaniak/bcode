@@ -86,6 +86,7 @@ async fn run_session(
     // exact request, not mint a new ID. Preparation/admission can fail after creation.
     let child_id = SessionId::new();
     let request = SessionSpawnRequest {
+        delegation: None,
         version: 1,
         creation: SessionChildCreateRequest {
             parent_id: parent.id,

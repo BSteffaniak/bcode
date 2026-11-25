@@ -13,7 +13,7 @@ bcode session activity <session-id> --children --limit 32 --json
 
 Retain `--child-id` to reconcile an identical creation request after a lost response. Conflicting retries fail closed. Creating an ordinary child does not submit work, copy the parent's conversation, change permissions, or create a worktree.
 
-Children remain independently openable at their session-ID-derived canonical paths in the parent's verified state location. Parent lifecycle actions do not implicitly cancel or delete descendants. There is no adoption or reparenting operation.
+Children remain independently openable at their session-ID-derived canonical paths in the parent's verified state location. Parent lifecycle actions do not implicitly cancel or delete descendants, except that a child delegated with `cancel_with_turn` is interrupted with its delegating turn (see [native delegation](native-delegation.md)). There is no adoption or reparenting operation.
 
 Discovery uses bounded parent-local pages, not a full-tree replay or a global catalog scan. Follow `next_after`, including across sparse pages. `complete` and `issues` express discovery trust independently of pagination. Pending publication, missing or inconsistent child storage, and stale or damaged checkpoints are surfaced rather than treated as an empty tree.
 

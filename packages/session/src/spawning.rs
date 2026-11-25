@@ -11,6 +11,7 @@ mod tests {
     fn request(parent_id: SessionId) -> SessionSpawnRequest {
         let child_id = SessionId::new();
         SessionSpawnRequest {
+            delegation: None,
             version: 1,
             creation: SessionChildCreateRequest {
                 child_id,

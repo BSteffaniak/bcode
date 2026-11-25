@@ -30,6 +30,9 @@ pub struct SessionSpawnRequest {
     /// Version-two managed execution intent. Version one must leave this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<ManagedSessionSpawnIntent>,
+    /// Native delegation intent; only version-one (provider execution) spawns may carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Box<crate::delegation::SessionDelegationIntent>>,
 }
 
 /// Exact managed selection, retained as part of canonical child creation.
@@ -65,6 +68,12 @@ impl SessionSpawnRequest {
         {
             return Err("managed spawn storage fence is unavailable".into());
         }
+        if self.delegation.is_some()
+            && (schema_version < crate::delegation::DELEGATION_EVENT_SCHEMA_VERSION
+                || writer_epoch < crate::delegation::DELEGATION_STORAGE_WRITER_EPOCH)
+        {
+            return Err("delegation spawn storage fence is unavailable".into());
+        }
         Ok(())
     }
 
@@ -72,6 +81,12 @@ impl SessionSpawnRequest {
     /// # Errors
     /// Rejects unknown versions, backend mixing and changed inherited model/account intent.
     pub fn validate_execution(&self) -> Result<(), String> {
+        if let Some(delegation) = &self.delegation {
+            delegation.validate()?;
+            if self.version != 1 || self.creation.child_id == self.creation.parent_id {
+                return Err("delegation requires an ordinary provider-execution child".into());
+            }
+        }
         match (self.version, &self.managed) {
             (1, None) => Ok(()),
             (2, Some(intent)) => {
@@ -348,6 +363,7 @@ mod tests {
             },
         };
         SessionSpawnRequest {
+            delegation: None,
             version: 2,
             creation: SessionChildCreateRequest {
                 child_id: child,
@@ -466,6 +482,7 @@ mod tests {
     #[test]
     fn composed_request_rejects_unknown_fields_and_preserves_auth_references() {
         let request = SessionSpawnRequest {
+            delegation: None,
             version: 1,
             creation: SessionChildCreateRequest {
                 child_id: crate::SessionId::new(),

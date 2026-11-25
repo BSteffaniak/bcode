@@ -80,6 +80,32 @@ pub const TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION: u32 = 1;
 pub const TOOL_ARTIFACT_CONTEXT_SCHEMA: &str = "bcode.artifact-context";
 /// Current artifact host-context schema version.
 pub const TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION: u32 = 1;
+/// Host-context schema identifying the exact Bcode runtime serving the invocation.
+pub const TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA: &str = "bcode.runtime-context";
+/// Current Bcode runtime host-context schema version.
+pub const TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA_VERSION: u32 = 1;
+
+/// Exact Bcode runtime identity offered to commands a tool starts.
+///
+/// Commands that invoke Bcode use these facts to reach the daemon artifact and state
+/// location serving the invocation instead of whichever `bcode` a search path resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolBcodeRuntimeContext {
+    /// Absolute path of the exact Bcode executable serving this daemon.
+    pub executable: std::path::PathBuf,
+    /// Absolute directory whose `bcode` entry resolves to `executable`, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_directory: Option<std::path::PathBuf>,
+    /// Absolute state root served by the daemon.
+    pub state_root: std::path::PathBuf,
+    /// Single explicit configuration file that faithfully reproduces the session's
+    /// configuration, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_file: Option<std::path::PathBuf>,
+    /// Session that owns the invocation.
+    pub session_id: String,
+}
 
 /// Opaque host-issued nested service route available to a prepared invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

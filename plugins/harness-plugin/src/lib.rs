@@ -7,6 +7,7 @@
 
 pub mod configuration;
 mod delegation;
+mod native;
 mod protocol;
 mod tools;
 mod workflow;

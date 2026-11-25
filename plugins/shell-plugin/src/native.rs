@@ -102,6 +102,8 @@ struct ShellPreparationDescriptor {
     workspace_root: Option<PathBuf>,
     #[serde(default)]
     artifact_root: Option<PathBuf>,
+    #[serde(default)]
+    bcode_runtime: Option<bcode_tool::ToolBcodeRuntimeContext>,
     timeout_ms: u64,
 }
 
@@ -127,6 +129,7 @@ fn shell_preparation_descriptor(
             bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
             "root",
         )?,
+        bcode_runtime: shell_bcode_runtime_context(preparation)?,
         timeout_ms,
     })
 }
@@ -165,6 +168,77 @@ fn shell_context_path(
         ));
     }
     Ok(Some(path))
+}
+
+/// The exact Bcode runtime serving the invocation, when the host provides one.
+///
+/// Paths must be absolute: a relative path would resolve against the command's working
+/// directory and could select a different Bcode.
+fn shell_bcode_runtime_context(
+    preparation: &bcode_tool::ToolPreparationRequest,
+) -> Result<Option<bcode_tool::ToolBcodeRuntimeContext>, String> {
+    let schema = bcode_tool::TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA;
+    let mut matching = preparation
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == schema);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(format!("duplicate Shell host context for {schema}"));
+    }
+    if entry.schema_version != bcode_tool::TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Shell host context version for {schema}: {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let context: bcode_tool::ToolBcodeRuntimeContext =
+        serde_json::from_value(entry.payload.clone())
+            .map_err(|error| format!("invalid Shell host context {schema}: {error}"))?;
+    let paths = [
+        Some(context.executable.as_path()),
+        context.cli_directory.as_deref(),
+        Some(context.state_root.as_path()),
+        context.config_file.as_deref(),
+    ];
+    if paths.into_iter().flatten().any(|path| !path.is_absolute()) {
+        return Err(format!(
+            "Shell host context {schema} paths must be absolute"
+        ));
+    }
+    Ok(Some(context))
+}
+
+/// Environment that makes `bcode` in a command reach the runtime serving the invocation.
+///
+/// The CLI directory is placed first on `PATH` so a bare `bcode` resolves to the exact
+/// executable; the state root, configuration file and session are exported for commands
+/// that build their own invocation.
+fn bcode_runtime_environment(
+    runtime: &bcode_tool::ToolBcodeRuntimeContext,
+    inherited_path: Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut environment = vec![
+        ("BCODE_EXECUTABLE", runtime.executable.clone().into_os_string()),
+        ("BCODE_STATE_DIR", runtime.state_root.clone().into_os_string()),
+        ("BCODE_SESSION_ID", runtime.session_id.clone().into()),
+    ];
+    if let Some(config_file) = &runtime.config_file {
+        environment.push(("BCODE_CONFIG", config_file.clone().into_os_string()));
+    }
+    if let Some(cli_directory) = &runtime.cli_directory {
+        let inherited = inherited_path.unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(cli_directory.clone()).chain(std::env::split_paths(&inherited)),
+        );
+        if let Ok(path) = path {
+            environment.push(("PATH", path));
+        }
+    }
+    environment
 }
 
 fn prepare_shell_tool(request: &ServiceRequest) -> ServiceResponse {
@@ -1079,6 +1153,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             TerminalRunPaths {
                 session_cwd: descriptor.workspace_root.as_deref(),
                 artifact_dir: descriptor.artifact_root.as_deref(),
+                bcode_runtime: descriptor.bcode_runtime.as_ref(),
                 input_bridge: Some(&context.bridge),
                 primary_presentation: Some(Arc::clone(&primary_presentation)),
             },
@@ -1383,6 +1458,7 @@ fn shell_program_and_args(
 struct TerminalRunPaths<'a> {
     session_cwd: Option<&'a Path>,
     artifact_dir: Option<&'a Path>,
+    bcode_runtime: Option<&'a bcode_tool::ToolBcodeRuntimeContext>,
     input_bridge: Option<&'a ServiceBridge>,
     primary_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
 }
@@ -1823,12 +1899,17 @@ fn run_terminal_shell_command_inner(
         cancellation: capture_cancellation,
     };
     let private_env = private_shell_environment(&shell_config.remove_env);
+    let runtime_env = paths
+        .bcode_runtime
+        .map(|runtime| bcode_runtime_environment(runtime, std::env::var_os("PATH")))
+        .unwrap_or_default();
     let (mut child, mut reader) = terminal_process::spawn(
         &terminal_process::TerminalSpawn {
             program: &program,
             args: &args,
             cwd: cwd.as_deref(),
             remove_env: private_env.iter().map(String::as_str).collect(),
+            set_env: &runtime_env,
             columns,
             rows,
         },
@@ -3392,6 +3473,7 @@ mod tests {
                 preparation_descriptor: serde_json::to_value(ShellPreparationDescriptor {
                     workspace_root: Some(workspace.path().to_path_buf()),
                     artifact_root: Some(workspace.path().to_path_buf()),
+                    bcode_runtime: None,
                     timeout_ms: 5_000,
                 })
                 .unwrap(),
@@ -4124,6 +4206,7 @@ mod tests {
             ShellPreparationDescriptor {
                 workspace_root: Some(std::env::temp_dir().join("workspace")),
                 artifact_root: Some(std::env::temp_dir().join("artifacts/session-1")),
+                bcode_runtime: None,
                 timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
             }
         );
@@ -4875,6 +4958,125 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn commands_reach_the_exact_bcode_serving_the_invocation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let environment = isolated_config_environment("bcode-runtime");
+        let root = tempfile::tempdir().unwrap();
+        // The pinned image has an arbitrary name; only the published entry is called `bcode`.
+        let executable = root.path().join("images").join("bcode-pinned-image");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\necho exact-bcode \"$@\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli_directory = root.path().join("cli");
+        std::fs::create_dir_all(&cli_directory).unwrap();
+        std::os::unix::fs::symlink(&executable, cli_directory.join("bcode")).unwrap();
+        let runtime = bcode_tool::ToolBcodeRuntimeContext {
+            executable: executable.clone(),
+            cli_directory: Some(cli_directory),
+            state_root: root.path().join("state"),
+            config_file: Some(root.path().join("bcode.toml")),
+            session_id: "session-under-test".into(),
+        };
+
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "test-bcode-runtime",
+            &ShellRunArguments {
+                command: "bcode --version; printf '%s|%s|%s|%s\\n' \"$BCODE_EXECUTABLE\" \"$BCODE_STATE_DIR\" \"$BCODE_CONFIG\" \"$BCODE_SESSION_ID\"".to_string(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                columns: None,
+                rows: None,
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                bcode_runtime: Some(&runtime),
+                session_cwd: None,
+                artifact_dir: None,
+                input_bridge: None,
+                primary_presentation: None,
+            },
+            &environment,
+        );
+
+        assert!(!response.is_error, "{}", response.output);
+        assert!(response.output.contains("exact-bcode --version"), "{}", response.output);
+        let expected = format!(
+            "{}|{}|{}|session-under-test",
+            executable.display(),
+            root.path().join("state").display(),
+            root.path().join("bcode.toml").display(),
+        );
+        assert!(response.output.contains(&expected), "{}", response.output);
+    }
+
+    #[test]
+    fn runtime_environment_prefixes_the_search_path_without_dropping_it() {
+        let runtime = bcode_tool::ToolBcodeRuntimeContext {
+            executable: PathBuf::from("/images/bcode-x"),
+            cli_directory: Some(PathBuf::from("/state/runtime/cli/abc")),
+            state_root: PathBuf::from("/state"),
+            config_file: None,
+            session_id: "s".into(),
+        };
+        let inherited = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        let environment = bcode_runtime_environment(&runtime, Some(inherited));
+        let path = environment
+            .iter()
+            .find(|(name, _)| *name == "PATH")
+            .map(|(_, value)| std::env::split_paths(value).collect::<Vec<_>>())
+            .expect("PATH");
+        assert_eq!(
+            path,
+            ["/state/runtime/cli/abc", "/usr/bin", "/bin"].map(PathBuf::from)
+        );
+        assert!(!environment.iter().any(|(name, _)| *name == "BCODE_CONFIG"));
+
+        let without_directory = bcode_tool::ToolBcodeRuntimeContext {
+            cli_directory: None,
+            ..runtime
+        };
+        assert!(
+            !bcode_runtime_environment(&without_directory, None)
+                .iter()
+                .any(|(name, _)| *name == "PATH")
+        );
+    }
+
+    #[test]
+    fn relative_runtime_context_paths_are_rejected() {
+        let mut request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "i".into(),
+                tool_name: "shell.run".into(),
+                arguments: json!({"command": "true"}),
+            },
+            host_context: vec![bcode_tool::ToolHostContextEntry {
+                schema: bcode_tool::TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA.into(),
+                schema_version: bcode_tool::TOOL_BCODE_RUNTIME_CONTEXT_SCHEMA_VERSION,
+                payload: json!({
+                    "executable": "bcode",
+                    "state_root": "/state",
+                    "session_id": "s",
+                }),
+            }],
+        };
+        assert!(shell_bcode_runtime_context(&request).is_err());
+        request.host_context[0].payload["executable"] = json!("/images/bcode");
+        assert_eq!(
+            shell_bcode_runtime_context(&request)
+                .unwrap()
+                .map(|context| context.executable),
+            Some(PathBuf::from("/images/bcode"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn timeout_terminates_shell_process_group() {
         let environment = isolated_config_environment("timeout");
         let started = Instant::now();
@@ -4893,6 +5095,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -4932,6 +5135,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -4972,6 +5176,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -5016,6 +5221,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -5103,6 +5309,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: Some(&bridge),
@@ -5147,6 +5354,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: Some(&bridge),
@@ -5205,6 +5413,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: None,
@@ -5270,6 +5479,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: None,
@@ -5434,6 +5644,7 @@ mod tests {
                 },
                 json!({}),
                 TerminalRunPaths {
+                    bcode_runtime: None,
                     session_cwd: None,
                     artifact_dir: Some(artifact_dir.path()),
                     input_bridge: None,
@@ -5497,6 +5708,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -5545,6 +5757,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -5588,6 +5801,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
@@ -5832,6 +6046,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(dir.path()),
                 input_bridge: None,
@@ -5879,6 +6094,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(dir.path()),
                 input_bridge: None,
@@ -5912,6 +6128,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(dir.path()),
                 input_bridge: None,
@@ -5950,6 +6167,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(dir.path()),
                 input_bridge: None,
@@ -5988,6 +6206,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(dir.path()),
                 input_bridge: None,
@@ -6151,6 +6370,7 @@ mod tests {
             },
             json!({}),
             TerminalRunPaths {
+                bcode_runtime: None,
                 session_cwd: None,
                 artifact_dir: Some(dir.path()),
                 input_bridge: None,
