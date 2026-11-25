@@ -30221,6 +30221,21 @@ async fn session_runtime_selection_payload(
     {
         return bcode_session_models::SessionRuntimeSelection::default();
     }
+    // A managed conversation executes on its native harness, never with a Bcode model, so it
+    // reports no Bcode model selection. Clients present the native model from the canonical
+    // harness evidence in the session's own history instead.
+    if matches!(
+        state
+            .sessions
+            .session_external_harness_state(session_id)
+            .await,
+        Ok(Some(_))
+    ) {
+        return bcode_session_models::SessionRuntimeSelection {
+            agent_id: Some(session_agent_selection(state, session_id).await),
+            ..bcode_session_models::SessionRuntimeSelection::default()
+        };
+    }
     let resolved = session_model_selection(state, session_id).await;
     bcode_session_models::SessionRuntimeSelection {
         account_reference: resolved.provider_context.account_reference.clone(),
@@ -72138,6 +72153,85 @@ library = "test"
 
     pub fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
+    }
+
+    #[tokio::test]
+    async fn managed_session_attach_reports_no_bcode_model_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent_with_metrics_and_lease_owner(
+            root.path(),
+            bcode_metrics::MetricsRegistry::disabled(),
+            SessionLeaseOwnerContext {
+                build_fingerprint: Some("artifact".into()),
+                daemon_instance_id: Some("daemon".into()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .unwrap();
+        let native = sessions
+            .create_session(None, root.path().into())
+            .await
+            .unwrap();
+        let managed = sessions
+            .create_session(None, root.path().into())
+            .await
+            .unwrap();
+        let supported = bcode_harness_models::HarnessCapability {
+            support: bcode_harness_models::HarnessSupportLevel::Supported,
+            constraints: vec![],
+        };
+        sessions
+            .configure_external_harness(
+                &bcode_session_models::ExternalHarnessOwner {
+                    session_id: managed.id,
+                    generation: 1,
+                    artifact_id: "artifact".into(),
+                    daemon_id: "daemon".into(),
+                },
+                bcode_harness_models::HarnessInstance {
+                    instance_id: "claude-code".into(),
+                    plugin_id: "bcode.claude-code".into(),
+                    executable: "/not-invoked".into(),
+                    config_namespace: "fixture".into(),
+                    auth: bcode_harness_models::HarnessAuthBinding {
+                        provider_id: "claude-code".into(),
+                        profile: "native".into(),
+                        credential_namespace: "fixture".into(),
+                        custody: bcode_harness_models::HarnessAuthCustody::NativeManaged,
+                    },
+                },
+                bcode_harness_models::HarnessCapabilities {
+                    resume: supported.clone(),
+                    steering: supported.clone(),
+                    approval: supported.clone(),
+                    questions: supported.clone(),
+                    assistance: supported.clone(),
+                    interrupt: supported.clone(),
+                    authoritative_settlement: supported.clone(),
+                    background_continuation: supported.clone(),
+                    authentication: supported,
+                    model_switch: bcode_harness_models::HarnessCapability::unsupported(),
+                    permission_mode: bcode_harness_models::HarnessCapability::unsupported(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = test_server_state(sessions);
+        state.selected_model_id = Some("gpt-6.1-sol".into());
+
+        let native = crate::session_runtime_selection_payload(&state, native.id).await;
+        assert_eq!(native.effective_model_id.as_deref(), Some("gpt-6.1-sol"));
+
+        let managed = crate::session_runtime_selection_payload(&state, managed.id).await;
+        drop(state);
+        assert!(managed.agent_id.is_some());
+        assert_eq!(
+            managed,
+            bcode_session_models::SessionRuntimeSelection {
+                agent_id: managed.agent_id.clone(),
+                ..bcode_session_models::SessionRuntimeSelection::default()
+            }
+        );
     }
 
     fn pending_tool_exchange(

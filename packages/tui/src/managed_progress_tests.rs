@@ -231,3 +231,123 @@ fn a_managed_turn_replaces_its_sending_row_and_shows_native_progress() {
     app.absorb_session_event(&result);
     assert_eq!(app.activity(), &ActivityState::Idle);
 }
+
+fn header_row(app: &mut BmuxApp) -> String {
+    let mut buffer = bmux_tui::buffer::Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 120, 30));
+    let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+    crate::render::render(app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
+    (0..buffer.area().height)
+        .filter_map(|row| buffer.row_symbols(row))
+        .find(|row| row.contains("bcode"))
+        .expect("header row")
+}
+
+impl Session {
+    fn selected_open(&mut self, effective_model_id: &str) -> [SessionEvent; 2] {
+        let request = ExternalHarnessRequest::from_models_request(
+            &bcode_harness_models::HarnessModelsRequest {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: "open-1".into(),
+                instance: instance(),
+                kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                    open: Box::new(bcode_harness_models::HarnessOpenRequest {
+                        open_id: "open-1".into(),
+                        session_id: self.id.to_string(),
+                        generation: GENERATION,
+                        working_directory: "/work".into(),
+                        resume: None,
+                        parent_assistance: None,
+                    }),
+                    selection: bcode_harness_models::HarnessModelSelection {
+                        model_id: "opus".into(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let claimed = self.event(ExternalHarnessOperationRecord::DeliveryClaimed {
+            request: request.clone(),
+        });
+        let completed = self.event(ExternalHarnessOperationRecord::DeliveryCompleted {
+            request,
+            response: bcode_session_models::external_harness::ExternalHarnessResponse {
+                schema_version: HARNESS_SCHEMA_VERSION,
+                request_id: "open-1".into(),
+                operation: bcode_harness_models::HarnessOperation::Open,
+                kind:
+                    bcode_session_models::external_harness::ExternalHarnessResponseKind::Selected {
+                        target: HarnessSessionTarget::Prepared(
+                            bcode_harness_models::HarnessPreparedSession {
+                                open_id: "open-1".into(),
+                                session_id: self.id.to_string(),
+                                instance_id: "work".into(),
+                                generation: GENERATION,
+                                native_version: "1.0".into(),
+                                requested_native_session_id: None,
+                            },
+                        ),
+                        evidence: bcode_harness_models::HarnessModelEvidence {
+                            requested_model_id: "opus".into(),
+                            effective_model_id: Some(effective_model_id.into()),
+                        },
+                    },
+            },
+        });
+        [claimed, completed]
+    }
+}
+
+#[test]
+fn managed_header_names_the_native_model_and_never_the_bcode_selection() {
+    let mut session = Session {
+        id: SessionId::new(),
+        sequence: 0,
+    };
+    let mut app = BmuxApp::new_with_history(Some(session.id), &[], &[]);
+    app.set_managed_execution(session.id);
+    app.set_managed_label("Claude Code".into());
+    // The Bcode selection a client may still hold (carried over from a previous session, or
+    // reported by an older daemon) is not what a managed conversation runs on.
+    app.apply_runtime_selection(
+        bcode_ipc::SessionRuntimeSelection {
+            provider_plugin_id: Some("bcode.openai-compatible".into()),
+            requested_model_id: Some("gpt-6.1-sol".into()),
+            effective_model_id: Some("gpt-6.1-sol".into()),
+            ..bcode_ipc::SessionRuntimeSelection::default()
+        },
+        None,
+    );
+    let configured = session.event(ExternalHarnessOperationRecord::Configured {
+        instance: instance(),
+        capabilities: Box::new(capabilities()),
+        open_request: None,
+    });
+    app.absorb_session_event(&configured);
+    let header = header_row(&mut app);
+    assert!(header.contains("Claude Code"), "{header}");
+    assert!(!header.contains("gpt-6.1-sol"), "{header}");
+
+    for event in session.selected_open("claude-opus-5-5") {
+        app.absorb_session_event(&event);
+    }
+    let header = header_row(&mut app);
+    assert!(header.contains("Claude Code · claude-opus-5-5"), "{header}");
+    assert!(!header.contains("gpt-6.1-sol"), "{header}");
+
+    let usage = session.page(vec![HarnessObservationKind::Usage {
+        input_tokens: 12,
+        output_tokens: 1776,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        total_cost_micros: None,
+        duration_ms: None,
+        model: Some("claude-sonnet-5-5".into()),
+    }]);
+    app.absorb_session_event(&usage);
+    let header = header_row(&mut app);
+    drop(app);
+    assert!(
+        header.contains("Claude Code · claude-sonnet-5-5"),
+        "{header}"
+    );
+}

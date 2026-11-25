@@ -268,10 +268,6 @@ struct ManagedExecutionPolicy {
 pub struct ManagedSessionSettings {
     /// Last acknowledged native permission mode, if changed in this attachment.
     pub permission_mode: Option<bcode_harness_models::HarnessPermissionMode>,
-    /// Last acknowledged native model selector, if changed in this attachment.
-    pub model_id: Option<String>,
-    /// Model the native executor last reported in its usage evidence.
-    pub observed_model: Option<String>,
 }
 
 /// Status indicator shown while the session runs in permission bypass.
@@ -2328,25 +2324,34 @@ impl BmuxApp {
         &self.thinking_label
     }
 
-    /// Return the model label shown in the header.
+    /// Return the model label shown in the header, if there is one to show.
+    ///
+    /// A managed conversation names only the native model its canonical harness evidence
+    /// reports, and nothing until it reports one: it never executes with Bcode's own model
+    /// selection, so that selection must not stand in for it.
     #[must_use]
-    pub fn model_header_label(&self) -> String {
+    pub fn model_header_label(&self) -> Option<String> {
+        if self.managed_execution_session().is_some() {
+            return self
+                .session_view
+                .snapshot()
+                .runtime
+                .managed_model
+                .as_ref()
+                .map(|model| model.model_id.clone());
+        }
         let model = self
-            .managed_label()
-            .and_then(|_| {
-                let settings = &self.managed_composer.settings;
-                settings
-                    .model_id
-                    .as_deref()
-                    .or(settings.observed_model.as_deref())
-            })
-            .or_else(|| self.session_view.snapshot().runtime.display_name.as_deref())
+            .session_view
+            .snapshot()
+            .runtime
+            .display_name
+            .as_deref()
             .or_else(|| self.selected_model_id())
             .unwrap_or("default");
-        self.reasoning_header_label().map_or_else(
+        Some(self.reasoning_header_label().map_or_else(
             || model.to_owned(),
             |reasoning| format!("{model} [{reasoning}]"),
-        )
+        ))
     }
 
     fn reasoning_header_label(&self) -> Option<&str> {
@@ -3570,9 +3575,6 @@ impl BmuxApp {
             | SessionEventKind::ExternalSubmissionAccepted { .. }
             | SessionEventKind::ExternalDeliveryObserved { .. }
             | SessionEventKind::ExternalObservationRecorded { .. } => {
-                if let Some(model) = reported_native_model(event) {
-                    self.managed_composer.settings.observed_model = Some(model);
-                }
                 // The canonical user message replaces the composer's pending row in the same
                 // update, so the two are never drawn together.
                 if let Some(id) =
@@ -4120,9 +4122,8 @@ impl BmuxApp {
     /// Record an acknowledged native setting and show it in the status indicator.
     pub fn apply_managed_setting(&mut self, setting: &bcode_harness_models::HarnessSessionSetting) {
         match setting {
-            bcode_harness_models::HarnessSessionSetting::Model { model_id } => {
-                self.managed_composer.settings.model_id = Some(model_id.clone());
-            }
+            // The model is projected from the canonical acknowledgement the daemon records.
+            bcode_harness_models::HarnessSessionSetting::Model { .. } => {}
             bcode_harness_models::HarnessSessionSetting::PermissionMode { mode } => {
                 self.managed_composer.settings.permission_mode = Some(*mode);
             }
@@ -5276,25 +5277,6 @@ fn context_window_percentage(input_tokens: u64, context_window: u64) -> u32 {
 }
 
 /// The model a native executor reported in the newest usage of a committed page.
-fn reported_native_model(event: &SessionEvent) -> Option<String> {
-    use bcode_session_models::external_harness::ExternalHarnessOperationRecord;
-    let SessionEventKind::ExternalHarnessOperation { operation } = &event.kind else {
-        return None;
-    };
-    let ExternalHarnessOperationRecord::ObservationPage { page, .. } = &operation.record else {
-        return None;
-    };
-    page.observations
-        .iter()
-        .rev()
-        .find_map(|observation| match &observation.kind {
-            bcode_harness_models::HarnessObservationKind::Usage {
-                model: Some(model), ..
-            } => Some(model.clone()),
-            _ => None,
-        })
-}
-
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
         // Shared SessionView projects these as inert canonical transcript content. Include them

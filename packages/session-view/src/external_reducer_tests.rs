@@ -19,7 +19,7 @@ use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind, SessionId,
     SessionLiveEvent, SessionLiveEventKind, TextStreamOperation, TextStreamUpdate,
 };
-use bcode_session_view_models::external::ExternalInteractionKind;
+use bcode_session_view_models::external::{ExternalInteractionKind, ManagedModelSource};
 use bcode_session_view_models::retention::ObservationRetentionLimits;
 use bcode_session_view_models::{
     ReasoningContentAvailability, ToolInvocationViewStatus, TranscriptViewItem,
@@ -2188,4 +2188,242 @@ fn native_observations_report_foreground_progress_until_the_turn_ends() {
         external_activity(&interrupted),
         Some(ExternalActivity::Idle)
     );
+}
+
+fn selected_open(fixture: &mut Fixture, effective_model_id: Option<&str>) -> [SessionEvent; 2] {
+    let request =
+        ExternalHarnessRequest::from_models_request(&bcode_harness_models::HarnessModelsRequest {
+            schema_version: HARNESS_SCHEMA_VERSION,
+            request_id: "open-1".into(),
+            instance: instance(),
+            kind: bcode_harness_models::HarnessModelsRequestKind::OpenSelected {
+                open: Box::new(bcode_harness_models::HarnessOpenRequest {
+                    open_id: "open-1".into(),
+                    session_id: fixture.session_id.to_string(),
+                    generation: GENERATION,
+                    working_directory: "/work".into(),
+                    resume: None,
+                    parent_assistance: None,
+                }),
+                selection: bcode_harness_models::HarnessModelSelection {
+                    model_id: "opus".into(),
+                },
+            },
+        })
+        .unwrap();
+    let target = HarnessSessionTarget::Prepared(bcode_harness_models::HarnessPreparedSession {
+        open_id: "open-1".into(),
+        session_id: fixture.session_id.to_string(),
+        instance_id: "work".into(),
+        generation: GENERATION,
+        native_version: "1.0".into(),
+        requested_native_session_id: None,
+    });
+    delivered(
+        fixture,
+        GENERATION,
+        "daemon",
+        &request,
+        HarnessOperation::Open,
+        ExternalHarnessResponseKind::Selected {
+            target,
+            evidence: bcode_harness_models::HarnessModelEvidence {
+                requested_model_id: "opus".into(),
+                effective_model_id: effective_model_id.map(str::to_owned),
+            },
+        },
+    )
+}
+
+fn model_switch(
+    fixture: &mut Fixture,
+    model_id: &str,
+    kind: ExternalHarnessResponseKind,
+) -> [SessionEvent; 2] {
+    let mutation = format!("configure-{model_id}");
+    let request = Fixture::request(
+        ExternalHarnessRequestKind::Configure(bcode_harness_models::HarnessConfigureRequest {
+            target: HarnessSessionTarget::Confirmed(fixture.binding(GENERATION)),
+            mutation_id: mutation.clone(),
+            setting: bcode_harness_models::HarnessSessionSetting::Model {
+                model_id: model_id.into(),
+            },
+        }),
+        &mutation,
+    );
+    delivered(
+        fixture,
+        GENERATION,
+        "daemon",
+        &request,
+        HarnessOperation::Configure,
+        kind,
+    )
+}
+
+fn turn_usage(fixture: &mut Fixture, id: &str, model: &str) -> SessionEvent {
+    fixture.page(vec![(
+        id,
+        native_kind(serde_json::json!({
+            "kind": "usage",
+            "input_tokens": 12,
+            "output_tokens": 1776,
+            "cache_read_input_tokens": 190_606,
+            "cache_creation_input_tokens": 26_927,
+            "total_cost_micros": 289_105,
+            "duration_ms": 22_304,
+            "model": model,
+        })),
+    )])
+}
+
+fn managed_model(pair: &Pair) -> Option<(&str, ManagedModelSource)> {
+    pair.ordinary
+        .snapshot()
+        .runtime
+        .managed_model
+        .as_ref()
+        .map(|model| (model.model_id.as_str(), model.source))
+}
+
+#[test]
+fn managed_model_is_known_from_open_evidence_before_the_first_turn_ends() {
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    assert_eq!(managed_model(&pair), None);
+
+    for event in selected_open(&mut fixture, Some("claude-opus-5-5")) {
+        pair.durable(&event);
+    }
+    assert_eq!(
+        managed_model(&pair),
+        Some(("claude-opus-5-5", ManagedModelSource::OpenedEffective))
+    );
+
+    // Turn content without usage leaves the open evidence in place.
+    let text = fixture.page(vec![(
+        "text-1",
+        HarnessObservationKind::Text {
+            text: "Looking".into(),
+            segment_id: Some("msg-1:0".into()),
+        },
+    )]);
+    pair.durable(&text);
+    assert_eq!(
+        managed_model(&pair),
+        Some(("claude-opus-5-5", ManagedModelSource::OpenedEffective))
+    );
+
+    pair.durable(&turn_usage(&mut fixture, "usage-1", "claude-opus-5-5"));
+    assert_eq!(
+        managed_model(&pair),
+        Some(("claude-opus-5-5", ManagedModelSource::Reported))
+    );
+}
+
+#[test]
+fn unresolved_open_evidence_names_the_requested_selector() {
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    for event in selected_open(&mut fixture, None) {
+        pair.durable(&event);
+    }
+    assert_eq!(
+        managed_model(&pair),
+        Some(("opus", ManagedModelSource::OpenedRequested))
+    );
+}
+
+#[test]
+fn only_an_acknowledged_switch_changes_the_managed_model() {
+    let mut fixture = Fixture::new();
+    let mut pair = Pair::new();
+    pair.durable(&fixture.configured());
+    for event in selected_open(&mut fixture, Some("claude-opus-5-5")) {
+        pair.durable(&event);
+    }
+
+    let [claimed, failed] = model_switch(
+        &mut fixture,
+        "haiku",
+        ExternalHarnessResponseKind::Failure(HarnessFailure::Unsupported),
+    );
+    pair.durable(&claimed);
+    assert_eq!(
+        managed_model(&pair).map(|model| model.0),
+        Some("claude-opus-5-5")
+    );
+    pair.durable(&failed);
+    assert_eq!(
+        managed_model(&pair).map(|model| model.0),
+        Some("claude-opus-5-5")
+    );
+
+    for event in model_switch(
+        &mut fixture,
+        "sonnet",
+        ExternalHarnessResponseKind::Acknowledged {
+            mutation_id: "configure-sonnet".into(),
+        },
+    ) {
+        pair.durable(&event);
+    }
+    assert_eq!(
+        managed_model(&pair),
+        Some(("sonnet", ManagedModelSource::Switched))
+    );
+
+    pair.durable(&turn_usage(&mut fixture, "usage-2", "claude-sonnet-5-5"));
+    assert_eq!(
+        managed_model(&pair),
+        Some(("claude-sonnet-5-5", ManagedModelSource::Reported))
+    );
+}
+
+#[test]
+fn older_history_never_replaces_a_newer_managed_model() {
+    let mut fixture = Fixture::new();
+    let configured = fixture.configured();
+    let open = selected_open(&mut fixture, Some("claude-opus-5-5"));
+    let switched = model_switch(
+        &mut fixture,
+        "sonnet",
+        ExternalHarnessResponseKind::Acknowledged {
+            mutation_id: "configure-sonnet".into(),
+        },
+    );
+    let usage = turn_usage(&mut fixture, "usage-1", "claude-sonnet-5-5");
+
+    // A reattached tail window, then older pages loaded above it.
+    let mut view = SessionView::new();
+    view.apply_history(std::slice::from_ref(&usage));
+    let model = |view: &SessionView| {
+        view.snapshot()
+            .runtime
+            .managed_model
+            .as_ref()
+            .map(|model| model.model_id.clone())
+    };
+    assert_eq!(model(&view).as_deref(), Some("claude-sonnet-5-5"));
+    view.rebuild_history_window(
+        &std::iter::once(configured)
+            .chain(open)
+            .chain(switched)
+            .chain([usage])
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(model(&view).as_deref(), Some("claude-sonnet-5-5"));
+
+    // A window holding no model evidence keeps the model already projected.
+    let text = fixture.page(vec![(
+        "text-2",
+        HarnessObservationKind::Text {
+            text: "Later".into(),
+            segment_id: Some("msg-2:0".into()),
+        },
+    )]);
+    view.rebuild_history_window(std::slice::from_ref(&text));
+    assert_eq!(model(&view).as_deref(), Some("claude-sonnet-5-5"));
 }

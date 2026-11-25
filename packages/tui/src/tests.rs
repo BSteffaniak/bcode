@@ -3961,7 +3961,10 @@ fn thinking_label_uses_effective_values() {
         app.thinking_label(),
         "display: all · request effort: medium · provider summary: detailed"
     );
-    assert_eq!(app.model_header_label(), "default [medium]");
+    assert_eq!(
+        app.model_header_label().as_deref(),
+        Some("default [medium]")
+    );
     drop(app);
 }
 

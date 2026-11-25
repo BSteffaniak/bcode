@@ -1825,6 +1825,12 @@ pub struct SessionRuntimeViewState {
     pub display_name: Option<String>,
     /// Concrete effective model, when known.
     pub effective_model_id: Option<String>,
+    /// Native model of a managed external conversation, when canonical evidence names one.
+    ///
+    /// Managed conversations never execute with the Bcode selection above, so presentation of
+    /// a managed conversation reads this instead.
+    #[serde(default)]
+    pub managed_model: Option<external::ManagedModelView>,
     /// Selected agent, when known.
     pub agent_id: Option<String>,
     /// Selected reasoning effort, when configured.

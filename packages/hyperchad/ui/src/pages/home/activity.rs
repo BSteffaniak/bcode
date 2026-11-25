@@ -14,9 +14,12 @@ use super::usage::runtime_usage;
 
 pub(super) fn runtime_state_section(snapshot: &SessionViewSnapshot) -> Containers {
     let runtime = &snapshot.runtime;
+    // A managed conversation's native model, when reported, is the model it runs on.
     let model = runtime
-        .requested_model_id
-        .as_deref()
+        .managed_model
+        .as_ref()
+        .map(|model| model.model_id.as_str())
+        .or(runtime.requested_model_id.as_deref())
         .or(runtime.effective_model_id.as_deref())
         .unwrap_or("—");
     let provider = runtime.provider_plugin_id.as_deref().unwrap_or("—");

@@ -184,3 +184,32 @@ pub struct ExternalSessionView {
     /// A presentation limit omitted content from this page.
     pub truncated: bool,
 }
+
+/// What established the native model of a managed external conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedModelSource {
+    /// The native harness reported the effective model when the conversation opened.
+    OpenedEffective,
+    /// The conversation opened with this selector and the native harness did not report
+    /// what it resolved to.
+    OpenedRequested,
+    /// The native harness acknowledged a switch to this selector for subsequent turns.
+    Switched,
+    /// The native harness reported this model in a turn's usage.
+    Reported,
+}
+
+/// Native model of a managed external conversation, derived from canonical harness evidence.
+///
+/// This is display state only. It is independent of the Bcode model selection, which a managed
+/// conversation never executes with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedModelView {
+    /// Native model identity as the harness reported or acknowledged it.
+    pub model_id: String,
+    /// What established the identity.
+    pub source: ManagedModelSource,
+    /// Canonical event sequence of the evidence; older evidence never replaces newer.
+    pub source_sequence: u64,
+}

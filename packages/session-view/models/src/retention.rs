@@ -156,6 +156,7 @@ pub fn inspect_runtime(
         requested_model_id,
         display_name,
         effective_model_id,
+        managed_model,
         agent_id,
         reasoning_effort,
         reasoning_summary,
@@ -188,6 +189,14 @@ pub fn inspect_runtime(
         last_turn_message.as_ref(),
     ] {
         walker.optional_text(text, 2)?;
+    }
+    if let Some(crate::external::ManagedModelView {
+        model_id,
+        source: _,
+        source_sequence: _,
+    }) = managed_model
+    {
+        walker.text(model_id, 3)?;
     }
     walker.usage.try_add(
         ObservationRetentionUsage {

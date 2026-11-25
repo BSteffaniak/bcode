@@ -45,9 +45,12 @@ pub fn project(snapshot: &SessionViewSnapshot, max_items: usize) -> SessionView 
             .filter(|_| snapshot.thinking.streaming)
             .map(|text| bounded_text(text, MAX_THINKING_BYTES)),
         agent: runtime.agent_id.clone(),
+        // A managed conversation's native model, when reported, is the model it runs on.
         model: runtime
-            .effective_model_id
-            .clone()
+            .managed_model
+            .as_ref()
+            .map(|model| model.model_id.clone())
+            .or_else(|| runtime.effective_model_id.clone())
             .or_else(|| runtime.requested_model_id.clone()),
         client_count: snapshot
             .session_summary

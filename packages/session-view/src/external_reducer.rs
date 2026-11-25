@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 
 use bcode_harness_models::HarnessCapabilities;
 use bcode_session_models::{SessionEvent, SessionTokenUsage, TextStreamUpdate};
-use bcode_session_view_models::external::ExternalInteractionView;
+use bcode_session_view_models::external::{
+    ExternalInteractionView, ManagedModelSource, ManagedModelView,
+};
 use bcode_session_view_models::retention::{
     ObservationRetentionExceeded, ObservationRetentionLimits, ObservationRetentionUsage,
 };
@@ -525,6 +527,9 @@ impl SessionView {
         journal: &mut ExternalJournal,
     ) {
         self.update_external_state(&mut projection, journal);
+        if let Some((model_id, source)) = projection.model.take() {
+            self.observe_managed_model(journal, event.sequence, model_id, source);
+        }
         let mut remaining = projection
             .effects
             .iter()
@@ -1044,6 +1049,30 @@ impl SessionView {
             journal.usage_requests.insert(key.clone(), old);
         }
         self.observe_model_usage(usage);
+    }
+
+    /// Adopt native model evidence unless newer canonical evidence is already projected, so
+    /// loading older history never replaces the current model.
+    fn observe_managed_model(
+        &mut self,
+        journal: &mut ExternalJournal,
+        sequence: u64,
+        model_id: String,
+        source: ManagedModelSource,
+    ) {
+        let next = ManagedModelView {
+            model_id,
+            source,
+            source_sequence: sequence,
+        };
+        let current = self.snapshot.runtime.managed_model.as_ref();
+        if current.is_some_and(|current| current.source_sequence > sequence || *current == next) {
+            return;
+        }
+        if journal.runtime.is_none() {
+            journal.runtime = Some(Box::new(retain_original(&mut self.snapshot.runtime)));
+        }
+        self.snapshot.runtime.managed_model = Some(next);
     }
 
     /// Label a live assistant item of a managed external session with the harness name.

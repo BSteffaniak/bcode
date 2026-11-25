@@ -974,9 +974,11 @@ fn header_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
                 .to_owned(),
             accent,
             false,
-        )
-        .required(app.model_header_label(), Style::new(), false)
-        .required(session_title, Style::new(), true);
+        );
+    if let Some(model) = app.model_header_label() {
+        line = line.required(model, Style::new(), false);
+    }
+    line = line.required(session_title, Style::new(), true);
     // A managed conversation runs on its native executor; Bcode provider routing is unused.
     if app.managed_label().is_none() {
         line = line.optional(

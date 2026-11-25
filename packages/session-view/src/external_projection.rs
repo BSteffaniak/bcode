@@ -21,7 +21,9 @@ use bcode_session_models::external_harness::{
     ExternalHarnessRequestKind, ExternalHarnessResponseKind as Response,
 };
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionTokenUsage};
-use bcode_session_view_models::external::{ExternalInteractionView, ExternalProvenanceView};
+use bcode_session_view_models::external::{
+    ExternalInteractionView, ExternalProvenanceView, ManagedModelSource,
+};
 use std::fmt::Write as _;
 
 use crate::external::{ExternalInteractionAvailability, external_interaction};
@@ -194,6 +196,9 @@ pub struct ExternalProjection {
     pub label: Option<String>,
     /// Native capabilities retained by a configuration record.
     pub capabilities: Option<HarnessCapabilities>,
+    /// Native model identity the event establishes for the conversation; the latest evidence
+    /// within the event wins.
+    pub model: Option<(String, ManagedModelSource)>,
     /// Ordered effects.
     pub effects: Vec<ExternalEffect>,
 }
@@ -234,6 +239,15 @@ impl Builder<'_> {
                 .generation
                 .map_or(generation, |current| current.max(generation)),
         );
+    }
+
+    fn observe_reported_model(&mut self, observation: &HarnessObservation) {
+        if let HarnessObservationKind::Usage {
+            model: Some(model), ..
+        } = &observation.kind
+        {
+            self.projection.model = Some((model.clone(), ManagedModelSource::Reported));
+        }
     }
 
     fn current_generation(&self) -> Option<u64> {
@@ -555,7 +569,26 @@ fn project_completion(
             builder.observe_generation(binding.generation);
         }
         Response::Opened(binding) => builder.observe_generation(binding.generation),
-        Response::Selected { .. } | Response::Receipt(_) | Response::Acknowledged { .. } => {}
+        Response::Selected { evidence, .. } => {
+            builder.projection.model = Some(evidence.effective_model_id.as_ref().map_or_else(
+                || {
+                    (
+                        evidence.requested_model_id.clone(),
+                        ManagedModelSource::OpenedRequested,
+                    )
+                },
+                |effective| (effective.clone(), ManagedModelSource::OpenedEffective),
+            ));
+        }
+        Response::Acknowledged { .. } => {
+            if let ExternalHarnessRequestKind::Configure(configure) = &request.kind
+                && let bcode_harness_models::HarnessSessionSetting::Model { model_id } =
+                    &configure.setting
+            {
+                builder.projection.model = Some((model_id.clone(), ManagedModelSource::Switched));
+            }
+        }
+        Response::Receipt(_) => {}
     }
     if let ExternalHarnessRequestKind::Respond { response, .. } = &request.kind {
         builder.resolved(response.generation, &response.request_id);
@@ -599,6 +632,7 @@ fn project_observation(
     observation.validate().map_err(|error| error.to_string())?;
     let generation = observation.generation;
     builder.observe_generation(generation);
+    builder.observe_reported_model(observation);
     let observation_id = &observation.observation_id;
     if push_content_effect(&mut builder.projection.effects, observation, instance) {
         return Ok(());
