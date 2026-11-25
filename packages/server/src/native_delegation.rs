@@ -588,7 +588,7 @@ async fn delegate(
         None => None,
     };
     let request = spawn_request(caller, input, &parent, intent.clone(), mode, agent);
-    let runtime = crate::workflow_runtime_context(state, caller.session_id).await;
+    let runtime = crate::delegation_runtime_context(state, caller.session_id).await;
     let spawned = Box::pin(crate::session_spawning::spawn_delegated(
         state, runtime, request,
     ))
@@ -665,7 +665,7 @@ async fn continue_child(
         execution: execution_options(caller.session_id, mode, None, None),
         ..TurnAdmissionMetadata::default()
     };
-    let runtime = crate::workflow_runtime_context(state, caller.session_id).await;
+    let runtime = crate::delegation_runtime_context(state, caller.session_id).await;
     let mut ownership = None;
     let admitted = Box::pin(crate::session_operations::submit_turn_with_runtime_context(
         state,

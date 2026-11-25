@@ -30,6 +30,12 @@ and no default external instance is configured. Bcode-child-only options:
 * `cancel_with_turn` (default `false`): whether interrupting the delegating turn interrupts the
   child.
 
+Children run on the parent's provider, model and credential context unless `model` overrides the
+model. That context comes from a client attached to the parent when one is; a parent with no
+attached client (for example, one working in the background) supplies its own session selection,
+so its children never fall back to the daemon's default auth profile. A `model` on the parent's
+provider keeps the parent's credential context.
+
 `harness.continue`, `harness.result` and `harness.interrupt` try the native interface first and
 fall back to the external managed-session path for external children. `harness.wait` and
 `harness.context` apply to Bcode children only. The build agent receives all of these tools;

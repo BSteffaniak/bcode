@@ -472,3 +472,65 @@ async fn interrupting_a_delegating_turn_interrupts_only_its_cancel_with_turn_chi
     drop(state);
     drop(fixture);
 }
+
+#[tokio::test]
+async fn detached_parents_delegate_with_their_own_model_and_auth_profile() {
+    let fixture = Fixture::new().await;
+    // The parent runs on an explicit selection and credential profile, with no client attached.
+    fixture.state.session_model_selections.lock().await.insert(
+        fixture.parent.id,
+        SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+            model_id: Some("fake-echo".to_owned()),
+            provider_context: bcode_model::ProviderRequestContext {
+                auth_profile: Some("parent-profile".to_owned()),
+                ..bcode_model::ProviderRequestContext::default()
+            },
+            ..SessionModelSelection::default()
+        },
+    );
+
+    let runtime = crate::delegation_runtime_context(&fixture.state, fixture.parent.id)
+        .await
+        .expect("a detached parent still supplies its own selection");
+    assert_eq!(
+        runtime.selected_provider_plugin_id.as_deref(),
+        Some("bcode.fake-provider")
+    );
+    assert_eq!(runtime.selected_model_id.as_deref(), Some("fake-echo"));
+    assert_eq!(
+        runtime.provider_context.auth_profile.as_deref(),
+        Some("parent-profile")
+    );
+
+    // Children run on that selection, including with an explicit model on the same provider.
+    let inherited = SessionId::new();
+    let mut explicit_model = delegate_request(SessionId::new());
+    explicit_model.model = Some("fake-echo".to_owned());
+    let explicit_id = explicit_model.child_id;
+    for request in [delegate_request(inherited), explicit_model] {
+        let _: NativeAdmissionResponse = fixture
+            .ok(
+                fixture.parent.id,
+                NATIVE_DELEGATION_DELEGATE_OPERATION,
+                serde_json::to_value(request).unwrap(),
+            )
+            .await;
+    }
+    let waited: NativeSummariesResponse = fixture
+        .ok(
+            fixture.parent.id,
+            NATIVE_DELEGATION_WAIT_OPERATION,
+            serde_json::json!({
+                "session_ids": [inherited, explicit_id],
+                "until": NativeWaitUntil::All,
+                "timeout_ms": 30_000,
+            }),
+        )
+        .await;
+    assert!(!waited.timed_out, "{waited:?}");
+    for child in &waited.children {
+        assert_eq!(child.status, NativeChildStatus::Settled, "{child:?}");
+    }
+    drop(fixture);
+}

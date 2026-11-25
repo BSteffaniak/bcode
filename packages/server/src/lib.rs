@@ -29757,6 +29757,34 @@ async fn workflow_runtime_context(
     attached_client_runtime_context(state, parent_session_id, &selection).await
 }
 
+/// Runtime context for a child delegated by `parent_session_id`.
+///
+/// Prefers an attached client's context, like [`workflow_runtime_context`]. A parent running
+/// with no attached client instead reproduces its own session selection (provider, model, and
+/// resolved credential context) over the startup configuration, so its children never silently
+/// fall back to the daemon's default auth profile.
+async fn delegation_runtime_context(
+    state: &ServerState,
+    parent_session_id: SessionId,
+) -> Option<ClientRuntimeContext> {
+    let selection = session_model_selection(state, parent_session_id).await;
+    if let Some(context) =
+        attached_client_runtime_context(state, parent_session_id, &selection).await
+    {
+        return Some(context);
+    }
+    selection.provider_plugin_id.as_ref()?;
+    let effective_config = bcode_config::encode_effective_config(&state.startup_config).ok()?;
+    Some(ClientRuntimeContext {
+        effective_config_toml: Some(Box::new(effective_config)),
+        selected_provider_plugin_id: selection.provider_plugin_id,
+        selected_model_id: selection.model_id,
+        requested_model_id: selection.requested_model_id,
+        provider_context: selection.provider_context,
+        ..ClientRuntimeContext::default()
+    })
+}
+
 async fn attached_client_runtime_context(
     state: &ServerState,
     session_id: SessionId,
